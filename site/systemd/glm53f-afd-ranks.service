@@ -1,0 +1,27 @@
+# Expert ranks on one DGX Spark: both TP4 rank daemons + the CUDA MPS control daemon
+# in ONE container (one GPU tenant). Started and stopped by ./start.sh, which orders
+# the whole lane (ranks before the coordinator), so it is not enabled at boot.
+[Unit]
+Description=GLM-5.3-Flash AFD expert ranks (2x TP4 under MPS 100)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/glm53f-afd/ranks.env
+ExecStartPre=/opt/glm53f-afd/bin/glm53f-afd-preflight ranks
+ExecStartPre=-/usr/bin/docker rm glm53f-afd-ranks
+ExecStart=/usr/bin/docker run --rm --name glm53f-afd-ranks --label glm53f-afd=ranks \
+  --network host --ipc host --ulimit memlock=-1 --cap-add IPC_LOCK --device /dev/infiniband --gpus all \
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility --user ${RUN_UID}:${RUN_GID} -e HOME=/tmp \
+  -v ${GLM_HOME}:${GLM_HOME} -v /tmp:/tmp -v /opt/glm53f-afd:/opt/glm53f-afd:ro \
+  ${RANK_IMAGE} bash /opt/glm53f-afd/bin/glm53f-afd-ranks-run ${RANK_A} ${IP_A} ${RANK_B} ${IP_B} ${PEERS} ${GLM_HOME} ${RANK_PORT}
+ExecStop=/usr/bin/docker stop -t 45 glm53f-afd-ranks
+TimeoutStartSec=180
+TimeoutStopSec=90
+KillMode=process
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

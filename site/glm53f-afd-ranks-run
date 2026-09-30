@@ -1,0 +1,44 @@
+#!/bin/bash
+# glm53f-afd-ranks-run — runs INSIDE the rank container on each Spark.
+# Starts the CUDA MPS control daemon, then the Spark's two TP4 expert-rank daemons
+# (one per fabric rail) as MPS clients at 100% active threads. Without MPS the two
+# ranks time-slice the GB10 and decode drops ~40% (measured: 26 vs 42 tok/s no-draft).
+# usage: glm53f-afd-ranks-run <rankA> <ipA> <rankB> <ipB> <peers> <glm_home> <rank_port>
+set -u
+RA=$1; IPA=$2; RB=$3; IPB=$4; PEERS=$5; G=$6; PORT=${7:-8600}
+B=/opt/glm53f-afd/bin/glm53f-rank
+L=$G/logs/ranks-$(date +%Y%m%d-%H%M%S)
+mkdir -p "$L"; ln -sfn "$L" "$G/logs/ranks-latest"
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+export GLM53F_WIRE_NOCRC=1
+unset GLM53F_RDMA            # the rank<->rank mesh stays TCP (upstream default)
+export CUDA_MPS_PIPE_DIRECTORY=/tmp/glm53f-mps CUDA_MPS_LOG_DIRECTORY=/tmp/glm53f-mps-log
+PIDS=()
+stop_all() {
+  for p in "${PIDS[@]}"; do kill -TERM "$p" 2>/dev/null; done
+  for _ in $(seq 1 15); do
+    alive=0; for p in "${PIDS[@]}"; do kill -0 "$p" 2>/dev/null && alive=1; done
+    [ $alive = 0 ] && break; sleep 1
+  done
+  for p in "${PIDS[@]}"; do kill -KILL "$p" 2>/dev/null; done   # rank clients only
+  # Quit MPS gracefully. SIGKILLing the MPS server on GB10 stranded ~6 GiB of
+  # unified memory until reboot in our drills.
+  echo quit | nvidia-cuda-mps-control 2>/dev/null
+  for _ in $(seq 1 20); do pgrep -f '^nvidia-cuda-mps-server' >/dev/null || break; sleep 1; done
+}
+trap 'echo "$(date -Is) TERM" >> "$L/wrapper.log"; stop_all; exit 143' TERM INT
+{ echo "ranks=$RA@$IPA $RB@$IPB peers=$PEERS"; sha256sum "$B"; echo "memlock=$(ulimit -l)"; date -Is; } > "$L/wrapper.log"
+mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
+nvidia-cuda-mps-control -d || { echo "$(date -Is) MPS daemon failed to start" >> "$L/wrapper.log"; exit 1; }
+sleep 2
+export CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=100
+"$B" serve --rank "$RA" --dir "$G/ranks/r$RA" --listen "$IPA:$PORT" --peers "$PEERS" > "$L/rank$RA.log" 2>&1 &
+PIDS+=($!)
+"$B" serve --rank "$RB" --dir "$G/ranks/r$RB" --listen "$IPB:$PORT" --peers "$PEERS" > "$L/rank$RB.log" 2>&1 &
+PIDS+=($!)
+echo "pids ${PIDS[*]}" >> "$L/wrapper.log"
+wait -n
+echo "$(date -Is) a rank daemon exited rc=$?" >> "$L/wrapper.log"
+stop_all
+wait
+exit 1

@@ -1,0 +1,41 @@
+#!/bin/bash
+# glm53f-afd-preflight {ranks|coord} — ExecStartPre on every host. Refuses to start
+# into an unsafe host instead of hanging it. Values come from /etc/glm53f-afd/*.env.
+set -u
+role=${1:?ranks|coord}
+f=/etc/glm53f-afd/$role.env
+[ -r "$f" ] && { set -a; . "$f"; set +a; }
+G=$GLM_HOME
+fail() { echo "preflight($role): REFUSE: $*" >&2; exit 1; }
+avail() { awk '/MemAvailable/{printf "%.1f", $2/1048576}' /proc/meminfo; }
+ge() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a>=b)}'; }
+pin() { [ -z "$1" ] || echo "$1  $2" | sha256sum -c --quiet || fail "sha256 mismatch: $2"; }
+[ "${REQUIRE_GUARD:-0}" = 1 ] && { systemctl is-active -q gb10-hostguard.service || fail "gb10-hostguard is not active"; }
+# One GPU tenant per host: on GB10, CUDA allocations are unified memory and are NOT
+# charged to the container cgroup, so a second resident model can livelock the box.
+others=$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null | grep -v -E 'glm53f|nvidia-cuda-mps' || true)
+[ -z "$others" ] || fail "another GPU process is running: $others"
+if [ "$role" = ranks ]; then
+  for _ in $(seq 1 30); do a=$(avail); ge "$a" "$MIN_FREE_GIB" && break; sleep 3; done
+  ge "$a" "$MIN_FREE_GIB" || fail "MemAvailable $a GiB < $MIN_FREE_GIB GiB (stranded GB10 memory? a reboot reclaims it)"
+  pgrep -f '^nvidia-cuda-mps-server' >/dev/null && fail "a stale MPS server is running"
+  ip -4 -br addr | grep -q "$IP_A/" || fail "fabric address $IP_A missing"
+  ip -4 -br addr | grep -q "$IP_B/" || fail "fabric address $IP_B missing"
+  [ -f "$G/ranks/r$RANK_A/manifest.txt" ] || fail "rank dir $G/ranks/r$RANK_A missing (run ./download.sh)"
+  [ -f "$G/ranks/r$RANK_B/manifest.txt" ] || fail "rank dir $G/ranks/r$RANK_B missing (run ./download.sh)"
+  pin "${RANK_BIN_SHA256:-}" /opt/glm53f-afd/bin/glm53f-rank
+else
+  a=$(avail); ge "$a" "$MIN_FREE_GIB" || fail "MemAvailable $a GiB < $MIN_FREE_GIB GiB"
+  if [ -n "${POWER_LIMIT_W:-}" ]; then
+    pl=$(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits | head -1 | cut -d. -f1)
+    [ "$pl" -le "$POWER_LIMIT_W" ] || fail "GPU power limit ${pl} W > ${POWER_LIMIT_W} W"
+  fi
+  IFS=, read -ra CIPS <<< "$COORD_FABRIC_IPS"
+  for ip in "${CIPS[@]}"; do ip -4 -br addr | grep -q "$ip/" || fail "fabric address $ip missing"; done
+  if [ -n "${API_KEY_FILE:-}" ]; then [ -s "$API_KEY_FILE" ] || fail "API_KEY_FILE $API_KEY_FILE missing or empty"; fi
+  [ -f "$G/coordinator/config.json" ] || fail "$G/coordinator missing (run ./download.sh)"
+  [ -f "$G/drafter/model.safetensors" ] || fail "$G/drafter missing (run ./download.sh)"
+  pin "${SERVE_SHA256:-}" /opt/glm53f-afd/bin/glm53f-serve
+  pin "${DRAFTER_SHA256:-}" "$G/drafter/model.safetensors"
+fi
+echo "preflight($role): OK"

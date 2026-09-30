@@ -1,0 +1,30 @@
+# Coordinator on the RTX 5090 host: glm53f-serve (attention, all KV, the DFlash2
+# drafter, sampling, OpenAI API). Connects to the four ranks once at start; after
+# any wire error /health latches 503 until it is restarted (./start.sh recover).
+# Started and stopped by ./start.sh; not enabled at boot.
+[Unit]
+Description=GLM-5.3-Flash AFD coordinator (glm53f-serve)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/glm53f-afd/coord.env
+ExecStartPre=/opt/glm53f-afd/bin/glm53f-afd-preflight coord
+ExecStartPre=/usr/bin/install -d -m755 /etc/glm53f-afd/secrets
+ExecStartPre=-/usr/bin/docker rm glm53f-afd-coord
+ExecStart=/usr/bin/docker run --rm --name glm53f-afd-coord --label glm53f-afd=coord \
+  --network host --ipc host --ulimit memlock=-1 --cap-add IPC_LOCK --device /dev/infiniband --gpus all \
+  --user ${RUN_UID}:${RUN_GID} -e HOME=/tmp -e GLM53F_RDMA=1 -e GLM53F_WIRE_NOCRC=1 \
+  --env-file /etc/glm53f-afd/coord.env \
+  -v ${GLM_HOME}:${GLM_HOME} -v /opt/glm53f-afd:/opt/glm53f-afd:ro -v /etc/glm53f-afd/secrets:/etc/glm53f-afd/secrets:ro \
+  ${COORD_IMAGE} bash /opt/glm53f-afd/bin/glm53f-afd-coord-run
+ExecStop=/usr/bin/docker stop -t 30 glm53f-afd-coord
+TimeoutStartSec=300
+TimeoutStopSec=60
+KillMode=process
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

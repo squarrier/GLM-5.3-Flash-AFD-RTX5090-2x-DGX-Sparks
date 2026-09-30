@@ -1,0 +1,21 @@
+#!/bin/bash
+# glm53f-afd-coord-run — runs INSIDE the coordinator container on the RTX host.
+# Env comes from /etc/glm53f-afd/coord.env (docker --env-file).
+set -u
+G=$GLM_HOME
+mkdir -p "$G/logs"
+LOG=$G/logs/coord-$(date +%Y%m%d-%H%M%S).log
+ln -sfn "$LOG" "$G/logs/coord-latest.log"
+names=()
+if [ -n "${SERVED_NAMES:-}" ]; then
+  IFS=, read -ra N <<< "$SERVED_NAMES"
+  for n in "${N[@]}"; do names+=(--served-model-name "$n"); done
+fi
+auth=()
+if [ -n "${API_KEY_FILE:-}" ]; then auth=(--api-key-file "$API_KEY_FILE"); fi
+echo "$(date -Is) coord-run: auth=$([ -n "${API_KEY_FILE:-}" ] && echo on || echo OFF) names=${SERVED_NAMES:-} max_context=$MAX_CONTEXT slots=$SLOTS extra=[${EXTRA_ARGS:-}]" >> "$LOG"
+# shellcheck disable=SC2086
+exec /opt/glm53f-afd/bin/glm53f-serve \
+  --checkpoint "$G/coordinator" --drafter "$G/drafter" \
+  --ranks "$RANKS" --max-context "$MAX_CONTEXT" --slots "$SLOTS" \
+  "${names[@]}" "${auth[@]}" ${EXTRA_ARGS:-} --listen "$API_LISTEN" >> "$LOG" 2>&1

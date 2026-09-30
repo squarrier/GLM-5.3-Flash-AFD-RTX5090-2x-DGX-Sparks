@@ -1,0 +1,221 @@
+From ff06fab7c575a35bd550c1ebda93b75da572d570 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 08:39:21 -0400
+Subject: [PATCH] api: --served-model-name (repeatable) /
+ GLM53F_SERVED_MODEL_NAMES
+
+The first name is the response `model` and every name is listed by
+/v1/models, so a deployment can keep a stable alias (e.g. an existing
+OpenAI-compatible endpoint name). Unset keeps the upstream id
+glm-5.3-flash. API layer only: no numerics change.
+---
+ crates/glm53f-api/src/chat.rs   |  6 ++---
+ crates/glm53f-api/src/models.rs | 14 +++++++-----
+ crates/glm53f-api/src/types.rs  | 28 +++++++++++++++++++++++
+ crates/glm53f-serve/src/lib.rs  | 39 +++++++++++++++++++++++++++++++++
+ crates/glm53f-serve/src/main.rs |  5 +++++
+ 5 files changed, 84 insertions(+), 8 deletions(-)
+
+diff --git a/crates/glm53f-api/src/chat.rs b/crates/glm53f-api/src/chat.rs
+index 1e369f4..9697a0c 100644
+--- a/crates/glm53f-api/src/chat.rs
++++ b/crates/glm53f-api/src/chat.rs
+@@ -9,7 +9,7 @@ use crate::dialect::{Dialect, ParseResult, ParsedCall, StreamTags};
+ use crate::engine::{Engine, GenerateOutcome, GenerateParams, PromptOptions};
+ use crate::http::{self, json_response, Response};
+ use crate::json::{self, Json};
+-use crate::types::{self, ApiError, ChatRequest, Tool, ToolCall, MODEL_ID};
++use crate::types::{self, ApiError, ChatRequest, Tool, ToolCall};
+ 
+ /// The response field that carries reasoning, in both modes: the non-streamed
+ /// `message.reasoning_content` and every streamed `delta.reasoning_content`. This is the DeepSeek
+@@ -178,7 +178,7 @@ fn non_stream_json(
+         ("id", types::s(id)),
+         ("object", types::s("chat.completion")),
+         ("created", Json::Num(created as f64)),
+-        ("model", types::s(MODEL_ID)),
++        ("model", types::s(&types::model_id())),
+         ("choices", types::arr(vec![types::obj(vec![
+             ("index", Json::Num(0.0)),
+             ("message", Json::Object(message)),
+@@ -213,7 +213,7 @@ impl ChunkHead {
+             ("id", types::s(&self.id)),
+             ("object", types::s("chat.completion.chunk")),
+             ("created", Json::Num(self.created as f64)),
+-            ("model", types::s(MODEL_ID)),
++            ("model", types::s(&types::model_id())),
+         ];
+         pairs.extend(rest);
+         sse_event(&types::obj(pairs))
+diff --git a/crates/glm53f-api/src/models.rs b/crates/glm53f-api/src/models.rs
+index e1ebb70..9c61baf 100644
+--- a/crates/glm53f-api/src/models.rs
++++ b/crates/glm53f-api/src/models.rs
+@@ -2,15 +2,19 @@
+ 
+ use crate::http::{json_response, Response};
+ use crate::json::{self, Json};
+-use crate::types::MODEL_ID;
+ 
+ pub fn handle() -> Response {
+     let body = json::serialize(&Json::Object(vec![
+         ("object".to_string(), Json::Str("list".to_string())),
+-        ("data".to_string(), Json::Array(vec![Json::Object(vec![
+-            ("id".to_string(), Json::Str(MODEL_ID.to_string())),
+-            ("object".to_string(), Json::Str("model".to_string())),
+-        ])])),
++        ("data".to_string(), Json::Array(
++            crate::types::served_model_names()
++                .into_iter()
++                .map(|id| Json::Object(vec![
++                    ("id".to_string(), Json::Str(id)),
++                    ("object".to_string(), Json::Str("model".to_string())),
++                ]))
++                .collect(),
++        )),
+     ]));
+     json_response(200, &body)
+ }
+diff --git a/crates/glm53f-api/src/types.rs b/crates/glm53f-api/src/types.rs
+index 653b5ed..c383ec9 100644
+--- a/crates/glm53f-api/src/types.rs
++++ b/crates/glm53f-api/src/types.rs
+@@ -160,6 +160,34 @@ pub struct ChatRequest {
+ /// checked, so clients that send another id are still served.
+ pub const MODEL_ID: &str = "glm-5.3-flash";
+ 
++/// Served model names (local patch 0001, `--served-model-name`): the first is reported as the
++/// response `model` and listed first by `/v1/models`. Unset = `[MODEL_ID]` (upstream behaviour).
++static SERVED_MODEL_NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
++
++/// Sets the served names once at start-up. Empty names are refused; an empty list keeps the default.
++pub fn set_served_model_names(names: Vec<String>) -> Result<(), String> {
++    if names.iter().any(|n| n.trim().is_empty()) {
++        return Err("--served-model-name: an empty name".into());
++    }
++    if names.is_empty() {
++        return Ok(());
++    }
++    SERVED_MODEL_NAMES.set(names).map_err(|_| "served model names already set".to_string())
++}
++
++/// The served names, primary first.
++pub fn served_model_names() -> Vec<String> {
++    match SERVED_MODEL_NAMES.get() {
++        Some(v) if !v.is_empty() => v.clone(),
++        _ => vec![MODEL_ID.to_string()],
++    }
++}
++
++/// The primary served name (the response `model`).
++pub fn model_id() -> String {
++    served_model_names().swap_remove(0)
++}
++
+ const IMAGE_TYPES: &[&str] = &["image_url", "input_image", "image"];
+ const MEDIA_TYPES: &[&str] = &["input_audio", "audio", "input_video", "video"];
+ 
+diff --git a/crates/glm53f-serve/src/lib.rs b/crates/glm53f-serve/src/lib.rs
+index ad759d0..612edd0 100644
+--- a/crates/glm53f-serve/src/lib.rs
++++ b/crates/glm53f-serve/src/lib.rs
+@@ -347,6 +347,8 @@ pub const USAGE: &str = "usage:
+   glm53f-serve --checkpoint <dir> --experts local [--experts-dir <dir>] [--dev-layers 0-N] [options]
+ options:
+   --tokenizer <file>  --chat-template <file>  --experts remote|local  --local-experts-gib <g>
++  --served-model-name <name>  repeatable: the first is the response `model`; all are listed
++                      by /v1/models (default glm-5.3-flash; env GLM53F_SERVED_MODEL_NAMES=a,b)
+   --api-key-file <file>  the API key, the file's first line: /v1/* then needs the header
+                       Authorization: Bearer <key> (401 otherwise); /health stays open
+   --slots <n>  --max-context <tokens>  --kv-gib <g>  --reserve-gib <g>
+@@ -503,6 +505,8 @@ pub struct Options {
+     pub listen: String,
+     /// The file whose first line is the API key (none: the API serves every request).
+     pub api_key_file: Option<PathBuf>,
++    /// `--served-model-name` (repeatable; local patch 0001): primary first. Empty = upstream id.
++    pub served_model_names: Vec<String>,
+     pub slots: usize,
+     /// None: the model's maximum context.
+     pub max_context: Option<usize>,
+@@ -656,6 +660,10 @@ impl Options {
+         let mut local_gib = 4.0;
+         let mut listen = env("GLM53F_API_ADDR").unwrap_or_else(|| "127.0.0.1:8100".into());
+         let mut api_key_file = env("GLM53F_API_KEY_FILE").map(PathBuf::from);
++        let mut served_model_names: Vec<String> = env("GLM53F_SERVED_MODEL_NAMES")
++            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
++            .unwrap_or_default();
++        let mut served_from_flags = false;
+         let mut slots = match env("GLM53F_MAX_SLOTS") {
+             Some(v) => number("GLM53F_MAX_SLOTS", &v)?,
+             None => 16,
+@@ -710,6 +718,13 @@ impl Options {
+                 "--local-experts-gib" => local_gib = number(k, &val()?)?,
+                 "--listen" => listen = val()?,
+                 "--api-key-file" => api_key_file = Some(PathBuf::from(val()?)),
++                "--served-model-name" => {
++                    if !served_from_flags {
++                        served_model_names.clear();
++                        served_from_flags = true;
++                    }
++                    served_model_names.push(val()?);
++                }
+                 "--slots" => slots = number(k, &val()?)?,
+                 "--max-context" => max_context = Some(number(k, &val()?)?),
+                 "--kv-gib" => kv_gib = Some(number(k, &val()?)?),
+@@ -799,6 +814,7 @@ impl Options {
+             experts,
+             listen,
+             api_key_file,
++            served_model_names,
+             slots,
+             max_context,
+             kv_gib,
+@@ -1247,6 +1263,29 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn served_model_names_are_repeatable_flags_or_a_variable() {
++        let none = |k: &str| (k == "GLM53F_SPARK_ADDRS").then(|| RANK_LIST.to_string());
++        let o = Options::parse(&args("--checkpoint /c"), &none).unwrap();
++        assert!(o.served_model_names.is_empty());
++        let o = Options::parse(
++            &args("--checkpoint /c --served-model-name my-glm --served-model-name GLM-5.3-Flash-AFD"),
++            &none,
++        )
++        .unwrap();
++        assert_eq!(o.served_model_names, vec!["my-glm", "GLM-5.3-Flash-AFD"]);
++        let envset = |k: &str| match k {
++            "GLM53F_SERVED_MODEL_NAMES" => Some("a, b ,c".to_string()),
++            "GLM53F_SPARK_ADDRS" => Some(RANK_LIST.to_string()),
++            _ => None,
++        };
++        let o = Options::parse(&args("--checkpoint /c"), &envset).unwrap();
++        assert_eq!(o.served_model_names, vec!["a", "b", "c"]);
++        // flags replace the variable
++        let o = Options::parse(&args("--checkpoint /c --served-model-name x"), &envset).unwrap();
++        assert_eq!(o.served_model_names, vec!["x"]);
++    }
++
+     #[test]
+     fn the_api_key_file_is_a_flag_or_a_variable_and_never_empty() {
+         let env = |k: &str| (k == "GLM53F_SPARK_ADDRS").then(|| RANK_LIST.to_string());
+diff --git a/crates/glm53f-serve/src/main.rs b/crates/glm53f-serve/src/main.rs
+index ef31062..517d7f2 100644
+--- a/crates/glm53f-serve/src/main.rs
++++ b/crates/glm53f-serve/src/main.rs
+@@ -79,6 +79,11 @@ mod daemon {
+     pub fn run(o: &Options) -> Result<(), String> {
+         // The API key first: a file that is missing or holds no key stops the daemon now, not
+         // after the weights load.
++        if let Err(e) = glm53f_api::types::set_served_model_names(o.served_model_names.clone()) {
++            eprintln!("glm53f-serve: {e}");
++            std::process::exit(2);
++        }
++        eprintln!("[coordinator] served model names: {}", glm53f_api::types::served_model_names().join(", "));
+         let api_key = match &o.api_key_file {
+             Some(path) => {
+                 let key = read_api_key(path)?;
+-- 
+2.43.0
+

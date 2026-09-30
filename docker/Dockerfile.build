@@ -1,0 +1,13 @@
+# CPU-only build image for glm53f-afd (no GPU is used at build or test time).
+# BASE: nvidia/cuda:12.9.1-devel-ubuntu24.04 (x86_64 RTX 5090 coordinator, sm_120)
+#       nvidia/cuda:13.0.1-devel-ubuntu24.04 (aarch64 DGX Spark ranks, sm_121)
+ARG BASE
+FROM ${BASE}
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl build-essential pkg-config rdma-core libibverbs-dev ibverbs-utils python3 git \
+    && rm -rf /var/lib/apt/lists/*
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.1 \
+    && rustc --version && cargo --version
+WORKDIR /src
