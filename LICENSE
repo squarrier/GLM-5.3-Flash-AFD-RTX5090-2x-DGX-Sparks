@@ -19,9 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-patches/0001-*.patch modifies hughmadden/glm53f-afd, MIT, Copyright (c) 2026
-Turquoise Bay AI Pty Ltd, and is offered under the same terms. The engine,
-weights and drafter are not included in this repository and keep their own
-licences (the DFlash2 drafter is CC BY-NC-ND 4.0).
