@@ -18,7 +18,7 @@ The routed-expert weights used by this recipe are **GLM-5.3-Flash TR3 4bpw (EXL3
 |---|---|---|
 | [hughmadden/glm53f-afd](https://github.com/hughmadden/glm53f-afd) v1.1.0 `91db3cc`, © 2026 Turquoise Bay AI Pty Ltd | MIT | The serving engine: coordinator, expert ranks, RDMA wire, API, KL gate. `patches/0001` modifies it. |
 
-glm53f-afd itself incorporates or derives from the following. Its [`NOTICE.md`](https://github.com/hughmadden/glm53f-afd/blob/91db3cc6fe672e2724efa3464f63bd31493f63f6/NOTICE.md) and `docs/REUSE.md` are the authoritative ledger.
+glm53f-afd itself incorporates or derives from the following. Its [`NOTICE.md`](https://github.com/hughmadden/glm53f-afd/blob/91db3cc6fe672e2724efa3464f63bd31493f63f6/NOTICE.md) and `docs/REUSE.md` are the authoritative ledger. Each licence below is the one that applies to the revision glm53f-afd v1.1.0 took code or constants from. A project may have relicensed later releases.
 
 | Project | Licence |
 |---|---|
@@ -26,7 +26,7 @@ glm53f-afd itself incorporates or derives from the following. Its [`NOTICE.md`](
 | [tpurtell/ds41rt](https://github.com/tpurtell/ds41rt) (T.J. Purtell) | MIT |
 | [tpurtell/glmrt-5.3-1rtx-4spark](https://github.com/tpurtell/glmrt-5.3-1rtx-4spark) (T.J. Purtell) | MIT |
 | [tpurtell/sparkinfer-glmrt](https://github.com/tpurtell/sparkinfer-glmrt) / [local-inference-lab/b12x](https://github.com/local-inference-lab/b12x) | Apache-2.0 |
-| [ashhart/TensorFold](https://github.com/ashhart/TensorFold) | MIT |
+| [ashhart/TensorFold](https://github.com/ashhart/TensorFold) @ `bb4b4a3` (v0.3.4.1), plus copy-window constants from `a83ed1e` (v0.3.2) | MIT for those revisions. TensorFold is Apache-2.0 from v0.6.0 (upstream `e3ac0ea`). |
 | [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3) | MIT |
 | [fla-org/flash-linear-attention](https://github.com/fla-org/flash-linear-attention) | MIT |
 | [z-lab/dflash](https://github.com/z-lab/dflash) | MIT |
