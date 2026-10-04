@@ -54,3 +54,7 @@ NVIDIA CUDA Toolkit container images (`nvidia/cuda:*-devel`; NVIDIA Deep Learnin
 
 - [MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks) (AGPL-3.0; MIT before 2026-09-07), by Mia ([@MiaAI_lab](https://x.com/MiaAI_lab), [MiaAI-Lab](https://github.com/MiaAI-Lab)). This README uses its layout, at [`674155d`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/tree/674155dec2f2f62bb879801b5ce2cfc759a0bebf), and her lane is the comparison baseline. **No code from it is included or adapted here.**
 - The public four-Spark recipes that glm53f-afd's NOTICE lists as sources: Matt Mastracci's ([@mmastrac](https://github.com/mmastrac)) [mmastrac/glm-5.3-flash-4x-gx10](https://github.com/mmastrac/glm-5.3-flash-4x-gx10) at `5ea4121` (no licence file), and Zbigniew Majewski's ([knapcio](https://github.com/knapcio)) [knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4](https://github.com/knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4) at `beca637` (MIT). glm53f-afd adapts parts of them, recorded in its `docs/REUSE.md`; nothing of theirs is in this repo.
+
+## AGENTS.md (rules for agents that edit this repo)
+
+`AGENTS.md` is "AGENTS.md - credit and attribution" by Mia ([@MiaAI_lab](https://x.com/MiaAI_lab), [MiaAI-Lab](https://github.com/MiaAI-Lab)), included unchanged (sha256 `81a6dd958181aa1d`) from <https://mia-ai.net/lab/downloads/agents-md-credit-and-attribution> (added 4 October 2026). Her page publishes it for use in other projects: "Drop this file in a project as AGENTS.md."

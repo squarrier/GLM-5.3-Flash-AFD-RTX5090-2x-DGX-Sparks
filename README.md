@@ -128,6 +128,7 @@ Measured recovery on our kit, through the watcher: coordinator fault 21 s, a Spa
 | `docker/Dockerfile.build` | The CPU-only build image (CUDA devel, Rust 1.98.1, rdma-core) |
 | `docs/` | Design, benchmarks, troubleshooting |
 | `extras/` | Watcher/telemetry and the GB10 host guard |
+| `AGENTS.md` | Credit and attribution rules for agents that edit this repo, by Mia, unchanged |
 
 ## Security
 
@@ -176,4 +177,5 @@ All the hard parts are other people's work:
   - [IncoAI](https://huggingface.co/incoai): the DFlash2 drafter.
   - [malaiwah](https://huggingface.co/malaiwah) (Michel Belleau): the quant-fidelity registry.
 - **The two-Spark reference:** [MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks) by Mia ([@MiaAI_lab](https://x.com/MiaAI_lab)). This README uses its layout, at [`674155d`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/tree/674155dec2f2f62bb879801b5ce2cfc759a0bebf), and her lane is our comparison baseline.
+- **[AGENTS.md](AGENTS.md):** the credit and attribution rules by Mia ([@MiaAI_lab](https://x.com/MiaAI_lab), [MiaAI-Lab](https://github.com/MiaAI-Lab)), from [mia-ai.net](https://mia-ai.net/lab/downloads/agents-md-credit-and-attribution), unchanged. Agents that edit this repo follow them.
 - **This recipe:** [@squarrier](https://github.com/squarrier), with the AI agents above.
