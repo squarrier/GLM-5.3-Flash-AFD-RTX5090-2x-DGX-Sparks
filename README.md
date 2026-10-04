@@ -11,13 +11,15 @@
   <img src="https://img.shields.io/badge/license-MIT-555?style=flat-square" alt="MIT">
 </p>
 
-This repo is a deployment recipe, not a new engine. It runs [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) with **[glm53f-afd](https://github.com/hughmadden/glm53f-afd)** (by [@dangerm00se](https://x.com/dangerm00se)) on a mixed box:
+This repo is a deployment recipe, not a new engine. It runs Z.ai's [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) (`eb9eb208`) with **[glm53f-afd](https://github.com/hughmadden/glm53f-afd)** v1.1.0 (`91db3cc`), by Hugh Madden / Turquoise Bay AI ([@dangerm00se](https://x.com/dangerm00se), [hughmadden](https://github.com/hughmadden)), on a mixed box:
 
 - An **x86 host with one RTX 5090** is the coordinator. It runs attention, holds all KV and KDA state, and runs the DFlash2 drafter, sampling and the OpenAI API.
 - **Two DGX Sparks (GB10)** hold the routed experts as four TP4 ranks (EXL3 4-bpw), two per Spark under CUDA MPS.
 - A ConnectX-7 in the 5090 box connects to the Sparks' ConnectX-7s over **RoCE v2 RDMA**.
 
-> **Weights attribution (required by licence):** routed-expert weights are *GLM-5.3-Flash TR3 4bpw* by **Local Inference Lab, Inc.**. Upstream: <https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw>, project home: <https://local-inference-lab.ai/>, licensed LicenseRef-LIL-Attribution-1.0 / ShapleyMCG 1.0. The DFlash2 drafter is CC BY-NC-ND 4.0 (non-commercial). This repo contains no weights; see [NOTICE.md](NOTICE.md).
+> **Weights attribution (required by licence):** routed-expert weights are *GLM-5.3-Flash TR3 4bpw* by **Local Inference Lab, Inc.** (published by Brandon M. Music, revision `5ab363a8`). Upstream: <https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw>, project home: <https://local-inference-lab.ai/>, licensed LicenseRef-LIL-Attribution-1.0 / ShapleyMCG 1.0. The DFlash2 drafter is [incoai/GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2) by [IncoAI](https://huggingface.co/incoai) (revision `bf582e4e`), CC BY-NC-ND 4.0 (non-commercial). This repo contains no weights; see [NOTICE.md](NOTICE.md).
+
+> **README layout:** this README uses the layout of the README of [GLM-5.3-Flash-EXL3-2x-DGX-Sparks](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks) by Mia ([@MiaAI_lab](https://x.com/MiaAI_lab), [MiaAI-Lab](https://github.com/MiaAI-Lab)), at [`674155d`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/tree/674155dec2f2f62bb879801b5ce2cfc759a0bebf). Her two-Spark lane is the comparison baseline in [Performance](#performance). No code from her repo is used.
 
 > **Provided as-is, with no support.** This is a personal homelab recipe, shared in case it helps someone. Issues and PRs may go unanswered. See [Support](#support).
 
@@ -163,15 +165,15 @@ This repo's scripts, units and docs are **MIT** ([LICENSE](LICENSE)). MIT matche
 - **EXL3 experts:** Local Inference Lab, LIL Attribution 1.0 / ShapleyMCG 1.0, with **attribution required**;
 - **DFlash2 drafter:** CC BY-NC-ND 4.0, **non-commercial**.
 
-This recipe does not use vLLM, and it contains no code from Mia's AGPL-3.0 repo, whose layout it only follows.
+This recipe does not use vLLM, and it contains no code from Mia's AGPL-3.0 repo. It uses that repo's README layout, credited at the top.
 
 All the hard parts are other people's work:
 
-- **[glm53f-afd](https://github.com/hughmadden/glm53f-afd)** by Hugh Madden / Turquoise Bay AI ([@dangerm00se](https://x.com/dangerm00se)): the engine, its KL gate, and [the report](https://services.turquoisebay.ai/share/glm53f-afd/). It builds on [mimo26f-afd](https://github.com/hughmadden/mimo26f-afd); T.J. Purtell's ([@wrldsuksgo2mars](https://x.com/wrldsuksgo2mars)) [ds41rt](https://github.com/tpurtell/ds41rt), [glmrt](https://github.com/tpurtell/glmrt-5.3-1rtx-4spark) and [sparkinfer-glmrt](https://github.com/tpurtell/sparkinfer-glmrt); [TensorFold](https://github.com/ashhart/TensorFold), [flash-linear-attention](https://github.com/fla-org/flash-linear-attention), [z-lab/dflash](https://github.com/z-lab/dflash), [SGLang](https://github.com/sgl-project/sglang), [b12x](https://github.com/local-inference-lab/b12x), [ExLlamaV3](https://github.com/turboderp-org/exllamav3) and [transformers](https://github.com/huggingface/transformers).
+- **[glm53f-afd](https://github.com/hughmadden/glm53f-afd)** by Hugh Madden / Turquoise Bay AI ([@dangerm00se](https://x.com/dangerm00se)): the engine, its KL gate, and [the report](https://services.turquoisebay.ai/share/glm53f-afd/). It incorporates or derives from, per its NOTICE: Hugh Madden's [mimo26f-afd](https://github.com/hughmadden/mimo26f-afd); T.J. Purtell's ([@wrldsuksgo2mars](https://x.com/wrldsuksgo2mars)) [ds41rt](https://github.com/tpurtell/ds41rt), [glmrt](https://github.com/tpurtell/glmrt-5.3-1rtx-4spark) and [sparkinfer-glmrt](https://github.com/tpurtell/sparkinfer-glmrt); Ash Hart's ([@ashhart](https://github.com/ashhart)) [TensorFold](https://github.com/ashhart/TensorFold); fla-org's [flash-linear-attention](https://github.com/fla-org/flash-linear-attention); Z Lab's [z-lab/dflash](https://github.com/z-lab/dflash); the sgl-project's [SGLang](https://github.com/sgl-project/sglang); Local Inference Lab's [b12x](https://github.com/local-inference-lab/b12x); turboderp's [ExLlamaV3](https://github.com/turboderp-org/exllamav3); and Hugging Face's [transformers](https://github.com/huggingface/transformers).
 - **Weights:**
   - [Z.ai](https://huggingface.co/zai-org/GLM-5.3-Flash): the base model.
-  - **Local Inference Lab, Inc.**: EXL3 TR3 4bpw experts, BF16 teacher logits and KL method. Upstream <https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw>, project home <https://local-inference-lab.ai/>.
+  - **Local Inference Lab, Inc.** (published by Brandon M. Music): EXL3 TR3 4bpw experts, BF16 teacher logits and KL method. Upstream <https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw>, project home <https://local-inference-lab.ai/>.
   - [IncoAI](https://huggingface.co/incoai): the DFlash2 drafter.
-  - [malaiwah](https://huggingface.co/malaiwah): the quant-fidelity registry.
-- **The two-Spark reference:** [MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks). Its layout inspired this README, and its lane is our comparison baseline.
+  - [malaiwah](https://huggingface.co/malaiwah) (Michel Belleau): the quant-fidelity registry.
+- **The two-Spark reference:** [MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks) by Mia ([@MiaAI_lab](https://x.com/MiaAI_lab)). This README uses its layout, at [`674155d`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/tree/674155dec2f2f62bb879801b5ce2cfc759a0bebf), and her lane is our comparison baseline.
 - **This recipe:** [@squarrier](https://github.com/squarrier), with the AI agents above.
