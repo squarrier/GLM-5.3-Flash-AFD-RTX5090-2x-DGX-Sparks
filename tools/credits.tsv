@@ -1,0 +1,29 @@
+# Credits the patch export writes into each patch's notes (the part after "---", which `git am` ignores).
+# Tab-separated. Lines starting with # are comments.
+#
+# pr <TAB> PR number <TAB> upstream commit (full sha) <TAB> commit subject, exactly
+#   MiaAI-Lab's open pull requests to ashhart/TensorFold. Her commits keep her authorship; the export
+#   matches them by subject and names the PR and her commit.
+pr	243	2c16d3edab62147c61cd3bc66fa4709fa4a4b689	feat(glm cuda): segmented KDA and DSA kernels for multi-stream verify windows (each segment its solo bits)
+pr	243	6a848caa01001eb4c5e39ea5ae63f8b67341307b	feat(glm cuda): DFlash2 for several streams: batched block passes and context updates (each stream's solo bits)
+pr	243	655db6b212eaa9b267fa0a78ed013890b2642f16	feat(glm cuda): --parallel N on two ranks: one cache pool, batched verify rounds (each reply its solo bits)
+pr	243	8845cd4a357ee62de5aad2195dc50dc16c524fea	feat(glm cuda): sealed rank messages, an exiting watchdog and /health's iteration_s
+pr	285	88091c15d110480271baca3df7f2614035cf4e95	fix(glm cuda): a tool call the end token left open is sent when it parses whole; a missing <arg_key> is put back
+pr	301	17f76b78a974d3d04d70cb270c8fbbdd2f0cb1ec	fix(glm cuda): a stopped request ends on every rank within a round
+#
+# recipe <TAB> short sha <TAB> full sha <TAB> release
+#   Commits of MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe that ports name ("@ <sha>" in the message, or
+#   a ".../tree/<sha>" link the commit adds to THIRD_PARTY_NOTICES.md).
+recipe	cf28cc4	cf28cc4f8038be322cdeda220c6f1c8ace8f27d1	v1.4
+recipe	1576746	1576746a04983b6eded0551dbf22512ee9e95654	v1.5
+#
+# port <TAB> recipe short sha <TAB> commit subject, exactly
+#   A follow-up to a port (tests or comments only) that names her recipe patches in its subject but cites no recipe
+#   commit in its message or in THIRD_PARTY_NOTICES.md: the recipe commit of the port it follows.
+port	1576746	tests: the prompt-switch test clears the decode switches before its decode-window check (MiaAI-Lab recipe patches 0016, 0047)
+#
+# extends <TAB> recipe short sha <TAB> her recipe patch numbers <TAB> commit subject, exactly
+#   A change of this recipe's own to code that came from her recipe (it keeps "Co-authored-by: MiaAI-Lab"): the notes
+#   name her patches and recipe commit, and say the change is this recipe's.
+extends	1576746	0030	glm5_next/cuda: room in the pool before kept prompts go, TF_GLM_CACHE_ROOM (default off)
+extends	1576746	0049	glm5_next/cuda: waiting prompts fill fewest uncached tokens first, with aging, TF_GLM_PREFILL_ORDER (extends MiaAI-Lab recipe patch 0049's shortest-first chunk)

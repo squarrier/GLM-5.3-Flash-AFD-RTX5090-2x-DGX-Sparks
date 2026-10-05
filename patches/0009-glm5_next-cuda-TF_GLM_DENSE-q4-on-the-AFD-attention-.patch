@@ -1,0 +1,1807 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 15:40:35 -0400
+Subject: [PATCH] glm5_next/cuda: TF_GLM_DENSE=q4 on the AFD attention node
+ (MiaAI-Lab recipe patches 0002, 0005, 0013, 0028)
+
+Ports Mia's AI Lab's (@MiaAI-Lab) 4-bit dense weights from the GLM-5.3-Flash EXL3 2x DGX Sparks recipe
+(github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold @ cf28cc4, v1.4; Apache License 2.0, Copyright
+2026 MiaAI-Lab) onto the split's world-1 attention node:
+
+- 0005-glm-dense-q4: quantize4_mse (MSE-searched affine 4-bit groups of 64, bf16 scale and bias), make_dense_q4,
+  stack_dense_q4, q4_weights (the startup estimate);
+- 0013-glm-decode-rounds: quantize4_mse_raw (the untiled MLX layout, split out, math unchanged) and no per-head
+  kv_k / kv_v copies beside the latent path's absorb (kv_b stays BF16 behind it);
+- 0002-glm-dense-fp8: F8 / make_f8 / _fmm / _matmul_f8 / fp8_weights, the head's format under q4 (TF_GLM_DENSE=fp8
+  itself is not ported);
+- 0028-glm-lean-prompt-scratch: prompt_split_k (4-bit prompt projections keep no split-K partials).
+
+The quantizers are copied op for op, so the world-1 node's codes and scales are the recipe's two TP2 ranks' bytes
+from the same checkpoint, joined by the split rule (rows quantize independently, and a column half is whole groups
+of 64). The estimate reads cfg.quant only under q4, so upstream's capacity tests, whose configs carry no quant, run
+as before.
+
+Default unchanged: TF_GLM_DENSE unset or bf16 builds the same objects as before (kv_k / kv_v included). No CUDA or
+C++ source changes: the 4-bit matmuls are TensorFold's tensorfold_qmm_v5 extension, the FP8 head a Triton kernel.
+
+Tests: tests/test_glm_q4dense.py (CPU: flag-off bytes against tests/data/glm_q4dense_base_digests.json, the recipe's
+copies, TP2 vs world 1; with TF_Q4_FIXTURES, real checkpoint tensors against the recipe tree's own per-rank bytes in
+tests/data/glm_q4dense_mia_digests.json).
+
+Credit: THIRD_PARTY_NOTICES.md and the ported code's headers name MiaAI-Lab and the patches.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning) and GLM-5.3-Flash (execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patches 0002, 0005, 0013, 0028,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit cf28cc4f8038be322cdeda220c6f1c8ace8f27d1 (v1.4); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |  12 +
+ .../families/glm5_next/cuda/engine.py         |   4 +
+ .../families/glm5_next/cuda/forward.py        |  19 +-
+ src/tensorfold/families/glm5_next/cuda/qmm.py | 236 +++++-
+ .../families/glm5_next/cuda/weights.py        |  46 +-
+ tests/data/glm_q4dense_base_digests.json      | 714 ++++++++++++++++++
+ tests/data/glm_q4dense_mia_digests.json       | 191 +++++
+ tests/test_glm_q4dense.py                     | 383 ++++++++++
+ 8 files changed, 1595 insertions(+), 10 deletions(-)
+ create mode 100644 tests/data/glm_q4dense_base_digests.json
+ create mode 100644 tests/data/glm_q4dense_mia_digests.json
+ create mode 100644 tests/test_glm_q4dense.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index 2f1c7ce..f39dd1e 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -125,3 +125,15 @@ The GLM-5.3-Flash `--parallel` engine (`families/glm5_next/cuda/multi.py`, `mult
+ `forward.py`) comes from MiaAI-Lab's
+ [GLM-5.3-Flash EXL3 2x DGX Sparks recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)
+ (patches 0026-0048), Apache License 2.0, Copyright (c) 2026 MiaAI-Lab, contributed to TensorFold by its author.
++
++## GLM dense 4-bit weights (TF_GLM_DENSE=q4)
++
++`families/glm5_next/cuda/qmm.py`'s `quantize4_mse`, `quantize4_mse_raw`, `make_dense_q4`, `stack_dense_q4`, `F8`,
++`make_f8`, `stack_f8`, `_fmm`, `_matmul_f8`, `fp8_weights` and `q4_weights`, and the `TF_GLM_DENSE=q4` paths of
++`weights.py`, `engine.py` and `forward.py` (`prompt_split_k`) are ported from MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/cf28cc4)
++patches 0002-glm-dense-fp8, 0005-glm-dense-q4, 0013-glm-decode-rounds and 0028-glm-lean-prompt-scratch,
++Apache License 2.0, Copyright 2026 MiaAI-Lab (see [the license text](LICENSES/Apache-2.0.txt)). Changes in the port:
++`TF_GLM_DENSE` takes `bf16` (the default) or `q4` only (the recipe's `fp8` is not ported); with the flag unset the
++loader builds the same objects as before, the per-head `kv_k` / `kv_v` copies included; the quantizers themselves
++are unchanged, so an EXL3 checkpoint's 4-bit codes and scales are the bytes the recipe builds from it.
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index aa95498..98c628c 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -207,6 +207,10 @@ class GlmEngine:
+             weights_estimate = split_weights(rule)
+         else:                                        # world-1 attention: whole tensors, the routed experts elsewhere
+             weights_estimate = split_weights(afd_rule, world=1)
++        from .qmm import dense_kind, q4_weights
++
++        if dense_kind() == "q4" and cfg.quant == "exl3":   # MiaAI-Lab 0005: the 4-bit matrices and the FP8 head
++            weights_estimate = q4_weights(weights_estimate)
+         if not self.mtp_on:
+             weights_estimate = without_mtp(weights_estimate, cfg.layers)
+         world = 1 if afd is not None else 2          # the AFD attention node holds every head and the whole draft
+diff --git a/src/tensorfold/families/glm5_next/cuda/forward.py b/src/tensorfold/families/glm5_next/cuda/forward.py
+index ff99d93..ce1f018 100644
+--- a/src/tensorfold/families/glm5_next/cuda/forward.py
++++ b/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -20,6 +20,20 @@ from .attention import AttnScratch, attention, kv_write
+ from .weights import LayerW, Weights
+ 
+ 
++def prompt_split_k(w: Weights) -> bool:
++    """Whether a prompt chunk's projections take split-K partials: an EXL3 checkpoint's BF16 ones do; 4-bit ones (an
++    MLX checkpoint, TF_GLM_DENSE=q4, read off the first layer's input projection) run without. (MiaAI-Lab recipe
++    patch 0028-glm-lean-prompt-scratch, Apache-2.0.)"""
++
++    if w.cfg.quant != "exl3":
++        return False
++    for layer in w.layers:                       # the first layer's input projection (KDA or DSA) tells
++        block = getattr(layer, "kda", None) or getattr(layer, "dsa", None)
++        if block is not None:
++            return not isinstance(block.proj, qmm.Q4)
++    return True
++
++
+ @dataclass
+ class Cut:
+     """The recurrent state and convolution windows at an interior prompt row."""
+@@ -117,7 +131,10 @@ class Buffers:
+         # AFD: the two expert halves' partial sums, then this node's shared expert, packed flat for hc_post
+         self.afd_recv = (torch.empty((3 * rows * D,), dtype=f32, device=dev)
+                          if getattr(w, "afd", None) is not None else None)
+-        self.sk = torch.empty((1 if prefill and not exl3 else 8 * rows * 16384,), dtype=f32, device=dev)
++        # split-K partials of BF16 / FP8 projections (``mm``): a prompt chunk's 4-bit ones run the prompt matmul, which
++        # keeps none, so an MLX checkpoint's and TF_GLM_DENSE=q4's prompt buffers hold none (the FP8 head reads one
++        # row with no K split); a partials buffer holds scratch only, so where it lives never changes a bit (0028)
++        self.sk = torch.empty((1 if prefill and not prompt_split_k(w) else 8 * rows * 16384,), dtype=f32, device=dev)
+         # final
+         self.hidden = torch.empty((rows, D), dtype=bf, device=dev)
+         self.fnormed = torch.empty((rows, D), dtype=bf, device=dev)
+diff --git a/src/tensorfold/families/glm5_next/cuda/qmm.py b/src/tensorfold/families/glm5_next/cuda/qmm.py
+index a366806..c25af49 100644
+--- a/src/tensorfold/families/glm5_next/cuda/qmm.py
++++ b/src/tensorfold/families/glm5_next/cuda/qmm.py
+@@ -1,4 +1,9 @@
+-"""GLM-5.3-Flash's 4-bit and BF16 dense matmuls; the same groups and K slices at any row count keep each row's bits."""
++"""GLM-5.3-Flash's 4-bit and BF16 dense matmuls; the same groups and K slices at any row count keep each row's bits.
++
++TF_GLM_DENSE=q4's quantizers, its FP8 head and their memory estimates are ported from Mia's AI Lab's (@MiaAI-Lab)
++GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patches 0002, 0005 and 0013 (Apache License 2.0, Copyright 2026 MiaAI-Lab;
++see THIRD_PARTY_NOTICES.md).
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -176,6 +181,64 @@ def quantize4(w: torch.Tensor, chunk: int = 8192) -> Q4:
+     return make_q4(words, scales.contiguous(), biases.contiguous())
+ 
+ 
++# -- TF_GLM_DENSE=q4 (ported) ---------------------------------------------------------------------------------------
++# Ported from Mia's AI Lab (@MiaAI-Lab), github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold @ cf28cc4
++# (recipe v1.4): 0005-glm-dense-q4 (quantize4_mse, make_dense_q4, stack_dense_q4,
++# q4_weights), 0013-glm-decode-rounds (quantize4_mse_raw split out of quantize4_mse, math unchanged) and
++# 0002-glm-dense-fp8 (F8, make_f8, _fmm, fp8_weights: the head's format under q4). Apache License 2.0, Copyright (c)
++# 2026 MiaAI-Lab. The quantizers are copied verbatim, op for op, so an EXL3 checkpoint's codes and scales are the bytes
++# the recipe builds from the same checkpoint on its two ranks (tests/test_glm_q4dense.py).
++def quantize4_mse(w: torch.Tensor, chunk: int = 4096, grid: int = 16) -> Q4:
++    """TF_GLM_DENSE=q4: bf16 weights as affine 4-bit groups of 64, each group's range the one of ``grid`` clippings
++    (1.0 down to 0.55 of its min / max) with the least squared error, scale and bias as stored (bf16). Lossy."""
++
++    return make_q4(*quantize4_mse_raw(w, chunk, grid))
++
++
++def quantize4_mse_raw(w: torch.Tensor, chunk: int = 4096,
++                      grid: int = 16) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """``quantize4_mse``'s groups in MLX's layout, untiled: words [n, k / 8] int32 (8 nibbles low to high), scales and
++    biases [n, k / 64] bf16 (what ``latent.AbsorbQ4`` reads)."""
++
++    n, k = w.shape
++    words = torch.empty((n, k // 8), dtype=torch.int32, device=w.device)
++    scales = torch.empty((n, k // 64), dtype=torch.bfloat16, device=w.device)
++    biases = torch.empty_like(scales)
++    for r in range(0, n, chunk):
++        g = w[r:r + chunk].float().view(-1, k // 64, 64)
++        lo0, hi0 = g.amin(-1), g.amax(-1)
++        best_err = best_s = best_b = None
++        for i in range(grid):
++            a = 1.0 - 0.45 * i / (grid - 1)
++            lo, hi = lo0 * a, hi0 * a
++            s = ((hi - lo) / 15).clamp_min(1e-8).to(torch.bfloat16)
++            b = lo.to(torch.bfloat16)
++            q = torch.round((g - b.float()[..., None]) / s.float()[..., None]).clamp(0, 15)
++            err = ((q * s.float()[..., None] + b.float()[..., None] - g) ** 2).sum(-1)
++            if best_err is None:
++                best_err, best_s, best_b = err, s, b
++            else:
++                take = err < best_err
++                best_err = torch.where(take, err, best_err)
++                best_s = torch.where(take, s, best_s)
++                best_b = torch.where(take, b, best_b)
++        q = torch.round((g - best_b.float()[..., None]) / best_s.float()[..., None]).clamp(0, 15).to(torch.int32)
++        q = q.view(-1, k // 8, 8)
++        part = torch.zeros(q.shape[:2], dtype=torch.int32, device=w.device)
++        for j in range(8):
++            part |= q[..., j] << (4 * j)
++        words[r:r + chunk], scales[r:r + chunk], biases[r:r + chunk] = part, best_s, best_b
++    return words, scales.contiguous(), biases.contiguous()
++
++
++def make_dense_q4(weight: torch.Tensor) -> "Q4 | F8":
++    return quantize4_mse(weight.to(torch.bfloat16)) if weight.shape[1] % 64 == 0 else make_f8(weight)
++
++
++def stack_dense_q4(parts: list[torch.Tensor]) -> "Q4 | F8":
++    return make_dense_q4(torch.cat([p.to(torch.bfloat16) for p in parts]))
++
++
+ def stack_b16(parts: list[torch.Tensor]) -> B16:
+     """Rows of several BF16 matrices with the same K, stacked in order."""
+ 
+@@ -220,10 +283,13 @@ B16_CONFIG = {16: (4, 3), 32: (4, 3), 64: (4, 2), 128: (8, 2)}
+ 
+ def matmul(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out: torch.Tensor | None = None,
+            f32: bool = False, part: torch.Tensor | None = None) -> torch.Tensor:
+-    """Multiply strided bf16 x by Q4 or BF16 q.T, returning bf16 or unrounded fp32 with f32; BF16 weights ignore xs."""
++    """Multiply strided bf16 x by Q4, BF16 or FP8 q.T, returning bf16 or unrounded fp32 with f32; BF16 and FP8
++    weights ignore xs."""
+ 
+     if isinstance(q, B16):
+         return _matmul_b16(x, q, out=out, f32=f32, part=part)
++    if isinstance(q, F8):                 # TF_GLM_DENSE=q4's head (MiaAI-Lab patch 0002)
++        return _matmul_f8(x, q, out=out, f32=f32, part=part)
+     if x.shape[1] != q.k or x.stride(1) != 1 or x.dtype != torch.bfloat16:
+         raise ValueError(f"matmul: x {tuple(x.shape)} {x.dtype} does not match K={q.k}")
+     if out is not None and (out.shape != (x.shape[0], q.n) or not out.is_contiguous()):
+@@ -265,3 +331,169 @@ def _matmul_b16(x: torch.Tensor, q: B16, *, out: torch.Tensor | None, f32: bool,
+         total = m * q.n
+         _reduce[(triton.cdiv(total, 1024),)](part, out, total, SK=sk, BLOCK=1024, F32=f32, num_warps=4)
+     return out
++
++
++# -- FP8 weights (ported, MiaAI-Lab patch 0002-glm-dense-fp8; Apache License 2.0, Copyright (c) 2026 MiaAI-Lab) ------
++# Under TF_GLM_DENSE=q4 only the head takes this format (the recipe's q4 keeps its head in FP8): the checkpoint's BF16
++# matrix stored as e4m3 with an fp32 scale per row and 128-column block, quantized once at load. Lossy (replies
++# differ from BF16 weights); the activations stay bf16 and the kernel keeps _bmm's structure (a row's bits never
++# depend on the other rows), so drafted replies still equal serial ones under it. TF_GLM_DENSE=fp8 itself is not
++# ported.
++F8_BLOCK = 128
++F8_MAX = 448.0
++
++
++@dataclass
++class F8:
++    """A BF16 matrix [n, k] held as FP8 e4m3 [n, k] and fp32 scales [n, k / 128]: W ~ q * scale."""
++
++    weight: torch.Tensor      # [n, k] torch.float8_e4m3fn
++    scale: torch.Tensor       # [n, k // 128] fp32
++    n: int
++    k: int
++
++    def nbytes(self) -> int:
++        return self.weight.numel() + self.scale.numel() * 4
++
++
++def make_f8(weight: torch.Tensor, rows: int = 8192) -> F8 | B16:
++    """Quantize a BF16 matrix a block of 128 columns at a time (absmax / 448 scale, round to nearest); a matrix whose
++    width is not a multiple of 128 stays BF16."""
++
++    n, k = weight.shape
++    if k % F8_BLOCK:
++        return make_b16(weight)
++    q = torch.empty((n, k), dtype=torch.float8_e4m3fn, device=weight.device)
++    scale = torch.empty((n, k // F8_BLOCK), dtype=torch.float32, device=weight.device)
++    for r in range(0, n, rows):
++        g = weight[r:r + rows].float().view(-1, k // F8_BLOCK, F8_BLOCK)
++        s = (g.abs().amax(-1) / F8_MAX).clamp_min(1e-30)
++        q[r:r + rows] = (g / s[..., None]).clamp(-F8_MAX, F8_MAX).view(-1, k).to(torch.float8_e4m3fn)
++        scale[r:r + rows] = s
++    return F8(q, scale, int(n), int(k))
++
++
++def stack_f8(parts: list[torch.Tensor]) -> F8 | B16:
++    return make_f8(torch.cat([p.to(torch.bfloat16) for p in parts]))
++
++
++@triton.jit
++def _fmm(X, W, S, OUT, PART, M, x_stride, N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
++         BLOCK_N: tl.constexpr, BK: tl.constexpr, F32: tl.constexpr):
++    """_bmm over FP8 weights: each BK step's product (bf16 inputs, fp32 sums) times its 128-column block's scales."""
++
++    PER: tl.constexpr = K // SK
++    KB: tl.constexpr = K // 128
++    pid_n = tl.program_id(1)
++    pid_s = tl.program_id(2)
++    rm = tl.program_id(0) * BM + tl.arange(0, BM)
++    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    rk = tl.arange(0, BK)
++    m_ok = rm < M
++    n_ok = rn < N
++    acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
++    for k0 in range(pid_s * PER, pid_s * PER + PER, BK):
++        x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
++        w = tl.load(W + rn[:, None].to(tl.int64) * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
++        s = tl.load(S + rn.to(tl.int64) * KB + k0 // 128, mask=n_ok, other=0.0)
++        acc = acc + tl.dot(x, tl.trans(w.to(tl.bfloat16))) * s[None, :]
++    out_mask = m_ok[:, None] & n_ok[None, :]
++    if SK == 1:
++        if F32:
++            tl.store(OUT + rm[:, None] * N + rn[None, :], acc, mask=out_mask)
++        else:
++            tl.store(OUT + rm[:, None] * N + rn[None, :], acc.to(tl.bfloat16), mask=out_mask)
++    else:
++        tl.store(PART + (pid_s * M + rm[:, None]) * N + rn[None, :], acc, mask=out_mask)
++
++
++def _matmul_f8(x: torch.Tensor, q: F8, *, out: torch.Tensor | None, f32: bool,
++               part: torch.Tensor | None) -> torch.Tensor:
++    m, k = x.shape
++    if k != q.k or x.stride(1) != 1 or x.dtype != torch.bfloat16 or k % F8_BLOCK:
++        raise ValueError(f"matmul: x {tuple(x.shape)} {x.dtype} does not match K={q.k}")
++    bm = bucket(min(m, 128))
++    warps, stages = F8_CONFIG[bm]
++    sk = b16_split_k(q.n, q.k)
++    if out is None:
++        out = torch.empty((m, q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
++    elif out.shape != (m, q.n) or not out.is_contiguous():
++        raise ValueError(f"matmul: out {tuple(out.shape)} must be a contiguous ({m}, {q.n})")
++    if sk > 1:
++        need = sk * m * q.n
++        if part is None or part.numel() < need:
++            part = torch.empty((need,), dtype=torch.float32, device=x.device)
++    bn = F8_BN_DECODE if bm == 16 else F8_BN
++    grid = (triton.cdiv(m, bm), triton.cdiv(q.n, bn), sk)
++    _fmm[grid](x, q.weight, q.scale, out, part if sk > 1 else out, m, x.stride(0), N=q.n, K=k, SK=sk, BM=bm,
++               BLOCK_N=bn, BK=B16_BK, F32=f32, num_warps=warps, num_stages=stages)
++    if sk > 1:
++        total = m * q.n
++        _reduce[(triton.cdiv(total, 1024),)](part, out, total, SK=sk, BLOCK=1024, F32=f32, num_warps=4)
++    return out
++
++
++F8_BN = 64
++F8_BN_DECODE = 32          # decode windows (up to 16 rows): narrower column tiles, deeper pipeline (measured +8%)
++# (warps, stages) by row bucket; neither they nor the column tile change a row's bits
++F8_CONFIG = {16: (4, 6), 32: (4, 3), 64: (4, 2), 128: (8, 2)}
++
++
++DENSE_KINDS = ("bf16", "q4")
++
++
++def dense_kind() -> str:
++    """TF_GLM_DENSE: how an EXL3 checkpoint's BF16 (non-expert) weights are held: bf16 (as stored, the default) or q4
++    (MiaAI-Lab's recipe patches 0002 + 0005: the projections in MSE-searched 4-bit groups of 64, the head in FP8, kv_b
++    in BF16). The recipe's fp8 is not ported here."""
++
++    import os
++
++    kind = os.environ.get("TF_GLM_DENSE", "bf16")
++    if kind not in DENSE_KINDS:
++        raise ValueError(f"TF_GLM_DENSE is bf16 or q4, not {kind!r}" +
++                         (" (the recipe's fp8 dense weights are not ported)" if kind == "fp8" else ""))
++    return kind
++
++
++# The matrices TF_GLM_DENSE converts (weights.py's q4 / stack / head), for the startup memory estimate (MiaAI-Lab 0002)
++_F8_NAMES = __import__("re").compile(
++    r"(\.(q_proj|k_proj|v_proj|f_a_proj|g_a_proj|b_proj|f_b_proj|g_b_proj|o_proj|q_a_proj|kv_a_proj_with_mqa|q_b_proj"
++    r"|wk|weights_proj|wq_b|gate_proj|up_proj|down_proj|eh_proj)\.weight|^lm_head\.weight)$")
++
++
++def q4_weights(base):
++    """fp8_weights, with the 4-bit matrices of TF_GLM_DENSE=q4 (all but the head and kv_b, which stay FP8) at half a
++    byte a value plus a bf16 scale and bias a group of 64. (MiaAI-Lab 0005; kv_b is not one of the converted names:
++    it stays BF16, as the loader keeps it.)"""
++
++    f8 = fp8_weights(base)
++
++    def transform(name: str, info: dict) -> tuple[int, int]:
++        total, extra = f8(name, info)
++        shape = info.get("shape") or []
++        if (total and info.get("dtype") == "BF16" and len(shape) == 2 and shape[-1] % 64 == 0
++                and name != "lm_head.weight" and "kv_b_proj" not in name
++                and "experts." not in name.replace("shared_experts.", "") and _F8_NAMES.search(name)):
++            n = base(name, info)[0] // 2
++            return n // 2 + n // 64 * 4, extra
++        return total, extra
++    return transform
++
++
++def fp8_weights(base):
++    """A split_weights transform that counts the matrices held as FP8 at a byte a value plus their block scales
++    (MiaAI-Lab 0002; under TF_GLM_DENSE=q4 only the head stays in FP8 after ``q4_weights``)."""
++
++    def transform(name: str, info: dict) -> tuple[int, int]:
++        total, extra = base(name, info)
++        shape = info.get("shape") or []
++        if (total and info.get("dtype") == "BF16" and len(shape) == 2 and shape[-1] % F8_BLOCK == 0
++                and "experts." not in name.replace("shared_experts.", "") and _F8_NAMES.search(name)):
++            if name == "lm_head.weight":                  # keep the 4-bit draft head split_weights adds
++                n = total * 16 // (2 * 16 + 9)          # its values: total = 2n + 9n / 16
++                return n + n // F8_BLOCK * 4 + n * 9 // 16, extra
++            n = total // 2
++            return n + n // F8_BLOCK * 4, extra
++        return total, extra
++    return transform
+diff --git a/src/tensorfold/families/glm5_next/cuda/weights.py b/src/tensorfold/families/glm5_next/cuda/weights.py
+index 0177c00..12f36fe 100644
+--- a/src/tensorfold/families/glm5_next/cuda/weights.py
++++ b/src/tensorfold/families/glm5_next/cuda/weights.py
+@@ -13,7 +13,8 @@ from tensorfold.cuda import experts as grouped
+ 
+ from tensorfold.cuda.exl3.experts import Exl3RoutedExperts as Exl3Experts
+ from . import latent
+-from .qmm import B16, Q4, as_i32, make_b16, make_q4, quantize4, stack_b16, stack_q4
++from .qmm import (B16, F8, Q4, as_i32, dense_kind, make_b16, make_dense_q4, make_f8, make_q4, quantize4, stack_b16,
++                  stack_dense_q4, stack_q4)
+ 
+ PREFIX = "model.language_model."
+ 
+@@ -162,8 +163,8 @@ class DSAW:
+     q_norm: torch.Tensor
+     kv_norm: torch.Tensor
+     q_b: Q4
+-    kv_k: Q4                  # key rows of kv_b for the local heads
+-    kv_v: Q4                  # value rows
++    kv_k: Q4 | None           # key rows of kv_b for the local heads (None: TF_GLM_DENSE=q4 on the latent path)
++    kv_v: Q4 | None           # value rows (None as kv_k: the latent path reads kv_b only through ``absorb``)
+     o: Q4
+     heads: int
+     index: IndexW | None = None
+@@ -215,7 +216,7 @@ class Weights:
+     embed: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+     layers: list[LayerW]
+     norm: torch.Tensor
+-    head: Q4 | B16
++    head: Q4 | B16 | F8               # F8: TF_GLM_DENSE=q4 (the recipe's q4 keeps the head in FP8)
+     mtp: MTPW | None
+     rank: int
+     world: int
+@@ -238,7 +239,8 @@ class Weights:
+             if isinstance(t, torch.Tensor) and t.data_ptr() not in seen:
+                 seen.add(t.data_ptr())
+                 total += t.numel() * t.element_size()
+-            elif isinstance(t, (Q4, B16, grouped.Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW, IndexW)):
++            elif isinstance(t, (Q4, B16, F8, grouped.Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW,
++                                IndexW)):
+                 for v in vars(t).values():
+                     add(v)
+             elif isinstance(t, (list, tuple)):
+@@ -286,10 +288,25 @@ def load(model_dir: str | Path, *, rank: int, world: int = 2, device: str = "cud
+     def trip(name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+         return (as_i32(t(name + ".weight")), t(name + ".scales"), t(name + ".biases"))
+ 
++    # TF_GLM_DENSE=q4 (MiaAI-Lab recipe patches 0002, 0005, 0013; Apache-2.0): an EXL3 checkpoint's BF16 projections as
++    # MSE-searched affine 4-bit groups of 64, the head in FP8, kv_b in BF16 (read only through ``absorb`` on the latent
++    # path), exactly the recipe's DENSE=q4 objects. Unset or bf16: the checkpoint's BF16, the objects as before.
++    q4dense = exl3 and dense_kind() == "q4"
++    q4stats = {"matrices": 0, "bytes": 0}
++
++    def counted(m):
++        q4stats["matrices"] += 1
++        q4stats["bytes"] += m.nbytes()
++        return m
++
+     def q4(name: str) -> Q4 | B16:
++        if q4dense:
++            return counted(make_dense_q4(t(name + ".weight")))
+         return make_b16(t(name + ".weight")) if exl3 else make_q4(*trip(name))
+ 
+     def stack(names: list[str]) -> Q4 | B16:
++        if q4dense:
++            return counted(stack_dense_q4([t(n + ".weight") for n in names]))
+         if exl3:
+             return stack_b16([t(n + ".weight") for n in names])
+         return stack_q4([trip(n) for n in names])
+@@ -312,7 +329,12 @@ def load(model_dir: str | Path, *, rank: int, world: int = 2, device: str = "cud
+         krows, vrows = rows[:, :cfg.qk_dim].reshape(-1), rows[:, cfg.qk_dim:].reshape(-1)
+         if exl3:
+             w = t(p + "kv_b_proj.weight")
+-            kv_k, kv_v = make_b16(w[krows]), make_b16(w[vrows])
++            if q4dense and latent.ENABLED:      # MiaAI-Lab 0013: no per-head copies beside the latent path's absorb
++                kv_k = kv_v = None
++            elif q4dense:                       # TF_GLM_LATENT=0 under q4: the recipe's FP8 kv_k / kv_v (0002/0005)
++                kv_k, kv_v = make_f8(w[krows]), make_f8(w[vrows])
++            else:
++                kv_k, kv_v = make_b16(w[krows]), make_b16(w[vrows])
+             full_k, full_v = (lambda: w[krows].float()), (lambda: w[vrows].float())
+         else:
+             w, s, b = trip(p + "kv_b_proj")
+@@ -435,7 +457,13 @@ def load(model_dir: str | Path, *, rank: int, world: int = 2, device: str = "cud
+         built = [layer(i) for i in which]
+         vl = cfg.vocab // world
+         draft_head = None
+-        if exl3:
++        if exl3 and q4dense:
++            raw = rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev)
++            head = make_f8(raw)                  # the recipe's q4 head: FP8, a scale per row and 128 columns (0002)
++            # Draft steps use the quantized head (the recipe's draft_quantize4: minmax unless TF_GLM_DRAFT_QUANT, which
++            # this tree does not read); verification keeps the head.
++            draft_head = quantize4(raw)
++        elif exl3:
+             head = make_b16(rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev))
+             # Draft steps use the quantized head; verification keeps the original head.
+             draft_head = quantize4(head.weight)
+@@ -453,4 +481,8 @@ def load(model_dir: str | Path, *, rank: int, world: int = 2, device: str = "cud
+     finally:
+         rd.close()
+     torch.cuda.empty_cache()
++    if q4dense:                                  # one startup line names the format (the bf16 path prints nothing new)
++        print(f"[tensorfold] TF_GLM_DENSE=q4: {q4stats['matrices']} matrices as 4-bit groups of 64 "
++              f"({q4stats['bytes'] / 2 ** 30:.2f} GiB), the head in FP8 ({head.nbytes() / 2 ** 30:.2f} GiB), kv_b in "
++              f"BF16; Weights.nbytes() {w.nbytes() / 2 ** 30:.2f} GiB", flush=True)
+     return w
+diff --git a/tests/data/glm_q4dense_base_digests.json b/tests/data/glm_q4dense_base_digests.json
+new file mode 100644
+index 0000000..e7d1eb9
+--- /dev/null
++++ b/tests/data/glm_q4dense_base_digests.json
+@@ -0,0 +1,714 @@
++{
++ "attention_world1": {
++  ".__class__": [
++   "Weights"
++  ],
++  "afd": [
++   "NoneType",
++   "None"
++  ],
++  "draft_head.__class__": [
++   "Q4"
++  ],
++  "draft_head.biases": [
++   "torch.bfloat16",
++   [
++    8,
++    1024
++   ],
++   "49788e09069aaced1a6e3705f646587a92efc31d1e8ebc1f14300a3e47baa012"
++  ],
++  "draft_head.gs": [
++   "int",
++   "64"
++  ],
++  "draft_head.k": [
++   "int",
++   "512"
++  ],
++  "draft_head.n": [
++   "int",
++   "1024"
++  ],
++  "draft_head.scales": [
++   "torch.bfloat16",
++   [
++    8,
++    1024
++   ],
++   "67bab58324317955df5d1fe8e98ced4f29acd3dbde8febd023ca677f06f49565"
++  ],
++  "draft_head.weight": [
++   "torch.int32",
++   [
++    16,
++    8,
++    8,
++    32,
++    2
++   ],
++   "cd115986ba1d46a983df37e561fe0c7a2d32df0232ae524e22bb64b36b5b2fed"
++  ],
++  "embed": [
++   "torch.bfloat16",
++   [
++    1024,
++    512
++   ],
++   "596b37fc51de93d03fffb404a8ea05689df579fb2e95b749429af35990559ea8"
++  ],
++  "head.__class__": [
++   "B16"
++  ],
++  "head.k": [
++   "int",
++   "512"
++  ],
++  "head.n": [
++   "int",
++   "1024"
++  ],
++  "head.weight": [
++   "torch.bfloat16",
++   [
++    1024,
++    512
++   ],
++   "81e1a43d9c6d7a5522738ec9691bd2921eb687c2083e7921ffefdd30ac61e5b6"
++  ],
++  "layers.0.__class__": [
++   "LayerW"
++  ],
++  "layers.0.attn_hc.__class__": [
++   "HCW"
++  ],
++  "layers.0.attn_hc.base": [
++   "torch.float32",
++   [
++    24
++   ],
++   "74c662fc55f8d687d15c14e85ef44fe25de22ebf31f4093cc357633da8820224"
++  ],
++  "layers.0.attn_hc.fn": [
++   "torch.bfloat16",
++   [
++    24,
++    2048
++   ],
++   "cf3913b89b1ddb0fbad9139d12f8ce072615d0051b123227d8396783c83b2313"
++  ],
++  "layers.0.attn_hc.scale": [
++   "torch.float32",
++   [
++    3
++   ],
++   "230bf01050ed91a965d2764b2242a0d577851dce2208f971bdb03c0639db62f7"
++  ],
++  "layers.0.dsa": [
++   "NoneType",
++   "None"
++  ],
++  "layers.0.ffn_hc.__class__": [
++   "HCW"
++  ],
++  "layers.0.ffn_hc.base": [
++   "torch.float32",
++   [
++    24
++   ],
++   "4d4d97a41b7c1e2a77544f1b58eebb9944cc9aee4b2ad4755e0130e8f84a75b8"
++  ],
++  "layers.0.ffn_hc.fn": [
++   "torch.bfloat16",
++   [
++    24,
++    2048
++   ],
++   "1b7459fd11b66c42835d045b4da4e406a5c201e192c4ccbb22c40cf731796b33"
++  ],
++  "layers.0.ffn_hc.scale": [
++   "torch.float32",
++   [
++    3
++   ],
++   "e9fd40d034c30841e1ad805f2d4d76f51a28a8635ed2ab9385a3a7010b7adc4a"
++  ],
++  "layers.0.in_norm": [
++   "torch.bfloat16",
++   [
++    512
++   ],
++   "2452308ab63ee1192c77ba950e1384fb99d9f0d90619715cc0c3a775eb0408da"
++  ],
++  "layers.0.index": [
++   "int",
++   "0"
++  ],
++  "layers.0.kda.__class__": [
++   "KDAW"
++  ],
++  "layers.0.kda.a_log": [
++   "torch.float32",
++   [
++    2
++   ],
++   "2dfddaf559356ebb3bcda017d298e62765d158585560504a0f1bce4e0cab8c3f"
++  ],
++  "layers.0.kda.conv": [
++   "torch.bfloat16",
++   [
++    768,
++    4
++   ],
++   "73da848d20fd73f1177dbefa1a5cfcf308f25e63e0949e3f6b8b40f194a9f557"
++  ],
++  "layers.0.kda.dt_bias": [
++   "torch.float32",
++   [
++    256
++   ],
++   "538cb41e7a6023ae0c779039462924f22d946742f09f1bd4741bf1b92c0eeda5"
++  ],
++  "layers.0.kda.fb.__class__": [
++   "B16"
++  ],
++  "layers.0.kda.fb.k": [
++   "int",
++   "128"
++  ],
++  "layers.0.kda.fb.n": [
++   "int",
++   "256"
++  ],
++  "layers.0.kda.fb.weight": [
++   "torch.bfloat16",
++   [
++    256,
++    128
++   ],
++   "db3b8c227c38ef5d7cebb1d33d0a61389439692a1a1d50637517532cf264dfac"
++  ],
++  "layers.0.kda.gb.__class__": [
++   "B16"
++  ],
++  "layers.0.kda.gb.k": [
++   "int",
++   "128"
++  ],
++  "layers.0.kda.gb.n": [
++   "int",
++   "256"
++  ],
++  "layers.0.kda.gb.weight": [
++   "torch.bfloat16",
++   [
++    256,
++    128
++   ],
++   "b688a715870d3ca0f1f1d2b71076770ee52412daa608a86b4bcf8366e29436cd"
++  ],
++  "layers.0.kda.heads": [
++   "int",
++   "2"
++  ],
++  "layers.0.kda.norm": [
++   "torch.bfloat16",
++   [
++    128
++   ],
++   "ddae7f38b3fbd35ff80aa27e64c8c22494d0fff55460403676ed9613fa08e321"
++  ],
++  "layers.0.kda.o.__class__": [
++   "B16"
++  ],
++  "layers.0.kda.o.k": [
++   "int",
++   "256"
++  ],
++  "layers.0.kda.o.n": [
++   "int",
++   "512"
++  ],
++  "layers.0.kda.o.weight": [
++   "torch.bfloat16",
++   [
++    512,
++    256
++   ],
++   "f0fd48c9f7555e321e163632cebbec215f706429f4659a229511d808eced0484"
++  ],
++  "layers.0.kda.proj.__class__": [
++   "B16"
++  ],
++  "layers.0.kda.proj.k": [
++   "int",
++   "512"
++  ],
++  "layers.0.kda.proj.n": [
++   "int",
++   "1026"
++  ],
++  "layers.0.kda.proj.weight": [
++   "torch.bfloat16",
++   [
++    1026,
++    512
++   ],
++   "77528e0b822771cadf9e1f3671ccdf67a8f1bfeaa5c1de30e7c8654dab76f228"
++  ],
++  "layers.0.kind": [
++   "str",
++   "'kda'"
++  ],
++  "layers.0.mlp.__class__": [
++   "MLPW"
++  ],
++  "layers.0.mlp.down.__class__": [
++   "B16"
++  ],
++  "layers.0.mlp.down.k": [
++   "int",
++   "256"
++  ],
++  "layers.0.mlp.down.n": [
++   "int",
++   "512"
++  ],
++  "layers.0.mlp.down.weight": [
++   "torch.bfloat16",
++   [
++    512,
++    256
++   ],
++   "fac1790c3aca20852e02eb2f93cf2d5e3ab47311ca2496ad6b6b6af699d718ca"
++  ],
++  "layers.0.mlp.gu.__class__": [
++   "B16"
++  ],
++  "layers.0.mlp.gu.k": [
++   "int",
++   "512"
++  ],
++  "layers.0.mlp.gu.n": [
++   "int",
++   "512"
++  ],
++  "layers.0.mlp.gu.weight": [
++   "torch.bfloat16",
++   [
++    512,
++    512
++   ],
++   "b6fc8a6d5ebc9dab7f43785a14c90ea91ba07c59f257a33b213229a7c98b8023"
++  ],
++  "layers.0.mlp.width": [
++   "int",
++   "256"
++  ],
++  "layers.0.moe": [
++   "NoneType",
++   "None"
++  ],
++  "layers.0.post_norm": [
++   "torch.bfloat16",
++   [
++    512
++   ],
++   "26bd1cf4b1ce4b7ba958660893e177515879521c6eee3c9d39ed28f0a1ef814b"
++  ],
++  "layers.1.__class__": [
++   "LayerW"
++  ],
++  "layers.1.attn_hc.__class__": [
++   "HCW"
++  ],
++  "layers.1.attn_hc.base": [
++   "torch.float32",
++   [
++    24
++   ],
++   "3cb551de475d1a3e8c47ce48195672a6a521a5eb6611a86f4ebb57177d686c51"
++  ],
++  "layers.1.attn_hc.fn": [
++   "torch.bfloat16",
++   [
++    24,
++    2048
++   ],
++   "62d3da76f5525219956d1892b71dff1193237e7cf945d0d2566fcbabbd3ff9f6"
++  ],
++  "layers.1.attn_hc.scale": [
++   "torch.float32",
++   [
++    3
++   ],
++   "d6bea2114db2e7bcbd4386f72f2be994d568e2c124f16ba2d81e181fb0aa0ed7"
++  ],
++  "layers.1.dsa.__class__": [
++   "DSAW"
++  ],
++  "layers.1.dsa.absorb.__class__": [
++   "AbsorbW"
++  ],
++  "layers.1.dsa.absorb.heads": [
++   "int",
++   "2"
++  ],
++  "layers.1.dsa.absorb.lw": [
++   "int",
++   "128"
++  ],
++  "layers.1.dsa.absorb.qk_dim": [
++   "int",
++   "256"
++  ],
++  "layers.1.dsa.absorb.v_dim": [
++   "int",
++   "256"
++  ],
++  "layers.1.dsa.absorb.wk": [
++   "torch.bfloat16",
++   [
++    2,
++    256,
++    128
++   ],
++   "409cf4afd4409d7aff5e243eca72e2d8feb647ac8ae0b992a8fce4edcf93c685"
++  ],
++  "layers.1.dsa.absorb.wv": [
++   "torch.bfloat16",
++   [
++    2,
++    256,
++    128
++   ],
++   "bce72d5791ceeb58f56d44e384608ca40dd8748ea1bd846ef4d0611fe51ba891"
++  ],
++  "layers.1.dsa.heads": [
++   "int",
++   "2"
++  ],
++  "layers.1.dsa.index.__class__": [
++   "IndexW"
++  ],
++  "layers.1.dsa.index.ape": [
++   "torch.bfloat16",
++   [
++    4,
++    128
++   ],
++   "28b04a70f38f64e35d56297543109bf7c66c3c290edf0e610013a93fa404c4ba"
++  ],
++  "layers.1.dsa.index.gate": [
++   "torch.bfloat16",
++   [
++    128,
++    512
++   ],
++   "fff662c37d363d5839b5d96f83d3484715511ea98e68967a5618ab55524eccb9"
++  ],
++  "layers.1.dsa.index.kw.__class__": [
++   "B16"
++  ],
++  "layers.1.dsa.index.kw.k": [
++   "int",
++   "512"
++  ],
++  "layers.1.dsa.index.kw.n": [
++   "int",
++   "130"
++  ],
++  "layers.1.dsa.index.kw.weight": [
++   "torch.bfloat16",
++   [
++    130,
++    512
++   ],
++   "23d02e85650229bd2b505f0cada62a072ea5ce4c4fd6a2943112ce3d88e78dab"
++  ],
++  "layers.1.dsa.index.ln_b": [
++   "torch.bfloat16",
++   [
++    128
++   ],
++   "c798ce6d49f3ed76a0a0371cde4829bb84ada69c57b49edf5ea8b98cb2a7ac73"
++  ],
++  "layers.1.dsa.index.ln_w": [
++   "torch.bfloat16",
++   [
++    128
++   ],
++   "9d7c07b5a17df8c47d581ab8847865ff13c24064a45f3e48725d3f0715a4e6a1"
++  ],
++  "layers.1.dsa.index.qb.__class__": [
++   "B16"
++  ],
++  "layers.1.dsa.index.qb.k": [
++   "int",
++   "128"
++  ],
++  "layers.1.dsa.index.qb.n": [
++   "int",
++   "256"
++  ],
++  "layers.1.dsa.index.qb.weight": [
++   "torch.bfloat16",
++   [
++    256,
++    128
++   ],
++   "f1cf09b518a602d7ccd8d9a57f616c3083829bc5d4104af72454b10a3d733833"
++  ],
++  "layers.1.dsa.kv_k.__class__": [
++   "B16"
++  ],
++  "layers.1.dsa.kv_k.k": [
++   "int",
++   "128"
++  ],
++  "layers.1.dsa.kv_k.n": [
++   "int",
++   "512"
++  ],
++  "layers.1.dsa.kv_k.weight": [
++   "torch.bfloat16",
++   [
++    512,
++    128
++   ],
++   "409cf4afd4409d7aff5e243eca72e2d8feb647ac8ae0b992a8fce4edcf93c685"
++  ],
++  "layers.1.dsa.kv_norm": [
++   "torch.bfloat16",
++   [
++    128
++   ],
++   "b9ac5e02ee89f91917bab8060688e3e72229e32c59cdc4f0c8369a2ebbdea3f2"
++  ],
++  "layers.1.dsa.kv_v.__class__": [
++   "B16"
++  ],
++  "layers.1.dsa.kv_v.k": [
++   "int",
++   "128"
++  ],
++  "layers.1.dsa.kv_v.n": [
++   "int",
++   "512"
++  ],
++  "layers.1.dsa.kv_v.weight": [
++   "torch.bfloat16",
++   [
++    512,
++    128
++   ],
++   "bce72d5791ceeb58f56d44e384608ca40dd8748ea1bd846ef4d0611fe51ba891"
++  ],
++  "layers.1.dsa.o.__class__": [
++   "B16"
++  ],
++  "layers.1.dsa.o.k": [
++   "int",
++   "512"
++  ],
++  "layers.1.dsa.o.n": [
++   "int",
++   "512"
++  ],
++  "layers.1.dsa.o.weight": [
++   "torch.bfloat16",
++   [
++    512,
++    512
++   ],
++   "51786a3f623180c91604f6b8cca4ed7e92de956de4df5c598b3d46d623444a69"
++  ],
++  "layers.1.dsa.proj.__class__": [
++   "B16"
++  ],
++  "layers.1.dsa.proj.k": [
++   "int",
++   "512"
++  ],
++  "layers.1.dsa.proj.n": [
++   "int",
++   "256"
++  ],
++  "layers.1.dsa.proj.weight": [
++   "torch.bfloat16",
++   [
++    256,
++    512
++   ],
++   "6d1f4bde18bde95fb068ea80f7fcb1d8c953f5f7f01dfacc14f19f47a0471957"
++  ],
++  "layers.1.dsa.q_b.__class__": [
++   "B16"
++  ],
++  "layers.1.dsa.q_b.k": [
++   "int",
++   "128"
++  ],
++  "layers.1.dsa.q_b.n": [
++   "int",
++   "512"
++  ],
++  "layers.1.dsa.q_b.weight": [
++   "torch.bfloat16",
++   [
++    512,
++    128
++   ],
++   "896d4d5bb4d2a79071720474e6abff80589417761737a36712ad7373104a70cb"
++  ],
++  "layers.1.dsa.q_norm": [
++   "torch.bfloat16",
++   [
++    128
++   ],
++   "7f92392760ce8aeaf80e708975d3307d1d4133d09f141e1e89e1aba0e12fd65b"
++  ],
++  "layers.1.ffn_hc.__class__": [
++   "HCW"
++  ],
++  "layers.1.ffn_hc.base": [
++   "torch.float32",
++   [
++    24
++   ],
++   "587fd97e042365432f6f782bf866bcb84069a3a4747b87f727a44eb76c038d81"
++  ],
++  "layers.1.ffn_hc.fn": [
++   "torch.bfloat16",
++   [
++    24,
++    2048
++   ],
++   "9e27003d52310ac659e5286ed2ab2f0e543cb1c540ca82a222222be2b311582e"
++  ],
++  "layers.1.ffn_hc.scale": [
++   "torch.float32",
++   [
++    3
++   ],
++   "8336df51c041614b13482346b8843470166c87b5fb82a5ed7e568e7620156dd1"
++  ],
++  "layers.1.in_norm": [
++   "torch.bfloat16",
++   [
++    512
++   ],
++   "bf59e0644045b1f70ff4ef2d2c855c2ff5be9d1da6baaebaa79a9ca6434c9c1d"
++  ],
++  "layers.1.index": [
++   "int",
++   "1"
++  ],
++  "layers.1.kda": [
++   "NoneType",
++   "None"
++  ],
++  "layers.1.kind": [
++   "str",
++   "'dsa'"
++  ],
++  "layers.1.mlp": [
++   "NoneType",
++   "None"
++  ],
++  "layers.1.moe.__class__": [
++   "MoEW"
++  ],
++  "layers.1.moe.bias": [
++   "torch.float32",
++   [
++    8
++   ],
++   "e7d5b2952e6faecc305c251f03f00fce4c4f5e4a2d740498f18b660883863941"
++  ],
++  "layers.1.moe.experts": [
++   "NoneType",
++   "None"
++  ],
++  "layers.1.moe.router": [
++   "torch.bfloat16",
++   [
++    8,
++    512
++   ],
++   "036c59c2d756527d9e210821620cac19b5b5f1827f803a7ebb9d006c305e2c9a"
++  ],
++  "layers.1.moe.shared.__class__": [
++   "MLPW"
++  ],
++  "layers.1.moe.shared.down.__class__": [
++   "B16"
++  ],
++  "layers.1.moe.shared.down.k": [
++   "int",
++   "256"
++  ],
++  "layers.1.moe.shared.down.n": [
++   "int",
++   "512"
++  ],
++  "layers.1.moe.shared.down.weight": [
++   "torch.bfloat16",
++   [
++    512,
++    256
++   ],
++   "c6884d240d6e627923614031ce8ccb6b2760f345061ba6d9ee214f5dfe0c10f3"
++  ],
++  "layers.1.moe.shared.gu.__class__": [
++   "B16"
++  ],
++  "layers.1.moe.shared.gu.k": [
++   "int",
++   "512"
++  ],
++  "layers.1.moe.shared.gu.n": [
++   "int",
++   "512"
++  ],
++  "layers.1.moe.shared.gu.weight": [
++   "torch.bfloat16",
++   [
++    512,
++    512
++   ],
++   "8bfa7ef06dae29fb0231ba70e344a964e5a827629353457d7392a81f5188db1b"
++  ],
++  "layers.1.moe.shared.width": [
++   "int",
++   "256"
++  ],
++  "layers.1.post_norm": [
++   "torch.bfloat16",
++   [
++    512
++   ],
++   "d8349977457ba8193ec1c8964114e8ab5467557f9988b6b87ef89bb5e1a7797d"
++  ],
++  "mtp": [
++   "NoneType",
++   "None"
++  ],
++  "norm": [
++   "torch.bfloat16",
++   [
++    512
++   ],
++   "72a1c9db1925d3ef8a71ad309b04ea4435d2161f0c9f4e0ab11c58eeae8d21a5"
++  ],
++  "rank": [
++   "int",
++   "0"
++  ],
++  "world": [
++   "int",
++   "1"
++  ]
++ },
++ "tree": "the split before the q4 port (base), synthetic EXL3 checkpoint of tests/cuda/test_glm_engine.py (exl3=True, mtp=False), world 1, experts=False, CPU"
++}
+\ No newline at end of file
+diff --git a/tests/data/glm_q4dense_mia_digests.json b/tests/data/glm_q4dense_mia_digests.json
+new file mode 100644
+index 0000000..1ef62d8
+--- /dev/null
++++ b/tests/data/glm_q4dense_mia_digests.json
+@@ -0,0 +1,191 @@
++{
++ "source": "MiaAI-Lab recipe tree (TF v0.6.0 + github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold patches 0001-0068 @ cf28cc4), run per TP2 rank (--side mia --div cpu) on Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold @078455ffe6472f9a52fbc1139f58b9db2881b25c fixtures; sha256 of the stored bytes (Q4: MLX words/scales/biases; F8: weight/scale), CPU arithmetic",
++ "meta": {
++  "side": "mia",
++  "div": "cpu",
++  "torch": "2.14.1+cu130",
++  "scalar_divs_intercepted": 0,
++  "sums64_emulated": 0,
++  "pythonpath": "<the recipe tree>/src"
++ },
++ "arrays": 53,
++ "cases": [
++  {
++   "key": "model.language_model.layers.1.self_attn.f_b_proj.weight",
++   "kind": "single",
++   "parts": [
++    "model.language_model.layers.1.self_attn.f_b_proj.weight"
++   ],
++   "ranks": {
++    "0": {
++     "q4_words": "bd13efaeaaa1ec57a8f3777976a23af586f0e52da9c8c16452d698131ac3528f",
++     "q4_scales": "693984d01095508b0fd19f0aaffc62ca9637cbca617baee894a66275fb71bb3e",
++     "q4_biases": "fa3e5163c7c3db3f76120194bb036e0095f05755a0252ddbde22e40fc74900a1"
++    },
++    "1": {
++     "q4_words": "2e1e12cdd1699c2c4839c35fa6227534e467db457d6985d22a8b2cbb6af812ef",
++     "q4_scales": "d4151a2f90397b2c6fa190cf8b4acfe80dc4007d20d1ca70483c5ec27d1335fb",
++     "q4_biases": "0cc81cb2f4faa8c9dc533bfa748848b1859a5f5b4347ec5186124c22a598b41b"
++    }
++   }
++  },
++  {
++   "key": "model.language_model.layers.1.mlp.down_proj.weight",
++   "kind": "single",
++   "parts": [
++    "model.language_model.layers.1.mlp.down_proj.weight"
++   ],
++   "ranks": {
++    "0": {
++     "q4_words": "a5b10b442e7baf2832a96424249de5504d5e171b335ec99fd6cd048c3639b800",
++     "q4_scales": "429d8959b5075a3c908746fc62cb0d04a8393fe2274b9fdc0ba539e7b7046705",
++     "q4_biases": "042f14c10ee95b91a664f41f79ceed4f9628f318ffffdb06431176faf77b70a4"
++    },
++    "1": {
++     "q4_words": "e95f4da7dcba2d8b737cc5de730af23da60640ce0dc070961ce3ddeed96a5973",
++     "q4_scales": "0987ba9838d487c28dda8339b69e7d6df4fde81577c1dffad3f557cf121d80d5",
++     "q4_biases": "1daa6da47616abc369796705043ab16f99a8db9825280941f3be9b7a21386272"
++    }
++   }
++  },
++  {
++   "key": "model.language_model.layers.44.mlp.shared_experts.down_proj.weight",
++   "kind": "single",
++   "parts": [
++    "model.language_model.layers.44.mlp.shared_experts.down_proj.weight"
++   ],
++   "ranks": {
++    "0": {
++     "q4_words": "dc9bad04465a0a95025d070c06be5553973060e173fa8227f0e36910c0032f13",
++     "q4_scales": "375d3519f4b3ec2a21cff1f94516cb925bfa7308b691c03560fad734f6dff1ee",
++     "q4_biases": "cd29a9f8e7ad051b65db4aab2fcb758ea8ea93d3d07d3d998305113b29ee5c01"
++    },
++    "1": {
++     "q4_words": "65ef55dba1380617987d3447cc6074566a9228f6106ecb0b4a64830108128e6d",
++     "q4_scales": "0ab8b20b109dcac9d6e4aab37e73b8d908afc6ed436273d800d1f6cce76d82fc",
++     "q4_biases": "2eff8f1f4d9a301d1cf35739930b1bf0ae914b21a429b62123340726113db971"
++    }
++   }
++  },
++  {
++   "key": "model.language_model.layers.3.self_attn.indexer.wq_b.weight",
++   "kind": "single",
++   "parts": [
++    "model.language_model.layers.3.self_attn.indexer.wq_b.weight"
++   ],
++   "ranks": {
++    "0": {
++     "q4_words": "4173ec508800be491beaca6c871ba6737629ed39f73217883a303305a5e6bdf0",
++     "q4_scales": "53a466815fa001d6045cef6854f6d32e9b500d00eff01083451044efb69e9e65",
++     "q4_biases": "17fa42337dd8145894144d94125df32b3db09085c92dd14a40132bcbc0ff3638"
++    },
++    "1": {
++     "q4_words": "4173ec508800be491beaca6c871ba6737629ed39f73217883a303305a5e6bdf0",
++     "q4_scales": "53a466815fa001d6045cef6854f6d32e9b500d00eff01083451044efb69e9e65",
++     "q4_biases": "17fa42337dd8145894144d94125df32b3db09085c92dd14a40132bcbc0ff3638"
++    }
++   }
++  },
++  {
++   "key": "model.language_model.layers.43.self_attn.q_b_proj.weight",
++   "kind": "single",
++   "parts": [
++    "model.language_model.layers.43.self_attn.q_b_proj.weight"
++   ],
++   "ranks": {
++    "0": {
++     "q4_words": "aae604df5fb0d0df24a386705ae85117597c10c1c969a6efbb11f8fad58208bd",
++     "q4_scales": "e174a08c0c4d38f6d31323623fb5b6b06dd0356f4afbcfbb0917a3d0abd18807",
++     "q4_biases": "7491b3644e0285653ccbd1ff738cf3c88f973206f90335dbbfbd852061cdec88"
++    },
++    "1": {
++     "q4_words": "0117576be47bd89576cd9adcb811de4e56e819fce31f43c3bb9a0f9d72df88a6",
++     "q4_scales": "35943821a93d57ac2c6c7516fb6b138b547ef4d0e2d0669b66a0e7152f82f34b",
++     "q4_biases": "e04f4f47f9c35c88cd6ce6f38172e73cca4e0b143dc807cc97c17be88b2f4963"
++    }
++   }
++  },
++  {
++   "key": "L3.dsa.proj",
++   "kind": "stack",
++   "parts": [
++    "model.language_model.layers.3.self_attn.q_a_proj.weight",
++    "model.language_model.layers.3.self_attn.kv_a_proj_with_mqa.weight"
++   ],
++   "ranks": {
++    "0": {
++     "q4_words": "3b340c46b10a558067f4289ea8586ca1d49acadedf5bbaa5631957d4989c9031",
++     "q4_scales": "391e3755deba491b25f57d83f54b001c531d3280fc50910742f986aed93666a2",
++     "q4_biases": "24a076f7c4b3704a76a49e90bd72e38c2bf12207b06f1d117ab166ae640fd889"
++    },
++    "1": {
++     "q4_words": "3b340c46b10a558067f4289ea8586ca1d49acadedf5bbaa5631957d4989c9031",
++     "q4_scales": "391e3755deba491b25f57d83f54b001c531d3280fc50910742f986aed93666a2",
++     "q4_biases": "24a076f7c4b3704a76a49e90bd72e38c2bf12207b06f1d117ab166ae640fd889"
++    }
++   }
++  },
++  {
++   "key": "L4.shared.gu",
++   "kind": "stack",
++   "parts": [
++    "model.language_model.layers.4.mlp.shared_experts.gate_proj.weight",
++    "model.language_model.layers.4.mlp.shared_experts.up_proj.weight"
++   ],
++   "ranks": {
++    "0": {
++     "q4_words": "8a36d5e39cde024a59acb7872b36991100258334f2f82963d2ed495689980b6e",
++     "q4_scales": "53e8860cdc9844ae1504e33b9a082a1ac5771c61bcf4c9eab39803e6138e1f31",
++     "q4_biases": "a2239d4c6d4203ffc83895049dba118533252dfeb5615105c919236ca89f8ce5"
++    },
++    "1": {
++     "q4_words": "1f8fafe69a30e16cef5829e98f5b28fbc91e662589a0efe93623a571692ba28c",
++     "q4_scales": "533102ee6ecce2378a880fba8835219d37ee220e301f7d9ff1e7d0867cd7feaf",
++     "q4_biases": "44a044082984bcd31e2c3fb5ac79c9b3e16b2a46bc0ccf10e45198cf885fd218"
++    }
++   }
++  },
++  {
++   "key": "L3.indexer.kw",
++   "kind": "stack",
++   "parts": [
++    "model.language_model.layers.3.self_attn.indexer.wk.weight",
++    "model.language_model.layers.3.self_attn.indexer.weights_proj.weight"
++   ],
++   "ranks": {
++    "0": {
++     "q4_words": "1d5318b80a3480200a21d2e8a3d3deda4dfdfcaf70cea87dc1e175ea8e230d9e",
++     "q4_scales": "81a1d5d30ae21fe839b01cc06b95981c131ffe6670527c523be64d94c92a97bf",
++     "q4_biases": "43f35292fcf83ee089ac4b975f72bdae2e0010110fb270c20fb8af34bd3b77c7"
++    },
++    "1": {
++     "q4_words": "1d5318b80a3480200a21d2e8a3d3deda4dfdfcaf70cea87dc1e175ea8e230d9e",
++     "q4_scales": "81a1d5d30ae21fe839b01cc06b95981c131ffe6670527c523be64d94c92a97bf",
++     "q4_biases": "43f35292fcf83ee089ac4b975f72bdae2e0010110fb270c20fb8af34bd3b77c7"
++    }
++   }
++  },
++  {
++   "key": "lm_head.weight.rows152832-154880",
++   "kind": "head",
++   "parts": [
++    "lm_head.weight.rows152832-154880"
++   ],
++   "rank_rows": {
++    "1": [
++     152832,
++     154880
++    ]
++   },
++   "ranks": {
++    "1": {
++     "f8_weight": "1b465b49c7fada73046bfe10797f1043b659208725a21d7646637287835e85a8",
++     "f8_scale": "bca6c8be4912b2678b6cc8f50d86e7e94546c30ca69556ab3189d1b3a22ac65f",
++     "draft_q4_words": "6256976c199e438bcc21d22df8690d66f33447a3fa4382a7705be324f3e2d71b",
++     "draft_q4_scales": "0772068bcbffd3a987b9534962717a122e45591801543a822292c218551dfd81",
++     "draft_q4_biases": "26277d1461c93a16d5485ddd48177303eb59536d4db986e12c83358a36d255e9"
++    }
++   }
++  }
++ ]
++}
+\ No newline at end of file
+diff --git a/tests/test_glm_q4dense.py b/tests/test_glm_q4dense.py
+new file mode 100644
+index 0000000..a23c563
+--- /dev/null
++++ b/tests/test_glm_q4dense.py
+@@ -0,0 +1,383 @@
++"""TF_GLM_DENSE=q4 on the AFD attention node, on the CPU (no GPU, no network).
++
++Ported from MiaAI-Lab's recipe (github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold @ cf28cc4, patches
++0002-glm-dense-fp8, 0005-glm-dense-q4, 0013-glm-decode-rounds, 0028-glm-lean-prompt-scratch; Apache License 2.0).
++
++- flag off (unset or ``bf16``): the world-1 attention node's every tensor is byte-identical to the base tree's
++  (``data/glm_q4dense_base_digests.json``: made by this file's ``--digests`` from the split before this port, on the
++  same synthetic checkpoint) and the startup estimate is unchanged;
++- flag on: every projection is the recipe's MSE 4-bit copy of the BF16 weight the flag-off node holds, the head its
++  FP8 copy, kv_b BF16 behind ``absorb`` only, every other tensor unchanged;
++- TP2 vs world 1: rows quantize independently and a column half is whole groups of 64, so the recipe's two ranks'
++  4-bit bytes are the world-1 node's split by the checkpoint split rule;
++- with TF_Q4_FIXTURES (tensors cut from the checkpoint Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold @078455ff;
++  not shipped), our bytes match the recipe tree's own per-rank bytes (``data/glm_q4dense_mia_digests.json``).
++"""
++
++from __future__ import annotations
++
++import hashlib
++import importlib.util
++import json
++import os
++import sys
++from pathlib import Path
++from unittest import mock
++
++import pytest
++import torch
++
++ROOT = Path(__file__).resolve().parents[1]
++DATA = ROOT / "tests" / "data"
++
++from tensorfold.cuda.geometry import split_weights  # noqa: E402
++from tensorfold.families.glm5_next.cuda import engine, qmm  # noqa: E402
++from tensorfold.families.glm5_next.cuda import split as tsplit  # noqa: E402
++from tensorfold.families.glm5_next.cuda.weights import load  # noqa: E402
++
++
++def _engine_module():
++    """tests/cuda/test_glm_engine.py's synthetic checkpoint builder, imported on a CPU-only host (its module skips
++    without CUDA; the builder itself is numpy)."""
++
++    with mock.patch("torch.cuda.is_available", return_value=True):
++        spec = importlib.util.spec_from_file_location("_glm_engine_ckpt", ROOT / "tests" / "cuda" / "test_glm_engine.py")
++        mod = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(mod)
++    return mod
++
++
++class _Event:
++    def synchronize(self) -> None:
++        pass
++
++
++class _Stream:
++    def record_event(self) -> _Event:
++        return _Event()
++
++
++def _load_cpu(path: Path, dense: str | None, **kw):
++    """The loader on the CPU: its per-layer CUDA events stubbed, TF_GLM_DENSE as given (None: unset)."""
++
++    env = {k: v for k, v in os.environ.items() if k != "TF_GLM_DENSE"}
++    if dense is not None:
++        env["TF_GLM_DENSE"] = dense
++    with mock.patch.dict(os.environ, env, clear=True), \
++            mock.patch("torch.cuda.current_stream", return_value=_Stream()):
++        return load(path, device="cpu", **kw)
++
++
++def digests(obj, prefix: str = "") -> dict[str, list]:
++    """Every tensor reachable from a Weights object: path -> [dtype, shape, sha256]; ints and None recorded too."""
++
++    out: dict[str, list] = {}
++
++    def walk(x, p: str) -> None:
++        if isinstance(x, torch.Tensor):
++            raw = x.detach().reshape(-1).contiguous().cpu().view(torch.uint8)
++            out[p] = [str(x.dtype), list(x.shape), hashlib.sha256(raw.numpy().tobytes()).hexdigest()]
++        elif x is None or isinstance(x, (bool, int, float, str)):
++            out[p] = [type(x).__name__, repr(x)]
++        elif isinstance(x, (list, tuple)):
++            for i, v in enumerate(x):
++                walk(v, f"{p}.{i}")
++        elif isinstance(x, dict):
++            for k in sorted(x, key=str):
++                walk(x[k], f"{p}.{k}")
++        elif hasattr(x, "__dict__"):
++            out[p + ".__class__"] = [type(x).__name__]
++            for k, v in sorted(vars(x).items()):
++                if k in ("cfg", "comm", "meta", "rd") or callable(v):
++                    continue
++                walk(v, f"{p}.{k}" if p else k)
++
++    walk(obj, prefix)
++    return out
++
++
++@pytest.fixture(scope="module")
++def ckpt(tmp_path_factory) -> Path:
++    path = tmp_path_factory.mktemp("q4dense")
++    _engine_module()._checkpoint(path, exl3=True, mtp=False)
++    return path
++
++
++@pytest.fixture(scope="module")
++def nodes(ckpt):
++    """The world-1 attention node (no routed experts) with the flag unset, bf16 and q4."""
++
++    return {d: _load_cpu(ckpt, d, rank=0, world=1, experts=False, mtp=False) for d in (None, "bf16", "q4")}
++
++
++def _projections(w):
++    """(path, object) of every matrix the loader builds through q4() / stack() (what TF_GLM_DENSE converts): the
++    B16 / Q4 / F8 fields of each layer's KDA, DSA and its indexer (TF 0.6.3's IndexW: kw = [wk | weights_proj], qb =
++    wq_b), dense MLP and shared expert; kv_k / kv_v (kv_b's per-head copies) are not among them."""
++
++    mats = (qmm.Q4, qmm.B16, qmm.F8)
++    for i, layer in enumerate(w.layers):
++        subs = []
++        if layer.kda is not None:
++            subs.append(("kda", layer.kda))
++        if layer.dsa is not None:
++            subs += [("dsa", layer.dsa), ("dsa.index", layer.dsa.index)]
++        if layer.mlp is not None:
++            subs.append(("mlp", layer.mlp))
++        if layer.moe is not None and layer.moe.shared is not None:
++            subs.append(("moe.shared", layer.moe.shared))
++        for label, o in subs:
++            for k, v in vars(o).items():
++                if k not in ("kv_k", "kv_v") and isinstance(v, mats):
++                    yield f"layers.{i}.{label}.{k}", v
++
++
++# -- flag off ----------------------------------------------------------------------------------------------------
++
++def test_flag_off_is_the_base_bytes(nodes):
++    """Unset and bf16 build the same objects, tensor for tensor, as the base tree (9d69a84) did."""
++
++    golden = json.loads((DATA / "glm_q4dense_base_digests.json").read_text())
++    for d in (None, "bf16"):
++        got = digests(nodes[d])
++        assert got == golden["attention_world1"], f"TF_GLM_DENSE={d}: objects differ from the base tree"
++
++
++def test_flag_off_estimate_unchanged():
++    """The engine applies q4_weights only under TF_GLM_DENSE=q4 (engine.py); unset or bf16 keep split_weights."""
++
++    import inspect
++
++    src = inspect.getsource(engine)
++    assert 'if dense_kind() == "q4" and cfg.quant == "exl3":' in src   # the flag first: unset reads no cfg.quant
++    info = {"dtype": "BF16", "shape": [4096, 4096]}
++    base = split_weights(tsplit.afd_rule, world=1)
++    q4e = qmm.q4_weights(base)
++    name = "model.language_model.layers.4.self_attn.q_proj.weight"
++    assert base(name, info) == (4096 * 4096 * 2, 0)
++    assert q4e(name, info) == (4096 * 4096 // 2 + 4096 * 64 * 4, 0)
++    kvb = "model.language_model.layers.3.self_attn.kv_b_proj.weight"
++    assert q4e(kvb, {"dtype": "BF16", "shape": [32768, 512]}) == base(kvb, {"dtype": "BF16", "shape": [32768, 512]})
++
++
++def test_dense_kind_values():
++    with mock.patch.dict(os.environ, {}, clear=True):
++        assert qmm.dense_kind() == "bf16"
++    for ok in ("bf16", "q4"):
++        with mock.patch.dict(os.environ, {"TF_GLM_DENSE": ok}):
++            assert qmm.dense_kind() == ok
++    for bad in ("fp8", "Q4", "int4", ""):
++        with mock.patch.dict(os.environ, {"TF_GLM_DENSE": bad}), pytest.raises(ValueError, match="TF_GLM_DENSE"):
++            qmm.dense_kind()
++
++
++# -- flag on -----------------------------------------------------------------------------------------------------
++
++def test_q4_objects_are_the_recipe_copies_of_the_bf16_weights(nodes):
++    off, on = nodes["bf16"], nodes["q4"]
++    n = 0
++    for (p, b), (p2, q) in zip(_projections(off), _projections(on)):
++        assert p == p2
++        assert isinstance(b, qmm.B16), p
++        if b.k % 64 == 0:
++            assert isinstance(q, qmm.Q4), p
++            w, s, z = qmm.to_mlx(q)
++            rw, rs, rz = qmm.quantize4_mse_raw(b.weight)
++            assert torch.equal(w, rw) and torch.equal(s, rs) and torch.equal(z, rz), p
++        else:                                      # make_dense_q4's fallback (the recipe's): FP8 for K % 64
++            assert type(q).__name__ in ("F8", "B16"), p
++        n += 1
++    assert n >= 10
++    assert isinstance(on.head, qmm.F8)
++    ref = qmm.make_f8(off.head.weight)
++    assert torch.equal(on.head.weight.view(torch.uint8), ref.weight.view(torch.uint8))
++    assert torch.equal(on.head.scale, ref.scale)
++    # the draft head: the same 4-bit minmax copy in both modes
++    assert all(torch.equal(getattr(on.draft_head, f), getattr(off.draft_head, f)) for f in ("weight", "scales", "biases"))
++
++
++def test_q4_keeps_kv_b_bf16_behind_absorb_only(nodes):
++    off, on = nodes["bf16"], nodes["q4"]
++    dsa = [(a.dsa, b.dsa) for a, b in zip(off.layers, on.layers) if a.dsa is not None]
++    assert dsa
++    for a, b in dsa:
++        assert isinstance(a.kv_k, qmm.B16) and isinstance(a.kv_v, qmm.B16)   # the base keeps per-head copies
++        assert b.kv_k is None and b.kv_v is None                          # recipe 0013: absorb only
++        assert type(b.absorb).__name__ == type(a.absorb).__name__ == "AbsorbW"
++        assert torch.equal(a.absorb.wk, b.absorb.wk) and torch.equal(a.absorb.wv, b.absorb.wv)
++
++
++def test_q4_leaves_every_other_tensor(nodes):
++    off, on = digests(nodes["bf16"]), digests(nodes["q4"])
++    converted = [p for p, _ in _projections(nodes["bf16"])] + ["head", "draft_head"] + \
++        [f"layers.{i}.dsa.kv_{x}" for i in range(len(nodes["bf16"].layers)) for x in "kv"]
++    same = [k for k in off if not any(k == c or k.startswith(c + ".") for c in converted)]
++    assert same
++    for k in same:
++        assert on.get(k) == off[k], k
++    assert nodes["q4"].nbytes() < nodes["bf16"].nbytes()
++
++
++def test_q4_estimate_counts_the_converted_bytes(ckpt):
++    """The startup estimate with q4 (``q4_weights``) is what the loaded node holds, give or take the 4-bit tiles'
++    row padding (to 128 rows) and the BF16 kv copies the base also leaves out of its estimate."""
++
++    from tensorfold.families.glm5_next.cuda.split import read_header
++
++    infos = {}
++    for f in sorted(Path(ckpt).glob("*.safetensors")):
++        header, _ = read_header(f)
++        infos.update({k: v for k, v in header.items() if k != "__metadata__"})
++    base = engine.without_mtp(split_weights(tsplit.afd_rule, world=1), 10 ** 6)
++    q4e = qmm.q4_weights(base)
++    est_b, est_q = (sum(fn(n, i)[0] for n, i in infos.items()) for fn in (base, q4e))
++    assert est_q < est_b
++    head = infos["lm_head.weight"]["shape"]
++    assert q4e("lm_head.weight", infos["lm_head.weight"])[0] == \
++        head[0] * head[1] + head[0] * head[1] // 128 * 4 + head[0] * head[1] * 9 // 16
++
++
++def test_prompt_split_k_follows_the_projection_format(nodes):
++    from tensorfold.families.glm5_next.cuda.forward import prompt_split_k
++
++    assert prompt_split_k(nodes["bf16"]) is True        # BF16 projections: split-K partials, as before
++    assert prompt_split_k(nodes["q4"]) is False         # 4-bit ones run the prompt matmul (recipe 0028)
++
++
++# -- TP2 vs world 1 ----------------------------------------------------------------------------------------------
++
++def _raw(w):
++    return qmm.quantize4_mse_raw(w)
++
++
++@pytest.mark.parametrize("n,k", [(64, 4096), (8192 // 16, 128), (256, 2048)])
++def test_rows_quantize_independently(n, k):
++    g = torch.Generator().manual_seed(n + k)
++    w = (torch.randn(n, k, generator=g) * 0.02).to(torch.bfloat16)
++    whole = _raw(w)
++    halves = [_raw(w[: n // 2]), _raw(w[n // 2:])]
++    for f in range(3):
++        assert torch.equal(whole[f], torch.cat([h[f] for h in halves]))
++
++
++@pytest.mark.parametrize("n,k", [(128, 8192), (64, 12288), (96, 2048), (64, 16384)])
++def test_column_halves_are_whole_groups(n, k):
++    """The recipe's column split (o_proj, down_proj) cuts K in halves; K / 2 is a multiple of 64 for every such
++    tensor of the checkpoint, so each half's groups are the whole tensor's."""
++
++    g = torch.Generator().manual_seed(n * k)
++    w = (torch.randn(n, k, generator=g) * 0.02).to(torch.bfloat16)
++    whole = _raw(w)
++    left, right = _raw(w[:, : k // 2].contiguous()), _raw(w[:, k // 2:].contiguous())
++    for f in range(3):
++        assert torch.equal(whole[f], torch.cat([left[f], right[f]], dim=1))
++
++
++def test_stack_rows_map_to_rank_stacks():
++    """A stack (KDA [q | k | v | f_a | g_a | b]) on world 1 vs each rank's stack of its row halves and the replicated
++    parts: the same rows, quantized the same."""
++
++    g = torch.Generator().manual_seed(5)
++    parts = {name: (torch.randn(n, 512, generator=g) * 0.02).to(torch.bfloat16)
++             for name, n in (("q", 256), ("k", 256), ("v", 256), ("f_a", 128), ("g_a", 128), ("b", 64))}
++    kinds = {"q": "row", "k": "row", "v": "row", "f_a": "rep", "g_a": "rep", "b": "row"}
++    whole = qmm.to_mlx(qmm.stack_dense_q4(list(parts.values())))
++    ranks = []
++    for r in (0, 1):
++        rp = [t[r * t.shape[0] // 2:(r + 1) * t.shape[0] // 2] if kinds[k] == "row" else t for k, t in parts.items()]
++        ranks.append(qmm.to_mlx(qmm.stack_dense_q4(rp)))
++    wo, ro = 0, [0, 0]
++    for k, t in parts.items():
++        n = t.shape[0]
++        for r in (0, 1):
++            take = n // 2 if kinds[k] == "row" else n
++            src = slice(ro[r], ro[r] + take)
++            dst = slice(wo + (r * n // 2 if kinds[k] == "row" else 0), wo + (r * n // 2 if kinds[k] == "row" else 0) + take)
++            for f in range(3):
++                assert torch.equal(ranks[r][f][src], whole[f][dst]), (k, r, f)
++            ro[r] += take
++        wo += n
++
++
++# -- the checkpoint's own tensors (opt-in: TF_Q4_FIXTURES) ---------------------------------------------------------
++
++FIX = os.environ.get("TF_Q4_FIXTURES")
++
++
++def _fixture(name: str) -> tuple[torch.Tensor, dict]:
++    meta = json.loads((Path(FIX) / f"{name}.json").read_text())
++    raw = (Path(FIX) / f"{name}.bin").read_bytes()
++    assert hashlib.sha256(raw).hexdigest() == meta["sha256"], name
++    rows = meta["rows"][1] - meta["rows"][0]
++    return torch.frombuffer(bytearray(raw), dtype=torch.bfloat16).view(rows, *meta["full_shape"][1:]), meta
++
++
++def _sha(t: torch.Tensor) -> str:
++    t = t.contiguous()
++    return hashlib.sha256(t.view(torch.uint8).numpy().tobytes()).hexdigest()
++
++
++def _fields(q) -> dict[str, torch.Tensor]:
++    if isinstance(q, qmm.Q4):
++        return dict(zip(("q4_words", "q4_scales", "q4_biases"), qmm.to_mlx(q)))
++    return {"f8_weight": q.weight, "f8_scale": q.scale}
++
++
++@pytest.mark.skipif(not FIX, reason="TF_Q4_FIXTURES: checkpoint fixtures (not shipped)")
++def test_checkpoint_tensors_match_the_recipe_ranks_bytes():
++    """Our world-1 bytes, cut as the recipe's TP2 ranks cut the tensor, against the sha256 of the bytes the recipe
++    tree itself built per rank (TF v0.6.0 + recipe @cf28cc4, CPU arithmetic, harness/q4_identity.py)."""
++
++    gold = json.loads((DATA / "glm_q4dense_mia_digests.json").read_text())
++    checked = 0
++    for case in gold["cases"]:
++        key, kind = case["key"], case["kind"]
++        if kind == "head":
++            t, meta = _fixture(key)
++            got = {**_fields(qmm.make_f8(t)), **{"draft_" + k: v for k, v in _fields(qmm.quantize4(t)).items()}}
++            a = meta["rows"][0]
++            for r, (lo, hi) in case["rank_rows"].items():
++                for f, sha in case["ranks"][r].items():
++                    assert _sha(got[f][lo - a:hi - a]) == sha, (key, r, f)
++                    checked += 1
++            continue
++        names = case["parts"]
++        tensors = [_fixture(n)[0] for n in names]
++        q = qmm.stack_dense_q4(tensors) if len(names) > 1 else qmm.make_dense_q4(tensors[0])
++        got = _fields(q)
++        rules = [tsplit.rule(n) for n in names]
++        for r in ("0", "1"):
++            for f, sha in case["ranks"][r].items():
++                x = got[f]
++                if len(names) == 1 and rules[0] == "col":
++                    h = x.shape[1] // 2
++                    piece = x[:, int(r) * h:(int(r) + 1) * h]
++                else:                                     # rows: each part's half (row) or all of it (rep)
++                    rows, off = [], 0
++                    for t, rule in zip(tensors, rules):
++                        n = t.shape[0]
++                        rows.append(x[off + int(r) * n // 2: off + (int(r) + 1) * n // 2] if rule == "row"
++                                    else x[off:off + n])
++                        off += n
++                    piece = torch.cat(rows)
++                assert _sha(piece) == sha, (key, r, f)
++                checked += 1
++    assert checked == gold["arrays"]
++
++
++# -- golden data -------------------------------------------------------------------------------------------------
++
++if __name__ == "__main__":                 # python tests/test_glm_q4dense.py --digests OUT (base digests, any tree)
++    import argparse
++    import tempfile
++
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--digests", required=True)
++    a = ap.parse_args()
++    with tempfile.TemporaryDirectory() as tmp:
++        _engine_module()._checkpoint(Path(tmp), exl3=True, mtp=False)
++        w = _load_cpu(Path(tmp), None, rank=0, world=1, experts=False, mtp=False)
++        Path(a.digests).write_text(json.dumps({"attention_world1": digests(w),
++                                               "tree": os.environ.get("PYTHONPATH", "")}, indent=1, sort_keys=True))
++    print("wrote", a.digests)
++    sys.exit(0)

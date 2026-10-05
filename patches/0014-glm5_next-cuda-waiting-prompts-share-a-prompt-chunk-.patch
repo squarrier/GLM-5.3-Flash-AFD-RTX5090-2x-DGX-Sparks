@@ -1,0 +1,1666 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 20:44:51 -0400
+Subject: [PATCH] glm5_next/cuda: waiting prompts share a prompt chunk,
+ TF_GLM_MULTI_PREFILL (MiaAI-Lab recipe patch 0049)
+
+MiaAI-Lab's recipe (github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold @ 1576746, with
+TF_GLM_MULTI_PREFILL=1 in its config) fills the prompts of concurrent requests together: one prompt chunk holds the
+next rows of several waiting prompts, back to back. Under --parallel, PR #243's engine fills them one stream at a
+time with a decode round between chunks, so the last of four short prompts that arrive together waits for eight
+forwards (four when undrafted). This ports recipe patch 0049-glm-multi-prefill (Apache License 2.0, Copyright 2026
+MiaAI-Lab):
+
+- multi_prefill.py (new) is the recipe's file: the settings (TF_GLM_MULTI_PREFILL, TF_GLM_MULTI_PREFILL_WAIT_MS),
+  Piece, layout (a shared slot, overlapping extents or too many rows are refused), PieceMixer and prefill_pieces.
+  The row-independent work (embedding, glue, the blocks' fronts and output projections, router, routed and shared
+  experts, the final norm) runs once over every row; what reads or writes a stream's own state runs piece by piece
+  through the calls a chunk of its own makes, so each prompt's rows get the bits they get alone.
+- forward.py: kda_block's and _dsa_latent's stream-state parts become kda_rows and dsa_rows, their fronts kda_front
+  and dsa_front (row ranges). kda_block and dsa_block call them for a chunk of their own (rows 0 .. R), so without
+  the setting the forward makes the calls it made before. compute(head=False) leaves the final norm's rows for the
+  per-piece head. The recipe's edits to its tensor-parallel _compute prefetch and split_layers are not taken; the
+  layer loop's existing mixer hook carries PieceMixer.
+- multi.py (PR #243's engine): rank 0 groups filling streams (_group: foreground first, then the fewest prompt rows
+  left, then admission order; each to its next kept point or its end, or the budget left in multiples of 64 rows,
+  within the single-stream row budget). The MFILL op carries the group inside rank 0's sealed message; rank 1 checks
+  each stop against its kept points before it fills (_fill_many). Streams drafting with the MTP head fill alone.
+  /health counts rank 0's multi-prompt chunks. GlmScheduler._admit can wait TF_GLM_MULTI_PREFILL_WAIT_MS on an idle
+  server for requests arriving together.
+- engine.py: the --parallel startup line names the setting; the AFD check reads both settings before the wire opens.
+
+On the attention/expert split a multi-prompt chunk is one prompt-chunk forward of at most the expert nodes'
+prefill_rows rows (the settings handshake's), behind one begin(R, chunk=True): the expert nodes need no change and
+the wire is unchanged. The setting is off unless TF_GLM_MULTI_PREFILL is set (the recipe's config turns it on);
+unset, the replies, cached counts and kept states are the ones before, and the forward's kernel calls are the same.
+
+Tests: tests/test_glm_multi_prefill.py (CPU: the settings, layout's refusals, staging and the experts' prefill_rows;
+PR #243's fake model grouped against ungrouped at two ranks, at world 1 over the fake AFD wire, with TF_GLM_KV=fp8's
+rings and with TF_GLM_SHARED_PREFIX's points: replies against the requests served alone, kept states and their pool
+rows; a burst of four short prompts in two prompt forwards instead of eight; rank 1's refusal; MTP streams; the idle
+server's wait; the real forward with PieceMixer over recorded kernels, each piece's calls those of its own chunk).
+tests/test_glm_multi.py and test_glm_multi_afd.py: the fake model runs a multi-prompt chunk's pieces.
+
+Credit: THIRD_PARTY_NOTICES.md ("GLM multi-prompt prefill") and the ported functions' comments name MiaAI-Lab and
+the patch.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patch 0049,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 1576746a04983b6eded0551dbf22512ee9e95654 (v1.5); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |  19 +
+ .../families/glm5_next/cuda/engine.py         |   8 +-
+ .../families/glm5_next/cuda/forward.py        | 142 +++-
+ .../families/glm5_next/cuda/multi.py          | 173 ++++-
+ .../families/glm5_next/cuda/multi_prefill.py  | 196 +++++
+ tests/test_glm_multi.py                       |  69 +-
+ tests/test_glm_multi_afd.py                   |   5 +
+ tests/test_glm_multi_prefill.py               | 677 ++++++++++++++++++
+ 8 files changed, 1236 insertions(+), 53 deletions(-)
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/multi_prefill.py
+ create mode 100644 tests/test_glm_multi_prefill.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index e9afcf5..2ce3cd2 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -190,3 +190,22 @@ these are adaptations onto the universal kernel, not copies: an item is an (expe
+ grouping, the A-fragment prefetch joins the kernel's own word prefetch, and the switches apply to 4-bit mcg layers at
+ GLM's tile settings, from 64-row windows, set by GLM's call sites only. Every other launch, GLM's decode windows
+ included, runs the kernels as before.
++
++## GLM multi-prompt prefill
++
++`families/glm5_next/cuda/multi_prefill.py` (`enabled`, `wait_ms`, `Piece`, `layout`, `PieceMixer`, `prefill_pieces`)
++and the `TF_GLM_MULTI_PREFILL` paths of `forward.py` (`kda_front`, `kda_rows`, `_scratch_rows`, `dsa_front`,
++`dsa_rows`, `compute`'s `head`), `multi.py` (`fill_unit`, `MultiDecoder._group`, `_fill_many`, `_started`, the MFILL
++op, `health`; `GlmScheduler._admit`'s wait) and `engine.py` (the startup line) are ported from MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/1576746)
++patch 0049-glm-multi-prefill, Apache License 2.0, Copyright 2026 MiaAI-Lab (see
++[the license text](LICENSES/Apache-2.0.txt)). `multi_prefill.py` is the recipe's file with a few lines changed for
++this tree (the module docstring, the mixer's call without the recipe's hyper-connection split, imports, the row limit
++and the AFD attention node's chunk header). Changes in the port: the recipe's edits
++to its TP-only `forward._compute` prefetch and `split_layers` are not taken; instead the layer loop's existing
++`mixer` hook runs `kda_rows` / `dsa_rows` per piece, and `kda_block` / `_dsa_latent` call the same functions for a
++chunk of their own, so without the setting the forward's calls are the ones before; there is no prompt grid here, so
++pieces end at a stream's kept points (or its end) and cut in multiples of 64 rows; streams drafting with the MTP head
++fill alone; on the attention/expert split's attention node a multi-prompt chunk is one prompt-chunk forward of at
++most the expert nodes' `prefill_rows` rows (no wire change). `TF_GLM_MULTI_PREFILL` is off unless set (the recipe's
++`config.sh` turns it on).
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 676d397..0b28f8b 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -489,7 +489,9 @@ class GlmEngine:
+                 print(f"[tensorfold] --parallel {parallel}: up to {parallel} requests decode together, their caches "
+                       f"in one pool of {pool_rows} tokens (each up to {self.limit}); {drafts or 'no'} drafts, prompt "
+                       f"chunks of {self.multi.fill_rows} rows while others decode (TF_GLM_FILL_ROWS, "
+-                      f"TF_GLM_FILL_SHARE {self.multi.share:g}); {self.multi.tune.describe()}", flush=True)
++                      f"TF_GLM_FILL_SHARE {self.multi.share:g})"
++                      f"{'; waiting prompts share prompt chunks (TF_GLM_MULTI_PREFILL)' if self.multi.group else ''}; "
++                      f"{self.multi.tune.describe()}", flush=True)
+                 if self.multi.row_ms is not None:
+                     print("[tensorfold] --parallel batched window ms by rows: " +
+                           " ".join(f"{i + 1}:{ms:.1f}" for i, ms in enumerate(self.multi.row_ms)), flush=True)
+@@ -975,9 +977,13 @@ def afd_parallel_check(env=None) -> None:
+     """--parallel on the AFD attention node runs eager batched windows: refuse the multi-stream settings
+     that need CUDA graphs across the AFD wire, before the wire opens and the weights load."""
+ 
++    from . import multi_prefill
+     from .multi_tune import MultiSettings
+ 
+     tune = MultiSettings.from_env(env)
++    # TF_GLM_MULTI_PREFILL and its wait read now: a typo fails before the wire opens (MiaAI-Lab recipe patch 0049)
++    multi_prefill.enabled(None if env is None else env.get("TF_GLM_MULTI_PREFILL", ""))
++    multi_prefill.wait_ms(None if env is None else env.get("TF_GLM_MULTI_PREFILL_WAIT_MS", ""))
+     if tune.depth == "joint":
+         raise ValueError("TF_GLM_MULTI_DEPTH=joint times the batched verify window's CUDA graphs, which --experts "
+                          "remote does not capture (eager windows over the AFD wire): unset it, or use policy / scale:A")
+diff --git a/src/tensorfold/families/glm5_next/cuda/forward.py b/src/tensorfold/families/glm5_next/cuda/forward.py
+index 5760b5b..4d2aba0 100644
+--- a/src/tensorfold/families/glm5_next/cuda/forward.py
++++ b/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -425,36 +425,79 @@ def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tenso
+     return gather(w, b, R)
+ 
+ 
++def kda_front(layer: LayerW, b: Buffers, lo: int, hi: int) -> None:
++    """A prompt chunk's KDA input projections of rows lo .. hi (row-independent: the prompt matmul's bits for any
++    row range; BF16 / FP8 projections of an EXL3 checkpoint keep rows apart too). (MiaAI-Lab recipe patch 0049's
++    split of ``kda_block``.)"""
++
++    k = layer.kda
++    p = b.kproj[0, lo:hi]
++    mm(b, b.normed[lo:hi], k.proj, b.xs[lo:hi], p)
++    mm(b, p[:, k.fa_off:k.fa_off + 128], k.fb, None, b.ka[lo:hi])
++    mm(b, p[:, k.ga_off:k.ga_off + 128], k.gb, None, b.kg[lo:hi])
++
++
+ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, cut: Cut | None = None) -> torch.Tensor:
+     c = w.cfg
+     k = layer.kda
+     li = st.kda_index[layer.index]
+     p = b.kproj[0, :R] if b.prefill else st.proj[li, :R]
+-    mm(b, b.normed[:R], k.proj, b.xs[:R], p)
+-    fa = p[:, k.fa_off:k.fa_off + 128]
+-    ga = p[:, k.ga_off:k.ga_off + 128]
+     pre = b.prefill
+-    mm(b, fa, k.fb, None if pre else qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
+-    mm(b, ga, k.gb, None if pre else qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
+-    cur = st.cur[li]
+-    if cut is None:
+-        out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
+-                            k.dt_bias, k.norm, c.eps, c.lower, R, b.kscratch if pre else st.scratch[li],
+-                            st.rec[1 - cur, li])
++    if pre:
++        kda_front(layer, b, 0, R)
++    else:
++        mm(b, b.normed[:R], k.proj, b.xs[:R], p)
++        fa = p[:, k.fa_off:k.fa_off + 128]
++        ga = p[:, k.ga_off:k.ga_off + 128]
++        mm(b, fa, k.fb, qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
++        mm(b, ga, k.gb, qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
++    if pre and cut is None:              # a prompt chunk keeps every row: the layer commits now (``kda_rows``)
++        out = kda_rows(layer, w, st, b, 0, R)
+     else:
+-        n = cut.point
+-        first = kda_mod.chain(p[:n], k.b_off, b.ka[:n], b.kg[:n], st.conv[li], k.conv, st.rec[cur, li],
+-                              k.a_log, k.dt_bias, k.norm, c.eps, c.lower, n, b.kscratch, cut.rec[li]).clone()
+-        _shift_conv(cut.conv[li:li + 1], b.kproj[:, :n], n)
+-        rest = kda_mod.chain(p[n:], k.b_off, b.ka[n:R], b.kg[n:R], cut.conv[li], k.conv, cut.rec[li],
+-                             k.a_log, k.dt_bias, k.norm, c.eps, c.lower, R - n, b.kscratch, st.rec[1 - cur, li])
+-        out = torch.cat((first, rest))
+-    if pre:                              # a prompt chunk keeps every row: the layer commits now
+-        st.cur[li] = 1 - cur
+-        _shift_conv(st.conv[li:li + 1], b.kproj[:, :R], R)
++        cur = st.cur[li]
++        if cut is None:
++            out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
++                                k.dt_bias, k.norm, c.eps, c.lower, R, st.scratch[li], st.rec[1 - cur, li])
++        else:                            # a cut only lies inside a prompt chunk (``compute``), which commits now
++            n = cut.point
++            first = kda_mod.chain(p[:n], k.b_off, b.ka[:n], b.kg[:n], st.conv[li], k.conv, st.rec[cur, li],
++                                  k.a_log, k.dt_bias, k.norm, c.eps, c.lower, n, b.kscratch, cut.rec[li]).clone()
++            _shift_conv(cut.conv[li:li + 1], b.kproj[:, :n], n)
++            rest = kda_mod.chain(p[n:], k.b_off, b.ka[n:R], b.kg[n:R], cut.conv[li], k.conv, cut.rec[li],
++                                 k.a_log, k.dt_bias, k.norm, c.eps, c.lower, R - n, b.kscratch, st.rec[1 - cur, li])
++            out = torch.cat((first, rest))
++            st.cur[li] = 1 - cur
++            _shift_conv(st.conv[li:li + 1], b.kproj[:, :R], R)
+     return out_proj(w, b, out, k.o, None if pre else qmm.group_sums(out, b.kxs[:R]), R)
+ 
+ 
++def _scratch_rows(s, lo: int):
++    """A prompt buffer's KDA scratch from row ``lo`` on (the same storage). (MiaAI-Lab recipe patch 0049)"""
++
++    if lo == 0:
++        return s
++    return SimpleNamespace(out=s.out[lo:], k=s.k[lo:], v=s.v[lo:], g=s.g[lo:], b=s.b[lo:])
++
++
++def kda_rows(layer: LayerW, w: Weights, st: State, b: Buffers, lo: int, n: int) -> torch.Tensor:
++    """A prompt chunk's KDA recurrence for rows lo .. lo + n of the prompt buffers (their projections done) on ``st``
++    from its position: the chain into b.kscratch.out[lo:lo + n] (returned), the layer's state committed and its conv
++    window shifted. ``kda_block`` runs a chunk as rows 0 .. R; a chunk of several streams' prompts
++    (``multi_prefill``) runs each stream's rows through this on that stream's state: the call they get alone.
++    (MiaAI-Lab recipe patch 0049)"""
++
++    c = w.cfg
++    k = layer.kda
++    li = st.kda_index[layer.index]
++    rs = slice(lo, lo + n)
++    cur = st.cur[li]
++    out = kda_mod.chain(b.kproj[0, rs], k.b_off, b.ka[rs], b.kg[rs], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
++                        k.dt_bias, k.norm, c.eps, c.lower, n, _scratch_rows(b.kscratch, lo), st.rec[1 - cur, li])
++    st.cur[li] = 1 - cur
++    _shift_conv(st.conv[li:li + 1], b.kproj[:, rs], n)
++    return out
++
++
+ def kda_segments(layer: LayerW, w: Weights, b: Buffers, R: int, seg: torch.Tensor, slots: Slots,
+                  proj: torch.Tensor, scratch, li: int) -> torch.Tensor:
+     """kda_block's decode path for a multi-stream window (``seg``: kda.segment_table, set): the projections on every
+@@ -479,6 +522,18 @@ def kda_segments(layer: LayerW, w: Weights, b: Buffers, R: int, seg: torch.Tenso
+         return out_proj(w, b, out, k.o, qmm.group_sums(out, b.kxs[:R]), R)
+ 
+ 
++def dsa_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
++    """DSA's projection, query / latent norms and query expansion of rows lo .. hi (row-independent kernels).
++    (MiaAI-Lab recipe patch 0049's split of ``dsa_block``.)"""
++
++    c = w.cfg
++    a = layer.dsa
++    mm(b, b.normed[lo:hi], a.proj, b.xs[lo:hi], b.dp[lo:hi])
++    glue.rmsnorm(b.dp[lo:hi, :c.q_lora], a.q_norm, c.eps, b.qr[lo:hi], b.xs_qr[lo:hi])
++    glue.rmsnorm(b.dp[lo:hi, c.q_lora:], a.kv_norm, c.eps, b.lat[lo:hi], b.xs_lat[lo:hi])
++    mm(b, b.qr[lo:hi], a.q_b, b.xs_qr[lo:hi], b.q[lo:hi].view(hi - lo, a.heads * c.qk_dim))
++
++
+ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
+               R: int, nch: int | None, index=None, host_pos: int | None = None,
+               sparse_np: int | None = None) -> torch.Tensor:
+@@ -486,11 +541,8 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
+ 
+     c = w.cfg
+     a = layer.dsa
+-    mm(b, b.normed[:R], a.proj, b.xs[:R], b.dp[:R])
+-    glue.rmsnorm(b.dp[:R, :c.q_lora], a.q_norm, c.eps, b.qr[:R], b.xs_qr[:R])
+-    glue.rmsnorm(b.dp[:R, c.q_lora:], a.kv_norm, c.eps, b.lat[:R], b.xs_lat[:R])
++    dsa_front(layer, w, b, 0, R)
+     HL = a.heads
+-    mm(b, b.qr[:R], a.q_b, b.xs_qr[:R], b.q[:R].view(R, HL * c.qk_dim))
+     if a.absorb is not None:
+         return _dsa_latent(a, w, kc, pos_dev, b, R, nch, index, host_pos, sparse_np)
+     if sparse_np is not None:
+@@ -539,11 +591,24 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
+                 index, host_pos: int | None, sparse_np: int | None = None) -> torch.Tensor:
+     """DSA on the latent cache: the same indexer and selection, attention over latents with kv_b's key blocks absorbed into the query."""
+ 
++    o = dsa_rows(a, w, lc, pos_dev, b, R, nch, index, host_pos, sparse_np)
++    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
++
++
++def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers, R: int, nch: int | None,
++             index, host_pos: int | None, sparse_np: int | None = None, lo: int = 0) -> torch.Tensor:
++    """``_dsa_latent`` up to its output projection, for rows lo .. lo + R of the buffers (their front done) on one
++    stream's caches (``lc``, ``index``, ``pos_dev``, ``host_pos``: its first row's position): the latent write,
++    indexer update, absorb, attention and expand; returns the rows' attention output [R, heads * v_dim] (b.vn's rows).
++    A chunk of several streams' prompts (``multi_prefill``) runs each stream's rows through this: the call they get
++    alone. (MiaAI-Lab recipe patch 0049)"""
++
+     c = w.cfg
+     HL = a.heads
+     s = b.lat_s
++    rs = slice(lo, lo + R)
+     with prof.timed("dsa: latent write"):
+-        latent.latent_write(b.lat[:R], lc, pos_dev)
++        latent.latent_write(b.lat[rs], lc, pos_dev)
+     # sparse_np: every row is past the dense limit (a captured graph); else the host position decides
+     all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= c.dense_limit)
+     sparse_rows = index is not None and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
+@@ -551,12 +616,12 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
+         ik, ig, pk = index
+         ix = a.index
+         with prof.timed("dsa: indexer update"):
+-            mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ikr[:R])
+-            glue.router(b.normed[:R], ix.gate, b.igr[:R])
+-            sparse.index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
++            mm(b, b.normed[rs], ix.kw, b.xs[rs], b.ikr[rs])
++            glue.router(b.normed[rs], ix.gate, b.igr[rs])
++            sparse.index_update(b.ikr[rs, :c.index_dim], b.igr[rs], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
+     with prof.timed("dsa: absorb"):
+-        qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R])
+-    ol = s.ol[:R]
++        qa = latent.absorb_q(b.q[rs], a.absorb, s.qa[rs])
++    ol = s.ol[rs]
+     scale = c.qk_dim ** -0.5
+     if not all_sparse:
+         # Rows past the dense limit are recomputed sparsely below, so the dense pass needs only the chunks up to it.
+@@ -564,14 +629,13 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
+             dense_attention(qa, lc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol)
+     if sparse_rows:
+         with prof.timed("dsa: select tokens"):
+-            mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
+-            tokens, counts = sparse.select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], pk, host_pos, R,
++            mm(b, b.qr[rs], ix.qb, b.xs_qr[rs], b.qi[rs])
++            tokens, counts = sparse.select_tokens(b.qi[rs], b.ikr[rs, c.index_dim:], pk, host_pos, R,
+                                                   pk.shape[0] - 2, pos_dev, bucket=sparse_np)
+         with prof.timed("dsa: sparse attention"):
+             latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
+     with prof.timed("dsa: expand"):
+-        o = latent.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
+-    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
++        return latent.expand_v(ol, a.absorb, b.vn[rs]).view(R, HL * c.v_dim)
+ 
+ 
+ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int, rows, sel=None, index=None, *,
+@@ -661,7 +725,8 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+                   host_pos: int | None = None, sparse_np: int | None = None, cut: Cut | None = None,
+                   mixer=None) -> None:
+     """``mixer``: the layer's KDA / DSA block as ``mixer(layer)`` instead of on ``st`` (a multi-stream window's
+-    segmented blocks, ``verify.BatchedVerify``); everything else is the same calls."""
++    segmented blocks, ``verify.BatchedVerify``; a multi-prompt chunk's pieces, ``multi_prefill.PieceMixer``);
++    everything else is the same calls."""
+ 
+     c = w.cfg
+     x = b.x[:R]
+@@ -712,8 +777,9 @@ def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int]) -> int:
+ 
+ 
+ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
+-            host_pos: int | None = None, sparse_np: int | None = None, cut: Cut | None = None, mixer=None):
+-    """Run capturable GPU work on static buffers and device positions; eager long contexts use host_pos (graphs sparse_np) to select sparse attention; ``mixer``: each layer's KDA / DSA block (``layer_forward``; ``st`` unused)."""
++            host_pos: int | None = None, sparse_np: int | None = None, cut: Cut | None = None, mixer=None,
++            head: bool = True):
++    """Run capturable GPU work on static buffers and device positions; eager long contexts use host_pos (graphs sparse_np) to select sparse attention; ``mixer``: each layer's KDA / DSA block (``layer_forward``; ``st`` unused); ``head`` False: the final norm's rows (b.fnormed) without the head, None (a multi-prompt chunk runs the head per piece, ``multi_prefill``)."""
+ 
+     if cut is not None and (not b.prefill or not 0 < cut.point < R):
+         raise ValueError("a prompt cut must lie inside a prefill chunk")
+@@ -727,6 +793,8 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
+     if not logits:
+         return None
+     glue.rmsnorm(b.hidden[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
++    if not head:                         # the normed rows without the head (MiaAI-Lab recipe patch 0049's use)
++        return None
+     if b.prefill:                        # the head reads the last row only (fnormed keeps every row for the MTP)
+         return mm(b, b.fnormed[R - 1:R], w.head, b.fxs[R - 1:R], b.logits[:1])
+     return mm(b, b.fnormed[:R], w.head, b.fxs[:R], b.logits[:R])
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index 8b1c4fb..05f1389 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -9,7 +9,10 @@ grammar).
+ 
+ Iterations (``GlmScheduler``, one worker thread on rank 0): admissions, then either one prompt chunk of the oldest
+ filling stream (FIFO, at most TF_GLM_FILL_ROWS rows while others decode, the engine's prompt chunk alone) or one
+-decode round, alternating by TF_GLM_FILL_SHARE; a prompt chunk never shares a forward with decode rows. A round: each
++decode round, alternating by TF_GLM_FILL_SHARE; a prompt chunk never shares a forward with decode rows. With
++TF_GLM_MULTI_PREFILL=1 a prompt chunk holds the next rows of several filling streams (``multi_prefill``: each
++stream's rows get the bits of a chunk of their own; the shortest remaining prompts first, within the same row
++budget; MiaAI-Lab recipe patch 0049). A round: each
+ decoding stream (admission order) proposes drafts under its own policy (DFlash2: every drafting stream's block in one
+ batched pass, ``dflash2_multi``; MTP: the stream's own chain on the MTP head), the combined window is capped at
+ ``MAX_WINDOW`` rows (the longest tails trimmed), one verify over every stream's rows (``forward_streams``:
+@@ -18,10 +21,10 @@ batched pass, ``dflash2_multi``; MTP: the stream's own chain on the MTP head), t
+ candidates in one all-gather, each stream accepts and commits its own.
+ 
+ Rank 0 decides everything that depends on time, clients or placement; rank 1 applies it. Each iteration rank 0 sends
+-ONE message (``GlmEngine._share``): ops ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, which both ranks
+-apply in order through the same code (rank 0 as it decides them). Rank 1 derives drafts itself and checks the depths
+-rank 0 sent. An idle rank 1 waits on the doorbell (``GlmEngine._await_bell``), not in an all-gather. After an error
+-the two ranks cannot be trusted to agree: ``broken`` latches and every later call fails until both restart.
++ONE message (``GlmEngine._share``): ops ADMIT, EVICT, MOVE, GROW, FILL, MFILL, ROUND, FINISH, IDLE, SLOT, which both
++ranks apply in order through the same code (rank 0 as it decides them). Rank 1 derives drafts itself and checks the
++depths rank 0 sent. An idle rank 1 waits on the doorbell (``GlmEngine._await_bell``), not in an all-gather. After an
++error the two ranks cannot be trusted to agree: ``broken`` latches and every later call fails until both restart.
+ 
+ Drafts never change a reply: a request's policy picks DFlash2 or MTP drafts (``multi_code``) and only how many rows
+ each round verifies depends on it."""
+@@ -44,13 +47,14 @@ from tensorfold.cuda.memory_gate import NoRoom as _NoRoom
+ from tensorfold.cuda.scheduler import Scheduler
+ from tensorfold.cuda.streams import Stream, next_fill
+ 
++from . import multi_prefill
+ from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
+ from .pool import ALIGN, Pool, align_up
+ from .verify import BatchedVerify, Segment, SerialVerify, Verified
+ 
+-ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT = range(1, 10)
++ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL = range(1, 11)
+ OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
+-       IDLE: "IDLE", SLOT: "SLOT"}
++       IDLE: "IDLE", SLOT: "SLOT", MFILL: "MFILL"}
+ 
+ 
+ def watchdog_seconds(value: str | None = None) -> float:
+@@ -145,6 +149,16 @@ def fill_rows(prefill_rows: int, value: str | None = None) -> int:
+     return rows
+ 
+ 
++def fill_unit(grid: int) -> int:
++    """Rows a prompt chunk cut short of a stream's next stop comes in multiples of (a multi-prompt chunk's share of
++    the row budget): 64 and the prompt grid (as TF_GLM_FILL_ROWS), so every cut stays on the grid; 64 without one
++    (``GlmEngine.grid`` 0, as here). (MiaAI-Lab recipe patch 0049)"""
++
++    import math
++
++    return math.lcm(64, grid) if grid else 64
++
++
+ def fill_share(value: str | None = None) -> float:
+     """TF_GLM_FILL_SHARE: the share of iterations prompt chunks take while other streams decode (default 0.5: a
+     chunk, a round, a chunk, ...); 1 fills every prompt before decoding on."""
+@@ -411,6 +425,16 @@ class MultiDecoder:
+         self.fill_rows = fill_rows(e.prefill_rows)
+         self.share = fill_share()
+         self.credit = 0.0
++        # TF_GLM_MULTI_PREFILL (MiaAI-Lab recipe patch 0049): rank 0 groups filling streams into one chunk (rank 1
++        # applies whatever MFILL it gets)
++        self.group = multi_prefill.enabled()
++        if self.group:
++            from . import latent
++
++            if not latent.ENABLED:
++                raise ValueError("TF_GLM_MULTI_PREFILL=1 needs the latent cache (TF_GLM_LATENT=1)")
++        self.unit = fill_unit(getattr(engine, "grid", 0))
++        self.grouped = {"chunks": 0, "pieces": 0, "rows": 0}           # rank 0's multi-prompt chunks, for /health
+         self.mtp = self.w.mtp is not None                # MTP drafts: the head is loaded (engine.mtp_head)
+         self.drafts = drafts
+         if self.drafts is None and engine.drafter is not None:
+@@ -484,6 +508,7 @@ class MultiDecoder:
+                             "paused": sum(l.decoding and l.paused for l in lanes)},
+                 "pool_tokens": self.pool.rows, "pool_free_tokens": self.pool.free_rows(),
+                 "kept_prompts": len(self.kept),
++                **({"multi_prefill": dict(self.grouped)} if getattr(self, "group", False) else {}),
+                 # how long rank 0's current iteration has run (0 between iterations): a stalled server keeps growing it
+                 "iteration_s": round(time.monotonic() - since, 1)
+                 if (since := getattr(self, "iteration_since", None)) is not None else 0.0}
+@@ -984,6 +1009,22 @@ class MultiDecoder:
+     def _iterate(self) -> list[Stream]:
+         prof = self.profiles[False] if self.profiles is not None else None      # prompt chunks count there
+         lane = self._fill_turn()
++        group = self._group(lane) if lane is not None and getattr(self, "group", False) else None
++        if group is not None:                 # TF_GLM_MULTI_PREFILL: several streams' rows in one chunk (0049)
++            t = time.perf_counter()
++            rows = sum(stop - x.st.pos for x, stop in group)
++            self._emit(MFILL, [len(group), *[v for x, stop in group for v in (x.sid, stop)]])
++            self._flush()
++            firsts = self._fill_many(group)
++            for (x, _), first in zip(group, firsts):
++                if first is not None:
++                    x.s.take([first], self._ends(x))
++            self.grouped["chunks"] += 1
++            self.grouped["pieces"] += len(group)
++            self.grouped["rows"] += rows
++            if prof is not None:
++                prof.fill(time.perf_counter() - t)
++            return [x.s for x, _ in group if x.s.done]
+         if lane is not None:
+             t = time.perf_counter()
+             stop = self._stop(lane)
+@@ -1084,6 +1125,40 @@ class MultiDecoder:
+         rows = self.fill_rows if busy or lane.s.background else self.e.prefill_rows
+         return min(stop, pos + rows)
+ 
++    def _group(self, first: Lane) -> list[tuple[Lane, int]] | None:
++        """Rank 0, TF_GLM_MULTI_PREFILL=1: the (lane, stop) pieces of this iteration's prompt chunk when it can hold
++        more than one stream's rows, else None (``first`` fills alone, as without the setting). The chunk's row budget
++        is the single-stream one (TF_GLM_FILL_ROWS while others decode, else the engine's prompt chunk). Foreground
++        streams before background ones, then the fewest prompt rows left first (a short prompt's first token does not
++        wait behind a long prompt; the long one takes the rest of the budget), then admission order; each takes the
++        rows to its next stop (a kept point or its end) when they fit, else the budget left in whole ``fill_unit``s.
++        Streams drafting with the MTP head fill alone (their rows also go through the head). (MiaAI-Lab recipe patch
++        0049)"""
++
++        def plain(x: Lane) -> bool:
++            return not x.decoding and not x.mtp
++
++        if not plain(first):
++            return None
++        busy = any(x.decoding and not x.s.done for x in self.lanes.values())
++        left = self.fill_rows if busy else self.e.prefill_rows
++        lanes = sorted((x for x in self.lanes.values() if plain(x)),
++                       key=lambda x: (bool(x.s.background), len(x.s.prompt) - x.st.pos, x.order))
++        out: list[tuple[Lane, int]] = []
++        for x in lanes:
++            pos, n = x.st.pos, len(x.s.prompt)
++            stop = next((p for p in x.stops if p > pos), n)
++            room = min(left, self.fill_rows if x.s.background else left)
++            if stop - pos > room:
++                stop = pos + room // self.unit * self.unit
++            if stop <= pos:
++                continue
++            out.append((x, stop))
++            left -= stop - pos
++            if left <= 0:
++                break
++        return out if len(out) > 1 else None
++
+     def _ends(self, lane: Lane) -> tuple[int, ...]:
+         return self.eos if lane.s.stop_eos else ()
+ 
+@@ -1123,12 +1198,67 @@ class MultiDecoder:
+         finally:
+             e.use(prev)
+             s.prefill_s += time.perf_counter() - t
++        self._started(lane, first)
++        return first
++
++    def _started(self, lane: Lane, first: int) -> None:
++        """Both ranks: the lane's prompt is in and its first token sampled: it decodes from the next round.
++        (MiaAI-Lab recipe patch 0049 splits this out of ``_fill`` for ``_fill_many``.)"""
++
++        s = lane.s
+         lane.decoding = True
+         lane.nexts = [first]
+         s.started = time.perf_counter()
+         if lane.policy is not None:
+             lane.depth = min(lane.policy.next(0, 0), s.count - 1)
+-        return first
++
++    @torch.no_grad()
++    def _fill_many(self, group: Sequence[tuple[Lane, int]]) -> list[int | None]:
++        """Both ranks, TF_GLM_MULTI_PREFILL: every (lane, stop)'s prompt rows pos .. stop in ONE chunk
++        (``multi_prefill.prefill_pieces``: each lane's rows the bits of a chunk of their own); then per lane, in
++        order, what ``_fill`` does after its chunk: its kept states, and at its prompt's end its first token (all
++        first tokens sampled together, each as alone: ``sample_streams``). Returns each lane's first token or None.
++        (MiaAI-Lab recipe patch 0049)"""
++
++        e = self.e
++        pieces = []
++        for lane, stop in group:
++            start, n = lane.st.pos, len(lane.s.prompt)
++            if lane.decoding or lane.mtp:
++                raise RuntimeError(f"stream {lane.sid} cannot join a multi-prompt chunk")
++            if not start < stop <= n or stop - start > e.prefill_rows:
++                raise RuntimeError(f"stream {lane.sid}: a prompt chunk {start} .. {stop} of {n}")
++            pieces.append(multi_prefill.Piece(lane.st, list(lane.s.prompt[start:stop]),
++                                              drafter=self._ctx(lane) if lane.dflash else None, head=stop == n))
++        t = time.perf_counter()
++        heads = multi_prefill.prefill_pieces(e, pieces)
++        parts, who = [], []
++        for k, ((lane, stop), out) in enumerate(zip(group, heads)):
++            n = len(lane.s.prompt)
++            if stop < n:
++                if stop in lane.stops:
++                    self._keep(lane, stop)
++                continue
++            if lane.point == n:
++                self._keep(lane, n)
++            logits = out[:1]
++            if lane.constraint is not None:             # the first token's row, under the reply's grammar
++                lane.constraint.mask(logits, lane.constraint.window([0], [-1]), self.w.vocab_offset)
++            parts.append((logits, [n], lane.s.sampling))
++            who.append(k)
++        firsts: list[int | None] = [None] * len(group)
++        if parts:
++            for k, rows in zip(who, sample_streams(self.w, parts)):
++                lane = group[k][0]
++                firsts[k] = rows[0]
++                if lane.constraint is not None:
++                    lane.constraint.advance([rows[0]])
++        dt = time.perf_counter() - t
++        for (lane, _), first in zip(group, firsts):
++            lane.s.prefill_s += dt
++            if first is not None:
++                self._started(lane, first)
++        return firsts
+ 
+     def _mtp_draft(self, l: Lane) -> list[int]:
+         """Both ranks: an MTP stream's drafts for this round, as ``decode.mtp_decode`` drafts alone: its last rows
+@@ -1377,6 +1507,16 @@ class MultiDecoder:
+                 first = self._fill(lane, p[1])
+                 if first is not None:
+                     lane.s.take([first], self._ends(lane))
++            elif op == MFILL:                 # TF_GLM_MULTI_PREFILL's multi-prompt chunk (MiaAI-Lab recipe patch 0049)
++                group = []
++                for sid, stop in zip(p[1:1 + 2 * p[0]:2], p[2:2 + 2 * p[0]:2]):
++                    lane = self.lanes[sid]
++                    if stop != self._stop_bound(lane, stop):
++                        raise RuntimeError(f"rank 1: stream {sid}'s prompt chunk to {stop} passes a kept point")
++                    group.append((lane, stop))
++                for (lane, _), first in zip(group, self._fill_many(group)):
++                    if first is not None:
++                        lane.s.take([first], self._ends(lane))
+             elif op == ROUND:
+                 n = p[0]
+                 sids, depths = p[1:1 + 2 * n:2], p[2:2 + 2 * n:2]
+@@ -1408,6 +1548,9 @@ class GlmScheduler(Scheduler):
+ 
+     def __init__(self, decoder: MultiDecoder, *, max_streams: int) -> None:
+         self.held = None
++        # TF_GLM_MULTI_PREFILL_WAIT_MS: an idle server's wait for requests arriving with the first (their prompts then
++        # share its first chunk); only with TF_GLM_MULTI_PREFILL=1 (MiaAI-Lab recipe patch 0049)
++        self.gather_s = multi_prefill.wait_ms() / 1000.0 if getattr(decoder, "group", False) else 0.0
+         super().__init__(decoder, max_streams=max_streams)
+ 
+     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
+@@ -1432,7 +1575,10 @@ class GlmScheduler(Scheduler):
+             else:
+                 return value
+ 
+-    def _admit(self, first=None) -> list[Stream]:
++    def _admit(self, first=None, until: float | None = None) -> list[Stream]:
++        """Waiting requests into free slots while they fit; ``until`` (a ``time.monotonic`` deadline): an empty queue
++        is waited on until then for more arrivals (TF_GLM_MULTI_PREFILL_WAIT_MS, MiaAI-Lab recipe patch 0049)."""
++
+         done: list[Stream] = []
+         while self.decoder.live() < self.max_streams:
+             if first is not None:
+@@ -1441,9 +1587,13 @@ class GlmScheduler(Scheduler):
+                 item, self.held = self.held, None
+             else:
+                 try:
+-                    item = self.waiting.get_nowait()
++                    left = until - time.monotonic() if until is not None else 0.0
++                    item = self.waiting.get(timeout=left) if left > 0 else self.waiting.get_nowait()
+                 except queue.Empty:
+                     break
++                if item is None and until is not None:   # close() during the wait: its stop goes back for the idle get
++                    self.waiting.stop()
++                    break
+             stream, box = item
+             if not self.decoder.fits(stream):
+                 self.held = item                     # waits, first in line, for room
+@@ -1512,7 +1662,8 @@ class GlmScheduler(Scheduler):
+         first = self.waiting.get() if idle else None                  # idle: wait for a request
+         if idle and first is None:
+             return False
+-        done = self._admit(first)
++        until = time.monotonic() + self.gather_s if idle and getattr(self, "gather_s", 0.0) > 0 else None
++        done = self._admit(first, until)
+         try:
+             done += self.decoder.round()
+         except Exception as exc:                 # noqa: BLE001  (the live requests fail)
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi_prefill.py b/src/tensorfold/families/glm5_next/cuda/multi_prefill.py
+new file mode 100644
+index 0000000..466d622
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/multi_prefill.py
+@@ -0,0 +1,196 @@
++# Ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe @ 1576746, patch 0049-glm-multi-prefill
++# (Apache-2.0, Copyright 2026 MiaAI-Lab; THIRD_PARTY_NOTICES.md "GLM multi-prompt prefill").
++"""TF_GLM_MULTI_PREFILL=1 (--parallel): one prompt chunk holds the next rows of several waiting prompts, each prompt's
++rows getting the bits they get in a chunk of their own.
++
++Without it, concurrent requests' prompts are prefilled one stream at a time (``multi.MultiDecoder``: the oldest
++filling stream's chunk, then a decode round, then the next chunk ...), so the last of four short prompts that arrive
++together waits for eight forwards (a drafted prompt is two chunks: up to the point before its last token, where its
++state is kept, then its last token) and the decode rounds between them. A forward's cost is mostly fixed at short
++lengths (the weights read once a layer whatever the rows; on the attention/expert split, the experts' exchange too),
++so a chunk of all four prompts costs little more than one of them.
++
++A multi-prompt chunk lays its pieces back to back ([s1 rows][s2 rows]...), as a batched verify window does, and runs
++one forward over them on the prompt buffers (``Engine.pbuf``):
++
++- the row-independent work runs once over every row: embedding, hyper-connection glue, the blocks' fronts (KDA input
++  projections; DSA projections, norms and query expansion), the output projections, the MoE router and routed
++  experts (each pair one fp32 chain: one expert read for every prompt), the shared expert, the final norm. These are
++  the kernels a prompt chunk already relies on to give a row the same bits whatever chunk it came in (``forward``'s
++  module docstring);
++- what reads or writes a stream's own state runs piece by piece on that stream's ``forward.State``, through the very
++  calls a chunk of its own makes, with the piece's rows as a view of the buffers: the KDA recurrence, its state commit
++  and conv shift (``forward.kda_rows``, at the stream's position), and DSA's latent write, indexer update, absorb,
++  dense / sparse attention and expand (``forward.dsa_rows``, at the stream's position with its own extent, index ring
++  and chunk count);
++- after the forward, per piece in order: the head's logits of its last row when the piece ends its prompt (one row,
++  as alone), its DFlash2 taps (its own context), its commit.
++
++So a piece's bits are those of the same rows run as a chunk of their own, from the same position: a valid chunking of
++its prompt (pieces start where its own chunks would, and end at its kept points or its end).
++
++On the attention/expert split's attention node a multi-prompt chunk is one forward of at most the experts'
++``prefill_rows`` rows (the settings handshake's), with one ``begin(R, chunk=True)`` header like any prompt chunk: the
++expert nodes take it on their prompt scratch, and their outputs are row-independent.
++
++Streams drafting with the MTP head (whose prompt rows also go through the head) are not grouped; they fill alone as
++before. The latent cache is required (``latent.ENABLED``, the default)."""
++
++from __future__ import annotations
++
++import itertools
++import os
++from collections.abc import Sequence
++from dataclasses import dataclass, field
++from typing import Any
++
++import torch
++
++
++def enabled(value: str | None = None) -> bool:
++    """TF_GLM_MULTI_PREFILL: 1 groups waiting prompts into one chunk (rank 0 decides; rank 1 follows its messages),
++    0 (default) fills them one stream at a time."""
++
++    value = (os.environ.get("TF_GLM_MULTI_PREFILL", "") if value is None else value).strip() or "0"
++    if value not in ("0", "1"):
++        raise ValueError(f"TF_GLM_MULTI_PREFILL: 0 or 1, not {value!r}")
++    return value == "1"
++
++
++def wait_ms(value: str | None = None) -> float:
++    """TF_GLM_MULTI_PREFILL_WAIT_MS: with TF_GLM_MULTI_PREFILL=1, how long an idle server waits after a request
++    arrives for more to arrive with it (so their prompts share the first chunk), ending as soon as every slot is
++    taken; 0 (default): no wait."""
++
++    value = (os.environ.get("TF_GLM_MULTI_PREFILL_WAIT_MS", "") if value is None else value).strip() or "0"
++    try:
++        ms = float(value)
++    except ValueError:
++        ms = -1.0
++    if not 0 <= ms <= 1000:
++        raise ValueError(f"TF_GLM_MULTI_PREFILL_WAIT_MS: milliseconds from 0 to 1000, not {value!r}")
++    return ms
++
++
++@dataclass(eq=False)
++class Piece:
++    """A stream's rows of a multi-prompt chunk: ``tokens`` its prompt from ``st.pos`` on; ``drafter`` its DFlash2
++    context (taps added after the forward) or None; ``head``: the piece ends its prompt (its last row's logits)."""
++
++    st: Any
++    tokens: list[int]
++    drafter: Any = None
++    head: bool = False
++    lo: int = field(default=0, init=False)       # its first row in the chunk
++
++    @property
++    def rows(self) -> int:
++        return len(self.tokens)
++
++
++def layout(pieces: Sequence[Piece], rows_max: int) -> int:
++    """Each piece's first row (back to back, in order); the chunk's rows. Pieces need rows, distinct stream slots and
++    disjoint extents; the chunk at most ``rows_max`` rows."""
++
++    if not pieces:
++        raise ValueError("a multi-prompt chunk needs a piece")
++    slots = [p.st.slot for p in pieces]
++    if len(set(slots)) != len(slots):
++        raise ValueError(f"a multi-prompt chunk's pieces share a stream slot: {slots}")
++    spans = sorted((p.st.base, p.st.base + p.st.capacity) for p in pieces)
++    if any(a[1] > b[0] for a, b in itertools.pairwise(spans)):
++        raise ValueError("a multi-prompt chunk's pieces have overlapping extents")
++    at = 0
++    for p in pieces:
++        if p.rows < 1:
++            raise ValueError("a multi-prompt chunk's piece without rows")
++        p.lo = at
++        at += p.rows
++    if at > rows_max:
++        raise ValueError(f"a multi-prompt chunk of {at} rows, the prompt buffers hold {rows_max}")
++    return at
++
++
++class PieceMixer:
++    """The layers' KDA / DSA blocks of a multi-prompt chunk (``forward.compute``'s ``mixer``, called by
++    ``layer_forward`` as ``mixer(layer)``): fronts and output projection over every row, the stream-state work piece
++    by piece."""
++
++    def __init__(self, w, b, pieces: Sequence[Piece], R: int) -> None:
++        self.w, self.b, self.pieces, self.R = w, b, list(pieces), R
++
++    def __call__(self, layer):
++        from . import prof, qmm
++        from .forward import chunks_for, dsa_front, dsa_rows, kda_front, kda_rows, out_proj
++
++        w, b, R = self.w, self.b, self.R
++        if layer.kind == "kda":
++            k = layer.kda
++            with prof.timed("kda"):
++                with prof.timed("kda: projections"):
++                    kda_front(layer, b, 0, R)
++                for p in self.pieces:
++                    kda_rows(layer, w, p.st, b, p.lo, p.rows)
++                with prof.timed("kda: out + all-gather"):
++                    return out_proj(w, b, b.kscratch.out[:R], k.o, None, R)
++        a, c = layer.dsa, w.cfg
++        if a.absorb is None:
++            raise ValueError("multi-prompt chunks need the latent cache (TF_GLM_LATENT=1)")
++        with prof.timed("dsa (total)"):
++            dsa_front(layer, w, b, 0, R)
++            for p in self.pieces:
++                st = p.st
++                di = st.dsa_index[layer.index]
++                dsa_rows(a, w, st.kc[di], st.pos_dev, b, p.rows, chunks_for(st, p.rows),
++                         st.index[di] if st.index is not None else None, st.pos, None, lo=p.lo)
++            o = b.vn[:R].view(R, a.heads * c.v_dim)
++            return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
++
++
++def _stage(w, b, pieces: Sequence[Piece], R: int) -> None:
++    """Every piece's room checked, the chunk's token ids into the prompt buffers (``forward.stage``'s pinned copy)."""
++
++    from .forward import check_room
++
++    for p in pieces:
++        check_room(w, p.st, p.rows)
++    tokens = [int(t) for p in pieces for t in p.tokens]
++    b.staged.synchronize()
++    b.ids_host[:R].numpy()[:] = tokens
++    b.ids[:R].copy_(b.ids_host[:R], non_blocking=True)
++    b.staged.record()
++
++
++@torch.no_grad()
++def prefill_pieces(e, pieces: Sequence[Piece]) -> list[torch.Tensor | None]:
++    """One prompt chunk over every piece (``decode.prefill_chunk`` for several streams at once): the forward, then per
++    piece its head's logits row (a copy, [1, V/world]) when it ends its prompt (else None), its DFlash2 taps and its
++    commit (each stream's position advances by its rows). At most ``e.prefill_rows`` rows, the prompt chunk the AFD
++    settings handshake gives the expert nodes; on the attention node the forward's header goes first, as a prompt
++    chunk's (``afd.begin(R, chunk=True)``)."""
++
++    from . import latent
++    from .forward import commit, compute, mm
++
++    if not latent.ENABLED:
++        raise ValueError("multi-prompt chunks need the latent cache (TF_GLM_LATENT=1)")
++    w, b = e.w, e.pbuf
++    R = layout(pieces, min(b.rows, e.prefill_rows))
++    _stage(w, b, pieces, R)
++    afd = getattr(w, "afd", None)
++    if afd is not None:
++        afd.begin(R, chunk=True)         # AFD: one prompt chunk's header, before its eager kernels (the experts' scratch)
++    compute(w, None, b, R, head=False, mixer=PieceMixer(w, b, pieces, R))     # leaves b.fnormed's rows
++    heads: list[torch.Tensor | None] = []
++    for p in pieces:
++        if p.head:                       # the head on the piece's last row: the one-row matmul a chunk of its own runs
++            r = p.lo + p.rows - 1
++            heads.append(mm(b, b.fnormed[r:r + 1], w.head, b.fxs[r:r + 1], b.logits[:1]).clone())
++        else:
++            heads.append(None)
++    for p in pieces:
++        if p.drafter is not None:
++            p.drafter.add_taps(torch.cat([t[p.lo:p.lo + p.rows] for t in b.taps], dim=1))
++    for p in pieces:
++        commit(w, p.st, b, p.rows, p.rows)
++    return heads
+diff --git a/tests/test_glm_multi.py b/tests/test_glm_multi.py
+index 24259e6..634410d 100644
+--- a/tests/test_glm_multi.py
++++ b/tests/test_glm_multi.py
+@@ -166,11 +166,12 @@ class FakeEngine:
+         self.slots = FakeSlots(torch, streams, self.rows)
+         self.home = self.st = FakeState(self.w, pool, self.rows, caches=self.caches, slots=self.slots)
+         self.buf = SimpleNamespace(prefill=False, ids=[], taps=None, fnormed=None)
+-        self.pbuf = SimpleNamespace(prefill=True, ids=[], taps=None, fnormed=None, engine=self)
++        self.pbuf = SimpleNamespace(prefill=True, ids=[], taps=None, fnormed=None, engine=self, rows=prefill_rows)
+         self.mbuf = SimpleNamespace(rows=self.rows)
+         self.last_hidden = None
+         self.constraint = self.window = None
+         self.forwards = self.mtp_steps = 0
++        self.chunks: list = []                   # multi-prompt chunks (fake_pieces_compute): [(slot, pos, rows)] each
+         self.graphs = SimpleNamespace(main={(r, p): None for r in range(1, 9) for p in (0, 1)})
+ 
+     def reset(self) -> None:
+@@ -285,6 +286,62 @@ def fake_commit(w, st, b, R, keep):
+     st.set_pos(st.pos + keep)
+ 
+ 
++# TF_GLM_MULTI_PREFILL (multi_prefill.prefill_pieces, MiaAI-Lab recipe patch 0049): the real prefill_pieces over a
++# fake forward that runs each piece's rows on its own state exactly as fake_compute runs a chunk of its own
++def fake_stage_pieces(w, b, pieces, R):
++    from tensorfold.families.glm5_next.cuda.forward import check_room
++
++    for p in pieces:
++        check_room(w, p.st, p.rows)
++    b.ids = [int(t) for p in pieces for t in p.tokens]
++    assert len(b.ids) == R
++
++
++def fake_pieces_compute(w, st, b, R, *, mixer=None, head=True, logits=True, **kw):
++    """A multi-prompt chunk: the pieces back to back in b.ids, each piece's rows written and folded into its own
++    state from its position (fake_compute's arithmetic), the chunk's taps in row order, and per piece ending a prompt
++    its last row's logits, which ``fake_head`` (the head's one-row matmul) reads back by row."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda.multi_prefill import PieceMixer
++
++    assert st is None and isinstance(mixer, PieceMixer) and logits and not head and b.prefill and mixer.R == R
++    wire = getattr(w, "afd", None)
++    if wire is not None:
++        wire.forward("chunk", R)
++    assert len(b.ids) == R and [p.lo for p in mixer.pieces] == [sum(q.rows for q in mixer.pieces[:k])
++                                                                for k in range(len(mixer.pieces))]
++    taps, heads = [], {}
++    for p in mixer.pieces:
++        s = p.st
++        assert b.ids[p.lo:p.lo + p.rows] == p.tokens
++        h = s.h()
++        for i, t in enumerate(p.tokens):
++            q = s.pos + i
++            s.write(q, t)
++            h = fold(h, q, t)
++        cur = s.cur[0]
++        s.rec[1 - cur][0] = h
++        s.cur = [1 - cur]
++        s.conv.copy_(torch.tensor(([0, 0, 0] + list(s.conv.tolist()) + p.tokens)[-3:]))
++        taps += [[s.pos + i, t] for i, t in enumerate(p.tokens)]
++        heads[p.lo + p.rows - 1] = s.logits(s.pos + p.rows - 1, h)
++    b.taps = [torch.tensor(taps, dtype=torch.int64)]
++    b.fnormed = torch.arange(R, dtype=torch.int64)[:, None]
++    b.fxs = torch.zeros((R, 1))
++    b.logits = torch.zeros((1, V))
++    b.head_rows = heads
++    b.engine.chunks.append([(p.st.slot, p.st.pos, p.rows) for p in mixer.pieces])
++
++
++def fake_head(b, x, q, xs, out, f32=False):
++    """forward.mm as prefill_pieces calls it: the head on one row of a multi-prompt chunk."""
++
++    assert b.prefill and q is b.engine.w.head and x.shape[0] == 1
++    return b.head_rows[int(x[0, 0])][None]
++
++
+ class FakeContext:
+     """dflash2_multi.DraftContext's surface: a flat context of (token + 1) rows, checked to arrive in order."""
+ 
+@@ -378,6 +435,10 @@ def fake(allocations, monkeypatch):  # noqa: F811
+     monkeypatch.setattr(decode, "mtp_forward", fake_mtp_forward)
+     monkeypatch.setattr(forward, "commit", fake_commit)
+     monkeypatch.setattr(forward, "State", FakeState)
++    multi_prefill = importlib.import_module("tensorfold.families.glm5_next.cuda.multi_prefill")
++    monkeypatch.setattr(multi_prefill, "_stage", fake_stage_pieces)     # TF_GLM_MULTI_PREFILL's chunks (0049)
++    monkeypatch.setattr(forward, "compute", fake_pieces_compute)
++    monkeypatch.setattr(forward, "mm", fake_head)
+     monkeypatch.delenv("TF_GLM_MULTI_LONE", raising=False)
+     return torch
+ 
+@@ -607,7 +668,7 @@ def test_one_message_an_iteration(fake):
+     p = Pair(torch, streams=2)
+     p.submit(_prompt(80, 7), 30, None)
+     p.submit(_prompt(20, 8), 25, _sampling("topk", 3))
+-    from tensorfold.families.glm5_next.cuda.multi import FILL, IDLE, ROUND
++    from tensorfold.families.glm5_next.cuda.multi import FILL, IDLE, MFILL, ROUND
+ 
+     kinds = []
+     while p.d[0].lanes:
+@@ -615,7 +676,7 @@ def test_one_message_an_iteration(fake):
+         done = p.d[0].round()
+         assert len(p.sent) - before == 1                     # the round's own message
+         ops = [op for op, _ in _ops(p.sent[-1])]
+-        assert ops[-1] in (FILL, ROUND)
++        assert ops[-1] in (FILL, MFILL, ROUND)               # MFILL: TF_GLM_MULTI_PREFILL=1's multi-prompt chunk
+         kinds.append(ops[-1])
+         p.d[0].finish(done)
+         extra = p.sent[before + 1:]
+@@ -623,7 +684,7 @@ def test_one_message_an_iteration(fake):
+         p.follow()
+         if not p.d[0].outbox:
+             p.check()
+-    assert FILL in kinds and ROUND in kinds
++    assert (FILL in kinds or MFILL in kinds) and ROUND in kinds
+     assert p.d[0].idle and p.d[1].idle
+ 
+ 
+diff --git a/tests/test_glm_multi_afd.py b/tests/test_glm_multi_afd.py
+index 2695837..cd91b9c 100644
+--- a/tests/test_glm_multi_afd.py
++++ b/tests/test_glm_multi_afd.py
+@@ -35,6 +35,7 @@ from tests.test_glm_multi import (  # noqa: F401
+     _sampling,
+     fake,
+     fake_commit,
++    fake_pieces_compute,
+     fold,
+     shell,
+     solo,
+@@ -110,6 +111,10 @@ def _batched(e):
+     def compute(w, st, b, R, *, mixer=None, **kw):
+         import torch
+ 
++        from tensorfold.families.glm5_next.cuda.multi_prefill import PieceMixer
++
++        if isinstance(mixer, PieceMixer):                # TF_GLM_MULTI_PREFILL's multi-prompt chunk (0049)
++            return fake_pieces_compute(w, st, b, R, mixer=mixer, **kw)
+         assert st is None and mixer is not None          # the batched window: no state of its own, a mixer
+         v = b.owner                                      # the BatchedVerify whose forward this is
+         w.afd.forward("batched", R)
+diff --git a/tests/test_glm_multi_prefill.py b/tests/test_glm_multi_prefill.py
+new file mode 100644
+index 0000000..d5f70f6
+--- /dev/null
++++ b/tests/test_glm_multi_prefill.py
+@@ -0,0 +1,677 @@
++"""TF_GLM_MULTI_PREFILL (MiaAI-Lab recipe patch 0049, ``multi_prefill``) on CPU: waiting prompts share a prompt chunk,
++and every reply, kept state and pool row is the one the streams get filled one at a time.
++
++- the settings, ``layout``'s refusals (a shared slot, overlapping extents, more rows than the prompt buffers or the
++  experts' ``prefill_rows``), the staging of the pieces' ids, and the refusal before the AFD wire opens;
++- #243's fake model (tests/test_glm_multi.py: logits that hash what each stream committed, read back from its pool
++  rows and its slot), with the real ``multi_prefill.prefill_pieces`` over a fake forward that runs each piece on its
++  own state: grouped == ungrouped (replies against the requests served alone, kept states and their pool rows, both
++  ranks alike) at two ranks, at world 1 over the fake AFD wire, with fp8 rings and with the shared-prefix points;
++  a burst of four short prompts makes two prompt forwards where it made eight (one where it made four undrafted);
++  rank 1 refuses a piece that passes a kept point; MTP streams fill alone; /health; the idle server's wait;
++- the forward seam itself: the real ``forward.compute`` with ``multi_prefill.PieceMixer`` over recorded kernels. Each
++  piece's stream-state calls (``forward.kda_rows``, ``forward.dsa_rows``) are exactly its solo chunk's, its rows a
++  view of the chunk's buffers; every other call is the one a solo chunk of all the rows makes; the AFD wire sees one
++  ``begin(R, chunk=True)`` and one exchange per MoE layer.
++"""
++
++from __future__ import annotations
++
++import importlib
++import queue
++import threading
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from tests import test_glm_kv8_multi as tk
++from tests import test_glm_multi as tm
++from tests import test_glm_multi_afd as ta
++from tests import test_glm_shared_prefix as tsp
++from tests.test_cuda_geometry import allocations  # noqa: F401  (fixture: fake triton, so decode imports)
++
++pytestmark = pytest.mark.torch
++
++fake = tm.fake
++afd_fake = ta.afd_fake
++rings = tk.rings
++
++BURST = [(9, 11, "topk"), (12, 12, "greedy"), (15, 13, "minp"), (17, 14, "nucleus")]     # (prompt, seed, sampling)
++
++
++# -- settings ------------------------------------------------------------------------------------------------------
++def test_the_settings(allocations, monkeypatch):  # noqa: F811
++    from tensorfold.families.glm5_next.cuda import multi_prefill as mp
++    from tensorfold.families.glm5_next.cuda.engine import afd_parallel_check
++    from tensorfold.families.glm5_next.cuda.multi import fill_unit
++
++    monkeypatch.delenv("TF_GLM_MULTI_PREFILL", raising=False)
++    monkeypatch.delenv("TF_GLM_MULTI_PREFILL_WAIT_MS", raising=False)
++    assert mp.enabled() is False and mp.enabled("") is False and mp.enabled("1") is True and mp.enabled(" 0 ") is False
++    for bad in ("2", "yes", "on", "-1"):
++        with pytest.raises(ValueError, match="TF_GLM_MULTI_PREFILL"):
++            mp.enabled(bad)
++    assert mp.wait_ms() == 0.0 and mp.wait_ms("25") == 25.0 and mp.wait_ms("1000") == 1000.0
++    for bad in ("-1", "1001", "x"):
++        with pytest.raises(ValueError, match="TF_GLM_MULTI_PREFILL_WAIT_MS"):
++            mp.wait_ms(bad)
++    assert fill_unit(0) == 64 and fill_unit(64) == 64 and fill_unit(48) == 192
++    afd_parallel_check({"TF_GLM_MULTI_PREFILL": "1", "TF_GLM_MULTI_PREFILL_WAIT_MS": "20"})     # allowed
++    with pytest.raises(ValueError, match="TF_GLM_MULTI_PREFILL"):                              # before the wire
++        afd_parallel_check({"TF_GLM_MULTI_PREFILL": "true"})
++    with pytest.raises(ValueError, match="TF_GLM_MULTI_PREFILL_WAIT_MS"):
++        afd_parallel_check({"TF_GLM_MULTI_PREFILL": "1", "TF_GLM_MULTI_PREFILL_WAIT_MS": "5000"})
++
++
++def _st(slot, base, capacity, pos=0):
++    return SimpleNamespace(slot=slot, base=base, capacity=capacity, pos=pos, index=None)
++
++
++def test_layout_and_its_refusals(allocations):  # noqa: F811
++    from tensorfold.families.glm5_next.cuda.multi_prefill import Piece, layout
++
++    a, b, c = Piece(_st(0, 0, 2048), [1] * 10), Piece(_st(2, 4096, 2048), [2] * 5, head=True), Piece(
++        _st(1, 2048, 2048), [3] * 7)
++    assert layout([a, b, c], 22) == 22 and [p.lo for p in (a, b, c)] == [0, 10, 15]
++    with pytest.raises(ValueError, match="prompt buffers hold 21"):                          # too many rows
++        layout([a, b, c], 21)
++    with pytest.raises(ValueError, match="share a stream slot"):
++        layout([a, Piece(_st(0, 6144, 2048), [4])], 64)
++    with pytest.raises(ValueError, match="overlapping extents"):
++        layout([a, Piece(_st(3, 1024, 2048), [4])], 64)
++    with pytest.raises(ValueError, match="without rows"):
++        layout([a, Piece(_st(3, 8192, 2048), [])], 64)
++    with pytest.raises(ValueError, match="needs a piece"):
++        layout([], 64)
++
++
++def test_staging_and_the_experts_prefill_rows(allocations, monkeypatch):  # noqa: F811
++    """The real ``_stage``: every piece's room checked, the ids back to back through the pinned copy; and
++    ``prefill_pieces`` lays out at most ``e.prefill_rows`` rows (the AFD settings handshake's), even when the prompt
++    buffers hold more, before anything reaches the wire."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import multi_prefill as mp
++
++    events = []
++    b = SimpleNamespace(rows=64, ids=torch.zeros((64,), dtype=torch.int32),
++                        ids_host=torch.zeros((64,), dtype=torch.int32),
++                        staged=SimpleNamespace(synchronize=lambda: events.append("sync"),
++                                               record=lambda: events.append("record")))
++    w = SimpleNamespace(cfg=SimpleNamespace(dense_limit=10**9))
++    pieces = [mp.Piece(_st(0, 0, 100, pos=40), [5, 6, 7]), mp.Piece(_st(1, 2048, 100, pos=3), [8, 9])]
++    R = mp.layout(pieces, 64)
++    mp._stage(w, b, pieces, R)
++    assert b.ids[:R].tolist() == [5, 6, 7, 8, 9] and events == ["sync", "record"]
++    with pytest.raises(ValueError, match="cache capacity"):
++        mp._stage(w, b, [mp.Piece(_st(0, 0, 100, pos=98), [1, 2, 3])], 3)
++    wire = SimpleNamespace(begin=lambda *a, **k: pytest.fail("the wire saw a chunk past prefill_rows"))
++    e = SimpleNamespace(w=SimpleNamespace(afd=wire, cfg=w.cfg), pbuf=b, prefill_rows=4)
++    with pytest.raises(ValueError, match="prompt buffers hold 4"):
++        mp.prefill_pieces(e, [mp.Piece(_st(0, 0, 100), [1, 2, 3]), mp.Piece(_st(1, 2048, 100), [4, 5])])
++
++
++# -- grouped == ungrouped on #243's fake model --------------------------------------------------------------------------
++def _mode(monkeypatch, on: bool, wait: str | None = None) -> None:
++    if on:
++        monkeypatch.setenv("TF_GLM_MULTI_PREFILL", "1")
++    else:
++        monkeypatch.delenv("TF_GLM_MULTI_PREFILL", raising=False)
++    if wait is None:
++        monkeypatch.delenv("TF_GLM_MULTI_PREFILL_WAIT_MS", raising=False)
++    else:
++        monkeypatch.setenv("TF_GLM_MULTI_PREFILL_WAIT_MS", wait)
++
++
++def kept_view(d) -> list:
++    """Every kept prompt by content (kids and extents may differ between the two modes): its ids, KDA state, conv
++    window, DFlash2 window and its rows in each pool plane."""
++
++    out = []
++    for c in d.kept:
++        x, n = c.extent, len(c.ids)
++        planes = [d.arena.view(0, x.base, x.size)[:n], d.arena.view(1, x.base, x.size)[:n // 4]]
++        if len(d.arena.planes) > 2:
++            planes.append(d.arena.view(2, x.base, x.size)[:n])
++        out.append((tuple(c.ids), c.rec.tolist(), c.conv.tolist(), bool(getattr(c, "shared", False)),
++                    [r.tolist() for r in (c.drafter_rows or [])], [p.tolist() for p in planes]))
++    return sorted(out, key=repr)
++
++
++def _fills(sent) -> tuple[int, int]:
++    from tensorfold.families.glm5_next.cuda.multi import FILL, MFILL
++
++    ops = [op for m in sent for op, _ in tm._ops(m)]
++    return ops.count(FILL), ops.count(MFILL)
++
++
++def burst_pair(torch, monkeypatch, on: bool, *, draft: bool = True, policy: str = "f3"):
++    """Four short prompts admitted together at two ranks; every message rank 0 sent is kept for counting."""
++
++    _mode(monkeypatch, on)
++    p = tm.Pair(torch, streams=4)
++    log = []
++    share = p.g[0]._share
++    p.g[0]._share = lambda values: (log.append(list(values)), share(values))[1]
++    reqs = [(tm._prompt(n, seed), 24, tm._sampling(kind, seed)) for n, seed, kind in BURST]
++    streams = [p.submit(pr, cnt, sp, policy=policy, draft=draft) for pr, cnt, sp in reqs]
++    p.run()
++    for s, (pr, cnt, sp) in zip(streams, reqs):
++        assert s.got == tm.solo(torch, pr, cnt, sp)
++    return p, log, streams
++
++
++@pytest.mark.parametrize("draft", [True, False], ids=["drafted", "undrafted"])
++def test_two_ranks_burst_grouped_equals_ungrouped(fake, monkeypatch, draft):
++    """Each drafted prompt keeps its state before its last token, so it fills in two pieces: 8 FILLs ungrouped, 2
++    MFILLs grouped (4 -> 1 undrafted). Replies equal their solo ones, both ranks agree after every message (Pair.check),
++    and the kept states with their pool rows are the same either way."""
++
++    torch = fake
++    p0, log0, s0 = burst_pair(torch, monkeypatch, False, draft=draft)
++    p1, log1, s1 = burst_pair(torch, monkeypatch, True, draft=draft)
++    assert [s.got for s in s0] == [s.got for s in s1]
++    assert kept_view(p0.d[0]) == kept_view(p1.d[0]) == kept_view(p1.d[1])
++    assert len(p0.d[0].kept) == (4 if draft else 0)
++    rows = sum(n for n, _, _ in BURST)
++    assert _fills(log0) == ((8 if draft else 4), 0)
++    assert _fills(log1) == (0, 2 if draft else 1)
++    assert p1.d[0].grouped == {"chunks": 2 if draft else 1, "pieces": 8 if draft else 4, "rows": rows}
++    assert "multi_prefill" in p1.d[0].health() and "multi_prefill" not in p0.d[0].health()
++    assert p1.g[0].e.chunks == p1.g[1].e.chunks and len(p1.g[0].e.chunks) == (2 if draft else 1)
++    first = p1.g[0].e.chunks[0]                                   # (slot, pos, rows): the four prompts, shortest first
++    assert [r for _, _, r in first] == ([n - 1 for n, _, _ in BURST] if draft else [n for n, _, _ in BURST])
++
++
++def test_mtp_streams_fill_alone(fake, monkeypatch):
++    """With the MTP head (no draft model), drafting streams' prompt rows go through the head too: they never join a
++    multi-prompt chunk, and the replies are their solo ones."""
++
++    torch = fake
++    _mode(monkeypatch, True)
++    p = tm.Pair(torch, streams=4, drafter=False, mtp=True)
++    reqs = [(tm._prompt(n, seed), 20, tm._sampling(kind, seed)) for n, seed, kind in BURST]
++    streams = [p.submit(pr, cnt, sp, policy="2") for pr, cnt, sp in reqs]
++    p.run()
++    for s, (pr, cnt, sp) in zip(streams, reqs):
++        assert s.got == tm.solo(torch, pr, cnt, sp)
++    assert p.d[0].grouped["chunks"] == 0 and p.g[0].e.mtp_steps > 0
++
++
++@pytest.mark.parametrize("streams,drafters", [(4, "dflash2"), (4, "both"), (2, "dflash2")])
++def test_two_ranks_staggered_requests(fake, monkeypatch, streams, drafters):
++    """#243's six staggered requests (greedy, top-k, nucleus, min-p, serial; DFlash2 and MTP drafts) with the setting
++    on: every reply is its solo one, both ranks agree, and prompts did share chunks."""
++
++    _mode(monkeypatch, True)
++    seen = []
++    real = tm.Pair.__init__
++
++    def init(self, *a, **k):                             # 256-row prompt chunks: room for several streams' pieces
++        real(self, *a, **{**k, "prefill_rows": 256})
++        seen.append(self)
++
++    monkeypatch.setattr(tm.Pair, "__init__", init)
++    tm.test_staggered_concurrent_requests_equal_their_solo_serial_replies(fake, streams, drafters)
++    assert seen and seen[0].d[0].grouped["chunks"] > 0 and seen[0].d[0].group
++
++
++def test_two_ranks_fp8_rings(fake, rings, monkeypatch):
++    """TF_GLM_KV=fp8's per-slot indexer rings: the burst and the staggered requests with the setting on."""
++
++    tk._ringed(fake)
++    p0, _, s0 = burst_pair(fake, monkeypatch, False)
++    p1, log1, s1 = burst_pair(fake, monkeypatch, True)
++    assert [s.got for s in s0] == [s.got for s in s1] and kept_view(p0.d[0]) == kept_view(p1.d[0])
++    assert _fills(log1) == (0, 2)
++    test_two_ranks_staggered_requests(fake, monkeypatch, 4, "dflash2")
++
++
++def _shared_burst(torch, monkeypatch, node_for, on: bool):
++    """Two conversations on long system blocks admitted together, with the shared-prefix points: their pieces end
++    at the system block's end and before each last token; then a third request resumes the system block."""
++
++    _mode(monkeypatch, on)
++    node = node_for()
++    gs = node.g if isinstance(node.g, list) else [node.g]
++    tsp.sharing(gs)
++    load, inference, _ = tsp.shapes()
++    other = tsp.benchy(tm._prompt(600, 501), tm._prompt(40, 7))
++    a = node.submit(load, 12, None)
++    b = node.submit(other, 14, tm._sampling("topk", 5))
++    node.run()
++    c = node.submit(inference, 10, None)
++    at = len(tsp.HEAD) + 600
++    assert c.cached == at
++    node.run()
++    for s, (pr, cnt, sp) in zip((a, b, c), ((load, 12, None), (other, 14, tm._sampling("topk", 5)),
++                                            (inference, 10, None))):
++        assert s.got == tm.solo(torch, pr, cnt, sp)
++    d = node.d[0] if isinstance(node.d, list) else node.d
++    return node, d, [s.got for s in (a, b, c)]
++
++
++def test_shared_points_two_ranks_and_world1(fake, afd_fake, monkeypatch):
++    """The shared points (TF_GLM_SHARED_PREFIX) as piece ends: the same replies, kept states (shared ones marked)
++    and cached counts grouped and ungrouped, at two ranks and at world 1 over the fake AFD wire."""
++
++    torch = fake
++    for make in (lambda: tm.Pair(torch, streams=2, blocks=8, prefill_rows=128),
++                 lambda: ta.World1(afd_fake, streams=2, prefill_rows=128)):
++        _, d0, g0 = _shared_burst(torch, monkeypatch, make, False)
++        n1, d1, g1 = _shared_burst(torch, monkeypatch, make, True)
++        assert g0 == g1 and kept_view(d0) == kept_view(d1) and d1.grouped["chunks"] > 0
++        assert any(c.shared for c in d1.kept)
++        if isinstance(n1, tm.Pair):
++            n1.check()
++        else:
++            n1.wire.pairs()
++
++
++def burst_world1(env, monkeypatch, on: bool, *, draft: bool = True):
++    _mode(monkeypatch, on)
++    n1 = ta.World1(env, streams=4)
++    reqs = [(tm._prompt(n, seed), 24, tm._sampling(kind, seed)) for n, seed, kind in BURST]
++    streams = [n1.submit(pr, cnt, sp, draft=draft) for pr, cnt, sp in reqs]
++    n1.run()
++    for s, (pr, cnt, sp) in zip(streams, reqs):
++        assert s.got == tm.solo(env.torch, pr, cnt, sp)
++    return n1, streams
++
++
++@pytest.mark.parametrize("draft", [True, False], ids=["drafted", "undrafted"])
++def test_world1_afd_burst_makes_fewer_prompt_forwards(afd_fake, monkeypatch, draft):
++    """The AFD attention node (world 1, no follower): a burst of four short prompts makes 2 prompt forwards where it
++    made 8 (1 where it made 4 undrafted), counted as ``begin(R, chunk=True)`` headers on the fake wire, each right
++    before its forward of R rows (at most the experts' prefill_rows); the replies and kept states are the same."""
++
++    n0, s0 = burst_world1(afd_fake, monkeypatch, False, draft=draft)
++    n1, s1 = burst_world1(afd_fake, monkeypatch, True, draft=draft)
++    assert [s.got for s in s0] == [s.got for s in s1] and kept_view(n0.d) == kept_view(n1.d)
++    c0 = [r for k, r in n0.wire.pairs() if k == "chunk"]
++    c1 = [r for k, r in n1.wire.pairs() if k == "chunk"]
++    begins = [c for c in n1.wire.calls if c[0] == "begin" and c[2]]
++    assert len(c0) == (8 if draft else 4) and len(c1) == len(begins) == (2 if draft else 1)
++    rows = sum(n for n, _, _ in BURST)
++    assert sum(c1) == sum(c0) == rows and all(r <= n1.g.e.prefill_rows for r in c1)
++    assert n1.shared == [] and n1.d.world == 1
++
++
++def test_world1_staggered_and_fp8(afd_fake, rings, monkeypatch):
++    _mode(monkeypatch, True)
++    tk._ringed(afd_fake.torch)
++    seen = []
++    real = ta.World1.__init__
++
++    def init(self, *a, **k):                             # 256-row prompt chunks: room for several streams' pieces
++        real(self, *a, **{**k, "prefill_rows": 256})
++        seen.append(self)
++
++    monkeypatch.setattr(ta.World1, "__init__", init)
++    ta.test_world1_staggered_requests_equal_their_solo_replies(afd_fake, 4)
++    assert seen[0].d.grouped["chunks"] > 0
++
++
++def test_rank1_refuses_a_piece_past_a_kept_point(fake, monkeypatch):
++    from tensorfold.families.glm5_next.cuda.multi import MFILL
++
++    _mode(monkeypatch, True)
++    p = tm.Pair(fake, streams=2)
++    a = p.submit(tm._prompt(20, 1), 8, None)
++    b = p.submit(tm._prompt(30, 2), 8, None)
++    p.d[0]._flush()                                       # the two ADMITs
++    p.follow()
++    la, lb = p.d[1].lanes[a.sid], p.d[1].lanes[b.sid]
++    assert la.stops == [19] and lb.stops == [29]
++    with pytest.raises(RuntimeError, match="passes a kept point"):
++        p.d[1].apply([MFILL, 5, 2, a.sid, 20, b.sid, 29])
++
++
++def test_the_idle_servers_wait(fake, afd_fake, monkeypatch):
++    """TF_GLM_MULTI_PREFILL_WAIT_MS: an idle server's admission waits for requests arriving with the first and ends as
++    soon as every slot is taken; a stop (close) during the wait goes back for the idle worker; off, no wait. Then the
++    threaded scheduler: four requests at once share the first prompt chunk, each reply its solo one."""
++
++    from tensorfold.cuda.scheduler import Waiting
++    from tensorfold.cuda.streams import Stream
++    from tensorfold.families.glm5_next.cuda.engine import encode_policy
++    from tensorfold.families.glm5_next.cuda.multi import GlmScheduler
++
++    def item(n, seed):
++        s = Stream(tm._prompt(n, seed), 4, None, draft=True)
++        s.glm = {"code": encode_policy("f3"), "spec": "f3"}
++        s.emit = lambda new: False
++        return s, queue.Queue()
++
++    def bare(d, most):                                   # no worker thread: _admit alone
++        s = GlmScheduler.__new__(GlmScheduler)
++        s.decoder, s.max_streams, s.waiting, s.held, s.boxes, s.yields = d, most, Waiting(), None, {}, 0
++        return s
++
++    _mode(monkeypatch, True, wait="900")
++    n1 = ta.World1(afd_fake, streams=2)
++    sched = bare(n1.d, 2)
++    threading.Timer(0.1, lambda: sched.waiting.put(item(12, 2))).start()
++    t = time.monotonic()
++    sched._admit(item(10, 1), time.monotonic() + 0.9)
++    assert n1.d.live() == 2 and time.monotonic() - t < 0.8          # both slots taken: no wait past the second
++    n2 = ta.World1(afd_fake, streams=3)
++    sched2 = bare(n2.d, 3)
++    threading.Timer(0.1, sched2.waiting.stop).start()
++    sched2._admit(item(10, 1), time.monotonic() + 2.0)
++    assert n2.d.live() == 1 and sched2.waiting.get(timeout=1) is None
++    # the threaded scheduler, TF_GLM_MULTI_PREFILL_WAIT_MS=1000: a burst of four lands in one first chunk
++    _mode(monkeypatch, True, wait="1000")
++    n4 = ta.World1(afd_fake, streams=4)
++    sched4 = GlmScheduler(n4.d, max_streams=4)
++    assert sched4.gather_s == 1.0
++    reqs = [(tm._prompt(n, seed), 16, tm._sampling(kind, seed)) for n, seed, kind in BURST]
++    results: dict[int, list[int]] = {}
++
++    def client(i):
++        got: list[int] = []
++        sched4.submit(reqs[i][0], reqs[i][1], reqs[i][2], True, lambda new: got.extend(new) or False,
++                      glm={"code": encode_policy("f3"), "spec": "f3"})
++        results[i] = got
++
++    threads = [threading.Thread(target=client, args=(i,)) for i in range(4)]
++    for th in threads:
++        th.start()
++    for th in threads:
++        th.join(timeout=120)
++    sched4.close()
++    assert [results[i] for i in range(4)] == [tm.solo(afd_fake.torch, *r) for r in reqs]
++    assert len(n4.g.e.chunks[0]) == 4 and n4.d.grouped["chunks"] == 2
++    _mode(monkeypatch, False, wait="900")
++    off = GlmScheduler(ta.World1(afd_fake, streams=2).d, max_streams=2)
++    assert off.gather_s == 0.0
++    off.close()
++
++
++# -- the forward seam: the real forward.compute and PieceMixer over recorded kernels ---------------------------------------
++class Rec:
++    """Every kernel call of a forward, in order: (name, arguments) with each tensor named by the buffer, state or
++    weight it views and its element offset, shape and strides; ``enter``/``exit`` around ``kda_rows`` and
++    ``dsa_rows`` (the stream-state parts)."""
++
++    def __init__(self, torch) -> None:
++        self.torch = torch
++        self.names: dict[int, tuple] = {}          # storage pointer -> (name, offset, row stride, row dim, rows)
++        self.aliases: dict[int, str] = {}          # whole objects passed as such (the buffers, the latent scratch)
++        self.calls: list[tuple] = []
++
++    def register(self, name: str, t, row: int = 0) -> None:
++        self.names[t.untyped_storage().data_ptr()] = (name, t.storage_offset(), t.stride(row) if t.dim() else 0, row,
++                                                       t.shape[row] if t.dim() else 0)
++
++    def norm(self, x):
++        """A view that runs to its buffer's last row records its rows as "END": a kernel reads the rows it is told
++        (KDA's scratch from row lo on, ``forward._scratch_rows``, has fewer rows than the whole scratch; the
++        extension only checks there are enough)."""
++
++        torch = self.torch
++        if id(x) in self.aliases:
++            return ("obj", self.aliases[id(x)])
++        if isinstance(x, torch.Tensor):
++            key = self.names.get(x.untyped_storage().data_ptr())
++            if key is None:
++                return ("anon", tuple(x.shape))
++            name, base, rs, row, rows = key
++            off = x.storage_offset() - base
++            shape = list(x.shape)
++            if rs and x.dim() > row and off % rs == 0 and off // rs + shape[row] == rows and x.stride(row) == rs:
++                shape[row] = "END"
++            return (name, off, tuple(shape), tuple(x.stride()))
++        if isinstance(x, (list, tuple)):
++            return tuple(self.norm(v) for v in x)
++        if isinstance(x, SimpleNamespace):
++            return tuple(sorted((k, self.norm(v)) for k, v in vars(x).items()))
++        return x if x is None or isinstance(x, (bool, int, float, str)) else ("obj", type(x).__name__)
++
++    def fn(self, name: str, ret=None):
++        def call(*a, **k):
++            self.calls.append((name, self.norm(a), tuple(sorted((key, self.norm(v)) for key, v in k.items()))))
++            return ret(*a, **k) if ret is not None else None
++        return call
++
++    def shifted(self, call, lo: int):
++        """A call with every prompt-buffer view moved ``lo`` rows up (``b.``-named tensors)."""
++
++        def mv(x):
++            if isinstance(x, tuple) and len(x) == 4 and isinstance(x[0], str) and x[0].startswith("b."):
++                rs = next(v[2] for v in self.names.values() if v[0] == x[0])
++                return (x[0], x[1] - lo * rs, x[2], x[3])
++            if isinstance(x, tuple):
++                return tuple(mv(v) for v in x)
++            return x
++        return mv(call)
++
++
++def build_forward(torch, rec: Rec, *, dense_limit: int = 10**6):
++    """Small CPU stand-ins for Weights (4 layers: KDA + dense MLP, DSA + MoE, KDA + MoE, DSA + MoE; EXL3-style shared
++    expert; the AFD wire), the prompt buffers and the per-stream states, every tensor registered by name."""
++
++    D, S, RMAX, V = 16, 2, 64, 32
++    cfg = SimpleNamespace(hidden=D, streams=S, eps=1e-5, hc_eps=1e-6, hc_iters=2, q_lora=8, kv_lora=8, qk_dim=4,
++                          v_dim=4, index_dim=4, dense_limit=dense_limit, top_k=2, experts=4, routed_scale=1.0,
++                          norm_topk=True, limit=10.0, lower=-5.0)
++    weights = {}
++
++    def W(name):
++        t = torch.zeros((2,))
++        weights[name] = t
++        rec.register("w." + name, t)
++        return t
++
++    layers = []
++    for i, (kind, ffn) in enumerate([("kda", "mlp"), ("dsa", "moe"), ("kda", "moe"), ("dsa", "moe")]):
++        p = f"L{i}."
++        layer = SimpleNamespace(index=i, kind=kind, in_norm=W(p + "in_norm"), post_norm=W(p + "post_norm"),
++                                attn_hc=SimpleNamespace(fn=W(p + "ahc.fn"), base=W(p + "ahc.base"), scale=W(p + "ahc.s")),
++                                ffn_hc=SimpleNamespace(fn=W(p + "fhc.fn"), base=W(p + "fhc.base"), scale=W(p + "fhc.s")),
++                                kda=None, dsa=None, mlp=None, moe=None)
++        if kind == "kda":
++            layer.kda = SimpleNamespace(proj=W(p + "proj"), fa_off=8, ga_off=16, fb=W(p + "fb"), gb=W(p + "gb"),
++                                        b_off=24, conv=W(p + "conv"), a_log=W(p + "a_log"), dt_bias=W(p + "dt"),
++                                        norm=W(p + "norm"), o=W(p + "o"))
++        else:
++            layer.dsa = SimpleNamespace(proj=W(p + "proj"), q_norm=W(p + "qn"), kv_norm=W(p + "kvn"), q_b=W(p + "qb"),
++                                        absorb=W(p + "absorb"), heads=2, o=W(p + "o"),
++                                        index=SimpleNamespace(kw=W(p + "ikw"), gate=W(p + "igate"), ln_w=W(p + "ilnw"),
++                                                              ln_b=W(p + "ilnb"), ape=W(p + "iape"), qb=W(p + "iqb")))
++        if ffn == "mlp":
++            layer.mlp = SimpleNamespace(gu=W(p + "gu"), down=W(p + "down"))
++        else:
++            layer.moe = SimpleNamespace(router=W(p + "router"), bias=W(p + "bias"), experts=W(p + "experts"),
++                                        shared=SimpleNamespace(gu=W(p + "sgu"), down=W(p + "sdown")))
++        layers.append(layer)
++
++    def buf(name, shape, row=0, dtype=None):
++        t = torch.zeros(shape, dtype=dtype or torch.float32)
++        rec.register("b." + name, t, row)
++        return t
++
++    b = SimpleNamespace(prefill=True, rows=RMAX, world=1, tap_at={2: [0]})
++    for name, width in [("x", S * D), ("normed", D), ("xs", 4), ("post", S), ("comb", S * S), ("ka", 8), ("kg", 8),
++                        ("dp", 16), ("qr", 8), ("xs_qr", 2), ("lat", 8), ("xs_lat", 2), ("xs_ao", 2), ("ikr", 6),
++                        ("igr", 4), ("qi", 8), ("part", D), ("sy", D), ("sgu", 8), ("sact", 4), ("sxs", 1),
++                        ("mlog", 4), ("wts", 3), ("hidden", D), ("fnormed", D), ("fxs", 4), ("gu", 8), ("act", 4),
++                        ("xs_act", 1), ("kxs", 2), ("xs_fa", 2), ("xs_ga", 2)]:
++        setattr(b, name, buf(name, (RMAX, width)))
++    b.hcpart = buf("hcpart", (RMAX, 2, 4))
++    b.q, b.vn = buf("q", (RMAX, 2, 4)), buf("vn", (RMAX, 2, 4))
++    b.pick = buf("pick", (RMAX, 3), dtype=torch.int32)
++    b.ids = buf("ids", (RMAX,), dtype=torch.int32)
++    b.ids_host = torch.zeros((RMAX,), dtype=torch.int32)
++    b.staged = SimpleNamespace(synchronize=lambda: None, record=lambda: None)
++    b.kproj = buf("kproj", (1, RMAX, 40), row=1)
++    b.kscratch = SimpleNamespace(out=buf("ks.out", (RMAX, 8)), k=buf("ks.k", (RMAX, 2, 4)),
++                                 v=buf("ks.v", (RMAX, 2, 4)), g=buf("ks.g", (RMAX, 2, 4)), b=buf("ks.b", (RMAX, 2)))
++    b.lat_s = SimpleNamespace(qa=buf("ls.qa", (RMAX, 2, 8)), ol=buf("ls.ol", (RMAX, 2, 8)), nch=64, part_rows=32)
++    rec.aliases[id(b)], rec.aliases[id(b.lat_s)] = "B", "LATENT_SCRATCH"
++    b.afd_recv = buf("afd_recv", (3 * RMAX * D,))
++    b.taps = [buf("tap0", (RMAX, D))]
++    b.logits = buf("logits", (1, V))
++    head, embed, norm = W("head"), W("embed"), W("norm")
++    wire = SimpleNamespace(begin=rec.fn("afd.begin"), exchange=rec.fn("afd.exchange"),
++                           collect=rec.fn("afd.collect", lambda bb, rows, d: bb.afd_recv[:3 * rows * d].view(3, rows, d)))
++    w = SimpleNamespace(cfg=cfg, layers=layers, head=head, embed=embed, norm=norm, comm=None, afd=wire, world=1)
++    return w, b
++
++
++class TraceState:
++    """forward.State's surface for the recorded forward: a slot's KDA states and conv windows, its extent's latents
++    and index rings, its device position."""
++
++    def __init__(self, torch, rec: Rec, slot: int, pos: int, *, index: bool = True) -> None:
++        p = f"st{slot}."
++        self.slot, self.base, self.capacity = slot, 4096 * slot, 4096
++        self.kda_index, self.dsa_index = {0: 0, 2: 1}, {1: 0, 3: 1}
++        self.cur = [0, 0]
++        self.rec = torch.zeros((2, 2, 4))
++        self.conv = torch.zeros((2, 3, 8))
++        self.kc = [torch.zeros((4096, 8)), torch.zeros((4096, 8))]
++        self.vc = [None, None]
++        self.pos_dev = torch.zeros((1,), dtype=torch.int64)
++        self.index = [tuple(torch.zeros((64, 4)) for _ in range(3)) for _ in range(2)] if index else None
++        for name, t in [("rec", self.rec), ("conv", self.conv), ("kc0", self.kc[0]), ("kc1", self.kc[1]),
++                        ("pos_dev", self.pos_dev)]:
++            rec.register(p + name, t)
++        for i, trio in enumerate(self.index or []):
++            for j, t in enumerate(trio):
++                rec.register(f"{p}index{i}.{j}", t)
++        self.pos = pos
++        self.pos_dev.fill_(pos)
++
++    def set_pos(self, pos: int) -> None:
++        self.pos = pos
++        self.pos_dev.fill_(pos)
++
++
++def patch_kernels(monkeypatch, rec: Rec, fwd, forward_mod=None) -> None:
++    """Every kernel the prompt chunk calls, recorded (and ``kda_rows`` / ``dsa_rows`` marked) on module ``fwd``."""
++
++    import torch
++
++    mods = {n: importlib.import_module(f"tensorfold.families.glm5_next.cuda.{n}")
++            for n in ("glue", "kda", "latent", "sparse", "qmm")}
++    for n in ("embed", "hc_pre", "hc_post", "rmsnorm", "router", "select", "swiglu", "combine", "stream_mean"):
++        monkeypatch.setattr(mods["glue"], n, rec.fn("glue." + n))
++    monkeypatch.setattr(mods["kda"], "chain", rec.fn("kda.chain", lambda *a, **k: a[13].out[:a[12]]))
++    monkeypatch.setattr(mods["latent"], "latent_write", rec.fn("latent.latent_write"))
++    monkeypatch.setattr(mods["latent"], "absorb_q", rec.fn("latent.absorb_q", lambda q, a, out: out))
++    monkeypatch.setattr(mods["latent"], "attention", rec.fn("latent.attention", lambda *a, out, **k: out))
++    monkeypatch.setattr(mods["latent"], "sparse_attention", rec.fn("latent.sparse_attention"))
++    monkeypatch.setattr(mods["latent"], "expand_v", rec.fn("latent.expand_v", lambda o, a, out: out))
++    monkeypatch.setattr(mods["sparse"], "index_update", rec.fn("sparse.index_update"))
++    monkeypatch.setattr(mods["sparse"], "select_tokens", rec.fn(
++        "sparse.select_tokens", lambda *a, **k: (torch.zeros((a[4], 4), dtype=torch.int32),
++                                                 torch.zeros((a[4],), dtype=torch.int32))))
++    monkeypatch.setattr(mods["qmm"], "group_sums", rec.fn("qmm.group_sums", lambda x, xs: xs))
++    monkeypatch.setattr(fwd, "mm", rec.fn("mm", lambda b, x, q, xs, out, f32=False: out))
++    monkeypatch.setattr(fwd, "_shift_conv", rec.fn("shift_conv"))
++    for name in ("kda_rows", "dsa_rows"):
++        real = getattr(fwd, name, None)
++        if real is None:
++            continue
++
++        def marked(*a, _real=real, _name=name, **k):
++            if _name == "kda_rows":                  # kda_rows(layer, w, st, b, lo, n)
++                lo, rows, slot = a[4], a[5], a[2].slot
++            else:                                    # dsa_rows(a, w, lc, pos_dev, b, R, ..., lo=0): the slot by pos_dev
++                lo, rows = k.get("lo", a[10] if len(a) > 10 else 0), a[5]
++                slot = int(rec.norm(a[3])[0].split(".")[0][2:])
++            rec.calls.append(("enter", _name, lo, rows, slot))
++            out = _real(*a, **k)
++            rec.calls.append(("exit", _name))
++            return out
++        monkeypatch.setattr(fwd, name, marked)
++
++
++def segments(calls) -> tuple[list, list]:
++    """(the calls outside kda_rows / dsa_rows, [(enter marker, calls inside)] in order)."""
++
++    outside, inside, cur = [], [], None
++    for c in calls:
++        if c[0] == "enter":
++            cur = (c, [])
++        elif c[0] == "exit":
++            inside.append(cur)
++            cur = None
++        elif cur is not None:
++            cur[1].append(c)
++        else:
++            outside.append(c)
++    return outside, inside
++
++
++@pytest.mark.parametrize("dense_limit", [10**6, 100], ids=["dense", "sparse-past-100"])
++def test_the_forward_seam_gives_each_piece_its_solo_calls(allocations, monkeypatch, dense_limit):  # noqa: F811
++    """Three streams' pieces (rows 7, 40 and 12 at positions 500, 90 and 3; with the dense limit at 100 the first
++    piece's rows are all sparse, the second's cross it and the third's are dense): the real prefill_pieces over the
++    real forward. Each piece's stream-state calls are its solo prefill_chunk's, with its rows a view ``lo`` rows into
++    the chunk's buffers (and its own position, chunk count, caches and rings); the rest is a solo chunk of all 59
++    rows; the wire saw one begin(59, chunk=True) and one exchange per MoE layer."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import decode
++    from tensorfold.families.glm5_next.cuda import multi_prefill as mp
++
++    forward = importlib.import_module("tensorfold.families.glm5_next.cuda.forward")
++    rec = Rec(torch)
++    w, b = build_forward(torch, rec, dense_limit=dense_limit)
++    patch_kernels(monkeypatch, rec, forward)
++    monkeypatch.setattr(decode, "commit", forward.commit)
++    plan = [(0, 500, 7), (1, 90, 40), (2, 3, 12)]                    # (slot, position, rows)
++    states = {s: TraceState(torch, rec, s, pos) for s, pos, _ in plan}
++    prompts = {s: list(range(1, pos + n + 1)) for s, pos, n in plan}
++    solo = {}
++    for s, pos, n in plan:                                           # each piece as a chunk of its own
++        e = SimpleNamespace(w=w, st=states[s], pbuf=b, prefill_rows=64, last_hidden=None,
++                            tap_rows=lambda k, bb: torch.cat([t[:k] for t in bb.taps], dim=1))
++        rec.calls = []
++        decode.prefill_chunk(e, prompts[s], pos, n, head=True)
++        solo[s] = list(rec.calls)
++        assert states[s].pos == pos + n
++        states[s].set_pos(pos)
++        states[s].cur = [0, 0]
++    R = sum(n for _, _, n in plan)
++    ref_state = TraceState(torch, rec, 7, 0, index=True)
++    rec.calls = []                                                   # a solo chunk of all the rows: the row-wise calls
++    decode.prefill_chunk(SimpleNamespace(w=w, st=ref_state, pbuf=b, prefill_rows=64, last_hidden=None,
++                                         tap_rows=lambda k, bb: None), list(range(R)), 0, R, head=False)
++    ref_out, _ = segments(rec.calls)
++    rec.calls = []
++    pieces = [mp.Piece(states[s], prompts[s][pos:pos + n], head=s != 1) for s, pos, n in plan]
++    heads = mp.prefill_pieces(SimpleNamespace(w=w, pbuf=b, prefill_rows=64), pieces)
++    out, inside = segments(rec.calls)
++    assert [st.pos for st in states.values()] == [pos + n for _, pos, n in plan]
++    assert [h is not None for h in heads] == [True, False, True]
++    # the stream-state parts: each piece's are its solo chunk's, moved lo rows into the chunk
++    for p, (s, pos, n) in zip(pieces, plan):
++        mine = [(m, [rec.shifted(c, p.lo) for c in calls]) for m, calls in inside if m[4] == s]
++        theirs = segments(solo[s])[1]
++        assert len(mine) == len(theirs) == 4
++        for (m1, c1), (m2, c2) in zip(mine, theirs):
++            assert m1[1] == m2[1] and m1[3] == m2[3] == n and m1[2] == p.lo and m2[2] == 0
++            assert c1 == c2
++        sparse_calls = [c for _, calls in theirs for c in calls if c[0] == "latent.sparse_attention"]
++        assert bool(sparse_calls) == (pos + n - 1 >= dense_limit)
++    assert len(inside) == 4 * len(plan)
++    # the row-wise rest: exactly a solo chunk of R rows (heads aside), behind one begin(R, chunk=True)
++    def is_head(c) -> bool:
++        return c[0] == "mm" and c[1][2][0] == "w.head"
++
++    head_calls = [c for c in out if is_head(c)]
++    assert [c for c in out if not is_head(c)] == [c for c in ref_out if not is_head(c)]
++    assert out[0] == ("afd.begin", (R,), (("chunk", True),))
++    assert [c[1][1][1] // b.fnormed.stride(0) for c in head_calls] == [p.lo + p.rows - 1 for p in pieces if p.head]
++    solo_heads = [[c for c in segments(solo[s])[0] if is_head(c)] for s, _, _ in plan]
++    for c, p, h in zip(head_calls, [q for q in pieces if q.head], [h[0] for h, q in zip(solo_heads, pieces) if q.head]):
++        name, args, kw = c                       # the piece's last row (moved lo rows), the same one-row logits buffer
++        assert rec.shifted((name, args[:4], kw), p.lo) == (h[0], h[1][:4], h[2]) and args[4] == h[1][4]
++    assert sum(c[0] == "afd.exchange" for c in out) == 3 and sum(c[0] == "afd.begin" for c in out) == 1
++    assert all(c[1][1] == R for c in out if c[0] in ("afd.exchange", "afd.collect"))

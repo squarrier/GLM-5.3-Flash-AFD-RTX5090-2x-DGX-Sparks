@@ -1,0 +1,3209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 15:43:21 -0400
+Subject: [PATCH] glm5_next/cuda: TF_GLM_KV=fp8 on the AFD attention node
+ (MiaAI-Lab recipe patch 0038, 0041's ring span)
+
+MiaAI-Lab's recipe (github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold @ cf28cc4, KV=fp8 by
+default) holds the DSA latent cache and the indexer's pooled keys as e4m3 rows with a power-of-two fp32 scale each
+(width + 16 bytes a row), and the indexer's per-token keys and gates in one window-sized ring a stream slot. This
+ports recipe patch 0038-glm-kv-fp8 and the ring-base span of 0041-glm-parallel-ring-base (Apache License 2.0,
+Copyright 2026 MiaAI-Lab) onto the split's world-1 attention node:
+
+- kv8.py: the recipe's file, unchanged (a two-line credit header added);
+- latent.py / sparse.py: the cache kernels and their entry points are the recipe's functions, source text identical
+  to the recipe's tree after 0038 (latent: _lat_write latent_write _tile _dense_chunks _sparse_chunks _lat_get
+  _lat_put _seg_lat_write seg_latent_write _seg_chunks; sparse: _index_write _pool_keys index_update _scores _pk_put
+  _pk_get _seg_index_write _seg_pool_keys seg_index_update _seg_scores seg_select_tokens). The launch wrappers keep
+  TensorFold's settings and pass kv8.parts (attention, sparse_attention, seg_attention, select_tokens);
+- segments.py, verify.py (0041's ring-base span), multi.py, forward.py (Caches: kv, rings, index_ring,
+  index_tensors), decode.py (Snapshot.tail, _ring_tail, put_ring_tail), engine.py and cuda/geometry.py
+  (mla_row_bytes, mla_index_ring, mla_ring_bytes; the estimate and the settings carry the kind): 0038's hunks,
+  applied by hand where TensorFold differs.
+
+Differences from the recipe, all glue:
+- the rings come with TF_GLM_KV=fp8 only (the recipe uses them for every kind), so unset or bf16 keeps the caches,
+  snapshots, estimate and kernel bytes exactly as before;
+- decode.prefill's kept point inside a prompt chunk (keep_at, not in the recipe) copies its ring tail before the
+  next chunk overwrites it; multi._keep re-takes the tail with the MTP layer's length; multi._reslot moves the
+  stream's ring rows with it (the recipe's 0038 leaves them; TF_GLM_MULTI_LONE is off by default in both);
+- pools are read with getattr, so a pool without rings (the multi-stream tests' pool double) is a bf16 pool.
+
+The attention node at world 1, with and without --parallel: 6,716 B a window token instead of 18,112; q4 dense +
+fp8 at --parallel 4 x 262,144 estimates 16.10 GiB of an RTX 5090's 28.75 GiB. Unset: byte-identical to before.
+
+Tests: tests/test_glm_kv8.py, tests/test_glm_kv8_multi.py and tests/glm_kv8_cpu.py (CPU: flag-off bytes, the
+recipe's kernels and bytes under Triton's interpreter against tests/data/glm_kv8_golden.json, dequantized reads,
+rings, --parallel slot moves, the estimate).
+
+Credit: THIRD_PARTY_NOTICES.md and the ported files' headers name MiaAI-Lab and the patches.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning) and GLM-5.3-Flash (execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patches 0038, 0041,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit cf28cc4f8038be322cdeda220c6f1c8ace8f27d1 (v1.4); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |  15 +
+ src/tensorfold/cuda/geometry.py               |  42 +-
+ .../families/glm5_next/cuda/decode.py         |  93 +-
+ .../families/glm5_next/cuda/engine.py         |  30 +-
+ .../families/glm5_next/cuda/forward.py        |  83 +-
+ src/tensorfold/families/glm5_next/cuda/kv8.py | 139 +++
+ .../families/glm5_next/cuda/latent.py         | 125 ++-
+ .../families/glm5_next/cuda/multi.py          |  16 +
+ .../families/glm5_next/cuda/segments.py       |  68 +-
+ .../families/glm5_next/cuda/sparse.py         | 183 ++--
+ .../families/glm5_next/cuda/verify.py         |  18 +-
+ tests/data/glm_kv8_golden.json                | 855 ++++++++++++++++++
+ tests/glm_kv8_cpu.py                          | 233 +++++
+ tests/test_glm_kv8.py                         | 338 +++++++
+ tests/test_glm_kv8_multi.py                   | 214 +++++
+ 15 files changed, 2290 insertions(+), 162 deletions(-)
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/kv8.py
+ create mode 100644 tests/data/glm_kv8_golden.json
+ create mode 100644 tests/glm_kv8_cpu.py
+ create mode 100644 tests/test_glm_kv8.py
+ create mode 100644 tests/test_glm_kv8_multi.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index f39dd1e..dab410e 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -137,3 +137,18 @@ Apache License 2.0, Copyright 2026 MiaAI-Lab (see [the license text](LICENSES/Ap
+ `TF_GLM_DENSE` takes `bf16` (the default) or `q4` only (the recipe's `fp8` is not ported); with the flag unset the
+ loader builds the same objects as before, the per-head `kv_k` / `kv_v` copies included; the quantizers themselves
+ are unchanged, so an EXL3 checkpoint's 4-bit codes and scales are the bytes the recipe builds from it.
++
++## GLM FP8 KV cache (TF_GLM_KV=fp8)
++
++`families/glm5_next/cuda/kv8.py` (unchanged) and the `TF_GLM_KV=fp8` paths of `latent.py`, `sparse.py`,
++`segments.py`, `forward.py` (`Caches`, `index_ring`), `decode.py` (`Snapshot.tail`, `_ring_tail`, `put_ring_tail`),
++`multi.py`, `verify.py`, `engine.py` and `cuda/geometry.py` (`mla_row_bytes`, `mla_index_ring`, `mla_ring_bytes`) are
++ported from MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/cf28cc4)
++patch 0038-glm-kv-fp8 (and the `_span` call of 0041-glm-parallel-ring-base), Apache License 2.0, Copyright 2026
++MiaAI-Lab (see [the license text](LICENSES/Apache-2.0.txt)). The cache kernels that both trees share are the recipe's
++functions verbatim. Changes in the port: the indexer's per-slot key and gate rings come with `TF_GLM_KV=fp8` only
++(the recipe uses them for every KV kind), so with the flag unset or `bf16` the caches, snapshots, estimate and kernels'
++bytes are the ones before; TensorFold's own launch settings (`select_tokens`, one pipeline stage) are kept; a kept
++prompt taken inside a prompt chunk (`decode.prefill`'s `keep_at`) and a stream moved to another slot
++(`multi._reslot`) keep their ring rows.
+diff --git a/src/tensorfold/cuda/geometry.py b/src/tensorfold/cuda/geometry.py
+index d596278..bc7b1ee 100644
+--- a/src/tensorfold/cuda/geometry.py
++++ b/src/tensorfold/cuda/geometry.py
+@@ -244,6 +244,28 @@ def indexed_prompt_bytes(t: dict, rows: int, world: int = 1) -> int:
+     return rows * _indexed_prefill_row(t, world, h, hk, hd, nv, dv, width, slots, moe)
+ 
+ 
++def mla_row_bytes(width: int, kv: str = "bf16") -> int:
++    """A GLM DSA cache row of ``width`` values: bf16, or TF_GLM_KV=fp8's e4m3 codes, fp32 scale and 12 pad bytes
++    (families/glm5_next/cuda/kv8.py)."""
++    if kv not in ("bf16", "fp8"):
++        raise ValueError(f"a GLM DSA cache is bf16 or fp8, not {kv!r}")
++    return width + 16 if kv == "fp8" else 2 * width
++
++
++def mla_index_ring(capacity: int, rows: int) -> int:
++    """Rows of GLM's indexer key and gate rings (forward.index_ring): the widest window and 3, rounded up to 64."""
++    return min(capacity, -(-(rows + 3) // 64) * 64)
++
++
++def mla_ring_bytes(t: dict, rows: int) -> int:
++    """One stream slot's indexer key and gate rings on a rank (forward.Caches): every indexed layer (the DSA layers
++    and the MTP layer), 2 x ``mla_index_ring`` rows of the index width in bf16, at most (a small window's ring is the
++    window)."""
++    _, attention = layer_counts(t)
++    count = attention + int(int(t.get("num_nextn_predict_layers", 0)) > 0)
++    return count * 2 * -(-(rows + 3) // 64) * 64 * int(t.get("index_head_dim", 128)) * 2
++
++
+ def exl3_expert_scratch(rows: int, slots: int, d: int, width: int) -> int:
+     """GLM's ``exl3_mm.Scratch`` for ``rows`` x ``slots`` pairs: fp16 rotated inputs and the fp32 split-K sums."""
+ 
+@@ -252,8 +274,12 @@ def exl3_expert_scratch(rows: int, slots: int, d: int, width: int) -> int:
+ 
+ 
+ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560, latent: bool = False,
+-                 mtp: bool | None = None, exl3_scratch: bool = True) -> Geometry:
+-    """GLM's engine; ``mtp``: whether it holds the MTP head's caches and buffers (None: when the checkpoint has one)."""
++                 mtp: bool | None = None, exl3_scratch: bool = True, kv: str = "bf16",
++                 ring_rows: int | None = None) -> Geometry:
++    """GLM's engine; ``mtp``: whether it holds the MTP head's caches and buffers (None: when the checkpoint has one);
++    ``kv``: the DSA caches' format (TF_GLM_KV, MiaAI-Lab's 0038): bf16 as before, or fp8, the latent rows and the
++    indexer's pooled keys as kv8 rows and the indexer's per-token keys and gates in a ring of ``mla_index_ring`` rows
++    for windows of ``ring_rows`` (default: a prompt chunk's) instead of over the capacity."""
+     linear, attention = layer_counts(t)
+     lin = t.get("linear_attn_config") or {}
+     heads = int(t["num_attention_heads"]) // world
+@@ -281,18 +307,26 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
+         fixed += exl3_expert_scratch(PREFILL_ROWS, slots, d, width) + 8 * PREFILL_ROWS * 16384 * 4
+     count = attention + int(mtp)
+     lw = int(t.get("kv_lora_rank", 512))
++    if kv != "bf16" and not latent:
++        raise ValueError("TF_GLM_KV=fp8 needs the latent cache")
++    ring_for = max(PREFILL_ROWS, rows) if ring_rows is None else int(ring_rows)
+     def bytes_at(capacity: int) -> int:
+         scratch = mla_chunk_scratch(t, world, capacity, latent=latent)
+         if latent:
+             # latent cache; a prompt chunk's partials (MLA_PROMPT_ATT_ROWS rows at a time) and absorbed rows (MTP's too)
+-            cache = count * capacity * lw * 2
++            cache = count * capacity * mla_row_bytes(lw, kv)
+             dense = min(capacity, minimum_slots) + PREFILL_ROWS
+             scratch += (((dense + 511) // 512) * min(PREFILL_ROWS, MLA_PROMPT_ATT_ROWS) * heads * (lw + 2) * 4
+                         + 4 * PREFILL_ROWS * heads * lw)
+         else:
+             cache = count * capacity * heads * (kd + vd) * 2
+             scratch += (2 if mtp else 1) * ((capacity + rows + 511) // 512) * rows * heads * (kd + 2) * 4
+-        cache += count * (2 * capacity + capacity // 4 + 2) * index * 2
++        if kv == "bf16":
++            cache += count * (2 * capacity + capacity // 4 + 2) * index * 2
++        else:
++            # TF_GLM_KV=fp8: the indexer's pooled keys over the capacity, its per-token keys and gates in rings
++            ring = mla_index_ring(capacity, ring_for)
++            cache += count * (2 * ring * index * 2 + (capacity // 4 + 2) * mla_row_bytes(index, kv))
+         return fixed + cache + scratch
+     return Geometry(bytes_at, reserve, minimum_slots)
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index 1986ff4..5b5167d 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -92,13 +92,17 @@ class Engine:
+ 
+     def __init__(self, w: Weights, *, capacity: int = 2560, max_rows: int = 8, prefill_rows: int = PREFILL_ROWS,
+                  graphs: bool = False, graph_rows: tuple[int, ...] = (1, 2, 3, 4), long_context: bool = False,
+-                 taps: tuple[int, ...] = (), streams: int = 1, pool_rows: int | None = None) -> None:
+-        """``streams``: stream slots (``forward.Slots``) and ``pool_rows``: tokens of the shared cache pool
++                 taps: tuple[int, ...] = (), streams: int = 1, pool_rows: int | None = None,
++                 kv: str | None = None) -> None:
++        """``kv``: the DSA caches' format (``kv8``; default TF_GLM_KV, bf16 unless set: fp8 halves the latent cache and
++        the indexer's pooled keys, and keeps the indexer's per-token keys and gates in per-slot rings, MiaAI-Lab's
++        0038); ``streams``: stream slots (``forward.Slots``) and ``pool_rows``: tokens of the shared cache pool
+         (``forward.Caches``, default ``capacity``) for concurrent streams (``multi``). ``st`` is the state the
+         single-stream paths run on: ``home`` (slot 0, the pool's first ``capacity`` tokens), the one the CUDA graphs
+         were captured on, unless ``use`` points it at another."""
+ 
+-        from .forward import Caches, Slots
++        from . import kv8
++        from .forward import Caches, Slots, index_ring
+ 
+         self.w = w
+         w.meta["long_context"] = long_context
+@@ -109,7 +113,12 @@ class Engine:
+             self.buf.set_taps(tuple(taps), w.cfg.hidden)         # before any graph capture
+             self.pbuf.set_taps(tuple(taps), w.cfg.hidden)
+         self.mbuf = Buffers(w, max_rows, capacity) if w.mtp is not None else None
+-        self.caches = Caches(w, pool_rows or capacity)
++        kv = kv8.kv_kind() if kv is None else kv
++        # TF_GLM_KV=fp8 (MiaAI-Lab 0038): the indexer's key and gate rings, one a slot, hold the widest window (a
++        # prompt chunk, an MTP absorb chunk, a verify window, a stream's rows of a batched window) and the 3 rows before
++        # it; bf16 (unset) keeps them in the arena planes, the caches exactly as before
++        ring = index_ring(pool_rows or capacity, max(max_rows, prefill_rows)) if kv != "bf16" else None
++        self.caches = Caches(w, pool_rows or capacity, streams=streams, ring=ring, kv=kv)
+         self.slots = Slots(w, streams, max_rows)
+         self.home = self.st = State(w, capacity, max_rows, caches=self.caches, slots=self.slots)
+         self.last_hidden: torch.Tensor | None = None
+@@ -282,16 +291,68 @@ class Snapshot:
+     rows: list | None = None      # the attention rows of ids, saved when another conversation took the live caches
+     nbytes: int = 0
+     drafter_rows: list | None = None  # a ring drafter's window rows before drafter_end, copied when taken
++    tail: list | None = None      # the indexer rings' rows of the pools still filling at ids' end (``_ring_tail``)
++
++
++def has_rings(st) -> bool:
++    """Whether ``st``'s indexer keys and gates live in per-slot rings (``forward.Caches``: TF_GLM_KV=fp8 on this
++    branch; MiaAI-Lab's recipe uses rings for every KV kind) rather than in the arena planes beside the pooled keys."""
++    caches = getattr(st, "caches", None)
++    return caches is not None and getattr(caches, "rings", None) is not None
++
++
++def _ring_tail(st, n: int, m: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
++    """(slots, rows) of the indexer's key and gate rings a snapshot of n tokens (m in the MTP head) needs besides the
++    pools: the tokens of each layer's pool still filling (n % 4 of them, the last ones), which later tokens' windows
++    overwrite in the ring (``forward.index_ring``). slots: ring rows (positions mod the ring); rows: [2, k, 128]
++    (keys, gates), cloned. None without rings (the planes keep every row: ``_row_views``)."""
++    if not has_rings(st):
++        return None
++    index, kc = getattr(st, "index", None) or [], getattr(st, "kc", [])
++    out = []
++
++    def take(trio, end):
++        ik, ig, _ = trio
++        slots = torch.arange(end - end % 4, end, device=ik.device) % ik.shape[0]
++        out.append((slots, torch.stack((ik[slots], ig[slots]))))
++
++    for trio in index[:len(kc)]:
++        if n % 4:
++            take(trio, n)
++    if m > 0 and m % 4 and len(index) > len(kc):
++        take(index[-1], m)
++    return out
++
++
++def put_ring_tail(st, snap: Snapshot) -> None:
++    """A kept snapshot's ring tail (``_ring_tail``) into ``st``'s rings (restore, and a multi-stream stream taking
++    over a kept prompt in any slot). Without rings there is none to put back."""
++    if not has_rings(st):
++        if snap.tail:
++            raise ValueError("a snapshot with indexer ring rows goes back to caches without rings")
++        return
++    index, kc = getattr(st, "index", None) or [], getattr(st, "kc", [])
++    idx = list(index[:len(kc)]) if len(snap.ids) % 4 else []
++    if snap.mtp_len > 0 and snap.mtp_len % 4 and len(index) > len(kc):
++        idx.append(index[-1])
++    tail = snap.tail or []
++    if len(tail) != len(idx):
++        raise ValueError("a snapshot's indexer ring rows do not match the caches they go back to")
++    for (ik, ig, _), (slots, rows) in zip(idx, tail):
++        ik.index_copy_(0, slots % ik.shape[0], rows[0])
++        ig.index_copy_(0, slots % ig.shape[0], rows[1])
+ 
+ 
+ def take_snapshot(e: Engine, ids: Sequence[int], pending: torch.Tensor | None, *, mtp: bool,
+                   drafter=None) -> Snapshot:
+-    """A ring drafter's window rows are copied now (``_ring_window``): its next rows overwrite them in the ring."""
++    """A ring drafter's window rows are copied now (``_ring_window``): its next rows overwrite them in the ring; so
++    are the indexer rings' rows of the pools still filling (``_ring_tail``)."""
+     st = e.st
+     rec = st.rec[st.cur[0]].clone() if st.cur else st.rec[0].clone()
++    mtp_len = st.mtp_len - st.mtp_drafted if mtp and pending is not None else -1
+     snap = Snapshot(list(ids), rec, st.conv.clone(), pending.clone() if pending is not None else None,
+-                    st.mtp_len - st.mtp_drafted if mtp and pending is not None else -1,
+-                    drafter.context_end if drafter is not None else -1)
++                    mtp_len, drafter.context_end if drafter is not None else -1,
++                    tail=_ring_tail(st, len(ids), max(mtp_len, 0)))
+     if drafter is not None and getattr(drafter, "ring", 0) and snap.drafter_end == len(snap.ids):
+         snap.drafter_rows = _ring_window(drafter, len(snap.ids))
+     return snap
+@@ -319,19 +380,22 @@ def _put_ring_window(drafter, n: int, rows: list[torch.Tensor]) -> None:
+ 
+ 
+ def _row_views(st, n: int, m: int) -> list[torch.Tensor]:
+-    """Views of the attention rows a snapshot of n tokens (m in the MTP head) depends on: latents or keys and values, indexer keys, gates and pools."""
++    """Views of the attention rows a snapshot of n tokens (m in the MTP head) depends on: latents or keys and values,
++    and the indexer's pooled keys; its per-token keys and gates too when they are arena planes (without rings: bf16),
++    else they live in rings (TF_GLM_KV=fp8: the snapshot's ``tail``)."""
+     views = [kc[:n] for kc in st.kc] + [vc[:n] for vc in st.vc if vc is not None]
+     idx = st.index or []
+     main_idx = idx[:len(st.kc)]
++    rings = has_rings(st)
+     for ik, ig, pk in main_idx:
+-        views += [ik[:n], ig[:n], pk[:n // 4 + 1]]
++        views += [pk[:n // 4 + 1]] if rings else [ik[:n], ig[:n], pk[:n // 4 + 1]]
+     if m > 0 and hasattr(st, "mtp_kc"):
+         views.append(st.mtp_kc[:m])
+         if getattr(st, "mtp_vc", None) is not None:
+             views.append(st.mtp_vc[:m])
+         if len(idx) > len(st.kc):
+             ik, ig, pk = idx[-1]
+-            views += [ik[:m], ig[:m], pk[:m // 4 + 1]]
++            views += [pk[:m // 4 + 1]] if rings else [ik[:m], ig[:m], pk[:m // 4 + 1]]
+     return views
+ 
+ 
+@@ -350,8 +414,10 @@ def row_bytes(e: Engine, snap: Snapshot) -> int:
+ 
+ 
+ def snapshot_bytes(snap: Snapshot) -> int:
+-    """A kept snapshot's device bytes: KDA states, conv windows, pending MTP rows, a ring window, saved rows."""
++    """Device memory a kept snapshot holds: its KDA states, conv windows, pending MTP rows, a ring drafter's window,
++    the indexer rings' tail and any saved rows."""
+     held = [snap.rec, snap.conv] + ([snap.pending] if snap.pending is not None else []) + (snap.drafter_rows or [])
++    held += [t for pair in (snap.tail or []) for t in pair]
+     return sum(t.numel() * t.element_size() for t in held) + (snap.nbytes if snap.rows is not None else 0)
+ 
+ 
+@@ -363,6 +429,7 @@ def load_rows(e: Engine, snap: Snapshot) -> None:
+ 
+ def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
+     st = e.st
++    put_ring_tail(st, snap)
+     if st.cur:
+         st.rec[st.cur[0]].copy_(snap.rec)
+     st.conv.copy_(snap.conv)
+@@ -439,6 +506,10 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+             if nxt:
+                 with prof.timed("mtp absorb"):
+                     _absorb_rows(e, b.fnormed[:len(nxt)], nxt)
++        if 0 < point <= R and has_rings(st):
++            # TF_GLM_KV=fp8: the kept point's indexer ring rows, before a later chunk's rows overwrite them (this
++            # chunk's and the 3 before it are all in the ring: ring >= rows + 3)
++            kept.tail = _ring_tail(st, keep_at, max(kept.mtp_len, 0))
+         with prof.timed("commit"):
+             commit(w, st, b, R, R)
+     if kept is not None:
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 98c628c..0a9baf6 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -178,7 +178,7 @@ class GlmEngine:
+         from .split import afd_rule, rule
+         from tensorfold.cuda.capacity import admit
+         from tensorfold.cuda.geometry import (PREFILL_ROWS, dflash2_geometry, dflash2_weights, mla_geometry,
+-                                              split_weights)
++                                              mla_ring_bytes, split_weights)
+ 
+         encode_policy(policy)                           # a bad default fails here, not in the first request
+         parallel = int(parallel)
+@@ -213,10 +213,21 @@ class GlmEngine:
+             weights_estimate = q4_weights(weights_estimate)
+         if not self.mtp_on:
+             weights_estimate = without_mtp(weights_estimate, cfg.layers)
++        # TF_GLM_KV=fp8 (MiaAI-Lab 0038): the DSA latent cache and the indexer's pooled keys as e4m3 rows (``kv8``),
++        # about half the bytes; the indexer's per-token keys and gates in per-slot rings. Unset / bf16: as before
++        from .kv8 import KINDS as KV_KINDS
++        from .kv8 import kv_kind
++
++        kv = kv_kind()
++        if kv != "bf16" and not LATENT:
++            raise ValueError("TF_GLM_KV=fp8 holds the latent cache: it needs TF_GLM_LATENT=1")
++        self.kv = kv
++        ring_rows = max(MAX_ROWS, PREFILL_ROWS if prefill_rows is None else int(prefill_rows))   # decode.Engine's
+         world = 1 if afd is not None else 2          # the AFD attention node holds every head and the whole draft
+         def geometry_for(text):                      # the afd attention runs no routed experts: no EXL3 scratch
+             return mla_geometry(text, world, MAX_ROWS, minimum_slots=DENSE_CAPACITY, latent=LATENT,
+-                                mtp=self.mtp_on, exl3_scratch=afd is None)
++                                mtp=self.mtp_on, exl3_scratch=afd is None,
++                                **({"kv": kv, "ring_rows": ring_rows} if kv != "bf16" else {}))
+ 
+         from tensorfold.cuda.capacity import Geometry
+ 
+@@ -228,6 +239,8 @@ class GlmEngine:
+             # verify window's buffers fit the decode rows the estimate sizes, its token selection's fp32 scores
+             # (MULTI_WINDOW rows x a pool of 4 tokens) grow with the pool
+             extra = (parallel - 1) * slot_bytes(text, world)
++            if kv != "bf16":                    # TF_GLM_KV=fp8: each slot's indexer rings (0038)
++                extra += (parallel - 1) * mla_ring_bytes(text, ring_rows)
+             per = 4 * MULTI_WINDOW // 4
+             return Geometry(lambda slots: g.bytes_at(slots) + extra + per * slots, g.reserve, g.minimum_slots)
+ 
+@@ -259,7 +272,7 @@ class GlmEngine:
+ 
+             multi_code = [1 + ("batched", "serial").index(verify_kind())] + MultiSettings.from_env().code()
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
+-                prefill_rows, int(self.mtp_on), int(DRAFT_RING), parallel, *multi_code]
++                prefill_rows, int(self.mtp_on), int(DRAFT_RING), parallel, *multi_code, KV_KINDS.index(kv)]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -268,7 +281,7 @@ class GlmEngine:
+         if len(both) > 1 and both[0][:-1] != both[1][:-1]:
+             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
+                                "TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING, --parallel, TF_GLM_MULTI_VERIFY, "
+-                               "TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE): "
++                               "TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, TF_GLM_KV): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+                                "(or pass --drafter none to both) and give both the same flags")
+         self.cache_bytes = (min(both[0][-1], both[1][-1]) if len(both) > 1 else both[0][-1]) << 20
+@@ -330,7 +343,14 @@ class GlmEngine:
+         self.e = Engine(w, capacity=pool_rows or capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
+                         graph_rows=GRAPH_ROWS, long_context=long_context,
+                         taps=self.drafter.tap_layers if self.drafter is not None else (), streams=parallel,
+-                        pool_rows=pool_rows)
++                        pool_rows=pool_rows, kv=kv)
++        if rank == 0 and kv != "bf16":
++            c = self.e.caches
++            rings = (f"indexer rings {c.ring_bytes() / 2 ** 30:.3f} GiB ({parallel} x {c.ring} rows)"
++                     if c.rings is not None else "no indexer caches (a dense window)")
++            print("[tensorfold] TF_GLM_KV=fp8: the DSA latent cache and the indexer's pooled keys as e4m3 rows with a "
++                  "power-of-two scale each (lossy; drafted replies still equal serial ones); "
++                  f"caches {c.arena.nbytes() / 2 ** 30:.2f} GiB over {c.rows} tokens, {rings}", flush=True)
+         if self.drafter is not None:
+             self.drafter.capture()
+         self.costs = self._calibrate()
+diff --git a/src/tensorfold/families/glm5_next/cuda/forward.py b/src/tensorfold/families/glm5_next/cuda/forward.py
+index ce1f018..5760b5b 100644
+--- a/src/tensorfold/families/glm5_next/cuda/forward.py
++++ b/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -15,7 +15,7 @@ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
+ from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
+ from tensorfold.cuda.kernels import prefill_attention, qmm as shared
+ 
+-from . import exl3_generic, glue, kda as kda_mod, latent, prof, qmm, sparse
++from . import exl3_generic, glue, kda as kda_mod, kv8, latent, prof, qmm, sparse
+ from .attention import AttnScratch, attention, kv_write
+ from .weights import LayerW, Weights
+ 
+@@ -166,13 +166,28 @@ class Buffers:
+         return p
+ 
+ 
++def index_ring(capacity: int, rows: int) -> int:
++    """Rows of the indexer's key and gate rings (``sparse.index_update``) for windows of up to ``rows`` rows: those
++    and the 3 before them, rounded up to 64; the context when that is less (then no row wraps)."""
++    return min(capacity, -(-(rows + 3) // 64) * 64)
++
++
+ class Caches:
+     """Every per-token cache of the model over ``rows`` tokens of a shared pool (``pool.Arena``): per DSA layer its
+     latents (or keys and values without the latent cache); the MTP layer's; and with long contexts per indexed layer
+     (the DSA layers, then the MTP layer) its index keys, gates and pooled keys (a row a pool of 4 tokens, 2 rows of
+-    pad). Element types and layouts are decided here; a ``State`` views them over its extent (``bind``)."""
++    pad). Element types and layouts are decided here; a ``State`` views them over its extent (``bind``).
++
++    ``ring``: the index keys and gates (read only by the pool a token falls in, while it fills) are not arena planes
++    but one ring of ``ring`` rows per stream slot (``streams`` of them, ``index_ring``): token t of the stream in slot
++    s at row s x ring + t % ring. They stay with the slot when its extent moves; a kept prompt carries the rows of its
++    pools still filling (``decode.Snapshot.tail``). None: arena planes (token t at its extent's row).
+ 
+-    def __init__(self, w: Weights, rows: int) -> None:
++    ``kv``: the latent planes' and pooled keys' format (TF_GLM_KV, ``kv8``): bf16, or fp8 (a uint8 row a token /
++    pool: e4m3 codes, an fp32 power-of-two scale, pad), with the latent cache only."""
++
++    def __init__(self, w: Weights, rows: int, *, streams: int = 1, ring: int | None = None,
++                 kv: str = "bf16") -> None:
+         from .pool import Arena, Plane
+ 
+         c = w.cfg
+@@ -180,15 +195,21 @@ class Caches:
+         HL = c.heads // w.world
+         dsa = len([l for l in w.layers if l.kind == "dsa"])
+         self.latent = latent.ENABLED
++        if kv not in kv8.KINDS or (kv != "bf16" and not self.latent):
++            raise ValueError(f"TF_GLM_KV={kv}: bf16, or fp8 with the latent cache (TF_GLM_LATENT=1)")
++        self.kv = kv
+         planes: list[Plane] = []
+ 
+-        def add(shape, div: int = 1, pad: int = 0) -> int:
+-            planes.append(Plane(torch.zeros((rows // div + pad, *shape), dtype=torch.bfloat16, device=dev), div, pad))
++        def add(shape, div: int = 1, pad: int = 0, fmt: str = "bf16") -> int:
++            n = rows // div + pad
++            t = (kv8.zeros(n, shape[0], fmt, dev) if fmt != "bf16" else
++                 torch.zeros((n, *shape), dtype=torch.bfloat16, device=dev))
++            planes.append(Plane(t, div, pad))
+             return len(planes) - 1
+ 
+         def attention_planes() -> tuple[int, int | None]:
+             if self.latent:          # one 512-wide latent a token and layer (kc), no separate values (vc)
+-                return add((c.kv_lora,)), None
++                return add((c.kv_lora,), fmt=kv), None
+             return add((HL, c.qk_dim)), add((HL, c.v_dim))
+ 
+         self.kc, self.vc = [], []
+@@ -197,14 +218,42 @@ class Caches:
+             self.kc.append(k)
+             self.vc.append(v)
+         self.mtp = attention_planes() if w.mtp is not None else None
+-        # DSA indexer caches (long contexts only): per layer (and the MTP layer, last) keys, gates, pool keys
++        # DSA indexer caches (long contexts only): per layer (and the MTP layer, last) keys, gates, pool keys; with a
++        # ring, index[i] = (None, None, pool plane) and rings[i] = (keys, gates) [streams x ring, 128]
+         self.index = None
++        self.rings = None
++        self.ring = None if ring is None else int(ring)
++        if self.ring is not None and self.ring < 4:
++            raise ValueError(f"index rings of {self.ring} rows")
+         if w.meta.get("long_context"):
+             n_idx = dsa + (1 if w.mtp is not None else 0)
+-            self.index = [(add((c.index_dim,)), add((c.index_dim,)), add((c.index_dim,), 4, 2)) for _ in range(n_idx)]
++            if self.ring is None:
++                self.index = [(add((c.index_dim,)), add((c.index_dim,)), add((c.index_dim,), 4, 2, kv))
++                              for _ in range(n_idx)]
++            else:
++                self.index = [(None, None, add((c.index_dim,), 4, 2, kv)) for _ in range(n_idx)]
++                ring_rows = int(streams) * self.ring
++                self.rings = [tuple(torch.zeros((ring_rows, c.index_dim), dtype=torch.bfloat16, device=dev)
++                                    for _ in range(2)) for _ in range(n_idx)]
+         self.arena = Arena(rows, planes)
+         self.rows = rows
+ 
++    def index_tensors(self, i: int) -> tuple:
++        """Indexed layer i's (keys, gates, pooled keys) over every stream: the rings (or planes) and the pool plane."""
++
++        planes = self.arena.planes
++        pk = planes[self.index[i][2]].tensor
++        if self.rings is None:
++            return planes[self.index[i][0]].tensor, planes[self.index[i][1]].tensor, pk
++        return self.rings[i][0], self.rings[i][1], pk
++
++    def ring_base(self, slot: int) -> int:
++        """The first ring row of stream slot ``slot`` (index rows at ring_base + t % ring)."""
++        return 0 if self.ring is None else int(slot) * self.ring
++
++    def ring_bytes(self) -> int:
++        return sum(t.numel() * t.element_size() for pair in (self.rings or []) for t in pair)
++
+     def bind(self, st: State, base: int, size: int) -> None:
+         """Point ``st``'s caches at tokens [base, base + size) of the pool."""
+ 
+@@ -213,7 +262,14 @@ class Caches:
+         st.vc = [view(i) for i in self.vc]
+         if self.mtp is not None:
+             st.mtp_kc, st.mtp_vc = view(self.mtp[0]), view(self.mtp[1])
+-        st.index = None if self.index is None else [tuple(view(i) for i in trio) for trio in self.index]
++        if self.index is None:
++            st.index = None
++        elif self.rings is None:
++            st.index = [tuple(view(i) for i in trio) for trio in self.index]
++        else:                        # the slot's rings (index_update's ring: their rows) and the extent's pools
++            r0 = self.ring_base(st.slot)
++            st.index = [(ik[r0:r0 + self.ring], ig[r0:r0 + self.ring], view(trio[2]))
++                        for (ik, ig), trio in zip(self.rings, self.index)]
+ 
+ 
+ class Slots:
+@@ -263,8 +319,8 @@ class State:
+     own (one sequence of ``capacity`` tokens, one slot), as it always held tensors of its own."""
+ 
+     def __init__(self, w: Weights, capacity: int, rows: int, *, caches: Caches | None = None, base: int = 0,
+-                 slots: Slots | None = None, slot: int = 0) -> None:
+-        self.caches = caches if caches is not None else Caches(w, capacity)
++                 slots: Slots | None = None, slot: int = 0, kv: str = "bf16") -> None:
++        self.caches = caches if caches is not None else Caches(w, capacity, kv=kv)
+         self.slots = slots if slots is not None else Slots(w, 1, rows)
+         self.slot = slot
+         kda_layers = [l for l in w.layers if l.kind == "kda"]
+@@ -293,6 +349,11 @@ class State:
+         self.base, self.capacity = int(base), int(capacity)
+         self.caches.bind(self, self.base, self.capacity)
+ 
++    @property
++    def kv(self) -> str:
++        """The DSA caches' format (TF_GLM_KV): the pool's."""
++        return self.caches.kv
++
+     @property
+     def graph_key(self) -> tuple[int, int]:
+         """What a captured graph baked in besides the shared buffers: the slot and the extent's base."""
+diff --git a/src/tensorfold/families/glm5_next/cuda/kv8.py b/src/tensorfold/families/glm5_next/cuda/kv8.py
+new file mode 100644
+index 0000000..3340b4c
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/kv8.py
+@@ -0,0 +1,139 @@
++# Ported unchanged from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe @ cf28cc4, patch 0038-glm-kv-fp8
++# (Apache-2.0, Copyright 2026 MiaAI-Lab; THIRD_PARTY_NOTICES.md "GLM FP8 KV cache").
++"""TF_GLM_KV=fp8: DSA's caches (the 512-wide latent a token and layer, the indexer's pooled keys) as FP8 e4m3 rows
++with a power-of-two scale each, about half the bytes of bf16. Lossy (the owner's call), never inexact: a row's bytes
++are a function of its bf16 row alone (one kernel helper, ``store_row``, quantizes prompt chunks' and decode windows'
++rows), and the readers take the codes to bf16 (exact) and fold each row's scale into their fp32 products (exact for a
++power of two), so a row's attention still depends on its query, its keys and the cache only: drafted == serial and
++resumed == fresh hold as with bf16 (tests/cuda/test_glm_kv8.py). The values are those of the bf16 kernels on the
++dequantized rows up to fp32 summation order (Triton lays converted tiles out for the tensor cores its own way).
++
++A quantized cache is a uint8 tensor [rows, width + PAD]: the row's e4m3 codes, its fp32 scale, 12 zero bytes (rows
++stay 16-byte aligned). One tensor a cache keeps the engine's generic row handling (slices, clones, kept snapshots'
++saved rows, ``row_bytes``) as it is. The scale is 2^(ceil(log2 amax) - SHIFT): the row's largest value quantizes to
++[128, 256], under e4m3's 448, so nothing saturates; a floating-point format's relative precision does not depend on
++the scale, so a per-row power of two loses nothing to a finer or fp32 scale but the values it pushes below e4m3's
++normal range (2^-6), under 2^-14 of the row's largest (DeepSeek-V3.2's indexer keeps FP8 keys with per-token ue8m0
++scales alike). On GLM-5.3-Flash's own kv_a / kv_a_layernorm rows (amax ~3-5x the rms) per-token fp32, per-128-block
++and fixed per-layer scales all land within 0.001 of this one's 2.65% relative error a row. bf16 caches stay as they were (a bf16 tensor [rows, width]); every kernel tells the two by dtype."""
++
++from __future__ import annotations
++
++import os
++
++import torch
++import triton
++import triton.language as tl
++
++KINDS = ("bf16", "fp8")
++PAD = 16             # bytes after an FP8 row's codes: its fp32 scale, then zeros
++SHIFT = 8            # a row's scale: 2^(ceil(log2 amax) - SHIFT), so its codes stay within +-256
++
++
++def kv_kind(env=None) -> str:
++    """TF_GLM_KV: bf16 (the default) or fp8, the DSA latent and indexer key caches' format (lossy: replies differ from
++    bf16's; drafted replies still equal serial ones, resumed prompts fresh ones)."""
++
++    kind = (os.environ if env is None else env).get("TF_GLM_KV", "bf16").strip() or "bf16"
++    if kind not in KINDS:
++        raise ValueError(f"TF_GLM_KV is bf16 or fp8, not {kind!r}")
++    return kind
++
++
++def row_bytes(width: int, kind: str) -> int:
++    """Bytes a cache row of ``width`` values takes."""
++    if kind not in KINDS:
++        raise ValueError(f"a cache is bf16 or fp8, not {kind!r}")
++    return width + PAD if kind == "fp8" else 2 * width
++
++
++def zeros(rows: int, width: int, kind: str, device) -> torch.Tensor:
++    """A zeroed cache of ``rows`` rows of ``width`` values (zero rows dequantize to zeros in either format)."""
++    if kind == "fp8":
++        if width % 4:
++            raise ValueError(f"an FP8 cache row needs a width divisible by 4, not {width}")
++        return torch.zeros((rows, width + PAD), dtype=torch.uint8, device=device)
++    return torch.zeros((rows, row_bytes(width, kind) // 2), dtype=torch.bfloat16, device=device)
++
++
++def quantized(cache: torch.Tensor) -> bool:
++    return cache.dtype == torch.uint8
++
++
++def kind_of(cache: torch.Tensor) -> str:
++    return "fp8" if quantized(cache) else "bf16"
++
++
++def width(cache: torch.Tensor) -> int:
++    """Values a row of ``cache`` holds."""
++    return cache.shape[-1] - PAD if quantized(cache) else cache.shape[-1]
++
++
++def parts(cache: torch.Tensor):
++    """A kernel's view of a cache: (codes or bf16 values, fp32 view for the scales, row stride in elements of the
++    first, FP8). A bf16 cache passes itself as the unused scale argument."""
++    if not quantized(cache):
++        return cache, cache, cache.shape[-1], False
++    if cache.stride(-1) != 1 or cache.shape[-1] % 16:
++        raise ValueError("an FP8 cache: contiguous rows of width + 16 bytes")
++    return cache.view(torch.float8_e4m3fn), cache.view(torch.float32), cache.shape[-1], True
++
++
++# -- the format in torch (tests, and the definition the kernels must equal) -------------------------------------------
++def scales(amax: torch.Tensor) -> torch.Tensor:
++    """fp32 amax -> the fp32 power-of-two scale (the kernels' ``scale_of``, bit for bit)."""
++    bits = amax.float().contiguous().view(torch.int32)
++    e = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
++    return ((e - SHIFT).clamp(1, 254) << 23).view(torch.float32)
++
++
++def quantize_rows(x: torch.Tensor) -> torch.Tensor:
++    """bf16 (or fp32) rows [n, width] -> an FP8 cache's rows [n, width + PAD], as the write kernels store them."""
++    x = x.float()
++    s = scales(x.abs().amax(dim=1))
++    inv = ((254 - (s.view(torch.int32) >> 23)) << 23).view(torch.float32)
++    out = torch.zeros((x.shape[0], x.shape[1] + PAD), dtype=torch.uint8, device=x.device)
++    out[:, :x.shape[1]] = (x * inv[:, None]).to(torch.float8_e4m3fn).view(torch.uint8)
++    out[:, x.shape[1]:x.shape[1] + 4] = s[:, None].contiguous().view(torch.uint8)
++    return out
++
++
++def dequantize(cache: torch.Tensor) -> torch.Tensor:
++    """A cache's rows as fp32 [n, width] (exact: e4m3 codes times a power of two; bf16 rows as they are)."""
++    if not quantized(cache):
++        return cache.float()
++    w = width(cache)
++    codes = cache[..., :w].contiguous().view(torch.float8_e4m3fn).float()
++    s = cache[..., w:w + 4].contiguous().view(torch.float32)
++    return codes * s
++
++
++# -- the format in kernels ------------------------------------------------------------------------------------------
++@triton.jit
++def scale_of(amax):
++    """fp32 amax -> 2^(ceil(log2 amax) - SHIFT) and its reciprocal, both exact powers of two (biased exponent held
++    within 1 .. 254: a zero row gets 2^-126 and zeros)."""
++    bits = amax.to(tl.int32, bitcast=True)
++    e = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
++    e = tl.minimum(tl.maximum(e - 8, 1), 254)
++    return (e << 23).to(tl.float32, bitcast=True), ((254 - e) << 23).to(tl.float32, bitcast=True)
++
++
++@triton.jit
++def store_row(VALS, SCL, row, x, LW: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr):
++    """Row ``row`` (int64) of a cache <- x fp32 [LW] as bf16 values, or FP8: the bf16 row's codes and scale."""
++    k = tl.arange(0, LW)
++    xb = x.to(tl.bfloat16)
++    if FP8:
++        xf = xb.to(tl.float32)
++        s, inv = scale_of(tl.max(tl.abs(xf), 0))
++        tl.store(VALS + row * RS + k, (xf * inv).to(tl.float8e4nv))
++        tl.store(SCL + row * (RS // 4) + LW // 4, s)
++    else:
++        tl.store(VALS + row * RS + k, xb)
++
++
++@triton.jit
++def row_scales(SCL, rows, ok, LW: tl.constexpr, RS: tl.constexpr):
++    """The scales of cache rows ``rows`` (int64 [N]; 1 where not ok)."""
++    return tl.load(SCL + rows * (RS // 4) + LW // 4, mask=ok, other=1.0)
+diff --git a/src/tensorfold/families/glm5_next/cuda/latent.py b/src/tensorfold/families/glm5_next/cuda/latent.py
+index b84208c..8eb3443 100644
+--- a/src/tensorfold/families/glm5_next/cuda/latent.py
++++ b/src/tensorfold/families/glm5_next/cuda/latent.py
+@@ -1,4 +1,9 @@
+-"""GLM's MLA attention on the 512-wide latent cache; kernels compute each row alone, so window rows keep serial bits (docs/recipes/glm-5.3-flash.md)."""
++"""GLM's MLA attention on the 512-wide latent cache; kernels compute each row alone, so window rows keep serial bits (docs/recipes/glm-5.3-flash.md).
++
++TF_GLM_KV=fp8's cache rows (the latent writes, and the reads that fold each row's scale in, segmented ones included)
++are ported from Mia's AI Lab's (@MiaAI-Lab) GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patch 0038-glm-kv-fp8
++(Apache License 2.0, Copyright 2026 MiaAI-Lab; see THIRD_PARTY_NOTICES.md).
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -7,6 +12,8 @@ import triton
+ import triton.language as tl
+ 
+ from . import LATENT as ENABLED     # off (TF_GLM_LATENT=0): per-head keys and values, 0.3.5's path, for A/B
++from . import kv8
++from .kv8 import row_scales
+ 
+ L = 512            # GLM-5.3-Flash's latent width (kv_lora_rank); the kernels take the width from the tensors
+ CHUNK = 512        # keys per chunk program, merged in absolute order
+@@ -188,39 +195,55 @@ def expand_v(o_lat: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
+ # ------------------------------------------------------------------------------------------------ caches ---
+ 
+ @triton.jit
+-def _lat_write(LAT, lat_stride, LC, POS, LW: tl.constexpr):
++def _lat_write(LAT, lat_stride, LC, LS, POS, LW: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr):
++    """Row r -> cache slot pos + r: the bf16 row as it is, or (FP8) its codes and scale (kv8.store_row, a function
++    of the row alone: prompt chunks and decode windows store the same bytes)."""
+     r = tl.program_id(0)
+     P = tl.load(POS).to(tl.int64)
+     k = tl.arange(0, LW)
+-    tl.store(LC + (P + r) * LW + k, tl.load(LAT + r * lat_stride + k))
++    kv8.store_row(LC, LS, P + r, tl.load(LAT + r * lat_stride + k).to(tl.float32), LW, RS, FP8)
+ 
+ 
+ def latent_write(lat: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor) -> None:
+-    """lat [R, latent] bf16 rows into cache slots pos .. pos + R - 1 (pos read on the device)."""
+-    _lat_write[(lat.shape[0],)](lat, lat.stride(0), cache, pos, LW=cache.shape[1], num_warps=4)
++    """lat [R, latent] bf16 rows into cache slots pos .. pos + R - 1 (pos read on the device); an FP8 cache
++    (TF_GLM_KV=fp8) takes each row's e4m3 codes and power-of-two scale."""
++    vals, scl, rs, fp8 = kv8.parts(cache)
++    if lat.shape[1] != kv8.width(cache):
++        raise ValueError(f"latent_write: rows of {lat.shape[1]} into a cache of {kv8.width(cache)}")
++    _lat_write[(lat.shape[0],)](lat, lat.stride(0), vals, scl, pos, LW=lat.shape[1], RS=rs, FP8=fp8, num_warps=4)
+ 
+ 
+ # --------------------------------------------------------------------------------------------- attention ---
+ 
+ @triton.jit
+-def _tile(q, kv, m, l, o, valid, SCALE: tl.constexpr):
+-    """One key tile for HB heads of one row: kv [KT, 512] is both key and value (the latent)."""
+-    scores = tl.dot(q, tl.trans(kv)).to(tl.float32) * SCALE
++def _tile(q, kv, ks, m, l, o, valid, SCALE: tl.constexpr, FP8: tl.constexpr):
++    """One key tile for HB heads of one row: kv [KT, 512] is both key and value (the latent). FP8: kv holds a
++    quantized cache's codes (exact in bf16) and ks [KT] their power-of-two scales, folded into the scores and the
++    probabilities (exactly: scaling by a power of two rounds nothing), so the arithmetic is this tile's on the
++    dequantized rows."""
++    scores = tl.dot(q, tl.trans(kv)).to(tl.float32)
++    if FP8:
++        scores = scores * ks[None, :]
++    scores = scores * SCALE
+     scores = tl.where(valid[None, :], scores, float("-inf"))
+     tile_m = tl.max(scores, 1)
+     active = tile_m != float("-inf")
+     next_m = tl.where(active, tl.maximum(m, tile_m), m)
+     alpha = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
+     p = tl.where(valid[None, :] & active[:, None], tl.exp(scores - next_m[:, None]), 0.0)
+-    o = o * alpha[:, None] + tl.dot(p.to(tl.bfloat16), kv)
++    if FP8:
++        o = o * alpha[:, None] + tl.dot((p * ks[None, :]).to(tl.bfloat16), kv)
++    else:
++        o = o * alpha[:, None] + tl.dot(p.to(tl.bfloat16), kv)
+     l = l * alpha + tl.sum(p, 1)
+     return next_m, l, o
+ 
+ 
+ @triton.jit
+-def _dense_chunks(QA, LC, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.constexpr, CH: tl.constexpr,
+-                  SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr):
+-    """Program (row, head block, chunk): causal attention of HB heads of row r over keys [c CH, (c + 1) CH)."""
++def _dense_chunks(QA, LC, LS, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.constexpr, CH: tl.constexpr,
++                  SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr):
++    """Program (row, head block, chunk): causal attention of HB heads of row r over keys [c CH, (c + 1) CH); cache
++    rows RS elements apart (FP8: codes, their scales through LS)."""
+     r = tl.program_id(0)
+     hb = tl.program_id(1)
+     c = tl.program_id(2)
+@@ -238,8 +261,9 @@ def _dense_chunks(QA, LC, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.constexpr,
+         for t in range(CH // KTT):
+             ki = start + t * KTT + tl.arange(0, KTT)
+             ok = ki <= limit
+-            kv = tl.load(LC + ki[:, None].to(tl.int64) * LW + k[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
+-            m, l, o = _tile(q, kv, m, l, o, ok, SCALE)
++            kv = tl.load(LC + ki[:, None].to(tl.int64) * RS + k[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
++            ks = row_scales(LS, ki.to(tl.int64), ok, LW, RS) if FP8 else None
++            m, l, o = _tile(q, kv, ks, m, l, o, ok, SCALE, FP8)
+     base = (c * R + r) * H + hh
+     tl.store(PO + base[:, None] * LW + k[None, :], o, mask=hok[:, None])
+     tl.store(PM + base, m, mask=hok)
+@@ -247,8 +271,9 @@ def _dense_chunks(QA, LC, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.constexpr,
+ 
+ 
+ @triton.jit
+-def _sparse_chunks(QA, LC, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.constexpr, LW: tl.constexpr,
+-                   CH: tl.constexpr, SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr):
++def _sparse_chunks(QA, LC, LS, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.constexpr, LW: tl.constexpr,
++                   CH: tl.constexpr, SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr, RS: tl.constexpr,
++                   FP8: tl.constexpr):
+     """Program (row, head block, chunk): HB heads of row r over its selected tokens [c CH, (c + 1) CH) in list order."""
+     r = tl.program_id(0)
+     hb = tl.program_id(1)
+@@ -266,8 +291,9 @@ def _sparse_chunks(QA, LC, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.const
+             idx = c * CH + t * KTT + tl.arange(0, KTT)
+             ok = idx < n
+             tok = tl.load(TOK + r * W + idx, mask=ok, other=0).to(tl.int64)
+-            kv = tl.load(LC + tok[:, None] * LW + k[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
+-            m, l, o = _tile(q, kv, m, l, o, ok, SCALE)
++            kv = tl.load(LC + tok[:, None] * RS + k[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
++            ks = row_scales(LS, tok, ok, LW, RS) if FP8 else None
++            m, l, o = _tile(q, kv, ks, m, l, o, ok, SCALE, FP8)
+     base = (c * R + r) * H + hh
+     tl.store(PO + base[:, None] * LW + k[None, :], o, mask=hok[:, None])
+     tl.store(PM + base, m, mask=hok)
+@@ -301,6 +327,13 @@ def _merge(PO, PM, PL, OUT, CNT, R, H: tl.constexpr, LW: tl.constexpr, NCH: tl.c
+     tl.store(OUT + (r * H + h) * LW + k, (o / l).to(tl.bfloat16))
+ 
+ 
++def _cache_parts(cache: torch.Tensor, lw: int):
++    """kv8.parts of a latent cache whose rows hold ``lw`` values."""
++    if kv8.width(cache) != lw or cache.stride(-1) != 1 or cache.stride(0) != cache.shape[1]:
++        raise ValueError(f"latent attention: a cache of contiguous {kv8.width(cache)}-wide rows, queries {lw} wide")
++    return kv8.parts(cache)
++
++
+ class LatentScratch:
+     """Chunk partials for ``part_rows`` (one ``attention`` call) x heads x chunks; queries and latents for ``rows``."""
+ 
+@@ -326,8 +359,10 @@ def attention(qa: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, s: Laten
+     hb = head_block(R) if hb is None else hb
+     if hb not in (HB, HB_WIDE):
+         raise ValueError(f"latent attention: {hb} heads a program, not {HB} or {HB_WIDE}")
+-    _dense_chunks[(R, triton.cdiv(H, hb), nch)](qa, cache, pos, s.po[:n * LW], s.pm[:n], s.pl[:n], R, H=H, LW=LW,
+-                                                CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, num_warps=8, num_stages=1)
++    vals, scl, rs, fp8 = _cache_parts(cache, LW)
++    _dense_chunks[(R, triton.cdiv(H, hb), nch)](qa, vals, scl, pos, s.po[:n * LW], s.pm[:n], s.pl[:n], R, H=H, LW=LW,
++                                                CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, RS=rs, FP8=fp8, num_warps=8,
++                                                num_stages=1)
+     _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
+     return out
+ 
+@@ -343,8 +378,10 @@ def sparse_attention(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor
+     pm = torch.empty((n,), dtype=torch.float32, device=qa.device)
+     pl = torch.empty((n,), dtype=torch.float32, device=qa.device)
+     hb = head_block(R)
+-    _sparse_chunks[(R, triton.cdiv(H, hb), nch)](qa, cache, tokens, counts, po, pm, pl, R, W=W, H=H, LW=LW,
+-                                                 CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, num_warps=8, num_stages=1)
++    vals, scl, rs, fp8 = _cache_parts(cache, LW)
++    _sparse_chunks[(R, triton.cdiv(H, hb), nch)](qa, vals, scl, tokens, counts, po, pm, pl, R, W=W, H=H, LW=LW,
++                                                 CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, RS=rs, FP8=fp8, num_warps=8,
++                                                 num_stages=1)
+     _merge[(R, H)](po, pm, pl, out, counts, R, H=H, LW=LW, NCH=nch, SPARSE=True, num_warps=4)
+ 
+ 
+@@ -357,37 +394,46 @@ def chunks_for(length: int) -> int:
+ # of a shared arena [P, LW]: per-row device tables (``segments.SegRows``: position, extent base, dense or sparse)
+ # drive the kernels below. Every row keeps the arithmetic, tiles and head blocks of today's single-stream kernels,
+ # so a segment's rows get the bits of that segment run alone on its extent (tests/cuda/test_glm_attn_segments.py).
+-# Cache reads and writes go through _lat_get / _lat_put (the one place a quantized cache plugs in).
++# Cache reads and writes go through _lat_get / _lat_put: bf16 rows, or TF_GLM_KV=fp8's (kv8: codes, then scales in
++# LS, rows RS elements apart), as the single-stream kernels read and write them.
+ 
+ @triton.jit
+-def _lat_get(LC, rows, ok, k, RS: tl.constexpr):
+-    """Cache rows ``rows`` (int64 [n]) as a bf16 tile [n, LW]; rows with ok false are not read (zeros)."""
+-    return tl.load(LC + rows[:, None] * RS + k[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
++def _lat_get(LC, LS, rows, ok, k, LW: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr):
++    """Cache rows ``rows`` (int64 [n]) as a bf16 tile [n, LW] (FP8: the codes, exact) and their scales [n] (FP8;
++    ones for bf16, unread); rows with ok false are not read (zeros)."""
++    kv = tl.load(LC + rows[:, None] * RS + k[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
++    if FP8:
++        return kv, row_scales(LS, rows, ok, LW, RS)
++    return kv, tl.full(rows.shape, 1.0, tl.float32)
+ 
+ 
+ @triton.jit
+-def _lat_put(LC, row, k, x, RS: tl.constexpr):
+-    """Cache row ``row`` (int64) <- x [LW] (bf16)."""
+-    tl.store(LC + row * RS + k, x)
++def _lat_put(LC, LS, row, x, LW: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr):
++    """Cache row ``row`` (int64) <- x [LW] (fp32 of a bf16 row), through kv8.store_row as latent_write stores it."""
++    kv8.store_row(LC, LS, row, x, LW, RS, FP8)
+ 
+ 
+ @triton.jit
+-def _seg_lat_write(LAT, lat_stride, LC, POS, BASE, LW: tl.constexpr):
++def _seg_lat_write(LAT, lat_stride, LC, LS, POS, BASE, LW: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr):
+     """Row r -> arena row base[r] + pos[r]."""
+     r = tl.program_id(0)
+     row = tl.load(BASE + r).to(tl.int64) + tl.load(POS + r).to(tl.int64)
+     k = tl.arange(0, LW)
+-    _lat_put(LC, row, k, tl.load(LAT + r * lat_stride + k), LW)
++    _lat_put(LC, LS, row, tl.load(LAT + r * lat_stride + k).to(tl.float32), LW, RS, FP8)
+ 
+ 
+ def seg_latent_write(lat: torch.Tensor, cache: torch.Tensor, rows) -> None:
+-    """lat [R, latent] bf16 rows into the arena at each row's base + pos (``rows``: segments.SegRows)."""
+-    _seg_lat_write[(lat.shape[0],)](lat, lat.stride(0), cache, rows.pos, rows.base, LW=cache.shape[1], num_warps=4)
++    """lat [R, latent] bf16 rows into the arena at each row's base + pos (``rows``: segments.SegRows); an FP8 arena
++    (TF_GLM_KV=fp8) takes latent_write's bytes."""
++    vals, scl, rs, fp8 = _cache_parts(cache, lat.shape[1])
++    _seg_lat_write[(lat.shape[0],)](lat, lat.stride(0), vals, scl, rows.pos, rows.base, LW=lat.shape[1], RS=rs,
++                                    FP8=fp8, num_warps=4)
+ 
+ 
+ @triton.jit
+-def _seg_chunks(QA, LC, POS, BASE, SPR, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.constexpr,
+-                LW: tl.constexpr, CH: tl.constexpr, SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr):
++def _seg_chunks(QA, LC, LS, POS, BASE, SPR, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.constexpr,
++                LW: tl.constexpr, CH: tl.constexpr, SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr,
++                RS: tl.constexpr, FP8: tl.constexpr):
+     """Program (row, head block, chunk): _dense_chunks for a dense row (keys base + 0 .. base + pos[r], its own
+     limit), _sparse_chunks for a sparse one (keys base + its selected tokens, list order): the same tiles, masks and
+     _tile math either way, so a row's partials are those of its single-stream kernel."""
+@@ -410,8 +456,8 @@ def _seg_chunks(QA, LC, POS, BASE, SPR, TOK, CNT, PO, PM, PL, R, W: tl.constexpr
+             ok = idx < n
+             tok = tl.load(TOK + r * W + idx, mask=ok & sp, other=0).to(tl.int64)
+             tok = tl.where(sp, tok, idx.to(tl.int64))
+-            kv = _lat_get(LC, B + tok, ok, k, LW)
+-            m, l, o = _tile(q, kv, m, l, o, ok, SCALE)
++            kv, ks = _lat_get(LC, LS, B + tok, ok, k, LW, RS, FP8)
++            m, l, o = _tile(q, kv, ks, m, l, o, ok, SCALE, FP8)
+     base = (c * R + r) * H + hh
+     tl.store(PO + base[:, None] * LW + k[None, :], o, mask=hok[:, None])
+     tl.store(PM + base, m, mask=hok)
+@@ -456,8 +502,9 @@ def seg_attention(qa: torch.Tensor, cache: torch.Tensor, rows, tokens: torch.Ten
+     hb = seg_head_block(R) if hb is None else hb
+     if hb not in (HB, HB_WIDE):
+         raise ValueError(f"segmented attention: {hb} heads a tile, not {HB} or {HB_WIDE}")
+-    _seg_chunks[(R, triton.cdiv(H, hb), nch)](qa, cache, rows.pos, rows.base, rows.sparse, tokens, counts,
++    vals, scl, rs, fp8 = _cache_parts(cache, LW)
++    _seg_chunks[(R, triton.cdiv(H, hb), nch)](qa, vals, scl, rows.pos, rows.base, rows.sparse, tokens, counts,
+                                               s.po[:n * LW], s.pm[:n], s.pl[:n], R, W=W, H=H, LW=LW, CH=CHUNK,
+-                                              SCALE=scale, HBT=hb, KTT=KT, num_warps=8, num_stages=1)
++                                              SCALE=scale, HBT=hb, KTT=KT, RS=rs, FP8=fp8, num_warps=8, num_stages=1)
+     _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
+     return out
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index 26845aa..4cbeb6d 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -718,8 +718,11 @@ class MultiDecoder:
+         if self.drafts is not None:
+             self._ctx(lane).reset()
+         if hit is not None:
++            from .decode import put_ring_tail
++
+             st.rec[st.cur[0]].copy_(hit.rec)
+             st.conv.copy_(hit.conv)
++            put_ring_tail(st, hit)          # the index rows of its pools still filling, into this slot's rings
+             st.set_pos(cut)
+             if dflash:
+                 if hit.drafter_end != cut or hit.drafter_rows is None:
+@@ -789,6 +792,10 @@ class MultiDecoder:
+         if lane.mtp:
+             snap.pending = self.e.last_hidden.clone()
+             snap.mtp_len = n - 1
++            if snap.tail is not None:             # TF_GLM_KV=fp8's rings: the MTP layer's filling pool too
++                from .decode import _ring_tail
++
++                snap.tail = _ring_tail(lane.st, n, snap.mtp_len)
+         snap.kid = self.next_kid
+         self.next_kid += 1
+         snap.extent = lane.extent
+@@ -806,6 +813,7 @@ class MultiDecoder:
+         x = c.extent
+         x.kept = [k for k in x.kept if k is not c]
+         c.rec = c.conv = c.pending = None
++        c.tail = None
+         c.drafter_rows = None
+         self._settle(x)
+ 
+@@ -1012,6 +1020,14 @@ class MultiDecoder:
+             raise RuntimeError(f"stream {lane.sid} cannot take slot {slot}: another stream holds it")
+         e.slots.rec[slot].copy_(e.slots.rec[old])
+         e.slots.conv[slot].copy_(e.slots.conv[old])
++        if getattr(e.caches, "rings", None) is not None:
++            # TF_GLM_KV=fp8: the indexer's key and gate rows live in the slot's rings (forward.Caches), so the rows of
++            # the pools the stream is still filling move with it (the recipe's 0038 leaves them behind; TF_GLM_MULTI_LONE
++            # is off there and here by default)
++            r0, r1, n = e.caches.ring_base(old), e.caches.ring_base(slot), e.caches.ring
++            for ik, ig in e.caches.rings:
++                ik[r1:r1 + n].copy_(ik[r0:r0 + n])
++                ig[r1:r1 + n].copy_(ig[r0:r0 + n])
+         if self.drafts is not None:
+             a, b = self.drafts.contexts[old], self.drafts.contexts[slot]
+             for dst, src in zip(list(b.kc) + list(b.vc), list(a.kc) + list(a.vc)):
+diff --git a/src/tensorfold/families/glm5_next/cuda/segments.py b/src/tensorfold/families/glm5_next/cuda/segments.py
+index 1a847f3..8bfa6b4 100644
+--- a/src/tensorfold/families/glm5_next/cuda/segments.py
++++ b/src/tensorfold/families/glm5_next/cuda/segments.py
+@@ -1,8 +1,11 @@
+ """Multi-stream decode windows: several streams' rows back to back ([s1: rows][s2: rows]...), each stream's per-token
+-DSA state in its own extent of shared arenas (latents [P, 512], index keys and gates [P, 128], pooled keys
+-[P / 4 + 2, 128]; extents aligned to EXTENT tokens). ``SegRows`` holds the per-row and per-segment device tables the
+-segmented kernels read (latent.seg_*, sparse.seg_*); ``SelectScratch`` the token selection's buffers. Static
+-buffers, so one CUDA graph per window size covers every mix of positions and context lengths."""
++DSA state in its own extent of shared arenas (latents [P, 512], pooled keys [P / 4 + 2, 128], bf16 or TF_GLM_KV=fp8's
++kv8 rows; extents aligned to EXTENT tokens) and its index keys and gates in its own part of [Q, 128] tensors: its
++extent (Q = P, token t at base + t) or, given ``ring``, its stream slot's ring of ``ring`` rows (token t at ring_base
+++ t % ring, as the single-stream rings of forward.index_ring; ``ring`` >= a segment's rows + 3). ``SegRows`` holds
++the per-row and per-segment device tables the segmented kernels read (latent.seg_*, sparse.seg_*); ``SelectScratch``
++the token selection's buffers. Static buffers, so one CUDA graph per window size covers every mix of positions and
++context lengths."""
+ 
+ from __future__ import annotations
+ 
+@@ -20,55 +23,78 @@ class SegRows:
+     """Device tables of a window of up to ``rows`` rows in up to ``max_segs`` segments, one int32 tensor:
+ 
+     per row: ``pos`` (the row's position in its stream), ``base`` (its stream's first arena row), ``seg`` (segment
+-    index), ``sparse`` (1: past the dense limit, attends to its selected tokens; 0: dense over keys 0 .. pos);
++    index), ``sparse`` (1: past the dense limit, attends to its selected tokens; 0: dense over keys 0 .. pos),
++    ``ibase`` (its stream's first row in the index key and gate arenas: its ring's, or ``base`` without rings);
+     per segment: ``seg_start`` (first row), ``seg_rows`` (0: unused), ``seg_pbase`` (pooled-key base, base / 4),
+-    ``seg_pools`` (pools its last row sees when it has sparse rows, else 0: what the selection scores)."""
++    ``seg_pools`` (pools its last row sees when it has sparse rows, else 0: what the selection scores).
+ 
+-    def __init__(self, rows: int, device, max_segs: int = MAX_SEGS) -> None:
++    ``ring``: rows of each stream's index key and gate ring (None: no rings, token t at base + t); a segment then
++    names its ring's first row (``set``'s fourth field: one ring a stream slot, slot x ring, the same for the
++    stream in every window)."""
++
++    NO_RING = 2 ** 31 - 1      # the kernels' ring size without rings (positions stay below it: base + pos)
++
++    def __init__(self, rows: int, device, max_segs: int = MAX_SEGS, ring: int | None = None) -> None:
++        if ring is not None and ring < 4:
++            raise ValueError(f"an index ring of {ring} rows")
+         self.rows, self.max_segs = rows, max_segs
+-        n = 4 * rows + 4 * max_segs
++        self.ring = ring
++        self.ring_rows = ring if ring is not None else self.NO_RING
++        n = 5 * rows + 4 * max_segs
+         pin = torch.cuda.is_available() and torch.device(device).type == "cuda"
+         self.host = torch.zeros((n,), dtype=torch.int32, pin_memory=pin)
+         self.dev = torch.zeros((n,), dtype=torch.int32, device=device)
+-        self.pos, self.base, self.seg, self.sparse = (self.dev[i * rows:(i + 1) * rows] for i in range(4))
+-        o = 4 * rows
++        self.pos, self.base, self.seg, self.sparse, self.ibase = (self.dev[i * rows:(i + 1) * rows] for i in range(5))
++        o = 5 * rows
+         self.seg_start, self.seg_rows, self.seg_pbase, self.seg_pools = (
+             self.dev[o + i * max_segs:o + (i + 1) * max_segs] for i in range(4))
+         self.staged = torch.cuda.Event() if pin else None
+         self.R = 0
+         self.segments: list[tuple[int, int, int]] = []
+ 
+-    def fill(self, segments: Sequence[tuple[int, int, int]], *, sparse_from: int | None = SPARSE_FROM):
+-        """The host tables for ``segments`` [(base, pos, rows)] in window order (numpy int32, the device layout).
++    def fill(self, segments: Sequence[tuple[int, ...]], *, sparse_from: int | None = SPARSE_FROM):
++        """The host tables for ``segments`` [(base, pos, rows[, ring_base])] in window order (numpy int32, the device
++        layout); ring_base (with rings, required): the stream's ring's first row.
+         ``sparse_from``: the first position that attends sparsely (None: no index, every row dense)."""
+ 
+         if not 1 <= len(segments) <= self.max_segs:
+             raise ValueError(f"a window of {len(segments)} segments, at most {self.max_segs}")
+-        R = sum(n for _, _, n in segments)
++        R = sum(seg[2] for seg in segments)
+         if R > self.rows:
+             raise ValueError(f"a window of {R} rows, the tables hold {self.rows}")
+         rows, S = self.rows, self.max_segs
+-        t = torch.zeros((4 * rows + 4 * S,), dtype=torch.int32).numpy()
++        t = torch.zeros((5 * rows + 4 * S,), dtype=torch.int32).numpy()
+         r = 0
+-        for s, (base, pos, n) in enumerate(segments):
++        for s, seg in enumerate(segments):
++            base, pos, n = seg[:3]
+             if n < 1 or pos < 0 or base < 0 or base % EXTENT:
+                 raise ValueError(f"segment {s}: base {base} (a multiple of {EXTENT}), position {pos}, {n} rows")
++            if self.ring is None:
++                ibase = base
++            else:
++                if len(seg) < 4 or seg[3] < 0:
++                    raise ValueError(f"segment {s}: index rings need the stream's ring base")
++                ibase = seg[3]
++                if n + 3 > self.ring:
++                    raise ValueError(f"segment {s}: {n} rows and the 3 before them past a ring of {self.ring}")
+             for i in range(n):
+                 q = pos + i
+                 t[r + i] = q
+                 t[rows + r + i] = base
+                 t[2 * rows + r + i] = s
+                 t[3 * rows + r + i] = int(sparse_from is not None and q >= sparse_from)
++                t[4 * rows + r + i] = ibase
+             last = pos + n - 1
+-            t[4 * rows + s] = r
+-            t[4 * rows + S + s] = n
+-            t[4 * rows + 2 * S + s] = base // POOL
+-            t[4 * rows + 3 * S + s] = (last + 1) // POOL if sparse_from is not None and last >= sparse_from else 0
++            o = 5 * rows
++            t[o + s] = r
++            t[o + S + s] = n
++            t[o + 2 * S + s] = base // POOL
++            t[o + 3 * S + s] = (last + 1) // POOL if sparse_from is not None and last >= sparse_from else 0
+             r += n
+         return t, R
+ 
+-    def set(self, segments: Sequence[tuple[int, int, int]], *, sparse_from: int | None = SPARSE_FROM) -> int:
+-        """Stage ``segments`` [(base, pos, rows)] into the device tables (a pinned copy, ordered on the current
++    def set(self, segments: Sequence[tuple[int, ...]], *, sparse_from: int | None = SPARSE_FROM) -> int:
++        """Stage ``segments`` [(base, pos, rows[, ring_base])] into the device tables (a pinned copy, ordered on the current
+         stream like forward.stage's token ids); returns the window's rows."""
+ 
+         t, R = self.fill(segments, sparse_from=sparse_from)
+diff --git a/src/tensorfold/families/glm5_next/cuda/sparse.py b/src/tensorfold/families/glm5_next/cuda/sparse.py
+index b537314..e04c95c 100644
+--- a/src/tensorfold/families/glm5_next/cuda/sparse.py
++++ b/src/tensorfold/families/glm5_next/cuda/sparse.py
+@@ -1,4 +1,9 @@
+-"""Sparse DSA keeps lower-index pools on score ties and visits selected tokens and chunks in position order so window rows preserve serial bits."""
++"""Sparse DSA keeps lower-index pools on score ties and visits selected tokens and chunks in position order so window rows preserve serial bits.
++
++TF_GLM_KV=fp8's index rows (the pooled keys' writes and scores, and the per-slot key and gate rings, segmented ones too)
++are ported from Mia's AI Lab's (@MiaAI-Lab) GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patch 0038-glm-kv-fp8
++(Apache License 2.0, Copyright 2026 MiaAI-Lab; see THIRD_PARTY_NOTICES.md).
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -8,6 +13,9 @@ import triton.language as tl
+ 
+ from tensorfold.cuda.geometry import MLA_SELECT_ROWS as SELECT_ROWS   # a prompt chunk's rows scored at once
+ 
++from . import kv8
++from .kv8 import row_scales
++
+ POOL = 4
+ TOPK_POOLS = 512
+ BR = 16
+@@ -17,8 +25,8 @@ TOKENS = TOPK_POOLS * POOL + POOL - 1      # a sparse row's attended tokens: its
+ 
+ 
+ @triton.jit
+-def _index_write(KR, k_stride, GR, LNW, LNB, IK, IG, POS, eps, D: tl.constexpr):
+-    """Row r: LayerNorm(k_raw) -> bf16 into IK[pos + r]; the gate row (fp32) -> bf16 into IG[pos + r]."""
++def _index_write(KR, k_stride, GR, LNW, LNB, IK, IG, POS, RING, eps, D: tl.constexpr):
++    """Row r: LayerNorm(k_raw) -> bf16 into IK[(pos + r) % RING]; the gate row (fp32) -> bf16 into IG alike."""
+ 
+     r = tl.program_id(0)
+     P = tl.load(POS).to(tl.int64)
+@@ -28,13 +36,16 @@ def _index_write(KR, k_stride, GR, LNW, LNB, IK, IG, POS, eps, D: tl.constexpr):
+     xc = x - mean
+     var = tl.sum(xc * xc, axis=0) / D
+     y = xc / tl.sqrt(var + eps) * tl.load(LNW + d).to(tl.float32) + tl.load(LNB + d).to(tl.float32)
+-    tl.store(IK + (P + r) * D + d, y.to(tl.bfloat16))
+-    tl.store(IG + (P + r) * D + d, tl.load(GR + r * D + d).to(tl.bfloat16))
++    slot = (P + r) % RING
++    tl.store(IK + slot * D + d, y.to(tl.bfloat16))
++    tl.store(IG + slot * D + d, tl.load(GR + r * D + d).to(tl.bfloat16))
+ 
+ 
+ @triton.jit
+-def _pool_keys(IK, IG, APE, PK, POS, R, D: tl.constexpr):
+-    """Program i: pool p = pos // 4 + i if it is complete within the window (ends at or before pos + R - 1)."""
++def _pool_keys(IK, IG, APE, PK, PKS, POS, R, RING, D: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr):
++    """Program i: pool p = pos // 4 + i if it is complete within the window (ends at or before pos + R - 1), from its
++    four tokens' keys and gates in the ring (token t at t % RING); a pool's bits depend on those rows only, whichever
++    window completes it. FP8 (TF_GLM_KV=fp8): the pooled key stored as kv8.store_row's codes and scale."""
+ 
+     i = tl.program_id(0)
+     P = tl.load(POS).to(tl.int64)
+@@ -42,40 +53,55 @@ def _pool_keys(IK, IG, APE, PK, POS, R, D: tl.constexpr):
+     if 4 * p + 3 > P + R - 1:
+         return
+     d = tl.arange(0, D)
+-    l0 = tl.load(IG + (4 * p + 0) * D + d).to(tl.float32) + tl.load(APE + 0 * D + d).to(tl.float32)
+-    l1 = tl.load(IG + (4 * p + 1) * D + d).to(tl.float32) + tl.load(APE + 1 * D + d).to(tl.float32)
+-    l2 = tl.load(IG + (4 * p + 2) * D + d).to(tl.float32) + tl.load(APE + 2 * D + d).to(tl.float32)
+-    l3 = tl.load(IG + (4 * p + 3) * D + d).to(tl.float32) + tl.load(APE + 3 * D + d).to(tl.float32)
++    s0 = (4 * p + 0) % RING
++    s1 = (4 * p + 1) % RING
++    s2 = (4 * p + 2) % RING
++    s3 = (4 * p + 3) % RING
++    l0 = tl.load(IG + s0 * D + d).to(tl.float32) + tl.load(APE + 0 * D + d).to(tl.float32)
++    l1 = tl.load(IG + s1 * D + d).to(tl.float32) + tl.load(APE + 1 * D + d).to(tl.float32)
++    l2 = tl.load(IG + s2 * D + d).to(tl.float32) + tl.load(APE + 2 * D + d).to(tl.float32)
++    l3 = tl.load(IG + s3 * D + d).to(tl.float32) + tl.load(APE + 3 * D + d).to(tl.float32)
+     m = tl.maximum(tl.maximum(l0, l1), tl.maximum(l2, l3))
+     e0 = tl.exp(l0 - m)
+     e1 = tl.exp(l1 - m)
+     e2 = tl.exp(l2 - m)
+     e3 = tl.exp(l3 - m)
+     s = ((e0 + e1) + e2) + e3
+-    k0 = tl.load(IK + (4 * p + 0) * D + d).to(tl.float32)
+-    k1 = tl.load(IK + (4 * p + 1) * D + d).to(tl.float32)
+-    k2 = tl.load(IK + (4 * p + 2) * D + d).to(tl.float32)
+-    k3 = tl.load(IK + (4 * p + 3) * D + d).to(tl.float32)
++    k0 = tl.load(IK + s0 * D + d).to(tl.float32)
++    k1 = tl.load(IK + s1 * D + d).to(tl.float32)
++    k2 = tl.load(IK + s2 * D + d).to(tl.float32)
++    k3 = tl.load(IK + s3 * D + d).to(tl.float32)
+     t0 = ((e0 / s).to(tl.bfloat16).to(tl.float32) * k0).to(tl.bfloat16).to(tl.float32)
+     t1 = ((e1 / s).to(tl.bfloat16).to(tl.float32) * k1).to(tl.bfloat16).to(tl.float32)
+     t2 = ((e2 / s).to(tl.bfloat16).to(tl.float32) * k2).to(tl.bfloat16).to(tl.float32)
+     t3 = ((e3 / s).to(tl.bfloat16).to(tl.float32) * k3).to(tl.bfloat16).to(tl.float32)
+-    tl.store(PK + p * D + d, (((t0 + t1) + t2) + t3).to(tl.bfloat16))
++    kv8.store_row(PK, PKS, p, ((t0 + t1) + t2) + t3, D, RS, FP8)
+ 
+ 
+ def index_update(k_raw: torch.Tensor, gate: torch.Tensor, ln_w: torch.Tensor, ln_b: torch.Tensor, ape: torch.Tensor,
+                  ik: torch.Tensor, ig: torch.Tensor, pk: torch.Tensor, pos: torch.Tensor) -> None:
+-    """Window rows' index keys and gates into the caches at pos.., then every pool the window completes."""
++    """Window rows' index keys and gates into their ring (ik, ig: bf16 [ring, 128], token t at row t % ring), then
++    every pool the window completes into pk (bf16, or TF_GLM_KV=fp8's kv8 rows). Only the pool a token belongs to
++    ever reads its key and gate, so the ring needs the window's rows and the 3 before it: ring >= R + 3
++    (forward.index_ring), or at least the context (no row wraps: the full-length caches of before)."""
+ 
+     R = k_raw.shape[0]
+-    _index_write[(R,)](k_raw, k_raw.stride(0), gate, ln_w, ln_b, ik, ig, pos, 1e-6, D=128, num_warps=1)
+-    _pool_keys[(R // 4 + 2,)](ik, ig, ape, pk, pos, R, D=128, num_warps=1)
++    ring = ik.shape[0]
++    if ik.dtype != torch.bfloat16 or ig.shape != ik.shape or not ik.is_contiguous() or not ig.is_contiguous():
++        raise ValueError("index_update: bf16 key and gate rings of one shape, contiguous")
++    _index_write[(R,)](k_raw, k_raw.stride(0), gate, ln_w, ln_b, ik, ig, pos, ring, 1e-6, D=128, num_warps=1)
++    if kv8.width(pk) != 128:
++        raise ValueError("index_update: 128-wide pooled keys")
++    pkv, pks, rs, fp8 = kv8.parts(pk)
++    _pool_keys[(R // 4 + 2,)](ik, ig, ape, pkv, pks, pos, R, ring, D=128, RS=rs, FP8=fp8, num_warps=1)
+ 
+ 
+ @triton.jit
+-def _scores(QI, W, w_stride, PK, OUT, POS, R, NP, scale, wscale, H: tl.constexpr, HP: tl.constexpr,
+-            D: tl.constexpr, BP: tl.constexpr, RB: tl.constexpr):
+-    """Program (RB rows, pool block): s_p = sum_h w_h relu(scale * qi_h . pool_p) up to each row's position, heads padded to HP; RB never changes a row's bits."""
++def _scores(QI, W, w_stride, PK, PKS, OUT, POS, R, NP, scale, wscale, H: tl.constexpr, HP: tl.constexpr,
++            D: tl.constexpr, BP: tl.constexpr, RB: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr):
++    """Program (RB rows, pool block): s_p = sum_h w_h relu(scale * qi_h . pool_p) up to each row's position, heads
++    padded to HP; RB never changes a row's bits. FP8 (TF_GLM_KV=fp8): the pooled keys' e4m3 codes on the tensor
++    cores, each pool's power-of-two scale on its dots."""
+ 
+     rb = tl.program_id(0)
+     pb = tl.program_id(1)
+@@ -92,8 +118,10 @@ def _scores(QI, W, w_stride, PK, OUT, POS, R, NP, scale, wscale, H: tl.constexpr
+     d = tl.arange(0, D)
+     hh = tl.arange(0, HP)
+     hok = hh < H
+-    k = tl.load(PK + p[:, None] * D + d[None, :], mask=(p < (P + rb * RB + RB) // 4)[:, None],
+-                other=0.0).to(tl.bfloat16)                                              # [BP, D]
++    kok = p < (P + rb * RB + RB) // 4
++    k = tl.load(PK + p[:, None].to(tl.int64) * RS + d[None, :], mask=kok[:, None], other=0.0).to(tl.bfloat16)  # [BP, D]
++    if FP8:
++        ks = row_scales(PKS, p.to(tl.int64), kok, D, RS)
+     for i in tl.static_range(RB):
+         r = rb * RB + i
+         if r < R:
+@@ -101,6 +129,8 @@ def _scores(QI, W, w_stride, PK, OUT, POS, R, NP, scale, wscale, H: tl.constexpr
+             q = tl.load(QI + (r * H + hh[:, None]) * D + d[None, :], mask=hok[:, None], other=0.0).to(tl.bfloat16)
+             kr = tl.where((p < npool)[:, None], k, 0.0)
+             dots = tl.dot(q, tl.trans(kr))                                                # [HP, BP] fp32
++            if FP8:
++                dots = dots * ks[None, :]
+             w = tl.load(W + r * w_stride + hh, mask=hok, other=0.0).to(tl.float32) * wscale
+             sc = tl.sum(w[:, None] * tl.maximum(dots * scale, 0.0), axis=0)
+             sc = tl.where(p < npool, sc, float("-inf"))
+@@ -196,12 +226,13 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: in
+     D = qi.shape[1] // H
+     wscale = 1.0 / 5.656854249492381 if H == 32 else H ** -0.5            # 32 ** -0.5 exactly as before
+     blocks = []
++    pkv, pks, rs, fp8 = kv8.parts(pk)                                  # bf16 pooled keys, or TF_GLM_KV=fp8's kv8 rows
+     for a in range(0, R, B):
+         n = min(B, R - a)
+         at = pos_dev if a == 0 else pos_dev + a                        # the block's first row's position
+-        _scores[(n, triton.cdiv(np_max, 64))](qi[a:a + n], wts[a:a + n], wts.stride(0), pk, scores, at, n, np_max,
+-                                             D ** -0.5, wscale, H=H, HP=max(16, triton.next_power_of_2(H)), D=D,
+-                                             BP=64, RB=1, num_warps=4)
++        _scores[(n, triton.cdiv(np_max, 64))](qi[a:a + n], wts[a:a + n], wts.stride(0), pkv, pks, scores, at, n,
++                                             np_max, D ** -0.5, wscale, H=H, HP=max(16, triton.next_power_of_2(H)),
++                                             D=D, BP=64, RB=1, RS=rs, FP8=fp8, num_warps=4)
+         blocks.append(top_pools(scores[:n], TOPK_POOLS, at))                           # ascending pool index
+     del scores
+     pools = blocks[0] if len(blocks) == 1 else torch.cat(blocks)
+@@ -311,10 +342,12 @@ def sparse_attention(q: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor, tokens
+ 
+ 
+ # ------------------------------------------------------------------------------------- multi-stream windows ---
+-# Segmented windows (latent.py's section of the same name): each stream's index keys and gates in its own extent of
+-# shared arenas [P, 128] (token t of the stream at base + t) and its pooled keys at base / 4 + p of [P / 4 + 2, 128];
+-# per-row device tables (``segments.SegRows``) give each row its position, base and kind. A row keeps its
+-# single-stream arithmetic. Reads and writes of the index caches go through the helpers below.
++# Segmented windows (latent.py's section of the same name): each stream's index keys and gates in its own part of
++# shared [Q, 128] tensors (token t of the stream at ibase + t % ring: its slot's ring, or its extent without rings)
++# and its pooled keys at base / 4 + p of [P / 4 + 2, 128]; per-row device tables (``segments.SegRows``) give each row
++# its position, bases and kind; pooled keys bf16 or TF_GLM_KV=fp8's kv8 rows (codes, then scales in PKS, rows RS
++# elements apart). A row keeps its single-stream arithmetic. Reads and writes of the index caches go through the
++# helpers below.
+ 
+ @triton.jit
+ def _ix_put(IX, row, d, x, D: tl.constexpr):
+@@ -329,23 +362,27 @@ def _ix_get(IX, row, d, D: tl.constexpr):
+ 
+ 
+ @triton.jit
+-def _pk_put(PK, row, d, x, D: tl.constexpr):
+-    """Pooled key row ``row`` (int64) <- x [D] (fp32) as bf16."""
+-    tl.store(PK + row * D + d, x.to(tl.bfloat16))
++def _pk_put(PK, PKS, row, x, D: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr):
++    """Pooled key row ``row`` (int64) <- x [D] (fp32) as bf16, or FP8 (kv8.store_row, as _pool_keys stores it)."""
++    kv8.store_row(PK, PKS, row, x, D, RS, FP8)
+ 
+ 
+ @triton.jit
+-def _pk_get(PK, rows, ok, d, D: tl.constexpr):
+-    """Pooled key rows ``rows`` (int64 [n]) as a bf16 tile [n, D]; rows with ok false are zeros."""
+-    return tl.load(PK + rows[:, None] * D + d[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
++def _pk_get(PK, PKS, rows, ok, d, D: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr):
++    """Pooled key rows ``rows`` (int64 [n]) as a bf16 tile [n, D] (FP8: the codes, exact) and their scales [n]
++    (FP8; ones for bf16, unread); rows with ok false are zeros."""
++    k = tl.load(PK + rows[:, None] * RS + d[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
++    if FP8:
++        return k, row_scales(PKS, rows, ok, D, RS)
++    return k, tl.full(rows.shape, 1.0, tl.float32)
+ 
+ 
+ @triton.jit
+-def _seg_index_write(KR, k_stride, GR, LNW, LNB, IK, IG, POS, BASE, eps, D: tl.constexpr):
+-    """_index_write for row r at its stream's row base[r] + pos[r]."""
++def _seg_index_write(KR, k_stride, GR, LNW, LNB, IK, IG, POS, IBASE, RING, eps, D: tl.constexpr):
++    """_index_write for row r at its stream's index row ibase[r] + pos[r] % RING."""
+ 
+     r = tl.program_id(0)
+-    row = tl.load(BASE + r).to(tl.int64) + tl.load(POS + r).to(tl.int64)
++    row = tl.load(IBASE + r).to(tl.int64) + tl.load(POS + r).to(tl.int64) % RING
+     d = tl.arange(0, D)
+     x = tl.load(KR + r * k_stride + d).to(tl.float32)
+     mean = tl.sum(x, axis=0) / D
+@@ -357,53 +394,62 @@ def _seg_index_write(KR, k_stride, GR, LNW, LNB, IK, IG, POS, BASE, eps, D: tl.c
+ 
+ 
+ @triton.jit
+-def _seg_pool_keys(IK, IG, APE, PK, POS, BASE, D: tl.constexpr):
++def _seg_pool_keys(IK, IG, APE, PK, PKS, POS, BASE, IBASE, RING, D: tl.constexpr, RS: tl.constexpr,
++                   FP8: tl.constexpr):
+     """Program r: the pool row r completes (pos[r] % 4 == 3), pool p = pos[r] // 4 of its stream, from tokens
+-    base + 4p .. base + 4p + 3 into pooled row base / 4 + p: _pool_keys' arithmetic (the pools a single-stream
+-    window completes are exactly those its rows end)."""
++    4p .. 4p + 3 (index rows ibase + t % RING) into pooled row base / 4 + p: _pool_keys' arithmetic (the pools a
++    single-stream window completes are exactly those its rows end)."""
+ 
+     r = tl.program_id(0)
+     q = tl.load(POS + r).to(tl.int64)
+     if q % 4 != 3:
+         return
+     B = tl.load(BASE + r).to(tl.int64)
+-    t = B + (q // 4) * 4
++    IB = tl.load(IBASE + r).to(tl.int64)
++    t = (q // 4) * 4
++    s0 = IB + (t + 0) % RING
++    s1 = IB + (t + 1) % RING
++    s2 = IB + (t + 2) % RING
++    s3 = IB + (t + 3) % RING
+     d = tl.arange(0, D)
+-    l0 = _ix_get(IG, t + 0, d, D) + tl.load(APE + 0 * D + d).to(tl.float32)
+-    l1 = _ix_get(IG, t + 1, d, D) + tl.load(APE + 1 * D + d).to(tl.float32)
+-    l2 = _ix_get(IG, t + 2, d, D) + tl.load(APE + 2 * D + d).to(tl.float32)
+-    l3 = _ix_get(IG, t + 3, d, D) + tl.load(APE + 3 * D + d).to(tl.float32)
++    l0 = _ix_get(IG, s0, d, D) + tl.load(APE + 0 * D + d).to(tl.float32)
++    l1 = _ix_get(IG, s1, d, D) + tl.load(APE + 1 * D + d).to(tl.float32)
++    l2 = _ix_get(IG, s2, d, D) + tl.load(APE + 2 * D + d).to(tl.float32)
++    l3 = _ix_get(IG, s3, d, D) + tl.load(APE + 3 * D + d).to(tl.float32)
+     m = tl.maximum(tl.maximum(l0, l1), tl.maximum(l2, l3))
+     e0 = tl.exp(l0 - m)
+     e1 = tl.exp(l1 - m)
+     e2 = tl.exp(l2 - m)
+     e3 = tl.exp(l3 - m)
+     s = ((e0 + e1) + e2) + e3
+-    k0 = _ix_get(IK, t + 0, d, D)
+-    k1 = _ix_get(IK, t + 1, d, D)
+-    k2 = _ix_get(IK, t + 2, d, D)
+-    k3 = _ix_get(IK, t + 3, d, D)
++    k0 = _ix_get(IK, s0, d, D)
++    k1 = _ix_get(IK, s1, d, D)
++    k2 = _ix_get(IK, s2, d, D)
++    k3 = _ix_get(IK, s3, d, D)
+     t0 = ((e0 / s).to(tl.bfloat16).to(tl.float32) * k0).to(tl.bfloat16).to(tl.float32)
+     t1 = ((e1 / s).to(tl.bfloat16).to(tl.float32) * k1).to(tl.bfloat16).to(tl.float32)
+     t2 = ((e2 / s).to(tl.bfloat16).to(tl.float32) * k2).to(tl.bfloat16).to(tl.float32)
+     t3 = ((e3 / s).to(tl.bfloat16).to(tl.float32) * k3).to(tl.bfloat16).to(tl.float32)
+-    _pk_put(PK, B // 4 + q // 4, d, ((t0 + t1) + t2) + t3, D)
++    _pk_put(PK, PKS, B // 4 + q // 4, ((t0 + t1) + t2) + t3, D, RS, FP8)
+ 
+ 
+ def seg_index_update(k_raw: torch.Tensor, gate: torch.Tensor, ln_w: torch.Tensor, ln_b: torch.Tensor,
+                      ape: torch.Tensor, ik: torch.Tensor, ig: torch.Tensor, pk: torch.Tensor, rows) -> None:
+-    """index_update for a segmented window: each row's index key and gate at its stream's base + pos, then every
+-    pool a row completes (``rows``: segments.SegRows)."""
++    """index_update for a segmented window: each row's index key and gate at its stream's ibase + pos % ring (its
++    slot's ring, or base + pos without rings: ``rows``: segments.SegRows), then every pool a row completes."""
+ 
+     R = k_raw.shape[0]
+-    _seg_index_write[(R,)](k_raw, k_raw.stride(0), gate, ln_w, ln_b, ik, ig, rows.pos, rows.base, 1e-6, D=128,
+-                           num_warps=1)
+-    _seg_pool_keys[(R,)](ik, ig, ape, pk, rows.pos, rows.base, D=128, num_warps=1)
++    _seg_index_write[(R,)](k_raw, k_raw.stride(0), gate, ln_w, ln_b, ik, ig, rows.pos, rows.ibase, rows.ring_rows,
++                           1e-6, D=128, num_warps=1)
++    pkv, pks, rs, fp8 = kv8.parts(pk)
++    _seg_pool_keys[(R,)](ik, ig, ape, pkv, pks, rows.pos, rows.base, rows.ibase, rows.ring_rows, D=128, RS=rs,
++                         FP8=fp8, num_warps=1)
+ 
+ 
+ @triton.jit
+-def _seg_scores(QI, W, w_stride, PK, OUT, o_stride, POS, SPR, SEG_START, SEG_ROWS, SEG_PBASE, SEG_POOLS, scale,
+-                wscale, H: tl.constexpr, HP: tl.constexpr, D: tl.constexpr, BP: tl.constexpr, G: tl.constexpr):
++def _seg_scores(QI, W, w_stride, PK, PKS, OUT, o_stride, POS, SPR, SEG_START, SEG_ROWS, SEG_PBASE, SEG_POOLS, scale,
++                wscale, H: tl.constexpr, HP: tl.constexpr, D: tl.constexpr, BP: tl.constexpr, G: tl.constexpr,
++                RS: tl.constexpr, FP8: tl.constexpr):
+     """Program (segment, g): pool blocks g, g + G, .. below the segment's pool count (on the device: the pools its
+     last row sees), each block's keys (at the stream's pooled base) loaded once for all the segment's sparse rows;
+     a row's scores are _scores' (its keys masked to its own pools before the dot, as with RB > 1), written for its
+@@ -420,7 +466,7 @@ def _seg_scores(QI, W, w_stride, PK, OUT, o_stride, POS, SPR, SEG_START, SEG_ROW
+     hok = hh < H
+     for pb in range(g, (npm + BP - 1) // BP, G):
+         p = pb * BP + tl.arange(0, BP)
+-        k = _pk_get(PK, pbase + p, p < npm, d, D)                                       # [BP, D]
++        k, ks = _pk_get(PK, PKS, pbase + p, p < npm, d, D, RS, FP8)                    # [BP, D], [BP]
+         for i in range(nr):
+             r = r0 + i
+             if tl.load(SPR + r) != 0:
+@@ -428,6 +474,8 @@ def _seg_scores(QI, W, w_stride, PK, OUT, o_stride, POS, SPR, SEG_START, SEG_ROW
+                 q = tl.load(QI + (r * H + hh[:, None]) * D + d[None, :], mask=hok[:, None], other=0.0).to(tl.bfloat16)
+                 kr = tl.where((p < npool)[:, None], k, 0.0)
+                 dots = tl.dot(q, tl.trans(kr))                                            # [HP, BP] fp32
++                if FP8:
++                    dots = dots * ks[None, :]
+                 w = tl.load(W + r * w_stride + hh, mask=hok, other=0.0).to(tl.float32) * wscale
+                 sc = tl.sum(w[:, None] * tl.maximum(dots * scale, 0.0), axis=0)
+                 tl.store(OUT + r * o_stride + p, sc, mask=p < npool)
+@@ -499,7 +547,9 @@ def seg_select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, row
+                                                                                                           torch.Tensor]:
+     """select_tokens for a segmented window: each sparse row's attended tokens [R, 2051] (relative to its stream,
+     ascending, -1 padded) and counts (0 for dense rows). Scores every segment's pools up to its device-side pool
+-    count, so one CUDA graph per window size serves every context length (``scratch``: segments.SelectScratch)."""
++    count (_seg_scores: a pool block's keys loaded once for all the segment's rows; _scores_rows' row-major loop
++    measured no faster here, and slower on dense windows), so one CUDA graph per window size serves every context
++    length (``scratch``: segments.SelectScratch)."""
+ 
+     if qi.stride(0) != qi.shape[1] or wts.stride(1) != 1:
+         raise ValueError("seg_select_tokens: index queries must be contiguous rows, weights unit-stride columns")
+@@ -511,10 +561,11 @@ def seg_select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, row
+     wscale = 1.0 / 5.656854249492381 if H == 32 else H ** -0.5            # select_tokens' constants
+     scores = scratch.scores
+     grid = min(SEG_SCORE_GRID, triton.cdiv(scores.shape[1], 64))
+-    _seg_scores[(rows.max_segs, grid)](qi, wts, wts.stride(0), pk, scores, scores.stride(0), rows.pos, rows.sparse,
+-                                       rows.seg_start, rows.seg_rows, rows.seg_pbase, rows.seg_pools, D ** -0.5,
+-                                       wscale, H=H, HP=max(16, triton.next_power_of_2(H)), D=D, BP=64, G=grid,
+-                                       num_warps=4)
++    pkv, pks, rs, fp8 = kv8.parts(pk)
++    _seg_scores[(rows.max_segs, grid)](qi, wts, wts.stride(0), pkv, pks, scores, scores.stride(0), rows.pos,
++                                       rows.sparse, rows.seg_start, rows.seg_rows, rows.seg_pbase, rows.seg_pools,
++                                       D ** -0.5, wscale, H=H, HP=max(16, triton.next_power_of_2(H)), D=D, BP=64,
++                                       G=grid, RS=rs, FP8=fp8, num_warps=4)
+     tokens, counts = scratch.tokens[:R], scratch.counts[:R]
+     if SEG_SPLIT:
+         select_split(scores[:R], TOPK_POOLS, scratch=scratch.split, rows=rows, tokens=tokens, counts=counts)
+diff --git a/src/tensorfold/families/glm5_next/cuda/verify.py b/src/tensorfold/families/glm5_next/cuda/verify.py
+index 1d0fa3c..ebd0047 100644
+--- a/src/tensorfold/families/glm5_next/cuda/verify.py
++++ b/src/tensorfold/families/glm5_next/cuda/verify.py
+@@ -97,7 +97,8 @@ class BatchedVerify:
+         if taps:
+             self.b.set_taps(tuple(taps), c.hidden)
+         self.taps = bool(taps)
+-        self.seg_rows = SegRows(rows, dev, max_segs=MAX_SEGS)
++        rings = getattr(e.caches, "rings", None)     # TF_GLM_KV=fp8's indexer rings (forward.Caches), else None
++        self.seg_rows = SegRows(rows, dev, max_segs=MAX_SEGS, ring=e.caches.ring if rings else None)
+         self.sel = SelectScratch(rows, e.caches.rows, dev) if e.caches.index is not None else None
+         kda_layers = [l for l in w.layers if l.kind == "kda"]
+         n = len(kda_layers)
+@@ -137,7 +138,7 @@ class BatchedVerify:
+         pool = torch.cuda.graph_pool_handle()
+         for R in rows or range(1, self.rows_max + 1):
+             self._stage([0] * R)
+-            self.seg_rows.set([(0, 0, R)], sparse_from=SPARSE_FROM if index else None)
++            self.seg_rows.set([self._span(e.home, 0, R)], sparse_from=SPARSE_FROM if index else None)
+             self._write_table([(R, 0, 0, 0, R)])
+             def run(R=R) -> None:
+                 compute(w, None, b, R, mixer=lambda layer: self._mixer(layer, R, index))
+@@ -170,7 +171,7 @@ class BatchedVerify:
+         for R in range(1, min(most or self.rows_max, self.rows_max) + 1):
+             g = self.graphs[R]
+             self._stage(tokens[:R])
+-            self.seg_rows.set([(self.e.home.base, 0, R)], sparse_from=SPARSE_FROM if index else None)
++            self.seg_rows.set([self._span(self.e.home, 0, R)], sparse_from=SPARSE_FROM if index else None)
+             self._write_table([(R, 0, 0, 0, R)])
+             best = float("inf")
+             for _ in range(reps + 1):
+@@ -191,6 +192,13 @@ class BatchedVerify:
+         self._write_table([(len(s.tokens), s.st.slot, s.st.cur[0] if s.st.cur else 0, s.st.slot,
+                             len(s.tokens) if keeps is None else keeps[k]) for k, s in enumerate(segments)])
+ 
++    def _span(self, st, pos: int, n: int) -> tuple:
++        """SegRows' segment of ``n`` rows of ``st`` from ``pos``: its extent's base, and its slot's ring base
++        (TF_GLM_KV=fp8: MiaAI-Lab's recipe patch 0041-glm-parallel-ring-base, Apache-2.0)."""
++        caches = self.e.caches
++        span = (st.base, pos, n)
++        return span + (caches.ring_base(st.slot),) if getattr(caches, "rings", None) else span
++
+     def _write_table(self, rows) -> None:
+         from . import kda as kda_mod
+ 
+@@ -223,7 +231,7 @@ class BatchedVerify:
+         spans = []
+         for seg in segments:
+             check_room(w, seg.st, len(seg.tokens))
+-            spans.append((seg.st.base, seg.st.pos, len(seg.tokens)))
++            spans.append(self._span(seg.st, seg.st.pos, len(seg.tokens)))
+         tokens = [t for seg in segments for t in seg.tokens]
+         R = len(tokens)
+         self._stage(tokens)
+@@ -266,7 +274,7 @@ class BatchedVerify:
+         di = self.dsa_index[layer.index]
+         planes = caches.arena.planes
+         lc = planes[caches.kc[di]].tensor
+-        index = None if caches.index is None else tuple(planes[i].tensor for i in caches.index[di])
++        index = None if caches.index is None else caches.index_tensors(di)
+         with prof.timed("dsa (total)"):
+             return dsa_segments(layer, self.w, lc, self.b, R, self.seg_rows, self.sel, index, select=select)
+ 
+diff --git a/tests/data/glm_kv8_golden.json b/tests/data/glm_kv8_golden.json
+new file mode 100644
+index 0000000..8e04ead
+--- /dev/null
++++ b/tests/data/glm_kv8_golden.json
+@@ -0,0 +1,855 @@
++{
++ "about": "tests/test_glm_kv8.py's references. base_*: the split before TF_GLM_KV's port; recipe_*: MiaAI-Lab's GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold @ cf28cc4 applied to TensorFold v0.6.0 (patches 0001-0068; recipe_post0038: 0001-0038). Kernel digests: tests/glm_kv8_cpu.py on the CPU (Triton 3.8 interpreter, patched conversions), torch 2.14.1, numpy float32 matmul on x86-64.",
++ "base_flag_off": {
++  "caches": {
++   "long=0,mtp=0": {
++    "index": null,
++    "kc": [
++     0,
++     1,
++     2
++    ],
++    "mtp": null,
++    "planes": [
++     [
++      [
++       4096,
++       512
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       4096,
++       512
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       4096,
++       512
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ]
++    ],
++    "vc": [
++     null,
++     null,
++     null
++    ]
++   },
++   "long=0,mtp=1": {
++    "index": null,
++    "kc": [
++     0,
++     1,
++     2
++    ],
++    "mtp": [
++     3,
++     null
++    ],
++    "planes": [
++     [
++      [
++       4096,
++       512
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       4096,
++       512
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       4096,
++       512
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       4096,
++       512
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ]
++    ],
++    "vc": [
++     null,
++     null,
++     null
++    ]
++   },
++   "long=1,mtp=0": {
++    "index": [
++     [
++      3,
++      4,
++      5
++     ],
++     [
++      6,
++      7,
++      8
++     ],
++     [
++      9,
++      10,
++      11
++     ]
++    ],
++    "kc": [
++     0,
++     1,
++     2
++    ],
++    "mtp": null,
++    "planes": [
++     [
++      [
++       4096,
++       512
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       4096,
++       512
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       4096,
++       512
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       4096,
++       128
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       4096,
++       128
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       1026,
++       128
++      ],
++      "torch.bfloat16",
++      4,
++      2
++     ],
++     [
++      [
++       4096,
++       128
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       4096,
++       128
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       1026,
++       128
++      ],
++      "torch.bfloat16",
++      4,
++      2
++     ],
++     [
++      [
++       4096,
++       128
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       4096,
++       128
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       1026,
++       128
++      ],
++      "torch.bfloat16",
++      4,
++      2
++     ]
++    ],
++    "vc": [
++     null,
++     null,
++     null
++    ]
++   },
++   "long=1,mtp=1": {
++    "index": [
++     [
++      4,
++      5,
++      6
++     ],
++     [
++      7,
++      8,
++      9
++     ],
++     [
++      10,
++      11,
++      12
++     ],
++     [
++      13,
++      14,
++      15
++     ]
++    ],
++    "kc": [
++     0,
++     1,
++     2
++    ],
++    "mtp": [
++     3,
++     null
++    ],
++    "planes": [
++     [
++      [
++       4096,
++       512
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       4096,
++       512
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       4096,
++       512
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       4096,
++       512
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       4096,
++       128
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       4096,
++       128
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       1026,
++       128
++      ],
++      "torch.bfloat16",
++      4,
++      2
++     ],
++     [
++      [
++       4096,
++       128
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       4096,
++       128
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       1026,
++       128
++      ],
++      "torch.bfloat16",
++      4,
++      2
++     ],
++     [
++      [
++       4096,
++       128
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       4096,
++       128
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       1026,
++       128
++      ],
++      "torch.bfloat16",
++      4,
++      2
++     ],
++     [
++      [
++       4096,
++       128
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       4096,
++       128
++      ],
++      "torch.bfloat16",
++      1,
++      0
++     ],
++     [
++      [
++       1026,
++       128
++      ],
++      "torch.bfloat16",
++      4,
++      2
++     ]
++    ],
++    "vc": [
++     null,
++     null,
++     null
++    ]
++   }
++  },
++  "geometry": {
++   "latent=0,mtp=0,exl3=0": [
++    5952263680,
++    52308421632,
++    197011909632,
++    775825861632
++   ],
++   "latent=0,mtp=0,exl3=1": [
++    5952263680,
++    52308421632,
++    197011909632,
++    775825861632
++   ],
++   "latent=0,mtp=1,exl3=0": [
++    7494293504,
++    58534379520,
++    217859211264,
++    855158538240
++   ],
++   "latent=0,mtp=1,exl3=1": [
++    7494293504,
++    58534379520,
++    217859211264,
++    855158538240
++   ],
++   "latent=1,mtp=0,exl3=0": [
++    6290167296,
++    7430933504,
++    10991897600,
++    25235753984
++   ],
++   "latent=1,mtp=0,exl3=1": [
++    6290167296,
++    7430933504,
++    10991897600,
++    25235753984
++   ],
++   "latent=1,mtp=1,exl3=0": [
++    7641683968,
++    8883224576,
++    12758761472,
++    28260909056
++   ],
++   "latent=1,mtp=1,exl3=1": [
++    7641683968,
++    8883224576,
++    12758761472,
++    28260909056
++   ]
++  }
++ },
++ "kernels": {
++  "base_bf16_planes": {
++   "R1.dense_out": "0d4c077b72fb5897f88b72f27d7c12c994a7b6d673928235a32a45a87bf06854",
++   "R2.sparse_out": "017062e73aef112b978d32114673c27093ae9e127eeb86524bfb9f8522dbf40d",
++   "R3.seg_out": "719d13405e617debbb4b426eb4d85da659b1cc7b1a620becdddc73d12debabda",
++   "R4.sel_counts": "36bc49238e7215ff6ac8e0a100fec7a511924ad0bb11ef95f880165f7e88b03d",
++   "R4.sel_tokens": "31ba7aaf6f9e811184d06a6bb0c1f7fd8dc674ed3b455b1b772f9710420c3855",
++   "R5.seg_counts": "0041552312b1445f3f98a2d66d77551169d03acc88b40898712ff12e61a191cb",
++   "R5.seg_tokens": "14063c0f72c6b7ec3fa9584bbd7d96b624377691d5aba0c1586b314a2e1cc0fa",
++   "W1.latent_cache": "5b6e14cba403bfb47a14ce1a28d84fd59a5c32efcb8452eb52522751774a6c47",
++   "W2.seg_latent_arena": "93ee0e784b518de44d5dbfa802580d6e51c3995924b45b21b5809a1a8e600db7",
++   "W3.index_gates": "ec409aaa78d53e1b28908e91719f0615204e5f1e85a821e28314eaa9cd0b11c9",
++   "W3.index_keys": "5ec884d7cd5ab74f5760cb09adc3390b4495af049cbf6fcdddbccefc668fff4a",
++   "W3.pooled_keys": "e6f557ecc7a8bc1d296d2c3de9900ad7d309d127167d2194fab3773799ad5520",
++   "W4.seg_index_gates": "8bcf77dd1dc6756997833bffe96cb2a78df77beb49e2a03fed637bbd8415b4c3",
++   "W4.seg_index_keys": "fba0792dfeb9d16c095bac57dc78964f4c3749cda3803e8c77d73d685c212f55",
++   "W4.seg_pooled_keys": "e5ae61822fb9eaa992cb151b1ea482c13f18271dd5afccb58f718afce170e76d",
++   "counts": [
++    2049,
++    2050,
++    2049,
++    2049
++   ]
++  },
++  "recipe_bf16_ring": {
++   "R1.dense_out": "0d4c077b72fb5897f88b72f27d7c12c994a7b6d673928235a32a45a87bf06854",
++   "R2.sparse_out": "017062e73aef112b978d32114673c27093ae9e127eeb86524bfb9f8522dbf40d",
++   "R3.seg_out": "719d13405e617debbb4b426eb4d85da659b1cc7b1a620becdddc73d12debabda",
++   "R4.sel_counts": "36bc49238e7215ff6ac8e0a100fec7a511924ad0bb11ef95f880165f7e88b03d",
++   "R4.sel_tokens": "31ba7aaf6f9e811184d06a6bb0c1f7fd8dc674ed3b455b1b772f9710420c3855",
++   "R5.seg_counts": "0041552312b1445f3f98a2d66d77551169d03acc88b40898712ff12e61a191cb",
++   "R5.seg_tokens": "14063c0f72c6b7ec3fa9584bbd7d96b624377691d5aba0c1586b314a2e1cc0fa",
++   "W1.latent_cache": "5b6e14cba403bfb47a14ce1a28d84fd59a5c32efcb8452eb52522751774a6c47",
++   "W2.seg_latent_arena": "93ee0e784b518de44d5dbfa802580d6e51c3995924b45b21b5809a1a8e600db7",
++   "W3.index_gates": "3ed85d30305f756908c6952d3f7430401fd9f46a9d4a5d051d343bd2d2ec23d3",
++   "W3.index_keys": "0a6059544269e6b7ea4bfe84edc2192b67c7ddb6c99f98470b00eddb6f9dc633",
++   "W3.pooled_keys": "e6f557ecc7a8bc1d296d2c3de9900ad7d309d127167d2194fab3773799ad5520",
++   "W4.seg_index_gates": "05245fe314989e3eafb70bbc7fb12712273982d651a04c24fe0dd419c5625011",
++   "W4.seg_index_keys": "1b33862fbd7c4a3aee2587ced7d6f51c2cfddfad54ba87df6161f0aeb816d5c8",
++   "W4.seg_pooled_keys": "e5ae61822fb9eaa992cb151b1ea482c13f18271dd5afccb58f718afce170e76d",
++   "counts": [
++    2049,
++    2050,
++    2049,
++    2049
++   ]
++  },
++  "recipe_fp8_ring": {
++   "R1.dense_out": "ed38b5e1c9650cc6ad659aaa1be4fa8ec702c22db2efe0bd9c11752628ee9b0e",
++   "R2.sparse_out": "7ce36cb8e2ecc180dcbd694d0073d1a32e0e2c8f1778d5a830ea5c32a5a8d68d",
++   "R3.seg_out": "58ad2b6dd12aa6ccd6167cfa2b7db5d5715fb33bedf0aae56f5607591b731cba",
++   "R4.sel_counts": "36bc49238e7215ff6ac8e0a100fec7a511924ad0bb11ef95f880165f7e88b03d",
++   "R4.sel_tokens": "36b2e2f73ca4dda1b1606e27eca7db546f89158ce7ef9bc02927fa1dae91b4dd",
++   "R5.seg_counts": "0041552312b1445f3f98a2d66d77551169d03acc88b40898712ff12e61a191cb",
++   "R5.seg_tokens": "141fc0729adf3f8c8ef9c03163683db8de28ab7d437889f5d344ec9e04d3e1e5",
++   "W1.latent_cache": "4cf0df1f74b55bf56a9beb137bb5c4d5a84a2f754cd55ce088824e725fee962e",
++   "W2.seg_latent_arena": "69c7fff1dd98cfa31333212511a177f56cd77290640641b4fa6ca2d5d471345e",
++   "W3.index_gates": "3ed85d30305f756908c6952d3f7430401fd9f46a9d4a5d051d343bd2d2ec23d3",
++   "W3.index_keys": "0a6059544269e6b7ea4bfe84edc2192b67c7ddb6c99f98470b00eddb6f9dc633",
++   "W3.pooled_keys": "dc26a1693620eb7fa40c324e5166b66283e9b1cb25b2be8e11c026bdd53d1ed3",
++   "W4.seg_index_gates": "05245fe314989e3eafb70bbc7fb12712273982d651a04c24fe0dd419c5625011",
++   "W4.seg_index_keys": "1b33862fbd7c4a3aee2587ced7d6f51c2cfddfad54ba87df6161f0aeb816d5c8",
++   "W4.seg_pooled_keys": "cf23a60f82b3f69d1bb923e9ea2a59d0b7b335524076119df5f7d9846c090e12",
++   "counts": [
++    2049,
++    2050,
++    2049,
++    2049
++   ],
++   "kernel_eq_ref": 1
++  },
++  "recipe_post0038_fp8_ring": {
++   "R1.dense_out": "ed38b5e1c9650cc6ad659aaa1be4fa8ec702c22db2efe0bd9c11752628ee9b0e",
++   "R2.sparse_out": "7ce36cb8e2ecc180dcbd694d0073d1a32e0e2c8f1778d5a830ea5c32a5a8d68d",
++   "R3.seg_out": "58ad2b6dd12aa6ccd6167cfa2b7db5d5715fb33bedf0aae56f5607591b731cba",
++   "R4.sel_counts": "36bc49238e7215ff6ac8e0a100fec7a511924ad0bb11ef95f880165f7e88b03d",
++   "R4.sel_tokens": "36b2e2f73ca4dda1b1606e27eca7db546f89158ce7ef9bc02927fa1dae91b4dd",
++   "R5.seg_counts": "0041552312b1445f3f98a2d66d77551169d03acc88b40898712ff12e61a191cb",
++   "R5.seg_tokens": "141fc0729adf3f8c8ef9c03163683db8de28ab7d437889f5d344ec9e04d3e1e5",
++   "W1.latent_cache": "4cf0df1f74b55bf56a9beb137bb5c4d5a84a2f754cd55ce088824e725fee962e",
++   "W2.seg_latent_arena": "69c7fff1dd98cfa31333212511a177f56cd77290640641b4fa6ca2d5d471345e",
++   "W3.index_gates": "3ed85d30305f756908c6952d3f7430401fd9f46a9d4a5d051d343bd2d2ec23d3",
++   "W3.index_keys": "0a6059544269e6b7ea4bfe84edc2192b67c7ddb6c99f98470b00eddb6f9dc633",
++   "W3.pooled_keys": "dc26a1693620eb7fa40c324e5166b66283e9b1cb25b2be8e11c026bdd53d1ed3",
++   "W4.seg_index_gates": "05245fe314989e3eafb70bbc7fb12712273982d651a04c24fe0dd419c5625011",
++   "W4.seg_index_keys": "1b33862fbd7c4a3aee2587ced7d6f51c2cfddfad54ba87df6161f0aeb816d5c8",
++   "W4.seg_pooled_keys": "cf23a60f82b3f69d1bb923e9ea2a59d0b7b335524076119df5f7d9846c090e12",
++   "counts": [
++    2049,
++    2050,
++    2049,
++    2049
++   ],
++   "kernel_eq_ref": 1
++  }
++ },
++ "recipe_source_sha256": {
++  "kv8.py": "a6c1886a1a4b7ef6000a62aa4bf829837738b96a0f573a20e211c5fb224b25e8",
++  "latent._dense_chunks": "e95ecb1842deb4b4d9f79a13d8d920d3f0a275388e00768be2558cc003d6a27a",
++  "latent._lat_get": "0c7898c97a69c32300046c18a31bd2bce76bfb0082c0bade3ba3da862708dc4e",
++  "latent._lat_put": "e0b080581da113f47926793fe0bf873398f8b4a0b85bda149d218c98df58d57b",
++  "latent._lat_write": "70d56bbc990a74133d3ee044858add6df8b33d311c64a2e539324b3fe0271c4b",
++  "latent._seg_chunks": "03bb71eaabff7d96825bc50aeee2c0d37d5573f18f0834d180fc0b9f6aa27e3e",
++  "latent._seg_lat_write": "4535cc37b55f6517b9456810b053b2ab84a7e2dd34ce9a13346a971d92990957",
++  "latent._sparse_chunks": "8d26e2dc93e05c4a2d25e3f1d255f4ff7dec89d4d3cf53b7d3295bcee8bb09f8",
++  "latent._tile": "faa358611a2e4826c4970b160bf8247621996df168c039d08071857c3896da0e",
++  "latent.latent_write": "8e2c2bca8ebcd2d2d0f28b6e2c4ca623a875a420e9d9ceeab69c4b97a20b5a35",
++  "latent.seg_latent_write": "bd62affe748986de0c5203579c9de8ad1baa791376990d7a692b7bffe82f1d68",
++  "sparse._index_write": "5254cf95358e626261967c292def18edfeb1b1dd5b8decebec859b2a32450229",
++  "sparse._pk_get": "b1da3a9bfa8641456eb633ef401994d968422c73749d9aa85a34e9b9a85dd6e7",
++  "sparse._pk_put": "526f499d8ed4a29df3589e80baf55b48367e9fdbdf73b88ec3de045d473584f3",
++  "sparse._pool_keys": "48360724d368e50d541639abd3fe7ab9efdda4b59d6d780db31e725ff205c428",
++  "sparse._scores": "709a3d36d946b94a6a36da94bb569fb618b4f087451aff5f29b26d0a244595b3",
++  "sparse._seg_index_write": "689a7c6eb376b74ce68b1238a708885d850773ed3115a00fcda680f525fc1ccc",
++  "sparse._seg_pool_keys": "bd4541a5534f4de4f748affb52e0dbecaeaecf38035133473353a58400710e80",
++  "sparse._seg_scores": "4471b779df22bfb5235075db896db848faa4df12cf4c814048fc8f5fbb5267e7",
++  "sparse.index_update": "762d033934b266222a1cd0e5878f0f1795dfe8b61caf1d51ac6aa283889b55a8",
++  "sparse.seg_index_update": "e8513e24b97a87fccda9ec750d49ba628515a16c0188e19ef09b86c1ac39b6eb",
++  "sparse.seg_select_tokens": "c5074a75b62246b713d57ea5c379ff95b1cd641702eb98fce3067f7d2231d4fd"
++ },
++ "text_config": {
++  "attention_bias": false,
++  "attention_dropout": 0.0,
++  "dtype": "bfloat16",
++  "eos_token_id": [
++   154820,
++   154827,
++   154829
++  ],
++  "first_k_dense_replace": 3,
++  "hc_eps": 1e-06,
++  "hc_mult": 4,
++  "hc_sinkhorn_iters": 20,
++  "head_dim": 0,
++  "hidden_act": "silu",
++  "hidden_size": 4096,
++  "index_head_dim": 128,
++  "index_kpool": 4,
++  "index_kpool_always_select_tail": true,
++  "index_kpool_compress": true,
++  "index_n_heads": 32,
++  "index_share_for_mtp_iteration": true,
++  "index_topk": 2048,
++  "indexer_rope_interleave": true,
++  "indexer_types": [
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full",
++   "full"
++  ],
++  "initializer_range": 0.02,
++  "intermediate_size": 12288,
++  "kv_lora_rank": 512,
++  "layer_types": [
++   "linear_attention",
++   "linear_attention",
++   "linear_attention",
++   "deepseek_sparse_attention",
++   "linear_attention",
++   "linear_attention",
++   "linear_attention",
++   "deepseek_sparse_attention",
++   "linear_attention",
++   "linear_attention",
++   "linear_attention",
++   "deepseek_sparse_attention",
++   "linear_attention",
++   "linear_attention",
++   "linear_attention",
++   "deepseek_sparse_attention",
++   "linear_attention",
++   "linear_attention",
++   "linear_attention",
++   "deepseek_sparse_attention",
++   "linear_attention",
++   "linear_attention",
++   "linear_attention",
++   "deepseek_sparse_attention",
++   "linear_attention",
++   "linear_attention",
++   "linear_attention",
++   "deepseek_sparse_attention",
++   "linear_attention",
++   "linear_attention",
++   "linear_attention",
++   "deepseek_sparse_attention",
++   "linear_attention",
++   "linear_attention",
++   "linear_attention",
++   "deepseek_sparse_attention",
++   "linear_attention",
++   "linear_attention",
++   "linear_attention",
++   "deepseek_sparse_attention",
++   "linear_attention",
++   "linear_attention",
++   "linear_attention",
++   "deepseek_sparse_attention",
++   "linear_attention"
++  ],
++  "linear_attn_config": {
++   "full_attn_layers": [
++    3,
++    7,
++    11,
++    15,
++    19,
++    23,
++    27,
++    31,
++    35,
++    39,
++    43
++   ],
++   "gate_lower_bound": -5.0,
++   "head_dim": 128,
++   "kda_layers": [
++    0,
++    1,
++    2,
++    4,
++    5,
++    6,
++    8,
++    9,
++    10,
++    12,
++    13,
++    14,
++    16,
++    17,
++    18,
++    20,
++    21,
++    22,
++    24,
++    25,
++    26,
++    28,
++    29,
++    30,
++    32,
++    33,
++    34,
++    36,
++    37,
++    38,
++    40,
++    41,
++    42,
++    44
++   ],
++   "num_heads": 64,
++   "short_conv_kernel_size": 4
++  },
++  "max_position_embeddings": 1048576,
++  "mhc": true,
++  "mla_use_nope": true,
++  "mlp_layer_types": [
++   "dense",
++   "dense",
++   "dense",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse",
++   "sparse"
++  ],
++  "model_type": "glm5_next_text",
++  "moe_intermediate_size": 2048,
++  "moe_router_dtype": "float32",
++  "n_group": 1,
++  "n_routed_experts": 288,
++  "n_shared_experts": 1,
++  "norm_topk_prob": true,
++  "num_attention_heads": 64,
++  "num_experts_per_tok": 8,
++  "num_hidden_layers": 45,
++  "num_key_value_heads": 64,
++  "num_nextn_predict_layers": 1,
++  "output_router_logits": false,
++  "pad_token_id": 154820,
++  "q_lora_rank": 1536,
++  "qk_head_dim": 256,
++  "qk_nope_head_dim": 256,
++  "qk_rope_head_dim": 0,
++  "rms_norm_eps": 1e-05,
++  "routed_scaling_factor": 2.5,
++  "router_aux_loss_coef": 0.001,
++  "scoring_func": "sigmoid",
++  "swiglu_limit": 10.0,
++  "tie_word_embeddings": false,
++  "topk_group": 1,
++  "topk_method": "noaux_tc",
++  "use_cache": true,
++  "v_head_dim": 256,
++  "vocab_size": 154880
++ }
++}
+diff --git a/tests/glm_kv8_cpu.py b/tests/glm_kv8_cpu.py
+new file mode 100644
+index 0000000..5332b33
+--- /dev/null
++++ b/tests/glm_kv8_cpu.py
+@@ -0,0 +1,233 @@
++"""TF_GLM_KV's cache kernels on the CPU, for tests/test_glm_kv8.py (run as a script in a subprocess: the kernels must be
++defined under TRITON_INTERPRET=1, which this module sets before anything imports triton).
++
++    python tests/glm_kv8_cpu.py CONFIGS...      CONFIG = kv:layout[:deq], kv in bf16|fp8, layout in planes|ring
++
++prints one JSON object: per config, the sha256 of every array the kernels wrote or returned (W*: the write paths'
++caches, R*: the read paths' outputs) and ``kernel_eq_ref`` (fp8: the stored rows equal ``kv8.quantize_rows``).
++``deq``: a bf16 run on the rows an fp8 cache holds, dequantized (its R* must equal the fp8 run's). It runs the tree on
++PYTHONPATH, so the same script records another tree's bytes (MiaAI-Lab's recipe tree, the base before TF_GLM_KV):
++tests/data/glm_kv8_golden.json.
++
++Triton 3.8's interpreter converts fp32 -> bf16 by truncation, fp32 -> fp8 e4m3 without carrying into the exponent,
++and multiplies bf16 dot operands as integers; ``patch_interpreter`` replaces those with IEEE round-to-nearest-even
++conversions (the GPU's cvt.rn.bf16.f32 and cvt.rn.satfinite.e4m3x2.f32) and a float32 product of exact float32
++operands. The write paths then use only exact or IEEE elementwise arithmetic and numpy reductions; the read paths'
++dot products depend on numpy's float32 matmul (stable on one host, not across BLAS builds).
++"""
++from __future__ import annotations
++
++import hashlib
++import importlib
++import json
++import os
++import sys
++
++os.environ["TRITON_INTERPRET"] = "1"
++
++import numpy as np
++import torch
++
++H, LW, D, IH = 64, 512, 128, 32          # world-1 attention heads, latent width, index width and heads
++SCALE = 256 ** -0.5
++
++
++def patch_interpreter() -> None:
++    import triton.language as tl
++    from triton.runtime import interpreter as itp
++
++    types = {tl.float32: torch.float32, tl.bfloat16: torch.bfloat16, tl.float16: torch.float16,
++             tl.float8e4nv: torch.float8_e4m3fn, tl.float8e5: torch.float8_e5m2}
++    original = itp._convert_float
++
++    def convert(input, input_dtype, output_dtype, rounding_mode):
++        src, dst = types.get(input_dtype), types.get(output_dtype)
++        if src is None or dst is None:
++            return original(input, input_dtype, output_dtype, rounding_mode)
++        arr = np.ascontiguousarray(input)
++        view = {1: np.uint8, 2: np.int16, 4: np.int32}[src.itemsize]
++        x = torch.from_numpy(arr.view(view).copy()).view(src)
++        y = x.float().clamp(-448.0, 448.0).to(dst) if dst == torch.float8_e4m3fn else x.to(dst)
++        bits = {1: (torch.uint8, np.uint8), 2: (torch.int16, np.uint16), 4: (torch.int32, np.uint32)}[y.element_size()]
++        return y.contiguous().view(bits[0]).numpy().view(bits[1]).reshape(input.shape)
++
++    def create_dot(self, a, b, d, input_precision, max_num_imprecise_acc):
++        def f32(h):
++            if h.dtype == tl.bfloat16 or (h.dtype.primitive_bitwidth == 8 and h.dtype.is_floating()):
++                return convert(h.data, h.dtype, tl.float32, None).view(np.float32)
++            return h.data.astype(np.float32) if h.dtype == tl.float16 else h.data
++        return itp.TensorHandle(np.matmul(f32(a), f32(b), dtype=d.data.dtype) + d.data, d.dtype.scalar)
++
++    itp._convert_float = convert
++    itp.InterpreterBuilder.create_dot = create_dot
++
++
++def latent_rows(n: int, seed: int, spread: float = 12.0) -> torch.Tensor:
++    """bf16 [n + 10, 512]: GLM-like rows (channel gains, outlier channels, row scales 2^-spread .. 2^spread), then
++    zeros, -0, a single value, rows of e4m3 rounding ties at three exponents, subnormal codes, tiny and huge rows."""
++    g = torch.Generator().manual_seed(seed)
++    gains = torch.exp(torch.randn(LW, generator=g) * 0.7)
++    gains[torch.randperm(LW, generator=g)[:6]] *= 20.0
++    x = torch.randn(n, LW, generator=g) * gains * torch.exp2(torch.empty(n, 1).uniform_(-spread, spread, generator=g))
++    extra = [torch.zeros(LW), torch.full((LW,), -0.0)]
++    one = torch.zeros(LW)
++    one[17] = -3.0
++    extra.append(one)
++    t = torch.arange(LW, dtype=torch.float32)
++    for e in (8, 3, -20):
++        r = 2.0 ** e * (1 + (t % 64) / 64.0) * torch.where(t % 2 == 0, 1.0, -1.0)
++        r[0] = 2.0 ** e * 1.99
++        extra.append(r)
++    sub = t * 2.0 ** -11
++    sub[0] = 255.0
++    extra += [sub, torch.randn(LW, generator=g) * 1e-30, torch.randn(LW, generator=g) * 1e30]
++    return torch.cat([x.to(torch.bfloat16), torch.stack(extra).to(torch.bfloat16)])
++
++
++def run(kv: str, layout: str, deq: bool) -> dict:
++    from tensorfold.families.glm5_next.cuda import latent, segments, sparse
++    try:
++        kv8 = importlib.import_module("tensorfold.families.glm5_next.cuda.kv8")
++    except ImportError:
++        kv8 = None
++    fp8, ring = kv == "fp8", layout == "ring"
++    dev = torch.device("cpu")
++    out: dict[str, torch.Tensor] = {}
++
++    def zeros(rows, width):
++        return kv8.zeros(rows, width, "fp8", dev) if fp8 else torch.zeros((rows, width), dtype=torch.bfloat16)
++
++    def pos_t(p):
++        return torch.tensor([p], dtype=torch.int32)
++
++    def prep(x):
++        return kv8.dequantize(kv8.quantize_rows(x)).to(torch.bfloat16) if deq else x
++
++    def seg(sr, segs, ring_bases, **kw):
++        return sr.set([s + (b,) for s, b in zip(segs, ring_bases)] if ring else segs, **kw)
++
++    # W1 latent_write; W2 seg_latent_write
++    rows = latent_rows(48, 1)                     # 57 rows
++    src = prep(rows)
++    cache = zeros(4096, LW)
++    writes = [(0, 0, 40), (100, 40, 7), (4096 - 16, 47, 10)]
++    for p, a, n in writes:
++        latent.latent_write(src[a:a + n], cache, pos_t(p))
++    out["W1.latent_cache"] = cache
++    if fp8:
++        ref = kv8.quantize_rows(rows)
++        out["kernel_eq_ref"] = torch.tensor([int(all(torch.equal(cache[p:p + n], ref[a:a + n])
++                                                     for p, a, n in writes))])
++    arena = zeros(3 * 2048, LW)
++    sr = segments.SegRows(32, dev, ring=2112) if ring else segments.SegRows(32, dev)
++    R = seg(sr, [(0, 5, 4), (2048, 2045, 3), (4096, 0, 6)], [0, 2112, 4224], sparse_from=None)
++    latent.seg_latent_write(src[:R], arena, sr)
++    out["W2.seg_latent_arena"] = arena
++
++    # W3 index_update, prompt chunks then decode windows; W4 seg_index_update, two streams
++    g = torch.Generator().manual_seed(2)
++    nk = 320
++    k_raw = (torch.randn(nk, D, generator=g) * 3).to(torch.bfloat16)
++    gate = torch.randn(nk, D, generator=g) * 2
++    ln_w = (1 + torch.randn(D, generator=g) * 0.2).to(torch.bfloat16)
++    ln_b = (torch.randn(D, generator=g) * 0.1).to(torch.bfloat16)
++    ape = (torch.randn(4, D, generator=g) * 0.5).to(torch.bfloat16)
++    pk = zeros(2048 // 4 + 2, D)
++    nring = 320 if ring else 2048
++    ik = torch.zeros((nring, D), dtype=torch.bfloat16)
++    ig = torch.zeros((nring, D), dtype=torch.bfloat16)
++    at = 0
++    for p, n in ((0, 300), (300, 7), (307, 1), (308, 12)):
++        sparse.index_update(k_raw[at:at + n], gate[at:at + n], ln_w, ln_b, ape, ik, ig, pk, pos_t(p))
++        at += n
++    out["W3.pooled_keys"], out["W3.index_keys"], out["W3.index_gates"] = pk, ik, ig
++    pk2 = zeros(2 * 4096 // 4 + 2, D)
++    nr2 = 2 * (64 if ring else 4096)
++    ik2 = torch.zeros((nr2, D), dtype=torch.bfloat16)
++    ig2 = torch.zeros((nr2, D), dtype=torch.bfloat16)
++    sr2 = segments.SegRows(32, dev, ring=64) if ring else segments.SegRows(32, dev)
++    used = 0
++    for win in ([(0, 0, 9), (4096, 0, 7)], [(0, 9, 8), (4096, 7, 13)], [(0, 17, 30), (4096, 20, 1)],
++                [(0, 47, 5), (4096, 21, 16)]):
++        R = seg(sr2, win, [0, 64], sparse_from=None)
++        sparse.seg_index_update(k_raw[used:used + R], gate[used:used + R], ln_w, ln_b, ape, ik2, ig2, pk2, sr2)
++        used += R
++    out["W4.seg_pooled_keys"], out["W4.seg_index_keys"], out["W4.seg_index_gates"] = pk2, ik2, ig2
++
++    # R1 dense, R2 sparse, R3 segmented attention over a written cache
++    n_ctx = 700
++    ctx = prep(latent_rows(n_ctx, 3, spread=2.0)[:n_ctx])
++    lc = zeros(4096, LW)
++    latent.latent_write(ctx, lc, pos_t(0))
++    q = torch.Generator().manual_seed(4)
++    qa = (torch.randn(4, H, LW, generator=q) * 0.5).to(torch.bfloat16)
++    pos = n_ctx - 4
++    nch = latent.chunks_for(n_ctx)
++    o = torch.empty((4, H, LW), dtype=torch.bfloat16)
++    latent.attention(qa, lc, pos_t(pos), latent.LatentScratch(4, H, nch, dev), scale=SCALE, nch=nch, out=o)
++    out["R1.dense_out"] = o
++    W = sparse.TOKENS
++    tok = torch.full((4, W), -1, dtype=torch.int32)
++    cnt = torch.zeros((4,), dtype=torch.int32)
++    for r in range(4):
++        k = pos + r + 1 - (r % 2) * 17
++        tok[r, :k] = torch.sort(torch.randperm(pos + r + 1, generator=q)[:k]).values.to(torch.int32)
++        cnt[r] = k
++    o2 = torch.zeros((4, H, LW), dtype=torch.bfloat16)
++    latent.sparse_attention(qa, lc, tok, cnt, o2, SCALE)
++    out["R2.sparse_out"] = o2
++    ar = zeros(2 * 2048, LW)
++    latent.latent_write(ctx[:300], ar, pos_t(0))
++    latent.latent_write(ctx[-600:], ar, pos_t(2048))
++    sr3 = segments.SegRows(16, dev, ring=64) if ring else segments.SegRows(16, dev)
++    R3 = seg(sr3, [(0, 298, 2), (2048, 597, 3)], [0, 64], sparse_from=500)
++    tok3 = torch.full((R3, W), -1, dtype=torch.int32)
++    cnt3 = torch.zeros((R3,), dtype=torch.int32)
++    for r, p in ((2, 597), (3, 598), (4, 599)):
++        k = p + 1 - 5
++        tok3[r, :k] = torch.sort(torch.randperm(p + 1, generator=q)[:k]).values.to(torch.int32)
++        cnt3[r] = k
++    o3 = torch.empty((R3, H, LW), dtype=torch.bfloat16)
++    latent.seg_attention(qa[:1].expand(R3, H, LW).contiguous(), ar, sr3, tok3, cnt3,
++                         latent.LatentScratch(R3, H, latent.seg_chunks(), dev), scale=SCALE, out=o3)
++    out["R3.seg_out"] = o3
++
++    # R4 / R5: the indexer's selection over pooled keys (cache rows as each format stores them)
++    npools = 2048
++    pk_rows = (torch.randn(npools, D, generator=torch.Generator().manual_seed(6)) *
++               torch.exp(torch.randn(npools, 1, generator=torch.Generator().manual_seed(8)))).to(torch.bfloat16)
++    pkl = zeros(npools + 2, D)
++    pkl[:npools] = kv8.quantize_rows(pk_rows) if fp8 else prep(pk_rows)
++    s = torch.Generator().manual_seed(5)
++    qi = (torch.randn(2, IH * D, generator=s) * 0.3).to(torch.bfloat16)
++    wts = torch.randn(2, D + IH, generator=s).to(torch.bfloat16)[:, D:]
++    out["R4.sel_tokens"], out["R4.sel_counts"] = sparse.select_tokens(qi, wts, pkl, 3000, 2, npools, pos_t(3000))
++    sel = segments.SelectScratch(8, (npools + 2) * 4, dev)
++    sr5 = segments.SegRows(8, dev, ring=64) if ring else segments.SegRows(8, dev)
++    seg(sr5, [(0, 6072, 1), (4096, 4088, 1)], [0, 64], sparse_from=500)
++    out["R5.seg_tokens"], out["R5.seg_counts"] = sparse.seg_select_tokens(qi, wts, pkl, sr5, sel)
++
++    def sha(t):
++        t = t.contiguous()
++        return hashlib.sha256(t.view(torch.uint8).numpy().tobytes() if t.is_floating_point() else
++                              t.numpy().tobytes()).hexdigest()
++
++    res = {k: sha(v) for k, v in sorted(out.items()) if k != "kernel_eq_ref"}
++    if "kernel_eq_ref" in out:
++        res["kernel_eq_ref"] = int(out["kernel_eq_ref"].item())
++    res["counts"] = [int(c) for c in out["R4.sel_counts"].tolist() + out["R5.seg_counts"].tolist()]
++    return res
++
++
++def main(argv) -> int:
++    patch_interpreter()
++    results = {}
++    for spec in argv:
++        kv, layout, *rest = spec.split(":")
++        results[spec] = run(kv, layout, deq=rest == ["deq"])
++    print(json.dumps(results))
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv[1:]))
+diff --git a/tests/test_glm_kv8.py b/tests/test_glm_kv8.py
+new file mode 100644
+index 0000000..253fcbe
+--- /dev/null
++++ b/tests/test_glm_kv8.py
+@@ -0,0 +1,338 @@
++"""TF_GLM_KV=fp8 on the AFD attention node: CPU checks of the port of MiaAI-Lab's recipe patch 0038-glm-kv-fp8
++(github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold @ cf28cc4, Apache-2.0), the recipe's default KV cache.
++
++- Flag off (unset or bf16): the caches, the geometry estimate and the kernels' bytes are the base tree's
++  (the split before this port: tests/data/glm_kv8_golden.json).
++- fp8: the cache kernels are the recipe's source text, their bytes the recipe tree's (the CPU runs below, digests in
++  the golden file), the reads equal a bf16 cache's of the dequantized rows, and the kv8 row format round-trips.
++- The rings (the indexer's per-token keys and gates, one ring a stream slot), snapshot tails, the multi-stream slot
++  move and segment spans; the attention node's estimate at --parallel 1/2/4 x 262,144 with q4 dense weights.
++
++The kernels run under Triton's CPU interpreter in a subprocess (tests/glm_kv8_cpu.py, conversions fixed).
++"""
++
++from __future__ import annotations
++
++import hashlib
++import inspect
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++from types import SimpleNamespace
++from unittest import mock
++
++import pytest
++import torch
++
++pytest.importorskip("triton")
++
++from tensorfold.cuda import geometry  # noqa: E402
++from tensorfold.families.glm5_next.cuda import decode, engine, forward, kv8  # noqa: E402
++
++ROOT = Path(__file__).resolve().parents[1]
++GOLDEN = json.loads((ROOT / "tests" / "data" / "glm_kv8_golden.json").read_text())
++TEXT = GOLDEN["text_config"]
++GIB = 2 ** 30
++
++
++def _weights(long_context: bool = True, mtp: bool = False):
++    """golden_probe.py's small model: 2 KDA and 3 DSA layers, world 1."""
++
++    cfg = SimpleNamespace(heads=64, kv_lora=512, qk_dim=192, v_dim=256, index_dim=128, lin_heads=8, conv=4)
++    kda = SimpleNamespace(proj=SimpleNamespace(n=64))
++    layers = [SimpleNamespace(kind=k, index=i, kda=kda if k == "kda" else None)
++              for i, k in enumerate(["kda", "dsa", "kda", "dsa", "dsa"])]
++    return SimpleNamespace(cfg=cfg, device=torch.device("cpu"), world=1, layers=layers,
++                           mtp=object() if mtp else None, meta={"long_context": long_context})
++
++
++def _planes(c):
++    return {"planes": [[list(p.tensor.shape), str(p.tensor.dtype), p.div, p.pad] for p in c.arena.planes],
++            "kc": c.kc, "vc": c.vc, "mtp": list(c.mtp) if c.mtp is not None else None,
++            "index": [list(t) for t in c.index] if c.index is not None else None}
++
++
++# -- the switch ----------------------------------------------------------------------------------------------------
++
++def test_kv_kind_values():
++    assert kv8.kv_kind({}) == "bf16"
++    assert kv8.kv_kind({"TF_GLM_KV": ""}) == "bf16"
++    assert kv8.kv_kind({"TF_GLM_KV": " bf16 "}) == "bf16"
++    assert kv8.kv_kind({"TF_GLM_KV": "fp8"}) == "fp8"
++    with pytest.raises(ValueError):
++        kv8.kv_kind({"TF_GLM_KV": "int8"})
++    with mock.patch.dict(os.environ, {}, clear=True):
++        assert kv8.kv_kind() == "bf16"
++
++
++# -- flag off: the base tree's objects -----------------------------------------------------------------------------
++
++def test_flag_off_caches_are_the_base_planes():
++    """Unset, Caches builds the base's arena planes (shapes, dtypes, order); no rings, no ring tails, and snapshots
++    keep the index keys and gates among their row views, as before."""
++
++    for key, want in GOLDEN["base_flag_off"]["caches"].items():
++        long_context, mtp = (bool(int(kv.split("=")[1])) for kv in key.split(","))
++        c = forward.Caches(_weights(long_context, mtp), 4096)
++        assert _planes(c) == want, key
++        assert c.kv == "bf16" and c.rings is None and c.ring is None and c.ring_bytes() == 0
++    c = forward.Caches(_weights(), 4096)
++    st = forward.State(_weights(), 2048, 8, caches=c, base=2048)
++    assert not decode.has_rings(st) and decode._ring_tail(st, 7, 0) is None
++    views = decode._row_views(st, 7, 0)
++    assert len(views) == 3 + 3 * 3                     # 3 latents; keys, gates and pools of 3 DSA layers
++    snap = decode.Snapshot([1] * 7, torch.zeros(1), torch.zeros(1), None, -1, -1)
++    decode.put_ring_tail(st, snap)                     # nothing to put back
++    assert snap.tail is None
++
++
++def test_flag_off_geometry_unchanged():
++    for key, want in GOLDEN["base_flag_off"]["geometry"].items():
++        latent, mtp, exl3 = (bool(int(kv.split("=")[1])) for kv in key.split(","))
++        g = geometry.mla_geometry(TEXT, 1, 8, minimum_slots=2560, latent=latent, mtp=mtp, exl3_scratch=exl3)
++        assert [g.bytes_at(c) for c in (2560, 65544, 262152, 1048584)] == want, key
++        if latent:
++            gb = geometry.mla_geometry(TEXT, 1, 8, minimum_slots=2560, latent=latent, mtp=mtp, exl3_scratch=exl3,
++                                       kv="bf16", ring_rows=4096)
++            assert [gb.bytes_at(c) for c in (2560, 262152)] == [want[0], want[2]]
++
++
++def test_engine_passes_the_flag_only_when_set():
++    """decode.Engine builds rings only for fp8; GlmEngine adds the ring bytes and the geometry's kv only for fp8, and
++    the ranks' settings vector carries the kind."""
++
++    src = inspect.getsource(decode.Engine.__init__)
++    assert 'if kv != "bf16" else None' in src and "ring=ring, kv=kv" in src
++    src = inspect.getsource(engine.GlmEngine.__init__)
++    assert '**({"kv": kv, "ring_rows": ring_rows} if kv != "bf16" else {})' in src
++    assert "extra += (parallel - 1) * mla_ring_bytes(text, ring_rows)" in src
++    assert "KV_KINDS.index(kv)]" in src and "pool_rows=pool_rows, kv=kv)" in src
++
++
++# -- the kernels on the CPU ------------------------------------------------------------------------------------------
++
++@pytest.fixture(scope="module")
++def runs():
++    """tests/glm_kv8_cpu.py on this tree: fp8 rings, bf16 rings, bf16 planes (the flag-off layout), and bf16 rings on
++    the rows an fp8 cache holds, dequantized."""
++
++    env = dict(os.environ, TRITON_INTERPRET="1", PYTHONPATH=os.pathsep.join(
++        [str(ROOT / "src")] + [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p]))
++    p = subprocess.run([sys.executable, str(ROOT / "tests" / "glm_kv8_cpu.py"), "fp8:ring", "bf16:ring",
++                        "bf16:planes", "bf16:ring:deq"], env=env, capture_output=True, text=True, timeout=1800,
++                       check=False)
++    assert p.returncode == 0, p.stderr[-3000:]
++    return json.loads(p.stdout.strip().splitlines()[-1])
++
++
++def _differ(a: dict, b: dict) -> list[str]:
++    return sorted(k for k in set(a) | set(b) if k != "counts" and a.get(k) != b.get(k))
++
++
++def test_flag_off_kernel_bytes_are_the_base(runs):
++    """bf16 caches in arena planes (the flag unset): every cache and output byte of the base tree's kernels."""
++
++    assert _differ(runs["bf16:planes"], GOLDEN["kernels"]["base_bf16_planes"]) == []
++
++
++def test_fp8_kernel_bytes_are_the_recipe(runs):
++    """fp8 in rings: the bytes of MiaAI-Lab's tree at the recipe's head and right after 0038; bf16 rings too."""
++
++    assert _differ(runs["fp8:ring"], GOLDEN["kernels"]["recipe_fp8_ring"]) == []
++    assert _differ(runs["fp8:ring"], GOLDEN["kernels"]["recipe_post0038_fp8_ring"]) == []
++    assert _differ(runs["bf16:ring"], GOLDEN["kernels"]["recipe_bf16_ring"]) == []
++
++
++def test_fp8_writes_are_kv8_rows_and_reads_the_dequantized_values(runs):
++    """The write kernels store kv8.quantize_rows' bytes; every read (dense, sparse, segmented attention, both
++    selections) returns what bf16 kernels return on the dequantized rows."""
++
++    fp8, deq = runs["fp8:ring"], runs["bf16:ring:deq"]
++    assert fp8["kernel_eq_ref"] == 1
++    reads = [k for k in fp8 if k.startswith("R")]
++    assert len(reads) == 7 and all(fp8[k] == deq[k] for k in reads)
++    assert min(fp8["counts"]) > 2000                   # both selections past the dense limit
++
++
++def test_copied_kernels_are_the_recipe_source():
++    root = ROOT / "src" / "tensorfold" / "families" / "glm5_next" / "cuda"
++    import ast
++
++    for name, want in GOLDEN["recipe_source_sha256"].items():
++        if name == "kv8.py":
++            lines = (root / "kv8.py").read_text().splitlines(keepends=True)
++            while lines and lines[0].startswith("#"):
++                lines.pop(0)                         # the port's two-line credit header
++            got = "".join(lines)
++        else:
++            mod, fn = name.split(".")
++            text = (root / f"{mod}.py").read_text()
++            lines = text.splitlines(keepends=True)
++            node = next(n for n in ast.parse(text).body if getattr(n, "name", None) == fn)
++            start = min([node.lineno] + [d.lineno for d in node.decorator_list])
++            got = "".join(lines[start - 1:node.end_lineno])
++        assert hashlib.sha256(got.encode()).hexdigest() == want, name
++
++
++# -- the kv8 row format --------------------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("seed", [0, 1, 2])
++def test_kv8_rows_round_trip(seed):
++    g = torch.Generator().manual_seed(seed)
++    x = (torch.randn(64, 512, generator=g) * torch.exp2(torch.empty(64, 1).uniform_(-30, 30, generator=g)))
++    x = torch.cat([x, torch.zeros(1, 512)]).to(torch.bfloat16)
++    q = kv8.quantize_rows(x)
++    assert q.dtype == torch.uint8 and q.shape == (65, 512 + kv8.PAD)
++    assert not q[:, 516:].any()                                     # pad bytes after the fp32 scale
++    s = q[:, 512:516].contiguous().view(torch.float32).flatten()
++    bits = s.view(torch.int32)
++    assert ((bits & 0x7FFFFF) == 0).all() and (s > 0).all()          # powers of two
++    codes = q[:, :512].contiguous().view(torch.float8_e4m3fn).float()
++    assert codes.abs().max() <= 256 and codes[-1].abs().max() == 0   # within +-2^SHIFT; a zero row stays zero
++    d = kv8.dequantize(q)
++    amax = x.float().abs().amax(1, keepdim=True)
++    assert ((d - x.float()).abs() <= amax / 16 + 1e-38).all()        # e4m3: half a step of the row's top binade
++    assert torch.equal(kv8.dequantize(kv8.quantize_rows(d)), d)      # the dequantized values are fixed points
++    assert torch.equal(d.to(torch.bfloat16).float(), d)              # and bf16-exact (what --rows-dequant feeds)
++    assert kv8.width(q) == 512 and kv8.kind_of(q) == "fp8" and kv8.row_bytes(512, "fp8") == 528
++
++
++# -- rings, snapshot tails, slot moves and spans ---------------------------------------------------------------------
++
++def test_index_ring_rows():
++    assert forward.index_ring(262152, 2048) == 2112 == geometry.mla_index_ring(262152, 2048)
++    assert forward.index_ring(1000, 2048) == 1000                  # a short context: no row wraps
++    assert forward.index_ring(262152, 8) == 64
++
++
++def test_fp8_caches_rings_and_views():
++    w = _weights()
++    c = forward.Caches(w, 8192, streams=4, ring=2112, kv="fp8")
++    assert c.kv == "fp8" and c.ring == 2112 and len(c.rings) == 3
++    lat = c.arena.planes[c.kc[0]].tensor
++    assert lat.dtype == torch.uint8 and lat.shape == (8192, 528)
++    pk = c.arena.planes[c.index[0][2]].tensor
++    assert pk.shape == (8192 // 4 + 2, 144) and c.index[0][:2] == (None, None)
++    assert all(t.shape == (4 * 2112, 128) and t.dtype == torch.bfloat16 for pair in c.rings for t in pair)
++    assert c.ring_bytes() == 3 * 2 * 4 * 2112 * 128 * 2
++    slots = forward.Slots(w, 4, 8)
++    st = forward.State(w, 4096, 8, caches=c, base=4096, slots=slots, slot=2)
++    ik, _ig, view = st.index[1]
++    assert ik.data_ptr() == c.rings[1][0][2 * 2112].data_ptr() and ik.shape == (2112, 128)
++    pool_plane = c.arena.planes[c.index[1][2]].tensor
++    assert view.data_ptr() == pool_plane[4096 // 4].data_ptr() and view.shape[1] == 144
++    assert c.index_tensors(1)[0] is c.rings[1][0] and c.ring_base(3) == 3 * 2112
++    with pytest.raises(ValueError):
++        forward.Caches(w, 8192, kv="int8")
++    with mock.patch.object(forward.latent, "ENABLED", False), pytest.raises(ValueError):
++        forward.Caches(w, 8192, kv="fp8")              # fp8 holds the latent cache: TF_GLM_LATENT=0 is refused
++
++
++def test_ring_tail_round_trip():
++    """A snapshot's tail is its filling pools' ring rows (n % 4 of them a layer); they go back after later rows
++    overwrote the ring, into the same or another slot's ring."""
++
++    w = _weights()
++    c = forward.Caches(w, 8192, streams=2, ring=128, kv="fp8")
++    slots = forward.Slots(w, 2, 8)
++    a = forward.State(w, 4096, 8, caches=c, base=0, slots=slots, slot=0)
++    for ik, ig in c.rings:
++        ik.copy_(torch.randn(ik.shape).to(torch.bfloat16))
++        ig.copy_(torch.randn(ig.shape).to(torch.bfloat16))
++    n = 1000 * 4 + 3                                       # 3 tokens of a pool still filling, at ring rows 4000-4002
++    tail = decode._ring_tail(a, n, 0)
++    assert len(tail) == 3 and tail[0][0].tolist() == [4000 % 128, 4001 % 128, 4002 % 128]
++    want = [(ik[a.caches.ring_base(0):][:128][[32, 33, 34]].clone()) for ik, _ in c.rings]
++    snap = decode.Snapshot([7] * n, torch.zeros(1), torch.zeros(1), None, -1, -1, tail=tail)
++    assert decode.snapshot_bytes(snap) >= sum(t.numel() * t.element_size() for pair in tail for t in pair)
++    b = forward.State(w, 4096, 8, caches=c, base=4096, slots=slots, slot=1)
++    for ik, ig in c.rings:
++        ik.zero_()
++        ig.zero_()
++    decode.put_ring_tail(b, snap)                          # slot 1's ring
++    for (ik, _), rows in zip(c.rings, want):
++        assert torch.equal(ik[128 + 32:128 + 35], rows) and not ik[:128].any()
++    assert decode._ring_tail(a, 4000, 0) == []             # a whole number of pools: nothing filling
++    plain = forward.State(w, 2048, 8, caches=forward.Caches(w, 2048))
++    with pytest.raises(ValueError):
++        decode.put_ring_tail(plain, snap)                  # ring rows have no place in caches without rings
++    views = decode._row_views(a, n, 0)
++    assert len(views) == 3 + 3                             # latents and pools; keys and gates are in the tail
++
++
++def test_reslot_moves_the_ring_rows():
++    """multi.MultiDecoder._reslot: a stream moved to another slot takes its ring rows (its filling pools' keys)."""
++
++    from tensorfold.families.glm5_next.cuda import multi
++
++    w = _weights()
++    c = forward.Caches(w, 8192, streams=3, ring=64, kv="fp8")
++    slots = forward.Slots(w, 3, 8)
++    st = forward.State(w, 4096, 8, caches=c, base=2048, slots=slots, slot=0)
++    for ik, ig in c.rings:
++        ik[:64].copy_(torch.randn(64, 128).to(torch.bfloat16))
++        ig[:64].copy_(torch.randn(64, 128).to(torch.bfloat16))
++    lane = SimpleNamespace(slot=0, sid=1, extent=SimpleNamespace(size=4096, base=2048), st=st)
++    fake = SimpleNamespace(e=SimpleNamespace(slots=slots, caches=c, rows=8), lanes={1: lane}, drafts=None, w=w)
++    multi.MultiDecoder._reslot(fake, lane, 2)
++    assert lane.slot == 2 and lane.st.slot == 2
++    for ik, ig in c.rings:
++        assert torch.equal(ik[128:192], ik[:64]) and torch.equal(ig[128:192], ig[:64])
++    assert lane.st.index[0][0].data_ptr() == c.rings[0][0][128].data_ptr()
++
++
++def test_verify_spans_name_the_ring():
++    from tensorfold.families.glm5_next.cuda import verify
++
++    w = _weights()
++    for ring, want in ((None, (2048, 5, 3)), (64, (2048, 5, 3, 128))):
++        c = forward.Caches(w, 8192, streams=3, ring=ring, kv="fp8" if ring else "bf16")
++        st = SimpleNamespace(base=2048, slot=2)
++        assert verify.BatchedVerify._span(SimpleNamespace(e=SimpleNamespace(caches=c)), st, 5, 3) == want
++
++
++# -- the attention node's estimate ------------------------------------------------------------------------------------
++
++def _estimate(kv: str, par: int, window: int = 262144) -> tuple[float, int]:
++    """GlmEngine's geometry on the AFD attention node (world 1, MTP off, latent cache, no EXL3 scratch) plus the
++    --parallel extras, in bytes at a --context window; and the geometry's bytes a further window token."""
++
++    from tensorfold.families.glm5_next.cuda.engine import MULTI_WINDOW, multi_draft_bytes, slot_bytes
++
++    rows = max(engine.MAX_ROWS, geometry.PREFILL_ROWS)
++    g = geometry.mla_geometry(TEXT, 1, engine.MAX_ROWS, minimum_slots=engine.DENSE_CAPACITY, latent=True, mtp=False,
++                              exl3_scratch=False, **({"kv": kv, "ring_rows": rows} if kv != "bf16" else {}))
++    slots = window + engine.MAX_ROWS
++    total = g.bytes_at(slots)
++    if par > 1:
++        draft = {"num_hidden_layers": 5, "num_key_value_heads": 8, "head_dim": 128, "sliding_window": 2048,
++                 "dflash_config": {"block_size": 8}}
++        total += (par - 1) * slot_bytes(TEXT, 1) + MULTI_WINDOW * slots
++        total += multi_draft_bytes(draft, par, 1, ring=True, capacity=slots)
++        if kv != "bf16":
++            total += (par - 1) * geometry.mla_ring_bytes(TEXT, rows)
++    return total, (g.bytes_at(slots + 65536) - g.bytes_at(slots)) // 65536
++
++
++def test_estimate_at_262144_with_q4():
++    """fp8 KV takes 6,716 B a window token on the 5090 (bf16: 18,112); with q4 dense weights --parallel 4 at a
++    262,144-token window estimates 16.10 GiB of the 28.75 GiB budget (bf16 KV: 18.83; bf16 dense with bf16 KV, the
++    split before these ports: 29.28, refused). Anchors: the measured single-stream estimate 28.18 GiB at 262,144 (bf16, bf16 KV)
++    and q4's weights 10.443 GiB below bf16's."""
++
++    base_bf16, slope_bf16 = _estimate("bf16", 1)
++    _, slope_fp8 = _estimate("fp8", 1)
++    assert (slope_bf16, slope_fp8) == (18112, 6716)
++    assert geometry.mla_ring_bytes(TEXT, 2048) == 12 * 2 * 2112 * 128 * 2       # 12 DSA layers, MTP off: 12.38 MiB
++    anchored = {}
++    for kv in ("bf16", "fp8"):
++        for par in (1, 2, 4):
++            total, _ = _estimate(kv, par)
++            for dense, saves in (("bf16", 0.0), ("q4", 16.950 - 6.506)):
++                anchored[kv, dense, par] = round((28.18 * GIB + total - base_bf16) / GIB - saves, 2)
++    assert anchored["bf16", "bf16", 1] == 28.18 and anchored["bf16", "bf16", 4] == 29.28
++    assert [anchored["fp8", "q4", p] for p in (1, 2, 4)] == [14.96, 15.38, 16.10]
++    assert [anchored["bf16", "q4", p] for p in (1, 2, 4)] == [17.74, 18.14, 18.83]
++    assert all(anchored["fp8", "q4", p] <= 28.75 for p in (1, 2, 4))
+diff --git a/tests/test_glm_kv8_multi.py b/tests/test_glm_kv8_multi.py
+new file mode 100644
+index 0000000..f5f19db
+--- /dev/null
++++ b/tests/test_glm_kv8_multi.py
+@@ -0,0 +1,214 @@
++"""TF_GLM_KV=fp8's indexer rings in the multi-stream engine (--parallel) and the single-stream paths, on the CPU.
++
++The fake model of tests/test_glm_multi.py and tests/test_glm_multi_afd.py (logits that hash what each stream
++committed, read back from its pool rows and its slot) with the fp8 layout of forward.Caches: one ring of the
++indexer's per-token keys and gates a stream slot, beside the extents' pools, and a pool's key computed from its four
++tokens' RING rows when its last token is written, as the indexer kernels compute it. A ring row lost or stale (a stream
++moved to another slot without its rows, a kept prompt resumed elsewhere without its tail, a tail overwritten by later
++windows) gives another pooled key, other logits and another reply, so every reply that equals its request served
++alone also says the rings followed the stream. The scenarios are the multi-stream suites' own (two ranks with serial
++verify windows; the AFD attention node at world 1 with the real batched-verify seam), run with these caches; two
++mutations (the ring rows left behind by a slot move, kept tails not put back) must make them fail.
++"""
++
++from __future__ import annotations
++
++import importlib
++
++import pytest
++
++from tests import test_glm_multi as tm
++from tests import test_glm_multi_afd as ta
++from tests.test_cuda_geometry import allocations  # noqa: F401  (fixture: fake triton, so decode imports)
++
++pytestmark = pytest.mark.torch
++
++# The two suites' fixtures, bound here by assignment: pytest registers them in this module under these same names,
++# as the by-name imports did (a test parameter that shadows a fixture imported by name is ruff's F811)
++fake = tm.fake
++afd_fake = ta.afd_fake
++
++RING = 72          # >= the fakes' widest window (64-row prompt chunks) + 3, as forward.index_ring sizes it; wraps often
++
++
++class RingCaches(tm.FakeCaches):
++    """The fake pool plus forward.Caches' fp8 rings: (keys, gates) [4 slots x RING, 1] of the one indexed layer."""
++
++    def __init__(self, torch, rows: int) -> None:
++        super().__init__(torch, rows)
++        self.ring = RING
++        self.rings = [tuple(torch.zeros((4 * RING, 1), dtype=torch.int64) for _ in range(2))]
++
++    def ring_base(self, slot: int) -> int:
++        return int(slot) * self.ring
++
++
++class RingState(tm.FakeState):
++    """forward.State's fp8 views: its slot's rings (index[0] = keys, gates, the extent's pools)."""
++
++    def bind(self, base: int, capacity: int) -> None:
++        super().bind(base, capacity)
++        c = self.caches
++        r0 = c.ring_base(self.slot)
++        self.index = [(c.rings[0][0][r0:r0 + c.ring], c.rings[0][1][r0:r0 + c.ring], self.pk)]
++
++    def write(self, q: int, tok: int) -> None:
++        if q >= self.capacity:
++            raise ValueError("context past the cache capacity")
++        ik, ig, _ = self.index[0]
++        n = ik.shape[0]
++        self.lat[q, 0] = tok + 1
++        ik[q % n, 0] = tok + 1
++        ig[q % n, 0] = 1 + (7 * tok + q) % 13
++        if q % 4 == 3:
++            # the pool's key from its 4 tokens' RING rows (as index_update's pooling reads them): the same value as the
++            # plain fake's (the sum of the tokens + 1, so its drafters' chains still match), unless a ring row is
++            # stale or missing; each row's gate must be its own token's at its own position
++            rows = [(q - i) % n for i in range(4)]
++            for i, r in enumerate(rows):
++                assert int(ig[r, 0]) == 1 + (7 * (int(ik[r, 0]) - 1) + q - i) % 13, ("stale ring row", q - i)
++            self.pk[q // 4, 0] = int(ik[rows, 0].sum())
++
++
++@pytest.fixture
++def rings(monkeypatch):
++    forward = importlib.import_module("tensorfold.families.glm5_next.cuda.forward")
++    monkeypatch.setattr(tm, "FakeCaches", RingCaches)
++    monkeypatch.setattr(tm, "FakeState", RingState)
++    monkeypatch.setattr(forward, "State", RingState)       # multi._reslot's State, whichever fixture ran first
++    return monkeypatch
++
++
++def _ringed(torch) -> None:
++    """The scenarios built ring caches (not the plain fake)."""
++    e = tm.shell(torch, 0, pool=2 * tm.ALIGN, streams=2).e
++    assert isinstance(e.caches, RingCaches) and isinstance(e.home, RingState)
++    from tensorfold.families.glm5_next.cuda.decode import has_rings
++
++    assert has_rings(e.home)
++
++
++# -- two ranks, serial verify windows (tests/test_glm_multi.py's scenarios) ------------------------------------------
++
++@pytest.mark.parametrize("streams,drafters", [(2, "dflash2"), (4, "dflash2"), (4, "both"), (2, "mtp")])
++def test_rings_staggered_requests_equal_their_solo_replies(fake, rings, streams, drafters):
++    _ringed(fake)
++    tm.test_staggered_concurrent_requests_equal_their_solo_serial_replies(fake, streams, drafters)
++
++
++@pytest.mark.parametrize("policy,mtp", [("f3", False), ("2", True)], ids=["dflash2", "mtp"])
++def test_rings_resumes_take_kept_prompts_over_or_copy_them(fake, rings, policy, mtp):
++    tm.test_resumes_take_kept_extents_over_or_copy_them(fake, policy, mtp)
++
++
++def test_rings_the_same_prompt_again_resumes_before_its_last_token(fake, rings):
++    tm.test_the_same_prompt_again_resumes_before_its_last_token(fake)
++
++
++def test_rings_a_lone_stream_moves_home_and_a_second_one_joins(fake, rings):
++    tm.test_a_lone_stream_moves_home_and_a_second_one_joins(fake)
++
++
++def test_rings_growth_pause_and_give_back(fake, rings):
++    tm.test_growth_moves_extents_and_keeps_every_row(fake)
++    tm.test_a_stream_without_room_pauses_and_the_youngest_goes_back_when_all_wait(fake)
++
++
++def test_rings_mtp_drafts_and_kept_prompts(fake, rings):
++    tm.test_mtp_drafts_need_kept_prompts_with_the_heads_rows(fake)
++
++
++# -- the AFD attention node at world 1, batched verify windows (tests/test_glm_multi_afd.py's scenarios) -------------
++
++@pytest.mark.parametrize("streams", [2, 4])
++def test_rings_world1_staggered_requests_equal_their_solo_replies(afd_fake, rings, streams):
++    ta.test_world1_staggered_requests_equal_their_solo_replies(afd_fake, streams)
++
++
++def test_rings_world1_cancel_pause_give_back_and_resume(afd_fake, rings):
++    ta.test_world1_cancel_pause_give_back_and_resume(afd_fake)
++
++
++def test_rings_world1_scheduler_burst(afd_fake, rings):
++    ta.test_world1_scheduler_burst(afd_fake)
++
++
++def test_rings_world1_prompt_rows_cross_in_fill_chunks(afd_fake, rings):
++    ta.test_prompt_rows_cross_in_fill_chunks(afd_fake, afd_fake.monkeypatch)
++
++
++def test_world1_spans_name_each_slots_ring(afd_fake, rings):
++    """BatchedVerify's segments carry each stream's ring base (verify._span) at world 1."""
++
++    w1 = ta.World1(afd_fake, streams=4)
++    seen = []
++    w1.verify.seg_rows.set = lambda spans, sparse_from=None: seen.append(list(spans))
++    for k in range(3):
++        w1.submit(tm._prompt(90 + 7 * k, 40 + k), 24)
++    w1.run()
++    assert seen and all(len(s) == 4 for spans in seen for s in spans)
++    assert {s[3] for spans in seen for s in spans} >= {0, RING}          # more than one slot's ring
++    assert all(s[3] % RING == 0 for spans in seen for s in spans)
++
++
++# -- the fake is ring-sensitive: the glue's absence fails the scenarios ------------------------------------------------
++
++def _moved_mid_pool(torch) -> None:
++    """One stream moved from slot 0 to slot 1 between two rounds while a pool is still filling (pos % 4 != 0), both
++    ranks; it decodes on in slot 1 and must still give its solo reply."""
++
++    p = tm.Pair(torch, streams=2, blocks=4)
++    prompt = tm._prompt(150, 90)
++    s = p.submit(prompt, 60, None, stop_eos=False)
++    moved = False
++    while p.d[0].lanes:
++        p.step()
++        lane = p.d[0].lanes.get(s.sid)
++        if not moved and lane is not None and lane.decoding and lane.slot == 0 and lane.st.pos % 4:
++            for d in p.d:
++                d._reslot(d.lanes[s.sid], 1)
++            moved = True
++    assert moved
++    assert s.got == tm.solo(torch, prompt, 60, None, stop_eos=False)
++
++
++def test_rings_a_stream_moved_mid_pool_keeps_its_rows(fake, rings):
++    _moved_mid_pool(fake)
++
++
++def test_mutation_slot_moves_without_ring_rows_fail(fake, rings):
++    """multi._reslot without its ring copy (the recipe's 0038 as written: the rows stay in the old slot's ring)."""
++
++    multi = importlib.import_module("tensorfold.families.glm5_next.cuda.multi")
++    orig = multi.MultiDecoder._reslot
++
++    def left_behind(self, lane, slot):
++        c = self.e.caches
++        r1 = c.ring_base(slot)
++        saved = [(ik[r1:r1 + c.ring].clone(), ig[r1:r1 + c.ring].clone()) for ik, ig in c.rings]
++        orig(self, lane, slot)
++        for (ik, ig), (a, b) in zip(c.rings, saved):        # undo the copy: the new slot's stale rows
++            ik[r1:r1 + c.ring].copy_(a)
++            ig[r1:r1 + c.ring].copy_(b)
++
++    rings.setattr(multi.MultiDecoder, "_reslot", left_behind)
++    with pytest.raises(AssertionError):
++        _moved_mid_pool(fake)
++
++
++def test_mutation_kept_prompts_without_their_tails_fail(fake, rings):
++    """Kept prompts resumed without their ring tails (decode.put_ring_tail a no-op)."""
++
++    decode = importlib.import_module("tensorfold.families.glm5_next.cuda.decode")
++    rings.setattr(decode, "put_ring_tail", lambda st, snap: None)
++    failed = 0
++    for policy, mtp in (("f3", False), ("2", True)):
++        try:
++            tm.test_resumes_take_kept_extents_over_or_copy_them(fake, policy, mtp)
++        except AssertionError:
++            failed += 1
++    try:
++        tm.test_the_same_prompt_again_resumes_before_its_last_token(fake)
++    except AssertionError:
++        failed += 1
++    assert failed >= 1

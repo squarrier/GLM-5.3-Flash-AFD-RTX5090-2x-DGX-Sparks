@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 23:01:33 -0400
+Subject: [PATCH] tests: the prompt-switch test clears the decode switches
+ before its decode-window check (MiaAI-Lab recipe patches 0016, 0047)
+
+tests/test_exl3_prompt_switches.py asserts that decode windows take no EXL3 switch while reading the process
+environment. With the decode kernel's switches (TF_GLM_EXL3_DEC / TF_GLM_EXL3_LOADS) set in the environment that no
+longer holds, so the test unsets them first, as it unsets its own.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patches 0016, 0047,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 1576746a04983b6eded0551dbf22512ee9e95654 (v1.5); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ tests/test_exl3_prompt_switches.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tests/test_exl3_prompt_switches.py b/tests/test_exl3_prompt_switches.py
+index 7dfbbbc..e39f187 100644
+--- a/tests/test_exl3_prompt_switches.py
++++ b/tests/test_exl3_prompt_switches.py
+@@ -230,7 +230,7 @@ def test_order_slots_bounds_every_grouping():
+ # ---------------------------------------------------------------------------------------------------- plumbing
+ 
+ def test_switches_read_mias_env_names(monkeypatch):
+-    for v in exl3_generic.SWITCHES.values():
++    for v in (*exl3_generic.SWITCHES.values(), "TF_GLM_EXL3_DEC", "TF_GLM_EXL3_LOADS"):   # the decode switches unset
+         monkeypatch.delenv(v, raising=False)
+     assert exl3_generic.switches(1) == {} and exl3_generic.switches(63) == {}
+     assert exl3_generic.switches(64) == {"nfirst": True, "prefetch": True, "order": True, "rowrot": True}

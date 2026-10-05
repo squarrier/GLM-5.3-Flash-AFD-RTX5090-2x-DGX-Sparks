@@ -1,0 +1,1209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 16:28:33 -0400
+Subject: [PATCH] GLM: attention-side prompt kernels behind switches (MiaAI-Lab
+ recipe patches 0004, 0009, 0028)
+
+Ports the attention node's prompt-chunk kernels of MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Spark recipe at 1576746
+(her tree d747563: the end state of patches 0004-glm-prompt-kernels, 0009-glm-prefill-kernels and 0028, with
+0038's FP8 cache rows in the one-pass kernel), each behind its own switch, off unless set:
+
+- TF_GLM_LATENT_MMA=1: a prompt chunk's absorb and expand on the tensor cores (_absorb_mma, _expand_mma).
+- TF_GLM_HC_MMA=1: a prompt chunk's hyper-connection mixing dots on the tensor cores (_hc_partial_mma).
+- TF_GLM_SEQ_ROWS=<rows> (her default 256): from that many rows, the BF16 / FP8 matmuls run every K slice in one
+  program and sum them in _reduce's order (the same bits, no fp32 partials), with her prompt tiles.
+- TF_GLM_SPARSE_ONEPASS=1: a prompt chunk's sparse rows in one online softmax a row (_sparse_onepass).
+- TF_GLM_PROMPT_DSA=1 (this port's name for her unconditional path): a prompt chunk's selection through
+  _select_prompt (pool_count's pools, TF_GLM_SCORE_RB rows a program), its dense pass only on the rows before
+  SPARSE_FROM (forward.dense_rows) and its dense blocks' positions from one device add (Buffers.att_starts):
+  the same tokens, counts and dense bits for every row a later kernel reads.
+
+The kernels are hers verbatim (ruff 0.6.9's E741 on her one-pass kernel's `l` silenced by comments only). With every
+switch unset the forward's calls are the base's. CPU: tests/test_glm_attn_prompt_kernels.py checks the switches
+and, under the Triton interpreter, that the ported kernels give her tree's digests on the same seeded inputs
+(tests/data/glm_attn_prompt_mia_digests.json) and this port's same-bits claims; on a GPU the same-bits checks.
+
+Unset, every call is the base's, arguments included (the CPU harness's kernel fakes take the base's
+signatures). The harness the call-recording tests share (test_glm_multi_prefill.py's build_forward and
+patch_kernels, which test_glm_prefill_pairs.py and test_glm_kda_chunked.py use) follows the switches too: its
+stand-in prompt buffers carry forward.Buffers' att_starts, it records sparse_onepass beside sparse_attention, and
+its latent fakes take the `prompt` keyword. tests/test_glm_decode_kernels.py's routing test checks the stock
+selection with TF_GLM_PROMPT_DSA unset, then that a prompt chunk takes _select_prompt with it set.
+
+Credit: THIRD_PARTY_NOTICES.md ("GLM attention-side prompt kernels") names MiaAI-Lab, the patches and the recipe
+commit.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patches 0004, 0009, 0028,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 1576746a04983b6eded0551dbf22512ee9e95654 (v1.5); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |  18 ++
+ .../families/glm5_next/cuda/forward.py        |  60 +++-
+ .../families/glm5_next/cuda/glue.py           |  44 ++-
+ .../families/glm5_next/cuda/latent.py         | 228 ++++++++++++++-
+ src/tensorfold/families/glm5_next/cuda/qmm.py | 133 +++++++--
+ .../families/glm5_next/cuda/sparse.py         |  73 +++++
+ tests/data/glm_attn_prompt_mia_digests.json   |  16 +
+ tests/test_glm_attn_prompt_kernels.py         | 274 ++++++++++++++++++
+ tests/test_glm_decode_kernels.py              |   9 +
+ tests/test_glm_multi_prefill.py               |  12 +-
+ 10 files changed, 816 insertions(+), 51 deletions(-)
+ create mode 100644 tests/data/glm_attn_prompt_mia_digests.json
+ create mode 100644 tests/test_glm_attn_prompt_kernels.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index ae51ccf..d4a292f 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -406,3 +406,21 @@ daemons carry the exchanges; its protocol 1 has one mailbox and one request per
+ opens N links to each expert node (`NAME`, `NAME-1`, ...) and sends the run's k-th request on link k mod N, leaving
+ MCDMA's protocol and daemons unchanged (installed separately, as above). No code is copied. Off unless set
+ (`TF_GLM_MCDMA_INFLIGHT` 1 .. 4; unset or 1: one link to each expert node, as before).
++
++## GLM attention-side prompt kernels (TF_GLM_LATENT_MMA, TF_GLM_HC_MMA, TF_GLM_SEQ_ROWS, TF_GLM_SPARSE_ONEPASS, TF_GLM_PROMPT_DSA)
++
++`families/glm5_next/cuda/latent.py`'s `_absorb_mma`, `_expand_mma`, `MMA_TILE`, `MMA_LAUNCH` and the `prompt` paths
++of `absorb_q` / `expand_v`, its `_tile_v`, `_onepass_ids`, `_onepass_rows`, `_onepass_scales`, `_sparse_onepass`,
++`ONEPASS_TILE`, `ONEPASS_LAUNCH` and `sparse_onepass`; `glue.py`'s `_hc_partial_mma` and `hc_pre`'s `prompt` path;
++`qmm.py`'s `_seq`, `F8_PROMPT`, `PROMPT_DEFAULT`, `_prompt_cfg` and the SEQ form of `_bmm` / `_fmm`; `sparse.py`'s
++`pool_count`, `score_rows` and `_select_prompt`; and `forward.py`'s `dense_rows`, `dense_attention`'s `hb` / `starts`
++and `Buffers.att_starts` are ported from MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/1576746)
++patches 0004-glm-prompt-kernels, 0009-glm-prefill-kernels and 0028 (the prompt dense blocks' device starts), in their
++end state in the recipe's tree (the one-pass kernel with 0038-glm-kv-fp8's FP8 rows, the selection as 0024 left it),
++Apache License 2.0, Copyright 2026 MiaAI-Lab (see [the license text](LICENSES/Apache-2.0.txt)). The kernels are the
++recipe's verbatim. Changes in the port: every path is behind its own switch, off unless set (the recipe runs them by
++default, or always): `TF_GLM_LATENT_MMA`, `TF_GLM_HC_MMA` and `TF_GLM_SPARSE_ONEPASS` keep the recipe's names and are
++read per call; `TF_GLM_SEQ_ROWS` (the recipe's name, its default 256) is off when unset; `TF_GLM_PROMPT_DSA` is this
++port's switch for the recipe's unconditional prompt-chunk selection, dense-row cut and device starts. The recipe's
++third `hc_pre(prompt=True)` call site belongs to its overlapped prompt pairs, which this tree does not have.
+diff --git a/src/tensorfold/families/glm5_next/cuda/forward.py b/src/tensorfold/families/glm5_next/cuda/forward.py
+index 653777a..b1be1ae 100644
+--- a/src/tensorfold/families/glm5_next/cuda/forward.py
++++ b/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -65,6 +65,9 @@ class Buffers:
+             # a prompt chunk's dense pass runs PROMPT_ATT_ROWS rows at a time: its fp32 partials hold that many rows
+             self.lat_s = latent.LatentScratch(rows, HL, latent.chunks_for(min(capacity, 2560) + rows), dev,
+                                               lw=c.kv_lora, part_rows=PROMPT_ATT_ROWS if prefill else rows)
++            # TF_GLM_PROMPT_DSA (MiaAI-Lab recipe patch 0028): the dense blocks' first-row offsets, one device add
++            self.att_starts = (torch.arange(0, rows, self.lat_s.part_rows, dtype=torch.int32, device=dev)
++                               if prefill else None)
+         else:
+             self.attn = AttnScratch(1 if prefill else rows, HL, c.qk_dim, capacity, dev)
+         if prefill:
+@@ -575,14 +578,37 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
+     return out_proj(w, b, o, a.o, None if b.prefill else qmm.group_sums(o, b.xs_ao[:R]), R)
+ 
+ 
++def dense_rows(c, R: int, host_pos: int | None) -> int:
++    """Rows of a window from ``host_pos`` that keep dense attention: those before the first position select_tokens
++    gives a sparse count (sparse_attention overwrites every row from there). All R when the position is not known
++    on the host or the config's dense limit is not the selection's. (MiaAI-Lab recipe patch 0009, verbatim;
++    TF_GLM_PROMPT_DSA)"""
++
++    if host_pos is None or c.dense_limit != sparse.SPARSE_FROM:
++        return R
++    return min(R, max(0, sparse.SPARSE_FROM - host_pos))
++
++
+ def dense_attention(qa: torch.Tensor, lc: torch.Tensor, pos_dev: torch.Tensor, s: latent.LatentScratch, *,
+-                    scale: float, nch: int, out: torch.Tensor) -> torch.Tensor:
+-    """``latent.attention`` in blocks of ``part_rows`` rows, each at its first row's position: one call's bits a row."""
++                    scale: float, nch: int, out: torch.Tensor, hb: int | None = None,
++                    starts: torch.Tensor | None = None) -> torch.Tensor:
++    """``latent.attention`` in blocks of ``part_rows`` rows, each at its first row's position: one call's bits a row.
++    ``hb``: the window's ``head_block`` (default: qa's rows'), which a window's first rows computed alone keep;
++    ``starts`` (TF_GLM_PROMPT_DSA, MiaAI-Lab recipe patch 0028): arange(0, rows, part_rows) on the device, block i's
++    queries at pos_dev + starts[i] from one add (the same positions as pos_dev + r0)."""
+ 
+     R, step = qa.shape[0], s.part_rows
+-    hb = latent.head_block(R)
++    hb = latent.head_block(R) if hb is None else hb
+     if R <= step:
+         return latent.attention(qa, lc, pos_dev, s, scale=scale, nch=nch, out=out, hb=hb)
++    if starts is not None:
++        if starts.numel() < -(-R // step):
++            raise ValueError(f"dense attention of {R} rows in blocks of {step} needs the blocks' start offsets")
++        at = pos_dev + starts                              # each block's first row's position, on the device
++        for i, r0 in enumerate(range(0, R, step)):
++            r1 = min(R, r0 + step)
++            latent.attention(qa[r0:r1], lc, at[i:i + 1], s, scale=scale, nch=nch, out=out[r0:r1], hb=hb)
++        return out
+     for r0 in range(0, R, step):
+         r1 = min(R, r0 + step)
+         at = pos_dev if r0 == 0 else pos_dev + r0          # the block's first row's position, on the device
+@@ -622,23 +648,36 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
+             mm(b, b.normed[rs], ix.kw, b.xs[rs], b.ikr[rs])
+             glue.router(b.normed[rs], ix.gate, b.igr[rs])
+             sparse.index_update(b.ikr[rs, :c.index_dim], b.igr[rs], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
++    # TF_GLM_LATENT_MMA (MiaAI-Lab 0004): prompt rows on the tensor cores; unset, the calls are the base's
++    mma = {"prompt": True} if b.prefill and latent.prompt_mma() else {}
+     with prof.timed("dsa: absorb"):
+-        qa = latent.absorb_q(b.q[rs], a.absorb, s.qa[rs])
++        qa = latent.absorb_q(b.q[rs], a.absorb, s.qa[rs], **mma)
+     ol = s.ol[rs]
+     scale = c.qk_dim ** -0.5
++    lean = b.prefill and sparse.prompt_dsa()     # TF_GLM_PROMPT_DSA (MiaAI-Lab 0009, 0028): the same bits
+     if not all_sparse:
+-        # Rows past the dense limit are recomputed sparsely below, so the dense pass needs only the chunks up to it.
++        # Rows past the dense limit are recomputed sparsely below, so the dense pass needs only the chunks up to it
++        # (and, TF_GLM_PROMPT_DSA, only the rows before it: a row's dense bits do not depend on the rows after it)
+         with prof.timed("dsa: dense attention"):
+-            dense_attention(qa, lc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol)
++            if lean:
++                dense = dense_rows(c, R, host_pos) if sparse_rows else R
++                dense_attention(qa[:dense], lc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch),
++                                out=ol[:dense], hb=latent.head_block(R), starts=b.att_starts)
++            else:
++                dense_attention(qa, lc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol)
+     if sparse_rows:
+         with prof.timed("dsa: select tokens"):
+             mm(b, b.qr[rs], ix.qb, b.xs_qr[rs], b.qi[rs])
+             tokens, counts = sparse.select_tokens(b.qi[rs], b.ikr[rs, c.index_dim:], pk, host_pos, R,
+                                                   pk.shape[0] - 2, pos_dev, bucket=sparse_np)
+         with prof.timed("dsa: sparse attention"):
+-            latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
++            if b.prefill and latent.sparse_onepass_on():    # TF_GLM_SPARSE_ONEPASS (0009): one pass a row
++                latent.sparse_onepass(qa, lc, tokens, counts, ol, scale)
++            else:
++                latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
+     with prof.timed("dsa: expand"):
+-        return latent.expand_v(ol, a.absorb, b.vn[rs]).view(R, HL * c.v_dim)
++        o = latent.expand_v(ol, a.absorb, b.vn[rs], **mma)
++        return o.view(R, HL * c.v_dim)
+ 
+ 
+ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int, rows, sel=None, index=None, *,
+@@ -770,8 +809,9 @@ def layer_front(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: i
+     c = w.cfg
+     x = b.x[:R]
+     h = layer.attn_hc
++    hc_kw = {"prompt": True} if b.prefill and glue.hc_mma() else {}     # TF_GLM_HC_MMA (MiaAI-Lab 0004)
+     glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
+-                b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
++                b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, **hc_kw)
+     if mixer is not None:
+         g = mixer(layer)
+     elif layer.kind == "kda":
+@@ -786,7 +826,7 @@ def layer_front(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: i
+         glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
+         h = layer.ffn_hc
+         glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
+-                    b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
++                    b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, **hc_kw)
+ 
+ 
+ def check_room(w: Weights, st: State, R: int, pos: int | None = None) -> None:
+diff --git a/src/tensorfold/families/glm5_next/cuda/glue.py b/src/tensorfold/families/glm5_next/cuda/glue.py
+index 9f6ed64..a020d70 100644
+--- a/src/tensorfold/families/glm5_next/cuda/glue.py
++++ b/src/tensorfold/families/glm5_next/cuda/glue.py
+@@ -180,15 +180,53 @@ def _hc_ext():
+                 extra_cuda_cflags=["-O3"], verbose=False)
+ 
+ 
++# -- TF_GLM_HC_MMA (ported: MiaAI-Lab recipe patch 0004-glm-prompt-kernels, her _hc_partial_mma and its launch
++# verbatim; Apache License 2.0, Copyright 2026 MiaAI-Lab; see THIRD_PARTY_NOTICES.md) ------------------------------
++@triton.jit
++def _hc_partial_mma(X, FN, PART, R, WIDE: tl.constexpr, NB: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr):
++    """Prompt rows, program (row block, K block): _hc_partial's 24 dots on the tensor cores (one fp32 chain over
++    ascending k tiles, a row's bits independent of the other rows) and its sum of squares, in PART's layout."""
++
++    rm = tl.program_id(0) * BM + tl.arange(0, BM)
++    b = tl.program_id(1)
++    KB: tl.constexpr = WIDE // NB
++    m = tl.arange(0, 32)
++    k = tl.arange(0, BK)
++    ok = rm < R
++    acc = tl.zeros((BM, 32), dtype=tl.float32)
++    ss = tl.zeros((BM,), dtype=tl.float32)
++    for t in range(KB // BK):
++        base = b * KB + t * BK
++        x = tl.load(X + rm[:, None] * WIDE + base + k[None, :], mask=ok[:, None], other=0.0)
++        w = tl.load(FN + m[None, :] * WIDE + base + k[:, None], mask=m[None, :] < 24, other=0.0)
++        acc = tl.dot(x, w, acc)
++        xf = x.to(tl.float32)
++        ss += tl.sum(xf * xf, axis=1)
++    tl.store(PART + (rm[:, None] * NB + b) * 32 + m[None, :], acc, mask=ok[:, None] & (m[None, :] < 24))
++    tl.store(PART + (rm * NB + b) * 32 + 24, ss, mask=ok)
++
++
++def hc_mma() -> bool:
++    """TF_GLM_HC_MMA (MiaAI-Lab recipe patch 0004's name; off unless set to 1, her default is on): a prompt chunk's
++    rows (``hc_pre(prompt=True)``) take their mixing dots on the tensor cores, _hc_partial_mma: other bits than
++    _hc_partial's (decode rows keep those), the same for any chunking (her arithmetic). Unset or 0: as before."""
++    return os.environ.get("TF_GLM_HC_MMA", "0") != "0"
++
++
+ def hc_pre(x: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.Tensor, norm_w: torch.Tensor,
+            out: torch.Tensor, xs: torch.Tensor, post: torch.Tensor, comb: torch.Tensor, part: torch.Tensor,
+-           eps: float, hc_eps: float, iters: int) -> None:
+-    """x [R, S*D] bf16 streams -> out [R, D] (normed collapsed row) + xs, and post [R, S], comb [R, S, S]."""
++           eps: float, hc_eps: float, iters: int, *, prompt: bool = False) -> None:
++    """x [R, S*D] bf16 streams -> out [R, D] (normed collapsed row) + xs, and post [R, S], comb [R, S, S];
++    ``prompt``: a prompt chunk's rows, under TF_GLM_HC_MMA their mixing dots on the tensor cores (other bits than
++    decode rows')."""
+ 
+     rows, wide = x.shape
+     d = norm_w.shape[0]
+     s = wide // d
+-    if (rows < HC_DEC_ROWS and hc_dec() and wide == 16384 and fn.shape[0] == 24 and HC_BLOCKS == 16
++    if prompt and hc_mma() and x.is_contiguous():
++        _hc_partial_mma[(triton.cdiv(rows, 64), HC_BLOCKS)](x, fn, part, rows, WIDE=wide, NB=HC_BLOCKS, BM=64, BK=64,
++                                                            num_warps=4, num_stages=3)
++    elif (rows < HC_DEC_ROWS and hc_dec() and wide == 16384 and fn.shape[0] == 24 and HC_BLOCKS == 16
+             and x.is_contiguous() and fn.is_contiguous() and part.is_contiguous()):
+         _hc_ext().hc_partial(x, fn, part, rows)                  # _hc_partial's bits on 48 blocks a row
+     else:
+diff --git a/src/tensorfold/families/glm5_next/cuda/latent.py b/src/tensorfold/families/glm5_next/cuda/latent.py
+index d8d57ce..5dd6d1c 100644
+--- a/src/tensorfold/families/glm5_next/cuda/latent.py
++++ b/src/tensorfold/families/glm5_next/cuda/latent.py
+@@ -3,6 +3,10 @@
+ TF_GLM_KV=fp8's cache rows (the latent writes, and the reads that fold each row's scale in, segmented ones included)
+ are ported from Mia's AI Lab's (@MiaAI-Lab) GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patch 0038-glm-kv-fp8
+ (Apache License 2.0, Copyright 2026 MiaAI-Lab; see THIRD_PARTY_NOTICES.md).
++A prompt chunk's absorb and expand on the tensor cores (_absorb_mma, _expand_mma; TF_GLM_LATENT_MMA) and its one-pass
++sparse attention (_tile_v, _onepass_*, _sparse_onepass, sparse_onepass; TF_GLM_SPARSE_ONEPASS) are ported from the same
++recipe @ 1576746, patches 0004-glm-prompt-kernels and 0009-glm-prefill-kernels (the one-pass kernel as 0038 left it,
++with FP8 cache rows); the kernels are hers verbatim, both switches off unless set to 1 (her default is on).
+ """
+ 
+ from __future__ import annotations
+@@ -162,14 +166,72 @@ def _expand_v4(OL, WW, WS, WB, OUT, R, H: tl.constexpr, DV: tl.constexpr, LW: tl
+         tl.store(OUT + (r * H + h) * DV + n, acc.to(tl.bfloat16))
+ 
+ 
++# -- TF_GLM_LATENT_MMA (ported: MiaAI-Lab recipe patch 0004-glm-prompt-kernels, her _absorb_mma / _expand_mma and
++# their tile and launch verbatim; Apache License 2.0, Copyright 2026 MiaAI-Lab) ------------------------------------
++@triton.jit
++def _absorb_mma(Q, WK, QA, R, H: tl.constexpr, D: tl.constexpr, LW: tl.constexpr, BM: tl.constexpr,
++                BN: tl.constexpr, BK: tl.constexpr):
++    """Prompt rows, program (head, row block, column block): QA = Q @ WK on the tensor cores, each row one fp32 chain
++    over ascending k blocks (its bits do not depend on the other rows)."""
++
++    h = tl.program_id(0)
++    rm = tl.program_id(1) * BM + tl.arange(0, BM)
++    n = tl.program_id(2) * BN + tl.arange(0, BN)
++    kk = tl.arange(0, BK)
++    ok = rm < R
++    acc = tl.zeros((BM, BN), dtype=tl.float32)
++    for k0 in range(0, D, BK):
++        q = tl.load(Q + (rm[:, None] * H + h) * D + k0 + kk[None, :], mask=ok[:, None], other=0.0)
++        w = tl.load(WK + (h * D + k0 + kk[:, None]) * LW + n[None, :])
++        acc = tl.dot(q, w, acc)
++    tl.store(QA + (rm[:, None] * H + h) * LW + n[None, :], acc.to(tl.bfloat16), mask=ok[:, None])
++
++
++@triton.jit
++def _expand_mma(OL, WV, OUT, R, H: tl.constexpr, DV: tl.constexpr, LW: tl.constexpr, BM: tl.constexpr,
++                BN: tl.constexpr, BK: tl.constexpr):
++    """Prompt rows, program (head, row block, output block): OUT = OL @ WV^T on the tensor cores, as _absorb_mma."""
++
++    h = tl.program_id(0)
++    rm = tl.program_id(1) * BM + tl.arange(0, BM)
++    n = tl.program_id(2) * BN + tl.arange(0, BN)
++    kk = tl.arange(0, BK)
++    ok = rm < R
++    acc = tl.zeros((BM, BN), dtype=tl.float32)
++    for k0 in range(0, LW, BK):
++        o = tl.load(OL + (rm[:, None] * H + h) * LW + k0 + kk[None, :], mask=ok[:, None], other=0.0)
++        w = tl.load(WV + (h * DV + n[:, None]) * LW + k0 + kk[None, :])
++        acc = tl.dot(o, tl.trans(w), acc)
++    tl.store(OUT + (rm[:, None] * H + h) * DV + n[None, :], acc.to(tl.bfloat16), mask=ok[:, None])
++
++
++# prompt chunks' tiles (rows, columns, k) and (warps, stages); fixed, so a row's bits never depend on the chunk
++MMA_TILE = (64, 128, 64)
++MMA_LAUNCH = (4, 3)
++
++
++def prompt_mma() -> bool:
++    """TF_GLM_LATENT_MMA (MiaAI-Lab recipe patch 0004's name; off unless set to 1, her default is on): a prompt
++    chunk's absorb and expand (bf16 kv_b, ``AbsorbW``) on the tensor cores, _absorb_mma / _expand_mma: other bits than
++    the decode kernels', the same for any chunking of the rows (her arithmetic). Unset or 0: the decode kernels."""
++    return os.environ.get("TF_GLM_LATENT_MMA", "0") != "0"
++
++
+ def row_block(R: int) -> int:
+     """Rows per program: 1 for decode windows (most parallel), 16 for prefill chunks (weights reused)."""
+     return 1 if R <= 16 else 16
+ 
+ 
+-def absorb_q(q: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
+-    """q [R, H, qk_dim] bf16 -> out [R, H, latent] bf16."""
++def absorb_q(q: torch.Tensor, a, out: torch.Tensor, *, prompt: bool = False) -> torch.Tensor:
++    """q [R, H, qk_dim] bf16 -> out [R, H, latent] bf16; ``prompt`` (a prompt chunk's rows under
++    TF_GLM_LATENT_MMA): on the tensor cores (other bits than decode rows', the same for any chunking)."""
+     R, H, D = q.shape
++    if prompt and isinstance(a, AbsorbW) and q.is_contiguous():
++        BM, BN, BK = MMA_TILE
++        warps, stages = MMA_LAUNCH
++        _absorb_mma[(H, triton.cdiv(R, BM), a.lw // BN)](q, a.wk, out, R, H=H, D=D, LW=a.lw, BM=BM, BN=BN, BK=BK,
++                                                          num_warps=warps, num_stages=stages)
++        return out
+     if isinstance(a, AbsorbQ4):
+         rb = row_block(R)
+         _absorb_q4[(H, a.lw // 64, triton.cdiv(R, rb))](q, a.wkw, a.wks, a.wkb, out, R, H=H, D=D, LW=a.lw, RB=rb,
+@@ -180,9 +242,15 @@ def absorb_q(q: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
+     return out
+ 
+ 
+-def expand_v(o_lat: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
+-    """o_lat [R, H, latent] bf16 -> out [R, H, v_dim] bf16."""
++def expand_v(o_lat: torch.Tensor, a, out: torch.Tensor, *, prompt: bool = False) -> torch.Tensor:
++    """o_lat [R, H, latent] bf16 -> out [R, H, v_dim] bf16; ``prompt`` as in absorb_q."""
+     R, H, _ = o_lat.shape
++    if prompt and isinstance(a, AbsorbW) and o_lat.is_contiguous():
++        BM, BN, BK = MMA_TILE
++        warps, stages = MMA_LAUNCH
++        _expand_mma[(H, triton.cdiv(R, BM), a.v_dim // BN)](o_lat, a.wv, out, R, H=H, DV=a.v_dim, LW=a.lw, BM=BM,
++                                                             BN=BN, BK=BK, num_warps=warps, num_stages=stages)
++        return out
+     if isinstance(a, AbsorbQ4):
+         BN = 16
+         _expand_v4[(H, a.v_dim // BN)](o_lat, a.wvw, a.wvs, a.wvb, out, R, H=H, DV=a.v_dim, LW=a.lw, BN=BN,
+@@ -301,6 +369,116 @@ def _sparse_chunks(QA, LC, LS, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.c
+     tl.store(PL + base, l, mask=hok)
+ 
+ 
++# -- TF_GLM_SPARSE_ONEPASS (ported: MiaAI-Lab recipe patch 0009-glm-prefill-kernels as 0038-glm-kv-fp8 left it, her
++# _tile_v, _onepass_ids, _onepass_rows, _onepass_scales and _sparse_onepass verbatim; Apache License 2.0, Copyright
++# 2026 MiaAI-Lab) -------------------------------------------------------------------------------------------------
++@triton.jit
++def _tile_v(q, kv, vv, ks, m, l, o, valid, SCALE: tl.constexpr, FP8: tl.constexpr):  # noqa: E741, RUF100
++    """_tile with the values a column slice vv [KT, VB] of the keys kv [KT, 512]."""
++    scores = tl.dot(q, tl.trans(kv)).to(tl.float32)
++    if FP8:
++        scores = scores * ks[None, :]
++    scores = scores * SCALE
++    scores = tl.where(valid[None, :], scores, float("-inf"))
++    tile_m = tl.max(scores, 1)
++    active = tile_m != float("-inf")
++    next_m = tl.where(active, tl.maximum(m, tile_m), m)
++    alpha = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
++    p = tl.where(valid[None, :] & active[:, None], tl.exp(scores - next_m[:, None]), 0.0)
++    if FP8:
++        o = o * alpha[:, None] + tl.dot((p * ks[None, :]).to(tl.bfloat16), vv)
++    else:
++        o = o * alpha[:, None] + tl.dot(p.to(tl.bfloat16), vv)
++    l = l * alpha + tl.sum(p, 1)  # noqa: E741, RUF100
++    return next_m, l, o
++
++
++@triton.jit
++def _onepass_ids(row, t0, n, KTT: tl.constexpr):
++    """Tile t0's token ids (0 past n, where their rows are masked)."""
++    idx = t0 + tl.arange(0, KTT)
++    return tl.load(row + idx, mask=idx < n, other=0).to(tl.int64)
++
++
++@triton.jit
++def _onepass_rows(LC, tok, t0, n, k, RS: tl.constexpr, KTT: tl.constexpr):
++    """Tile t0's latent rows [KTT, LW] (bf16 values or FP8 codes, RS elements apart); rows past n: zeros, unread."""
++    ok = t0 + tl.arange(0, KTT) < n
++    return tl.load(LC + tok[:, None] * RS + k[None, :], mask=ok[:, None], other=0.0)
++
++
++@triton.jit
++def _onepass_scales(LS, tok, t0, n, LW: tl.constexpr, RS: tl.constexpr, KTT: tl.constexpr, FP8: tl.constexpr):
++    """Tile t0's row scales [KTT] (FP8; ones, which nothing reads, for a bf16 cache)."""
++    if FP8:
++        return row_scales(LS, tok, t0 + tl.arange(0, KTT) < n, LW, RS)
++    return tl.full((KTT,), 1.0, tl.float32)
++
++
++@triton.jit
++def _sparse_onepass(QA, LC, LS, TOK, CNT, OUT, W: tl.constexpr, H: tl.constexpr, LW: tl.constexpr,
++                    SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr, SPLIT: tl.constexpr,
++                    STAGES: tl.constexpr, PREFETCH: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr):
++    """Prompt rows, program (row, head group, latent slice): HBT heads of row r over all its selected tokens in one
++    online softmax, KTT-key tiles in list order (_tile's math), straight to OUT[r, h] bf16: no partials, no merge.
++    PREFETCH: tile t + 1's gather is issued into registers before tile t's dots (a load blocks only at first use),
++    with Triton's pipeliner off; else the loop is left to Triton's pipeliner at STAGES. SPLIT > 1: the program keeps
++    LW / SPLIT output columns and recomputes the full-width scores. PREFETCH never changes the arithmetic on a bf16
++    cache (on FP8 codes Triton may lay the converted tile out otherwise: other bits, the same values); the tile
++    (HBT, KTT, SPLIT) and launch are fixed (ONEPASS_TILE, ONEPASS_LAUNCH), so a row's bits depend on its q, its token
++    list and the cache only, never on the other rows or R. Rows with CNT 0 are left alone. FP8 (TF_GLM_KV=fp8): LC
++    holds e4m3 codes RS bytes apart, LS their scales (kv8), folded into scores and probabilities (_tile)."""
++    r = tl.program_id(0)
++    hb = tl.program_id(1)
++    vs = tl.program_id(2)
++    n = tl.load(CNT + r)
++    if n == 0:
++        return
++    VB: tl.constexpr = LW // SPLIT
++    hh = hb * HBT + tl.arange(0, HBT)
++    hok = hh < H
++    k = tl.arange(0, LW)
++    v = vs * VB + tl.arange(0, VB)
++    q = tl.load(QA + (r * H + hh[:, None]) * LW + k[None, :], mask=hok[:, None], other=0).to(tl.bfloat16)
++    m = tl.full((HBT,), float("-inf"), tl.float32)
++    l = tl.zeros((HBT,), tl.float32)  # noqa: E741, RUF100
++    o = tl.zeros((HBT, VB), tl.float32)
++    row = TOK + r * W
++    if PREFETCH:
++        # ids run two tiles ahead and rows one: tile t + 1's gather is issued (its ids already there) before tile t's
++        # dots, so neither load's latency stalls the in-order warp in front of the tensor-core work
++        tok = _onepass_ids(row, 0, n, KTT)
++        kv = _onepass_rows(LC, tok, 0, n, k, RS, KTT)
++        ks = _onepass_scales(LS, tok, 0, n, LW, RS, KTT, FP8)
++        tok_next = _onepass_ids(row, KTT, n, KTT)
++        for t0 in range(0, n, KTT):
++            ok = t0 + tl.arange(0, KTT) < n
++            kv_next = _onepass_rows(LC, tok_next, t0 + KTT, n, k, RS, KTT)
++            ks_next = _onepass_scales(LS, tok_next, t0 + KTT, n, LW, RS, KTT, FP8)
++            tok_after = _onepass_ids(row, t0 + 2 * KTT, n, KTT)
++            if SPLIT == 1:
++                m, l, o = _tile(q, kv.to(tl.bfloat16), ks, m, l, o, ok, SCALE, FP8)  # noqa: E741, RUF100
++            else:
++                vv = tl.load(LC + tok[:, None] * RS + v[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
++                m, l, o = _tile_v(q, kv.to(tl.bfloat16), vv, ks, m, l, o, ok, SCALE, FP8)  # noqa: E741, RUF100
++            tok = tok_next
++            kv = kv_next
++            ks = ks_next
++            tok_next = tok_after
++    else:
++        for t0 in tl.range(0, n, KTT, num_stages=STAGES):
++            ok = t0 + tl.arange(0, KTT) < n
++            tok = _onepass_ids(row, t0, n, KTT)
++            kv = _onepass_rows(LC, tok, t0, n, k, RS, KTT)
++            ks = _onepass_scales(LS, tok, t0, n, LW, RS, KTT, FP8)
++            if SPLIT == 1:
++                m, l, o = _tile(q, kv.to(tl.bfloat16), ks, m, l, o, ok, SCALE, FP8)  # noqa: E741, RUF100
++            else:
++                vv = tl.load(LC + tok[:, None] * RS + v[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
++                m, l, o = _tile_v(q, kv.to(tl.bfloat16), vv, ks, m, l, o, ok, SCALE, FP8)  # noqa: E741, RUF100
++    tl.store(OUT + (r * H + hh[:, None]) * LW + v[None, :], (o / l[:, None]).to(tl.bfloat16), mask=hok[:, None])
++
++
+ @triton.jit
+ def _merge(PO, PM, PL, OUT, CNT, R, H: tl.constexpr, LW: tl.constexpr, NCH: tl.constexpr, SPARSE: tl.constexpr):
+     """Program (row, head): the row's chunk partials in chunk order -> OUT[r, h] bf16. Sparse: rows with CNT 0 skip."""
+@@ -361,7 +539,11 @@ class LatentScratch:
+ 
+ def attention(qa: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, s: LatentScratch, *, scale: float,
+               nch: int, out: torch.Tensor, hb: int | None = None) -> torch.Tensor:
+-    """Dense causal attention of qa [R, H, 512] through pos + R - 1 in nch 512-key chunks; a row ignores the others."""
++    """Dense causal attention of qa [R, H, 512] through pos + R - 1 in nch 512-key chunks; a row ignores the others.
++
++    Row r's programs read only its query, keys 0 .. pos + r and its own partials, so the first rows of a window
++    computed alone (``qa[:n]``, the same nch and ``hb``: the window's ``head_block``) get the window's bits (MiaAI-Lab
++    recipe patch 0009: what ``forward.dense_rows`` relies on)."""
+     R, H, LW = qa.shape
+     if nch > s.nch or R > s.part_rows or LW != s.lw:
+         raise ValueError(f"latent attention: {R} rows, {nch} chunks, width {LW} past the scratch's "
+@@ -396,6 +578,42 @@ def sparse_attention(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor
+     _merge[(R, H)](po, pm, pl, out, counts, R, H=H, LW=LW, NCH=nch, SPARSE=True, num_warps=4)
+ 
+ 
++# prompt chunks' sparse attention in one pass (TF_GLM_SPARSE_ONEPASS=1; unset: the chunk programs and their merge).
++# Fixed tile (heads, keys, latent slices) and pipeline depth, so a row's bits never depend on the chunk it sits in.
++ONEPASS_TILE = (32, 32, 1)          # heads per program (a rank's 32), keys per tile, latent slices: sets the bits
++# warps, Triton pipeline stages, register prefetch of the next tile: speed only on bf16 caches (on FP8 codes the
++# launch sets the bits too, fixed like the tile)
++ONEPASS_LAUNCH = (8, 1, True)
++
++
++def sparse_onepass_on() -> bool:
++    """TF_GLM_SPARSE_ONEPASS (MiaAI-Lab recipe patch 0009's name; off unless set to 1, her default is on): a prompt
++    chunk's sparse rows through ``sparse_onepass`` (other bits than ``sparse_attention``'s merged chunks: one online
++    softmax a row, her arithmetic). Unset or 0: ``sparse_attention``."""
++    return os.environ.get("TF_GLM_SPARSE_ONEPASS", "0") != "0"
++
++
++def sparse_onepass(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor,
++                   out: torch.Tensor, scale: float, *, tile: tuple | None = None, launch: tuple | None = None) -> None:
++    """sparse_attention for a prompt chunk's rows: one program a row (and head group) walks every selected token in
++    one online softmax and writes out[r] directly, no fp32 partials; rows with counts 0 are left alone. Other bits
++    than sparse_attention's (one chain instead of merged 512-token chunks), the same for any chunking of the rows.
++    ``tile`` / ``launch`` override ONEPASS_TILE / ONEPASS_LAUNCH (benchmarks)."""
++    R, H, LW = qa.shape
++    if not (qa.is_contiguous() and out.is_contiguous() and tokens.is_contiguous() and cache.is_contiguous()):
++        raise ValueError("sparse_onepass: expected contiguous queries, output, token lists and cache")
++    vals, scl, rs, fp8 = _cache_parts(cache, LW)
++    if R == 0:
++        return
++    hbt, kt, split = tile or ONEPASS_TILE
++    warps, stages, prefetch = launch or ONEPASS_LAUNCH
++    hbt = max(16, min(hbt, triton.next_power_of_2(H)))            # tensor-core tiles need 16 rows
++    _sparse_onepass[(R, triton.cdiv(H, hbt), split)](qa, vals, scl, tokens, counts, out, W=tokens.shape[1], H=H,
++                                                     LW=LW, SCALE=scale, HBT=hbt, KTT=kt, SPLIT=split, STAGES=stages,
++                                                     PREFETCH=bool(prefetch), RS=rs, FP8=fp8, num_warps=warps,
++                                                     num_stages=1 if prefetch else stages)
++
++
+ def chunks_for(length: int) -> int:
+     return triton.cdiv(length, CHUNK)
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/qmm.py b/src/tensorfold/families/glm5_next/cuda/qmm.py
+index b471297..ad639bd 100644
+--- a/src/tensorfold/families/glm5_next/cuda/qmm.py
++++ b/src/tensorfold/families/glm5_next/cuda/qmm.py
+@@ -2,7 +2,7 @@
+ 
+ TF_GLM_DENSE=q4's quantizers, its FP8 head and their memory estimates are ported from Mia's AI Lab's (@MiaAI-Lab)
+ GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patches 0002, 0005 and 0013 (Apache License 2.0, Copyright 2026 MiaAI-Lab;
+-see THIRD_PARTY_NOTICES.md).
++see THIRD_PARTY_NOTICES.md); TF_GLM_SEQ_ROWS's prompt form of the BF16 / FP8 matmuls from its patch 0004.
+ """
+ 
+ from __future__ import annotations
+@@ -250,10 +250,52 @@ def stack_b16(parts: list[torch.Tensor]) -> B16:
+ B16_BN, B16_BK = 64, 64
+ 
+ 
++# -- TF_GLM_SEQ_ROWS (ported: MiaAI-Lab recipe patch 0004-glm-prompt-kernels, her _seq, F8_PROMPT, PROMPT_DEFAULT,
++# _prompt_cfg and the SEQ form of _bmm / _fmm verbatim; Apache License 2.0, Copyright 2026 MiaAI-Lab) ---------------
++# from this many rows (a prompt chunk) one program runs all of a matmul's K slices and sums them in _reduce's order:
++# the same bits as the split grid, without writing and reading back fp32 partials for every row. Measured at 2,048
++# rows (GB10): 1.3-3.2x on N >= 512, K <= 4,096; slower on narrow outputs (N 32-288) and long K (6,144, 8,192).
++# BF16 and FP8 weights only (an EXL3 checkpoint's projections with TF_GLM_DENSE unset, the FP8 head): 4-bit prompt
++# rows already run the shared prefill matmul.
++def seq_rows() -> int | None:
++    """TF_GLM_SEQ_ROWS (MiaAI-Lab recipe patch 0004's name; her default 256): the rows from which a BF16 / FP8
++    matmul takes the SEQ form and the prompt tiles (the same bits); unset or 0 here: never (as before)."""
++    value = os.environ.get("TF_GLM_SEQ_ROWS", "").strip()
++    if not value or value == "0":
++        return None
++    if not value.isdigit():
++        raise ValueError(f"TF_GLM_SEQ_ROWS is a row count, not {value!r}")
++    return int(value)
++
++
++def _seq(sk: int, m: int, n: int, k: int) -> bool:
++    rows = seq_rows()
++    return rows is not None and sk > 1 and m >= rows and n >= 512 and k <= 4096
++
++
++# prompt chunks (SEQ_ROWS rows or more): (BM, BN, warps, stages) and SEQ by per-rank shape (N, K), swept on GB10 at
++# 2,048 rows; no choice changes a row's bits. Other shapes take PROMPT_DEFAULT.
++F8_PROMPT = {(6432, 4096): (128, 128, 8, 3), (2048, 4096): (64, 64, 8, 3), (4096, 1024): (64, 128, 8, 3),
++             (4096, 4096): (64, 128, 8, 3), (8192, 1536): (64, 128, 4, 3), (12288, 4096): (128, 64, 4, 3),
++             (4096, 6144): (128, 64, 8, 4), (4096, 8192): (64, 64, 4, 4), (1536, 4096): (64, 64, 8, 3)}
++PROMPT_DEFAULT = (64, 128, 8, 3)
++
++
++def _prompt_cfg(sk: int, m: int, n: int, k: int):
++    """(BM, BN, warps, stages, seq) for a prompt chunk's matmul, or None below SEQ_ROWS rows (or unset)."""
++    rows = seq_rows()
++    if rows is None or m < rows:
++        return None
++    if (n, k) in F8_PROMPT:
++        return (*F8_PROMPT[(n, k)], sk > 1)
++    return (*PROMPT_DEFAULT, _seq(sk, m, n, k))
++
++
+ @triton.jit
+ def _bmm(X, W, OUT, PART, M, x_stride, N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
+-         BLOCK_N: tl.constexpr, BK: tl.constexpr, F32: tl.constexpr):
+-    """Multiply bf16 rows over a fixed K slice in order with fp32 sums, independently of other rows."""
++         BLOCK_N: tl.constexpr, BK: tl.constexpr, F32: tl.constexpr, SEQ: tl.constexpr = False):
++    """Multiply bf16 rows over a fixed K slice in order with fp32 sums, independently of other rows; SEQ: one program
++    runs every slice and sums them as _reduce does (the same bits, without the fp32 partials' round trip)."""
+ 
+     PER: tl.constexpr = K // SK
+     pid_n = tl.program_id(1)
+@@ -263,13 +305,26 @@ def _bmm(X, W, OUT, PART, M, x_stride, N: tl.constexpr, K: tl.constexpr, SK: tl.
+     rk = tl.arange(0, BK)
+     m_ok = rm < M
+     n_ok = rn < N
+-    acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+-    for k0 in range(pid_s * PER, pid_s * PER + PER, BK):
+-        x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
+-        w = tl.load(W + rn[:, None].to(tl.int64) * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
+-        acc = acc + tl.dot(x, tl.trans(w))
++    if SEQ:
++        acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
++        for s in tl.static_range(SK):
++            part = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
++            for k0 in range(s * PER, s * PER + PER, BK):
++                x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
++                w = tl.load(W + rn[:, None].to(tl.int64) * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
++                part = part + tl.dot(x, tl.trans(w))
++            if s == 0:
++                acc = part
++            else:
++                acc = acc + part
++    else:
++        acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
++        for k0 in range(pid_s * PER, pid_s * PER + PER, BK):
++            x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
++            w = tl.load(W + rn[:, None].to(tl.int64) * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
++            acc = acc + tl.dot(x, tl.trans(w))
+     out_mask = m_ok[:, None] & n_ok[None, :]
+-    if SK == 1:
++    if SK == 1 or SEQ:
+         if F32:
+             tl.store(OUT + rm[:, None] * N + rn[None, :], acc, mask=out_mask)
+         else:
+@@ -349,18 +404,19 @@ def _matmul_b16(x: torch.Tensor, q: B16, *, out: torch.Tensor | None, f32: bool,
+     bm = bucket(min(m, 128))              # a prompt chunk runs as 128-row blocks: no bucket changes a row's bits
+     warps, stages = B16_CONFIG[bm]
+     sk = b16_split_k(q.n, q.k)
++    seq = _seq(sk, m, q.n, q.k)           # TF_GLM_SEQ_ROWS (MiaAI-Lab 0004): False unless set
+     if out is None:
+         out = torch.empty((m, q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
+     elif out.shape != (m, q.n) or not out.is_contiguous():
+         raise ValueError(f"matmul: out {tuple(out.shape)} must be a contiguous ({m}, {q.n})")
+-    if sk > 1:
++    if sk > 1 and not seq:
+         need = sk * m * q.n
+         if part is None or part.numel() < need:
+             part = torch.empty((need,), dtype=torch.float32, device=x.device)
+-    grid = (triton.cdiv(m, bm), triton.cdiv(q.n, B16_BN), sk)
+-    _bmm[grid](x, q.weight, out, part if sk > 1 else out, m, x.stride(0), N=q.n, K=k, SK=sk, BM=bm,
+-               BLOCK_N=B16_BN, BK=B16_BK, F32=f32, num_warps=warps, num_stages=stages)
+-    if sk > 1:
++    grid = (triton.cdiv(m, bm), triton.cdiv(q.n, B16_BN), 1 if seq else sk)
++    _bmm[grid](x, q.weight, out, part if sk > 1 and not seq else out, m, x.stride(0), N=q.n, K=k, SK=sk, BM=bm,
++               BLOCK_N=B16_BN, BK=B16_BK, F32=f32, SEQ=seq, num_warps=warps, num_stages=stages)
++    if sk > 1 and not seq:
+         total = m * q.n
+         _reduce[(triton.cdiv(total, 1024),)](part, out, total, SK=sk, BLOCK=1024, F32=f32, num_warps=4)
+     return out
+@@ -412,8 +468,9 @@ def stack_f8(parts: list[torch.Tensor]) -> F8 | B16:
+ 
+ @triton.jit
+ def _fmm(X, W, S, OUT, PART, M, x_stride, N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
+-         BLOCK_N: tl.constexpr, BK: tl.constexpr, F32: tl.constexpr):
+-    """_bmm over FP8 weights: each BK step's product (bf16 inputs, fp32 sums) times its 128-column block's scales."""
++         BLOCK_N: tl.constexpr, BK: tl.constexpr, F32: tl.constexpr, SEQ: tl.constexpr = False):
++    """_bmm over FP8 weights: each BK step's product (bf16 inputs, fp32 sums) times its 128-column block's scales;
++    SEQ as in _bmm."""
+ 
+     PER: tl.constexpr = K // SK
+     KB: tl.constexpr = K // 128
+@@ -424,14 +481,28 @@ def _fmm(X, W, S, OUT, PART, M, x_stride, N: tl.constexpr, K: tl.constexpr, SK:
+     rk = tl.arange(0, BK)
+     m_ok = rm < M
+     n_ok = rn < N
+-    acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+-    for k0 in range(pid_s * PER, pid_s * PER + PER, BK):
+-        x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
+-        w = tl.load(W + rn[:, None].to(tl.int64) * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
+-        s = tl.load(S + rn.to(tl.int64) * KB + k0 // 128, mask=n_ok, other=0.0)
+-        acc = acc + tl.dot(x, tl.trans(w.to(tl.bfloat16))) * s[None, :]
++    if SEQ:
++        acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
++        for p in tl.static_range(SK):
++            part = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
++            for k0 in range(p * PER, p * PER + PER, BK):
++                x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
++                w = tl.load(W + rn[:, None].to(tl.int64) * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
++                s = tl.load(S + rn.to(tl.int64) * KB + k0 // 128, mask=n_ok, other=0.0)
++                part = part + tl.dot(x, tl.trans(w.to(tl.bfloat16))) * s[None, :]
++            if p == 0:
++                acc = part
++            else:
++                acc = acc + part
++    else:
++        acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
++        for k0 in range(pid_s * PER, pid_s * PER + PER, BK):
++            x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
++            w = tl.load(W + rn[:, None].to(tl.int64) * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
++            s = tl.load(S + rn.to(tl.int64) * KB + k0 // 128, mask=n_ok, other=0.0)
++            acc = acc + tl.dot(x, tl.trans(w.to(tl.bfloat16))) * s[None, :]
+     out_mask = m_ok[:, None] & n_ok[None, :]
+-    if SK == 1:
++    if SK == 1 or SEQ:
+         if F32:
+             tl.store(OUT + rm[:, None] * N + rn[None, :], acc, mask=out_mask)
+         else:
+@@ -448,19 +519,23 @@ def _matmul_f8(x: torch.Tensor, q: F8, *, out: torch.Tensor | None, f32: bool,
+     bm = bucket(min(m, 128))
+     warps, stages = F8_CONFIG[bm]
+     sk = b16_split_k(q.n, q.k)
++    seq = _seq(sk, m, q.n, q.k)           # TF_GLM_SEQ_ROWS (MiaAI-Lab 0004): False, and no prompt tiles, unless set
++    bn = F8_BN_DECODE if bm == 16 else F8_BN
++    cfg = _prompt_cfg(sk, m, q.n, q.k)
++    if cfg is not None:
++        bm, bn, warps, stages, seq = cfg
+     if out is None:
+         out = torch.empty((m, q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
+     elif out.shape != (m, q.n) or not out.is_contiguous():
+         raise ValueError(f"matmul: out {tuple(out.shape)} must be a contiguous ({m}, {q.n})")
+-    if sk > 1:
++    if sk > 1 and not seq:
+         need = sk * m * q.n
+         if part is None or part.numel() < need:
+             part = torch.empty((need,), dtype=torch.float32, device=x.device)
+-    bn = F8_BN_DECODE if bm == 16 else F8_BN
+-    grid = (triton.cdiv(m, bm), triton.cdiv(q.n, bn), sk)
+-    _fmm[grid](x, q.weight, q.scale, out, part if sk > 1 else out, m, x.stride(0), N=q.n, K=k, SK=sk, BM=bm,
+-               BLOCK_N=bn, BK=B16_BK, F32=f32, num_warps=warps, num_stages=stages)
+-    if sk > 1:
++    grid = (triton.cdiv(m, bm), triton.cdiv(q.n, bn), 1 if seq else sk)
++    _fmm[grid](x, q.weight, q.scale, out, part if sk > 1 and not seq else out, m, x.stride(0), N=q.n, K=k, SK=sk,
++               BM=bm, BLOCK_N=bn, BK=B16_BK, F32=f32, SEQ=seq, num_warps=warps, num_stages=stages)
++    if sk > 1 and not seq:
+         total = m * q.n
+         _reduce[(triton.cdiv(total, 1024),)](part, out, total, SK=sk, BLOCK=1024, F32=f32, num_warps=4)
+     return out
+diff --git a/src/tensorfold/families/glm5_next/cuda/sparse.py b/src/tensorfold/families/glm5_next/cuda/sparse.py
+index 7a1a8cb..279eca1 100644
+--- a/src/tensorfold/families/glm5_next/cuda/sparse.py
++++ b/src/tensorfold/families/glm5_next/cuda/sparse.py
+@@ -6,6 +6,8 @@ are ported from Mia's AI Lab's (@MiaAI-Lab) GLM-5.3-Flash EXL3 2x DGX Sparks rec
+ TF_GLM_DECODE_SELECT's decode-window scoring and visible-pool selection (_scores_rows, _visible_bound, _tokens,
+ _select_decode, _top_pools_visible, select_split's ``pos``) are ported from the same recipe's patches
+ 0031-glm-decode-index-regs and 0043-glm-visible-pools (with 0029's row routing and 0009's _tokens that they use).
++TF_GLM_PROMPT_DSA's prompt-chunk selection (pool_count, score_rows / TF_GLM_SCORE_RB, _select_prompt) is ported from
++its patch 0009-glm-prefill-kernels as 0024 and 0038 left it.
+ """
+ 
+ from __future__ import annotations
+@@ -349,12 +351,83 @@ def pool_bucket(pos: int, R: int, np_max: int) -> int:
+     return min(np_max, max(1024, 1 << (visible - 1).bit_length()))
+ 
+ 
++# -- TF_GLM_PROMPT_DSA's prompt selection (ported: MiaAI-Lab recipe patch 0009-glm-prefill-kernels as 0024 and 0038
++# left it, her pool_count, score_rows and _select_prompt verbatim but for the switch; Apache License 2.0, Copyright
++# 2026 MiaAI-Lab) -------------------------------------------------------------------------------------------------
++def prompt_dsa() -> bool:
++    """TF_GLM_PROMPT_DSA (this port's switch for MiaAI-Lab recipe patches 0009 and 0028's prompt-chunk DSA path, which
++    her tree runs unconditionally; off unless set to 1): a prompt chunk's token selection through _select_prompt (the
++    same tokens and counts for every counted row), its dense pass only on the rows before SPARSE_FROM
++    (``forward.dense_rows``) and its dense blocks' positions from one device add (``Buffers.att_starts``). The same
++    bits for every row a later kernel reads."""
++    return os.environ.get("TF_GLM_PROMPT_DSA", "0") != "0"
++
++
++def pool_count(pos: int, R: int, np_max: int) -> int:
++    """Pools a prompt chunk scores: the visible ones rounded up to a multiple of 1,024 (at most ``pool_bucket``)."""
++    visible = (pos + R) // POOL + 1
++    return min(np_max, -(-visible // 1024) * 1024)
++
++
++def score_rows() -> int:
++    """TF_GLM_SCORE_RB: rows a prompt chunk's _scores program takes (1, 2, 4 or 8; each pool tile loaded once for
++    them, the same bits: row r's pool keys are masked to its own pools before the dot). At most 8: a block's key load
++    then stays within the pool cache's rows (capacity // 4 + 2)."""
++    value = int(os.environ.get("TF_GLM_SCORE_RB", "4"))
++    if value not in (1, 2, 4, 8):
++        raise ValueError(f"TF_GLM_SCORE_RB is 1, 2, 4 or 8, not {value}")
++    return value
++
++
++def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: int, R: int, np_max: int,
++                   pos_dev: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    """select_tokens for a prompt chunk, with select_tokens' counts and, for every counted row, its tokens:
++
++    - it scores NP = pool_count pools, not pool_bucket's power of two: the columns left out lie past every row's
++      visible pools, where _scores writes -inf, and they have the highest indices, so they rank below every column
++      kept (-inf ties go to the lower pool; a negative NaN, the one key below -inf's, is never an arithmetic result
++      on the GPU). A counted row has more than 512 visible pools and NP >= 1024 >= 512, so its best 512 pools, the
++      radix select's threshold and ties are the same. (Rows with count 0, whose tokens nothing reads, may differ.)
++      The scores buffer keeps pool_bucket's size (the allocator's few sizes), used as a contiguous [R, NP] prefix;
++    - _scores takes score_rows() rows a program: a row's keys are masked to its own pools before its dot, as with 1;
++    - one kernel (_tokens) writes tokens and counts with select_tokens' integer formulas."""
++
++    dev = qi.device
++    NP = pool_count(pos, R, np_max)
++    # rows go through in blocks of SELECT_ROWS: every block scores the chunk's NP pools (the same columns, so the same
++    # bits a row), and the fp32 scores take SELECT_ROWS rows, not the chunk's, of the capacity-sized memory
++    B = min(R, SELECT_ROWS)
++    buf = torch.empty((B * pool_bucket(pos, R, np_max),), dtype=torch.float32, device=dev)
++    H = wts.shape[1]
++    D = qi.shape[1] // H
++    wscale = 1.0 / 5.656854249492381 if H == 32 else H ** -0.5            # 32 ** -0.5 exactly as before
++    rb = score_rows()
++    width = TOPK_POOLS * POOL + POOL - 1
++    tokens = torch.empty((R, width), dtype=torch.int32, device=dev)
++    counts = torch.empty((R,), dtype=torch.int32, device=dev)
++    pkv, pks, rs, fp8 = kv8.parts(pk)
++    for a in range(0, R, B):
++        n = min(B, R - a)
++        at = pos_dev if a == 0 else pos_dev + a
++        scores = buf[:n * NP].view(n, NP)
++        _scores[(triton.cdiv(n, rb), triton.cdiv(NP, 64))](qi[a:a + n], wts[a:a + n], wts.stride(0), pkv, pks, scores,
++                                                           at, n, NP, D ** -0.5, wscale, H=H,
++                                                           HP=max(16, triton.next_power_of_2(H)), D=D, BP=64, RB=rb,
++                                                           RS=rs, FP8=fp8, num_warps=4)
++        pools = top_pools(scores, TOPK_POOLS)                                           # ascending pool index
++        _tokens[(n,)](pools, at, tokens[a:a + n], counts[a:a + n], W=width, K=TOPK_POOLS, PL=POOL, BLOCK=1024,
++                      num_warps=4)
++    return tokens, counts
++
++
+ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: int | None, R: int, np_max: int,
+                   pos_dev: torch.Tensor, *, bucket: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+     """Each row's attended tokens [R, 2051] ascending (-1 padded) and their count past the dense limit; ``bucket`` fixes the pool count for graphs."""
+ 
+     if qi.stride(0) != qi.shape[1] or wts.stride(1) != 1:
+         raise ValueError("select_tokens: index queries must be contiguous rows, weights unit-stride columns")
++    if prompt_dsa() and bucket is None and pos is not None and R >= PROMPT_ROWS:
++        return _select_prompt(qi, wts, pk, pos, R, np_max, pos_dev)          # TF_GLM_PROMPT_DSA (0009)
+     # score only visible pools, rounded up to a power of two so the allocator reuses a few sizes (exact sizes fragmented memory at 128k)
+     np_max = bucket if bucket is not None else pool_bucket(pos, R, np_max)
+     if decode_select() and not (bucket is None and pos is not None and R >= PROMPT_ROWS) and np_max >= TOPK_POOLS:
+diff --git a/tests/data/glm_attn_prompt_mia_digests.json b/tests/data/glm_attn_prompt_mia_digests.json
+new file mode 100644
+index 0000000..17f3f86
+--- /dev/null
++++ b/tests/data/glm_attn_prompt_mia_digests.json
+@@ -0,0 +1,16 @@
++{
++ "source": "MiaAI-Lab GLM-5.3-Flash EXL3 recipe 1576746 (Apache-2.0), her TensorFold tree d747563 (patches 0004-glm-prompt-kernels, 0009-glm-prefill-kernels, 0028; 0038's FP8 rows); made by running tests/test_glm_attn_prompt_kernels.py's cases on her tree (ours=False) under the Triton interpreter (triton 3.8.0, torch 2.14.1, bf16 dot operands widened to fp32)",
++ "digests": {
++  "absorb_mma": "e478f2337f24b0e39c2a8d02",
++  "dense_rows_starts": "aa256f678c2e97dd70542a02",
++  "expand_mma": "efa091aee3c1636044c105ff",
++  "hc_mma": "6ab05bb21ebf352aa59cdd4e",
++  "onepass_bf16": "2fcbb9e8df99ab205b11f4b0",
++  "onepass_fp8": "1ff59ef9970b3d5d7df8fb3d",
++  "select_prompt_2045": "2f06a166b73e821f9f6bebcc",
++  "select_prompt_8400": "5964c1b41aa2cde6164f3073",
++  "seq_b16_512x1024": "96b9e69b2893e40efc8152c4",
++  "seq_f8_4096x1024": "c02ab0f345db71540748f90e",
++  "seq_f8_512x1024": "75b02fec4e6a886e3e011614"
++ }
++}
+diff --git a/tests/test_glm_attn_prompt_kernels.py b/tests/test_glm_attn_prompt_kernels.py
+new file mode 100644
+index 0000000..3a6c0f7
+--- /dev/null
++++ b/tests/test_glm_attn_prompt_kernels.py
+@@ -0,0 +1,274 @@
++"""MiaAI-Lab recipe patches 0004-glm-prompt-kernels, 0009-glm-prefill-kernels and 0028's prompt dense blocks
++(recipe 1576746, her tree d747563), each behind its own switch, default off.
++
++- Switches unset: every helper says so and the paths are the base's (TF_GLM_LATENT_MMA, TF_GLM_HC_MMA,
++  TF_GLM_SEQ_ROWS, TF_GLM_SPARSE_ONEPASS, TF_GLM_PROMPT_DSA).
++- ``cases``: the ported kernels on seeded inputs, digests and this port's same-bits checks. Under the Triton
++  interpreter (TRITON_INTERPRET=1) the digests equal her tree's (tests/data/glm_attn_prompt_mia_digests.json, made by
++  running these cases on her tree d747563 with the same inputs); on a GPU the same-bits checks must hold.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import hashlib
++import json
++import os
++from pathlib import Path
++
++import pytest
++import torch
++
++from tensorfold.families.glm5_next.cuda import forward, glue, kv8, latent, qmm, sparse
++
++SWITCHES = ("TF_GLM_LATENT_MMA", "TF_GLM_HC_MMA", "TF_GLM_SEQ_ROWS", "TF_GLM_SPARSE_ONEPASS", "TF_GLM_PROMPT_DSA")
++ON = {"TF_GLM_LATENT_MMA": "1", "TF_GLM_HC_MMA": "1", "TF_GLM_SEQ_ROWS": "16", "TF_GLM_SPARSE_ONEPASS": "1",
++      "TF_GLM_PROMPT_DSA": "1", "TF_GLM_SCORE_RB": "4"}
++DIGESTS = Path(__file__).parent / "data" / "glm_attn_prompt_mia_digests.json"
++
++
++def test_switches_default_off(monkeypatch):
++    for name in (*SWITCHES, "TF_GLM_SCORE_RB"):
++        monkeypatch.delenv(name, raising=False)
++    assert not latent.prompt_mma() and not glue.hc_mma() and not latent.sparse_onepass_on()
++    assert not sparse.prompt_dsa() and qmm.seq_rows() is None
++    assert qmm._prompt_cfg(4, 2048, 4096, 4096) is None and not qmm._seq(4, 2048, 4096, 1024)
++    assert sparse.score_rows() == 4
++    for name in SWITCHES:
++        monkeypatch.setenv(name, "0")
++    assert not (latent.prompt_mma() or glue.hc_mma() or latent.sparse_onepass_on() or sparse.prompt_dsa())
++    assert qmm.seq_rows() is None
++
++
++def test_switches_on(monkeypatch):
++    for name, value in ON.items():
++        monkeypatch.setenv(name, value)
++    assert latent.prompt_mma() and glue.hc_mma() and latent.sparse_onepass_on() and sparse.prompt_dsa()
++    assert qmm.seq_rows() == 16
++    # her table and default tiles (MiaAI-Lab 0004): SEQ only with split K, from SEQ_ROWS rows
++    assert qmm._prompt_cfg(4, 2048, 4096, 1024) == (64, 128, 8, 3, True)
++    assert qmm._prompt_cfg(4, 8, 4096, 1024) is None
++    assert qmm._prompt_cfg(4, 2048, 777, 1024) == (64, 128, 8, 3, True)
++    assert qmm._prompt_cfg(4, 2048, 288, 1024) == (64, 128, 8, 3, False)       # narrow: no SEQ
++    monkeypatch.setenv("TF_GLM_SEQ_ROWS", "lots")
++    with pytest.raises(ValueError):
++        qmm.seq_rows()
++    monkeypatch.setenv("TF_GLM_SCORE_RB", "3")
++    with pytest.raises(ValueError):
++        sparse.score_rows()
++
++
++def test_dense_rows_and_pool_count():
++    class C:
++        dense_limit = sparse.SPARSE_FROM
++
++    class Other:
++        dense_limit = 2048
++
++    assert sparse.SPARSE_FROM == 2051
++    assert forward.dense_rows(C, 6, 2047) == 4              # rows 2047 .. 2050 dense, 2051 and 2052 sparse
++    assert forward.dense_rows(C, 2048, 0) == 2048 and forward.dense_rows(C, 2048, 1024) == 1027
++    assert forward.dense_rows(C, 512, 4096) == 0 and forward.dense_rows(C, 8, None) == 8
++    assert forward.dense_rows(Other, 8, 2047) == 8
++    assert sparse.pool_count(2045, 8, 1024) == 1024 and sparse.pool_bucket(2045, 8, 1024) == 1024
++    assert sparse.pool_count(8400, 8, 4096) == 3072 and sparse.pool_bucket(8400, 8, 4096) == 4096
++    assert sparse.pool_count(8400, 8, 2048) == 2048
++
++
++# -- the kernels' cases (also run on her tree d747563 for the digests: only names both trees have) --
++def _digest(*ts: torch.Tensor) -> str:
++    h = hashlib.sha256()
++    for t in ts:
++        h.update(t.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes())
++    return h.hexdigest()[:24]
++
++
++def _randn(shape, seed, scale=1.0, dtype=torch.bfloat16, device="cpu"):
++    return (torch.randn(shape, generator=torch.Generator().manual_seed(seed)) * scale).to(dtype).to(device)
++
++
++def _f8(w: torch.Tensor):
++    n, k = w.shape
++    blocks = w.float().view(n, k // 128, 128)
++    s = blocks.abs().amax(-1).clamp_min(1e-8) / 448.0
++    wq = (blocks / s[..., None]).view(n, k).to(torch.float8_e4m3fn)
++    return qmm.F8(weight=wq.contiguous(), scale=s.contiguous(), n=n, k=k)
++
++
++@contextlib.contextmanager
++def bf16_dot():
++    """Triton 3.8.0's interpreter multiplies bf16 dot operands as their raw uint16 storage (it widens only fp8):
++    widen them to fp32 (exact) for the duration, so the interpreter's numbers are real ones."""
++    import numpy as np
++    import triton.language as tl
++    from triton.runtime import interpreter as ti
++
++    builder = next(c for c in vars(ti).values() if isinstance(c, type) and "create_dot" in vars(c))
++    dot = builder.create_dot
++
++    def wide(h):
++        if h.dtype == tl.bfloat16:
++            return ti.TensorHandle((h.data.astype(np.uint32) << 16).view(np.float32), tl.float32)
++        return h
++
++    builder.create_dot = lambda self, a, b, d, ip, mx: dot(self, wide(a), wide(b), d, ip, mx)
++    try:
++        yield
++    finally:
++        builder.create_dot = dot
++
++
++def cases(device: str = "cpu", ours: bool = True, setenv=None) -> tuple[dict, dict]:
++    """(digests, checks): the ported kernels with every switch on (``setenv`` sets them for our per-call switches;
++    her tree read them at import). ``ours``: also this port's same-bits checks (switch-off paths vs ported ones)."""
++
++    setenv = setenv or os.environ.__setitem__
++    for name, value in ON.items():
++        setenv(name, value)
++    dev = device
++    out: dict[str, str] = {}
++    chk: dict[str, object] = {}
++    R, H, D, LW, DV = 70, 2, 128, 256, 128
++    q = _randn((R, H, D), 1, device=dev)
++    a = latent.AbsorbW(_randn((H, D, LW), 2, 0.05, device=dev), _randn((H, DV, LW), 3, 0.05, device=dev))
++    o = torch.empty((R, H, LW), dtype=torch.bfloat16, device=dev)
++    latent.absorb_q(q, a, o, prompt=True)
++    out["absorb_mma"] = _digest(o)
++    ov = torch.empty((R, H, DV), dtype=torch.bfloat16, device=dev)
++    latent.expand_v(_randn((R, H, LW), 4, device=dev), a, ov, prompt=True)
++    out["expand_mma"] = _digest(ov)
++    if ours:
++        lo = torch.empty((64, H, LW), dtype=torch.bfloat16, device=dev)
++        hi = torch.empty((R - 64, H, LW), dtype=torch.bfloat16, device=dev)
++        latent.absorb_q(q[:64].contiguous(), a, lo, prompt=True)
++        latent.absorb_q(q[64:].contiguous(), a, hi, prompt=True)
++        chk["absorb_mma rows independent of the chunk"] = bool(torch.equal(torch.cat([lo, hi]), o))
++        ref = torch.einsum("rhd,hdl->rhl", q.float(), a.wk.float())
++        chk["absorb_mma max |err| vs fp32 einsum"] = float((o.float() - ref).abs().max())
++
++    S, DH = 4, 512                                  # 128-column blocks: _hc_partial's SUB (the model's are 1,024)
++    x = _randn((R, S * DH), 5, device=dev)
++    fn = _randn((24, S * DH), 6, 0.05, device=dev)
++    base = _randn((24,), 7, 0.1, torch.float32, device=dev)
++    scale = torch.tensor([0.5, 0.25, 0.125], device=dev)
++    norm_w = _randn((DH,), 8, 0.1, device=dev).float() + 1.0
++
++    def hc(mma: str):
++        setenv("TF_GLM_HC_MMA", mma)
++        bufs = (torch.empty((R, DH), dtype=torch.bfloat16, device=dev), torch.empty((R, DH // 64), device=dev),
++                torch.empty((R, S), device=dev), torch.empty((R, S * S), device=dev),
++                torch.zeros((R, glue.HC_BLOCKS, 32), device=dev))
++        glue.hc_pre(x, fn, base, scale, norm_w, *bufs, 1e-6, 1e-6, 3, prompt=True)
++        setenv("TF_GLM_HC_MMA", "1")
++        return bufs
++
++    hb = hc("1")
++    out["hc_mma"] = _digest(*hb)
++    if ours:
++        h0 = hc("0")
++        chk["hc: max |out|, |post|, |comb| mma vs switch off"] = [
++            float((h0[i].float() - hb[i].float()).abs().max()) for i in (0, 2, 3)]
++
++    for kind, (N, K) in (("b16", (512, 1024)), ("f8", (512, 1024)), ("f8", (4096, 1024))):
++        name = f"seq_{kind}_{N}x{K}"
++        xm = _randn((64, K), 9, device=dev)
++        w = _randn((N, K), 10, 0.05, device=dev)
++        wq = qmm.B16(weight=w.contiguous(), n=N, k=K) if kind == "b16" else _f8(w)
++        om = qmm.matmul(xm, wq)
++        out[name] = _digest(om)
++        if ours:
++            setenv("TF_GLM_SEQ_ROWS", "0")
++            o0 = qmm.matmul(xm, wq)
++            setenv("TF_GLM_SEQ_ROWS", "16")
++            chk[f"{name}: SEQ == split grid + _reduce (bits)"] = bool(torch.equal(om, o0))
++
++    RS, HS, NC = 4, 16, 600
++    qa = _randn((RS, HS, 512), 11, device=dev)
++    lat = _randn((NC, 512), 12, device=dev)
++    counts = torch.tensor([100, 37, 0, 64], dtype=torch.int32)
++    tokens = torch.full((RS, sparse.TOKENS), -1, dtype=torch.int32)
++    for r in range(RS):
++        pick = torch.randperm(NC, generator=torch.Generator().manual_seed(20 + r))[: int(counts[r])].sort().values
++        tokens[r, : len(pick)] = pick.to(torch.int32)
++    counts, tokens = counts.to(dev), tokens.to(dev)
++    for kind in ("bf16", "fp8"):
++        name = f"onepass_{kind}"
++        cache = lat.contiguous() if kind == "bf16" else kv8.quantize_rows(lat)
++        op = torch.zeros((RS, HS, 512), dtype=torch.bfloat16, device=dev)
++        latent.sparse_onepass(qa, cache, tokens, counts, op, 0.0625)
++        out[name] = _digest(op)
++        if ours:
++            vals = kv8.dequantize(cache).float() if kind == "fp8" else lat.float()
++            err = 0.0
++            for r in (0, 1, 3):
++                sel = vals[tokens[r, : int(counts[r])].long()]
++                ref = torch.softmax(qa[r].float() @ sel.T * 0.0625, -1) @ sel
++                err = max(err, float((op[r].float() - ref).abs().max()))
++            chk[f"{name}: max |onepass - torch softmax reference|"] = err
++            chk[f"{name}: count-0 row left alone"] = bool(torch.equal(op[2], torch.zeros_like(op[2])))
++
++    for pos, R2, np_max in ((2045, 8, 1024), (8400, 8, 4096)):
++        name = f"select_prompt_{pos}"
++        qi = _randn((R2, 32 * 128), 30, device=dev)
++        wts = _randn((R2, 32), 31, device=dev)
++        pk = _randn((np_max + 2, 128), 32, device=dev)
++        pos_dev = torch.tensor([pos], dtype=torch.int32, device=dev)
++        tok, cnt = sparse._select_prompt(qi, wts, pk, pos, R2, np_max, pos_dev)
++        counted = cnt > 0
++        out[name] = _digest(cnt, tok[counted])
++        if ours:
++            setenv("TF_GLM_PROMPT_DSA", "0")
++            tok0, cnt0 = sparse.select_tokens(qi, wts, pk, pos, R2, np_max, pos_dev)
++            setenv("TF_GLM_PROMPT_DSA", "1")
++            chk[f"{name}: counts and counted rows' tokens == switch off"] = bool(
++                torch.equal(cnt, cnt0) and torch.equal(tok[counted], tok0[counted]))
++
++    R3, HD, pos = 6, 16, 2047                       # rows 2047 .. 2052: 2051 and 2052 are sparse-counted
++    qa3 = _randn((R3, HD, 512), 40, device=dev)
++    lc = _randn((pos + R3 + 8, 512), 41, device=dev)
++    pos_dev = torch.tensor([pos], dtype=torch.int32, device=dev)
++    nch = latent.chunks_for(pos + R3)
++    s = latent.LatentScratch(R3, HD, nch, dev, lw=512, part_rows=2)
++    hbk = latent.head_block(R3)
++    full = torch.zeros((R3, HD, 512), dtype=torch.bfloat16, device=dev)
++    for r0 in range(0, R3, 2):                       # the switch-off path: blocks at pos_dev + r0
++        latent.attention(qa3[r0:r0 + 2], lc, pos_dev + r0, s, scale=0.0625, nch=nch, out=full[r0:r0 + 2], hb=hbk)
++    out["dense_rows_starts"] = _digest(full)
++    if ours:
++        class C:
++            dense_limit = sparse.SPARSE_FROM
++
++        n = forward.dense_rows(C, R3, pos)
++        starts = torch.arange(0, R3, 2, dtype=torch.int32, device=dev)
++        lean = torch.zeros_like(full)
++        forward.dense_attention(qa3[:n], lc, pos_dev, s, scale=0.0625, nch=nch, out=lean[:n], hb=hbk, starts=starts)
++        whole = torch.zeros_like(full)
++        forward.dense_attention(qa3, lc, pos_dev, s, scale=0.0625, nch=nch, out=whole, hb=hbk, starts=starts)
++        chk["lean dense rows == full pass rows, starts path == pos_dev + r0 path (bits)"] = bool(
++            n == 4 and torch.equal(lean[:n], full[:n]) and torch.equal(whole, full))
++    return out, chk
++
++
++def _assert_checks(chk: dict) -> None:
++    for name, value in chk.items():
++        if isinstance(value, bool):
++            assert value, name
++    assert chk["absorb_mma max |err| vs fp32 einsum"] < 0.05
++    assert max(chk["hc: max |out|, |post|, |comb| mma vs switch off"]) < 1e-3
++    for kind in ("bf16", "fp8"):
++        assert chk[f"onepass_{kind}: max |onepass - torch softmax reference|"] < 0.05
++
++
++@pytest.mark.skipif(os.environ.get("TRITON_INTERPRET") != "1", reason="the Triton interpreter (TRITON_INTERPRET=1)")
++def test_interpreter_digests_equal_mia(monkeypatch):
++    with bf16_dot():
++        got, chk = cases("cpu", True, lambda k, v: monkeypatch.setenv(k, v))
++    want = json.loads(DIGESTS.read_text())["digests"]
++    assert got == want
++    _assert_checks(chk)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
++def test_cuda_same_bits(monkeypatch):
++    _, chk = cases("cuda", True, lambda k, v: monkeypatch.setenv(k, v))
++    _assert_checks(chk)
+diff --git a/tests/test_glm_decode_kernels.py b/tests/test_glm_decode_kernels.py
+index 0682859..b7d61a8 100644
+--- a/tests/test_glm_decode_kernels.py
++++ b/tests/test_glm_decode_kernels.py
+@@ -314,6 +314,7 @@ def test_decode_select_same_tokens(monkeypatch, R, pos, pools, bucket):
+ 
+ 
+ def test_decode_select_routing(monkeypatch):
++    monkeypatch.delenv("TF_GLM_PROMPT_DSA", raising=False)        # the prompt selection switch: set at the end
+     calls = []
+     monkeypatch.setattr(sparse, "_select_decode", lambda *a: calls.append(a[3]) or ("t", "c"))
+     monkeypatch.setattr(sparse, "_scores", Rec())
+@@ -330,3 +331,11 @@ def test_decode_select_routing(monkeypatch):
+     sparse.select_tokens(big, torch.zeros((64, 32), dtype=torch.bfloat16), torch.zeros((4098, 128),
+                          dtype=torch.bfloat16), 5000, 64, 4096, pos_dev)
+     assert calls == [4]
++    # TF_GLM_PROMPT_DSA=1 (MiaAI-Lab 0009): a prompt chunk takes _select_prompt, a decode window still the above
++    monkeypatch.setenv("TF_GLM_PROMPT_DSA", "1")
++    monkeypatch.setattr(sparse, "_select_prompt", lambda *a: calls.append(("prompt", a[4])) or ("tp", "cp"))
++    assert sparse.select_tokens(big, torch.zeros((64, 32), dtype=torch.bfloat16), torch.zeros((4098, 128),
++                                dtype=torch.bfloat16), 5000, 64, 4096, pos_dev) == ("tp", "cp")
++    assert sparse.select_tokens(qi, wts, torch.zeros((4098, 128), dtype=torch.bfloat16), 5000, 4, 4096,
++                                pos_dev) == ("t", "c")
++    assert calls == [4, ("prompt", 64), 4]
+diff --git a/tests/test_glm_multi_prefill.py b/tests/test_glm_multi_prefill.py
+index d5f70f6..9393ad6 100644
+--- a/tests/test_glm_multi_prefill.py
++++ b/tests/test_glm_multi_prefill.py
+@@ -510,7 +510,9 @@ def build_forward(torch, rec: Rec, *, dense_limit: int = 10**6):
+     b.kscratch = SimpleNamespace(out=buf("ks.out", (RMAX, 8)), k=buf("ks.k", (RMAX, 2, 4)),
+                                  v=buf("ks.v", (RMAX, 2, 4)), g=buf("ks.g", (RMAX, 2, 4)), b=buf("ks.b", (RMAX, 2)))
+     b.lat_s = SimpleNamespace(qa=buf("ls.qa", (RMAX, 2, 8)), ol=buf("ls.ol", (RMAX, 2, 8)), nch=64, part_rows=32)
+-    rec.aliases[id(b)], rec.aliases[id(b.lat_s)] = "B", "LATENT_SCRATCH"
++    # forward.Buffers' dense blocks' first-row offsets (a prompt chunk's, read under TF_GLM_PROMPT_DSA)
++    b.att_starts = torch.arange(0, RMAX, b.lat_s.part_rows, dtype=torch.int32)
++    rec.aliases[id(b)], rec.aliases[id(b.lat_s)], rec.aliases[id(b.att_starts)] = "B", "LATENT_SCRATCH", "ATT_STARTS"
+     b.afd_recv = buf("afd_recv", (3 * RMAX * D,))
+     b.taps = [buf("tap0", (RMAX, D))]
+     b.logits = buf("logits", (1, V))
+@@ -561,10 +563,11 @@ def patch_kernels(monkeypatch, rec: Rec, fwd, forward_mod=None) -> None:
+         monkeypatch.setattr(mods["glue"], n, rec.fn("glue." + n))
+     monkeypatch.setattr(mods["kda"], "chain", rec.fn("kda.chain", lambda *a, **k: a[13].out[:a[12]]))
+     monkeypatch.setattr(mods["latent"], "latent_write", rec.fn("latent.latent_write"))
+-    monkeypatch.setattr(mods["latent"], "absorb_q", rec.fn("latent.absorb_q", lambda q, a, out: out))
++    monkeypatch.setattr(mods["latent"], "absorb_q", rec.fn("latent.absorb_q", lambda q, a, out, **k: out))
+     monkeypatch.setattr(mods["latent"], "attention", rec.fn("latent.attention", lambda *a, out, **k: out))
+     monkeypatch.setattr(mods["latent"], "sparse_attention", rec.fn("latent.sparse_attention"))
+-    monkeypatch.setattr(mods["latent"], "expand_v", rec.fn("latent.expand_v", lambda o, a, out: out))
++    monkeypatch.setattr(mods["latent"], "sparse_onepass", rec.fn("latent.sparse_onepass"))  # TF_GLM_SPARSE_ONEPASS
++    monkeypatch.setattr(mods["latent"], "expand_v", rec.fn("latent.expand_v", lambda o, a, out, **k: out))
+     monkeypatch.setattr(mods["sparse"], "index_update", rec.fn("sparse.index_update"))
+     monkeypatch.setattr(mods["sparse"], "select_tokens", rec.fn(
+         "sparse.select_tokens", lambda *a, **k: (torch.zeros((a[4], 4), dtype=torch.int32),
+@@ -658,7 +661,8 @@ def test_the_forward_seam_gives_each_piece_its_solo_calls(allocations, monkeypat
+         for (m1, c1), (m2, c2) in zip(mine, theirs):
+             assert m1[1] == m2[1] and m1[3] == m2[3] == n and m1[2] == p.lo and m2[2] == 0
+             assert c1 == c2
+-        sparse_calls = [c for _, calls in theirs for c in calls if c[0] == "latent.sparse_attention"]
++        sparse_calls = [c for _, calls in theirs for c in calls
++                        if c[0] in ("latent.sparse_attention", "latent.sparse_onepass")]
+         assert bool(sparse_calls) == (pos + n - 1 >= dense_limit)
+     assert len(inside) == 4 * len(plan)
+     # the row-wise rest: exactly a solo chunk of R rows (heads aside), behind one begin(R, chunk=True)

@@ -1,0 +1,2391 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 22:18:23 -0400
+Subject: [PATCH] glm5_next/cuda: chunked KDA prompt kernel, prompt grid and
+ prompt replay, TF_GLM_KDA_CHUNKED (MiaAI-Lab recipe patches 0012, 0014, 0039,
+ 0008, 0042)
+
+MiaAI-Lab's recipe (github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold @ 1576746, with KDA_CHUNKED=1
+in its config) runs GLM-5.3-Flash's linear-attention (KDA) prompt chunks in chunked (WY) form: one CUDA kernel of
+32-row sub-chunks at absolute positions, the 128 x 128 state carried in registers. Its arithmetic is close to the
+serial kernel's, not the same bits ("50k prefill 29.3 -> 26.4 s"); a row's bits depend only on its sub-chunk and the
+state entering it, so prompt chunks and kept prompt states sit on a 64-token grid, and an identical prompt replays
+its kept end state. This ports the end state of recipe patches 0012-glm-kda-chunked, 0014-glm-kda-chunked-gb10 and
+0039-glm-kda-chunked-kernel, with 0008-glm-prompt-grid and 0042-glm-prompt-replay (Apache License 2.0, Copyright 2026
+MiaAI-Lab):
+
+- kda_chunk.cu / kda_chunk.cpp (new): the recipe's kernel and binding, byte for byte (a two-line credit header added).
+  Built as tensorfold_glm_kda_chunk with -O3 --fmad=false, like kda.cu.
+- kda_chunked.py (new): the recipe's torch references (prep_reference, recurrent_reference, chunked_reference,
+  gate_norm_reference, chain_reference) verbatim, and chain, which runs the kernel. The recipe file defines
+  chain_reference twice; the first, shadowed one is dropped.
+- kda.py: TF_GLM_KDA_CHUNKED; chain(..., pos=) sends a prompt chunk to the chunked kernel under the setting; decode
+  windows keep the serial kernels. prompt_kw(pos) gives a prompt chunk's position only under the setting, so without
+  it forward.py's calls (kda_rows, and this tree's kept-cut path inside a chunk) are the ones before.
+- engine.py: kda_chunked_on, GRIDS, prompt_grid (TF_GLM_PROMPT_GRID; 64 under TF_GLM_KDA_CHUNKED=1, read before the
+  AFD wire opens), grid_point, keep_at; both ranks must agree on the grid and the setting; startup lines. With a grid
+  the single-stream engine keeps a drafted prompt's state at its grid point (prefilling to it as a prompt of that
+  length, no cut inside a chunk), an on-grid prompt's end state keeps the head's logits row, and _resume takes an
+  on-grid state or the whole prompt with its row (a replay). Shared-prefix points round down to the grid.
+- decode.py: Snapshot.head, whole, prefill's replay (the state goes back, the first token is sampled from the kept
+  row, nothing prefilled; an MTP stream's last hidden row waits for the first token) and its grid check.
+- multi.py (PR #243's engine): the same with a grid: Lane.head, keep_at's points, _resume, _keep(head=), the replay
+  FILL, fill_rows on the grid; multi-prompt chunks leave replays out.
+
+Without a grid nothing changes: a drafted prompt keeps its state before its last token, and no kept state carries a
+head row. TF_GLM_KDA_CHUNKED and TF_GLM_PROMPT_GRID are off unless set (the recipe's config turns KDA_CHUNKED on);
+unset, the replies, cached counts, kept states and pool rows are the ones before, and the forward's kernel calls are
+the same. On the attention/expert split this is attention-node only: the expert nodes and the wire are unchanged. The
+new CUDA module needs an entry wherever the extensions are prebuilt.
+
+Tests: tests/test_glm_kda_chunked.py (CPU: the references pinned to the recipe's source; chunked equals the delta
+rule in float64; a cut on the 32-row grid keeps the bits, one elsewhere does not; kda.chain's and kda_chunked.chain's
+dispatch; the forward's recorded calls with and without the setting; the settings). tests/test_glm_prompt_grid.py
+(CPU, PR #243's fake model at a 64-token grid: grid points, resumes, replays prefilling nothing, next turns, at two
+ranks with DFlash2 and MTP drafts, at world 1 over the fake AFD wire, with TF_GLM_KV=fp8's rings, shared-prefix
+points, multi-prompt chunks, and the single-stream engine; replies equal their requests served alone).
+tests/cuda/test_glm_kda_chunked.py (GPU: the kernel against the references, determinism, the grid cut's bits).
+
+Credit: THIRD_PARTY_NOTICES.md ("GLM chunked KDA prompt kernel, prompt grid and prompt replay") and the ported
+functions' comments name MiaAI-Lab and the patches.
+
+Picked onto the joined head with prompt chunk pairs (sliced fills 0062, decode kernels 0016, draft policies
+0021, tool calls, prompt chunk pairs): the conflicts keep both sides, and a replay never starts a sliced fill
+(`lane.head is None`: a replay has no prompt rows), as in MiaAI-Lab's 0062 end state. A pair's second chunk
+keeps a prompt's end state with its head row on the grid, as `_fill` and `_fill_many` do, so an on-grid prompt
+filled in pairs replays too; a replay never joins a pair.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patches 0012, 0014, 0039, 0008, 0042,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 1576746a04983b6eded0551dbf22512ee9e95654 (v1.5); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |  23 +
+ .../families/glm5_next/cuda/decode.py         |  49 +-
+ .../families/glm5_next/cuda/engine.py         | 135 +++-
+ .../families/glm5_next/cuda/forward.py        |  11 +-
+ src/tensorfold/families/glm5_next/cuda/kda.py |  20 +-
+ .../families/glm5_next/cuda/kda_chunk.cpp     |  58 ++
+ .../families/glm5_next/cuda/kda_chunk.cu      | 747 ++++++++++++++++++
+ .../families/glm5_next/cuda/kda_chunked.py    | 186 +++++
+ .../families/glm5_next/cuda/multi.py          | 101 ++-
+ tests/cuda/test_glm_kda_chunked.py            |  76 ++
+ tests/test_glm_kda_chunked.py                 | 271 +++++++
+ tests/test_glm_prompt_grid.py                 | 193 +++++
+ 12 files changed, 1810 insertions(+), 60 deletions(-)
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/kda_chunk.cpp
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/kda_chunk.cu
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/kda_chunked.py
+ create mode 100644 tests/cuda/test_glm_kda_chunked.py
+ create mode 100644 tests/test_glm_kda_chunked.py
+ create mode 100644 tests/test_glm_prompt_grid.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index 71ce11a..e4e4505 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -317,3 +317,26 @@ used in place of the recipe's copies; 0056's image path (GLM vision) is not take
+ recipe's GLM call streamer is in this tree after all (the smooth-streaming section above predates it): with
+ `TF_GLM_STREAM_SMOOTH=1` too, a round's whole calls and keep-alive deltas go into the playout queue after the
+ round's text, unpaced, as in the recipe's end state.
++
++## GLM chunked KDA prompt kernel, prompt grid and prompt replay
++
++`families/glm5_next/cuda/kda_chunk.cu` and `kda_chunk.cpp` (the recipe's files, with a two-line credit header),
++`kda_chunked.py` (the recipe's torch references `prep_reference`, `recurrent_reference`, `chunked_reference`,
++`gate_norm_reference` and `chain_reference`, and `chain`, which runs the CUDA kernel), `kda.py`'s `CHUNKED` and
++`chain(..., pos=)`, `engine.py`'s `kda_chunked_on`, `GRIDS`, `prompt_grid` and `grid_point`, and the prompt-grid and
++prompt-replay paths of `decode.py` (`Snapshot.head`, `whole`, `prefill`'s replay and grid check), `engine.py`
++(`GlmEngine._resume` / `_run_once`, the startup lines) and `multi.py` (`Lane.head`, `fill_rows`' grid,
++`MultiDecoder._resume` / `_keep` / `_fill`, the replay in `_admitted`) are ported from MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/1576746)
++patches 0012-glm-kda-chunked, 0014-glm-kda-chunked-gb10 and 0039-glm-kda-chunked-kernel (their end state: 0039's
++CUDA kernel replaces the earlier Triton versions), 0008-glm-prompt-grid and 0042-glm-prompt-replay, Apache License
++2.0, Copyright 2026 MiaAI-Lab (see [the license text](LICENSES/Apache-2.0.txt)). Changes in the port: `kda_chunked.py`
++drops a first, shadowed definition of `chain_reference` (the recipe file defines it twice; the second one is the one
++Python keeps, and it is taken verbatim); prompt chunks pass their position to `kda.chain` only under
++`TF_GLM_KDA_CHUNKED=1` (`kda.prompt_kw`), so without it the serial kernels' calls are the ones before; this tree keeps
++its kept-cut path inside a prompt chunk, which gets the rows' positions too; without a prompt grid a drafted prompt
++keeps its state before its last token as before (`multi.keep_point`), and only with `TF_GLM_PROMPT_GRID` (64 under
++`TF_GLM_KDA_CHUNKED=1`) at the recipe's grid point, an on-grid prompt's end state keeping its head's logits row for
++a replay; MTP streams replay too (the kept last hidden row waits for the first token); multi-prompt chunks
++(`TF_GLM_MULTI_PREFILL`) leave replays out. `TF_GLM_KDA_CHUNKED` and `TF_GLM_PROMPT_GRID` are off unless set (the
++recipe's `config.sh` sets `KDA_CHUNKED=1`).
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index e276618..3ab7eed 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -296,6 +296,11 @@ class Snapshot:
+     nbytes: int = 0
+     drafter_rows: list | None = None  # a ring drafter's window rows before drafter_end, copied when taken
+     tail: list | None = None      # the indexer rings' rows of the pools still filling at ids' end (``_ring_tail``)
++    # the head's logits row at ids' end (this rank's vocabulary slice, before any grammar mask), kept with a prompt's
++    # own end state: a request of exactly these ids resumes here and samples its first token from it, prefilling
++    # nothing (``prefill``); None for states short of a prompt's end, and always without TF_GLM_PROMPT_GRID
++    # (MiaAI-Lab recipe patch 0042)
++    head: torch.Tensor | None = None
+ 
+ 
+ def has_rings(st) -> bool:
+@@ -449,6 +454,7 @@ def snapshot_bytes(snap: Snapshot) -> int:
+     """Device memory a kept snapshot holds: its KDA states, conv windows, pending MTP rows, a ring drafter's window,
+     the indexer rings' tail and any saved rows."""
+     held = [snap.rec, snap.conv] + ([snap.pending] if snap.pending is not None else []) + (snap.drafter_rows or [])
++    held += [snap.head] if snap.head is not None else []          # MiaAI-Lab recipe patch 0042
+     held += [t for pair in (snap.tail or []) for t in pair]
+     return sum(t.numel() * t.element_size() for t in held) + (snap.nbytes if snap.rows is not None else 0)
+ 
+@@ -481,12 +487,25 @@ def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
+ 
+ 
+ # -- prefill ----------------------------------------------------------------------------------------------------
++def whole(snap: Snapshot | None, prompt: Sequence[int]) -> bool:
++    """Whether ``snap`` is a state of exactly ``prompt`` that kept its head's logits row (a replay resumes there).
++    (MiaAI-Lab recipe patch 0042)"""
++
++    return snap is not None and getattr(snap, "head", None) is not None and len(snap.ids) == len(prompt)
++
++
+ @torch.no_grad()
+ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True, drafter=None,
+-            resume: Snapshot | None = None, keep_at: int | None = None, keep=None, sample: bool = True) -> int | None:
++            resume: Snapshot | None = None, keep_at: int | None = None, keep=None, sample: bool = True,
++            keep_head: bool = False) -> int | None:
+     """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state;
+     ``sample=False`` (MiaAI-Lab recipe patch 0015's shared-prefix points): commit only, no first token (None), leaving
+-    the state a prompt of this length leaves before its sample."""
++    the state a prompt of this length leaves before its sample.
++
++    TF_GLM_PROMPT_GRID (MiaAI-Lab recipe patches 0008, 0042): a resumed prompt starts on the grid (``e.grid``), and
++    ``resume`` may also be a state of the whole prompt that kept its head's logits row (``whole``, a replay): the
++    state goes back and the first token is sampled from that row, nothing prefilled. ``keep_head``: the kept state of
++    the prompt's end (``keep_at`` its length) keeps the head's logits row it samples from (before a grammar's mask)."""
+ 
+     if not prompt:
+         raise ValueError("prefill requires at least one token")
+@@ -494,27 +513,40 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+     afd = getattr(w, "afd", None)
+     use_mtp = mtp and w.mtp is not None
+     begin = 0
++    replay = sample and whole(resume, prompt)
+     if resume is None:
+         e.reset()
+         if drafter is not None:
+             drafter.reset()
+     else:
+         begin = len(resume.ids)
+-        if begin >= len(prompt) or list(prompt[:begin]) != resume.ids:
++        grid = getattr(e, "grid", 0)
++        if grid and begin % grid:
++            raise ValueError(f"a resumed prefill starts on the {grid}-row grid, not at {begin}")
++        if (begin >= len(prompt) and not replay) or list(prompt[:begin]) != resume.ids:
+             raise ValueError("a resumed prefill needs a snapshot of a strict prefix of the prompt")
+         if (use_mtp and resume.mtp_len < 0) or (drafter is not None and resume.drafter_end != begin):
+             raise ValueError("this snapshot's draft caches do not fit the request")
+         restore(e, resume, drafter)
+-        if use_mtp:
++        if use_mtp and replay:
++            # the prompt's last hidden row waits for the first token, as a fresh prefill leaves it (the MTP cache
++            # holds every row before it: mtp_len n - 1)
++            e.last_hidden = resume.pending[-1:].clone()
++        elif use_mtp:
+             k = resume.pending.shape[0]
+             _absorb_rows(e, resume.pending, list(prompt[begin - k + 1:begin + 1]))
++    if keep_head and keep_at != len(prompt):
++        raise ValueError("a kept head's logits row goes with the prompt's own end state")
+     from .forward import Cut
+ 
+     if keep_at is not None and (keep is None or not max(1, begin) <= keep_at <= len(prompt)):
+         raise ValueError("a kept prefix needs a callback and a point in the prompt's prefill")
+     kept = resume if keep_at == begin else None
+     last = None
+-    prof.active = True
++    if replay:
++        last = resume.head.clone()                       # a grammar's mask below writes into the rows it samples
++    else:
++        prof.active = True
+     for start in range(begin, len(prompt), e.prefill_rows):
+         chunk = list(prompt[start:start + e.prefill_rows])
+         R = len(chunk)
+@@ -550,9 +582,12 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+         with prof.timed("commit"):
+             commit(w, st, b, R, R)
+     if kept is not None:
++        if keep_head:                                    # the end state's head row, for a replay (0042)
++            kept.head = last.clone()
+         keep(kept)
+-    prof.active = False
+-    prof.report(len(prompt) - begin)
++    if not replay:
++        prof.active = False
++        prof.report(len(prompt) - begin)
+     if not sample:
+         return None
+     if e.constraint is not None:                         # the first token's row, under the reply's grammar
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index e906e6f..acfbcc2 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -216,6 +216,71 @@ def kept_most(entries: int, spare: int, state: int) -> int:
+     return max(1, min(int(entries), int(spare) // max(1, int(state))))
+ 
+ 
++# MiaAI-Lab recipe patches 0008 (TF_GLM_PROMPT_GRID) and 0039 (TF_GLM_KDA_CHUNKED): the prompt grid
++GRIDS = (16, 32, 64, 128)             # TF_GLM_PROMPT_GRID's values besides 0 (off)
++
++
++def kda_chunked_on() -> bool:
++    """TF_GLM_KDA_CHUNKED=1: KDA prompt chunks in chunked (WY) form (``kda_chunked``). (MiaAI-Lab recipe patch 0039)"""
++
++    from .kda import CHUNKED
++
++    return CHUNKED
++
++
++def prompt_grid(prefill_rows: int, value: str | None = None, chunked: bool | None = None) -> int:
++    """TF_GLM_PROMPT_GRID: 0 (off, the default) or G in ``GRIDS``, which ``prefill_rows`` must be a multiple of.
++
++    With G set, every prompt chunk starts on a multiple of G and a kept prompt state sits at the last multiple of G
++    in the prompt (``grid_point``), so prompt kernels whose rows depend on G-row block alignment resume exactly.
++    ``chunked`` (default: TF_GLM_KDA_CHUNKED): the chunked KDA prompt path, whose rows depend on the alignment of its
++    32-row sub-chunks, needs G a multiple of 32; unset or 0 then means 64. (MiaAI-Lab recipe patches 0008, 0039)"""
++
++    if chunked is None:
++        chunked = kda_chunked_on()
++    value = os.environ.get("TF_GLM_PROMPT_GRID", "") if value is None else value
++    value = value.strip()
++    if value in ("", "0"):
++        if not chunked:
++            return 0
++        value = "64"
++    if not value.isdecimal() or int(value) not in GRIDS:
++        raise ValueError(f"TF_GLM_PROMPT_GRID: 0 or one of {', '.join(map(str, GRIDS))}, not {value!r}")
++    grid = int(value)
++    if chunked and grid % 32:
++        raise ValueError(f"TF_GLM_PROMPT_GRID={grid}: TF_GLM_KDA_CHUNKED=1 runs prompt chunks in 32-row sub-chunks at "
++                         f"absolute positions, so prompt chunks must start on a grid of 32, 64 or 128 (0: 64)")
++    if prefill_rows % grid:
++        raise ValueError(f"TF_GLM_PROMPT_GRID={grid}: prompt chunks of {prefill_rows} rows (TF_GLM_PREFILL_ROWS) "
++                         f"must be a multiple of it")
++    return grid
++
++
++def grid_point(n: int, cut: int, grid: int) -> int | None:
++    """Where a drafted request of an n-token prompt resumed at ``cut`` keeps its prompt state, or None for nowhere.
++
++    Off (grid 0) and on-grid prompts: at n. Otherwise at B = floor(n / grid) * grid, when B lies past ``cut`` (so
++    B > 0); the request then prefills up to B, keeps that state, and resumes from it to n. (MiaAI-Lab recipe patch
++    0008. Here only with a grid: without one, a prompt keeps its state before its last token, ``multi.keep_point``.)"""
++
++    if not grid or n % grid == 0:
++        return n
++    point = n // grid * grid
++    return point if point > cut else None
++
++
++def keep_at(n: int, cut: int, grid: int) -> int | None:
++    """Where a drafted request's prompt state is kept: ``grid_point`` with a prompt grid (MiaAI-Lab recipe patch 0008;
++    an on-grid prompt keeps its end state with its head's logits row, 0042), else before its last token
++    (``multi.keep_point``, as before)."""
++
++    if grid:
++        return grid_point(n, cut, grid)
++    from .multi import keep_point
++
++    return keep_point(n, cut)
++
++
+ # MiaAI-Lab recipe patch 0015 (TF_GLM_SHARED_PREFIX): shared-prefix prompt states
+ SHARED_DEFAULT = 256                  # TF_GLM_SHARED_PREFIX=1: the fewest tokens a shared-prefix state adds
+ SHARED_MIN = 16
+@@ -320,7 +385,7 @@ class GlmEngine:
+     kept_cap = None             # --parallel at world 1 (AFD): kept prompts within what the window leaves (kept_most)
+     shared = 0                  # TF_GLM_SHARED_PREFIX (``shared_prefix``): 0 off, else the fewest tokens it adds
+     opener = None               # rank 0, shared on: ``<|user|>``'s id, whose first appearance ends the system block
+-    grid = 0                    # the prompt grid shared-prefix points round down to: 0, exact (serial KDA prompts)
++    grid = 0                    # TF_GLM_PROMPT_GRID (``prompt_grid``; 64 under TF_GLM_KDA_CHUNKED=1), 0: off
+ 
+     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
+                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
+@@ -426,6 +491,9 @@ class GlmEngine:
+         long_context = self.limit > cfg.dense_limit
+         # both ranks must run the same calls: refuse to start when they were given different settings
+         prefill_rows = PREFILL_ROWS if prefill_rows is None else int(prefill_rows)
++        # TF_GLM_PROMPT_GRID=G (MiaAI-Lab recipe patch 0008; 64 under TF_GLM_KDA_CHUNKED=1, 0039): prompt chunks start
++        # on multiples of G and kept prompt states sit on them. Read before anything reaches the AFD wire
++        self.grid = prompt_grid(prefill_rows)
+         if afd is not None:
+             from . import prefill_pairs
+             from .afd import settings_for
+@@ -447,6 +515,7 @@ class GlmEngine:
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
+                 prefill_rows, int(self.mtp_on), int(DRAFT_RING), parallel, *multi_code, self.shared,
+                 KV_KINDS.index(kv)]
++        mine += [self.grid, int(kda_chunked_on())]        # TF_GLM_PROMPT_GRID, TF_GLM_KDA_CHUNKED (recipe 0008, 0039)
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -456,7 +525,7 @@ class GlmEngine:
+             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
+                                "TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING, --parallel, TF_GLM_MULTI_VERIFY, "
+                                "TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, TF_GLM_KV, "
+-                               "TF_GLM_SHARED_PREFIX): "
++                               "TF_GLM_SHARED_PREFIX, TF_GLM_PROMPT_GRID, TF_GLM_KDA_CHUNKED): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+                                "(or pass --drafter none to both) and give both the same flags")
+         self.cache_bytes = (min(both[0][-1], both[1][-1]) if len(both) > 1 else both[0][-1]) << 20
+@@ -527,6 +596,7 @@ class GlmEngine:
+                 print(f"[tensorfold] TF_GLM_PREFILL_PAIRS=1: prompt chunks fill in pairs while no stream decodes (one "
+                       f"chunk's attention while the experts compute the other's); the second chunk's buffers "
+                       f"{prefill_pairs.slot_bytes(self.e.pbuf) / 2 ** 20:.0f} MiB", flush=True)
++        self.e.grid = self.grid                  # a resumed prompt starts on it (``decode.prefill``; recipe 0008)
+         if rank == 0 and kv != "bf16":
+             c = self.e.caches
+             rings = (f"indexer rings {c.ring_bytes() / 2 ** 30:.3f} GiB ({parallel} x {c.ring} rows)"
+@@ -536,6 +606,13 @@ class GlmEngine:
+                   f"caches {c.arena.nbytes() / 2 ** 30:.2f} GiB over {c.rows} tokens, {rings}", flush=True)
+         # rank 0: the role token whose first appearance ends a prompt's system block (a shared-prefix point, 0015)
+         self.opener = user_opener(model_dir) if self.shared and rank == 0 else None
++        if rank == 0 and self.grid:
++            print(f"[tensorfold] prompt chunks and kept prompt states on a {self.grid}-token grid "
++                  f"(TF_GLM_PROMPT_GRID; MiaAI-Lab recipe patch 0008)", flush=True)
++        if rank == 0 and kda_chunked_on():
++            print("[tensorfold] TF_GLM_KDA_CHUNKED=1: KDA prompt chunks in chunked (WY) form, 32-row sub-chunks "
++                  "(close to the serial kernel, not its bits; decode keeps the serial kernel; MiaAI-Lab recipe patch "
++                  "0039)", flush=True)
+         if rank == 0 and self.shared:
+             print(f"[tensorfold] shared-prefix prompt states: kept where a prompt stops sharing another and at the end "
+                   f"of its system block, when they add {self.shared}+ tokens (TF_GLM_SHARED_PREFIX; MiaAI-Lab recipe "
+@@ -733,13 +810,18 @@ class GlmEngine:
+         return auto, auto or not dflash, dflash
+ 
+     def _resume(self, prompt: list[int], code: list[int]):
+-        """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters."""
++        """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters, or of
++        the whole prompt when it kept its head's logits row (a replay, ``decode.whole``; TF_GLM_PROMPT_GRID only:
++        MiaAI-Lab recipe patches 0008, 0042)."""
+ 
+         _, mtp, dflash = self._drafters(code)
+         best = None
+         for snap in self.cache:
+             fits = (not dflash or snap.drafter_end == len(snap.ids)) and (not mtp or snap.mtp_len >= 0)
+-            if fits and len(snap.ids) < len(prompt) and prompt[:len(snap.ids)] == snap.ids and (
++            fits = fits and not (self.grid and len(snap.ids) % self.grid)     # prompt chunks start on the grid
++            short = len(snap.ids) < len(prompt) or (len(snap.ids) == len(prompt) and
++                                                    getattr(snap, "head", None) is not None)
++            if fits and short and prompt[:len(snap.ids)] == snap.ids and (
+                     best is None or len(snap.ids) > len(best.ids)):
+                 best = snap
+         return best
+@@ -812,7 +894,8 @@ class GlmEngine:
+         if not self.shared:
+             return []
+         cut = len(hit.ids) if hit is not None else 0
+-        return shared_points(prompt, cut, max(1, len(prompt) - 1), self.grid, self.shared, known_ids(self.cache),
++        point = grid_point(len(prompt), cut, self.grid) if self.grid else max(1, len(prompt) - 1)    # recipe 0008
++        return shared_points(prompt, cut, point, self.grid, self.shared, known_ids(self.cache),
+                              self.opener)
+ 
+     def _held_bytes(self) -> int:
+@@ -833,7 +916,7 @@ class GlmEngine:
+     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
+                   on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool,
+                   shared=()) -> dict[str, Any]:
+-        from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode
++        from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode, whole
+         from .drafter_choice import DrafterChoice, auto_decode
+         from .stop import StopVote
+ 
+@@ -850,11 +933,21 @@ class GlmEngine:
+             load_rows(self.e, hit, **({"drafter": kept_drafter} if kept_drafter is not None else {}))
+             hit.rows, hit.nbytes = None, 0            # live again
+         self.live = list(prompt)
+-        point = max(1, len(prompt) - 1) if draft else None
++        if self.grid:
++            # TF_GLM_PROMPT_GRID (MiaAI-Lab recipe patch 0008): a drafted prompt keeps its state at ``point``: its
++            # end when that is on the grid, else the last grid multiple in it. Short of the end, the prompt prefills to
++            # the point as a prompt of that length would (no first token), keeps that state, and resumes from it as a
++            # later request would: so any prompt extending prompt[:point] passes through the same state there
++            point = grid_point(len(prompt), cut, self.grid) if draft else None
++        else:
++            point = max(1, len(prompt) - 1) if draft else None
+         # TF_GLM_SHARED_PREFIX (MiaAI-Lab recipe patch 0015): rank 0's shared-prefix points (past the resume point, short
+         # of ``point``) are kept the same way, each prefilled to as a prompt of its length and resumed from, so fresh
+         # and resumed prompts pass through the same states there too
+         stops = sorted(p for p in set(shared) if point is not None and cut < p < point)
++        shared_stops = list(stops)
++        if self.grid and point is not None and point < len(prompt):
++            stops.append(point)
+         kept: list = []
+         resume = hit
+         for stop in stops:
+@@ -862,17 +955,32 @@ class GlmEngine:
+                     keep=kept.append, sample=False)
+             resume = kept[-1]
+         sharing = bool(self.shared and draft)
+-        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=resume,
+-                        keep_at=point, keep=kept.append if sharing else self._remember)
++        if self.grid:
++            # a replay of a kept prompt (``decode.whole``, MiaAI-Lab recipe patch 0042: its state and head's logits
++            # row) prefills nothing and keeps nothing new; a prompt's own end state keeps the head's row it sampled
++            # from, for a later replay
++            end = point == len(prompt) and not whole(hit, prompt)
++            first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=resume,
++                            keep_at=len(prompt) if end else None, keep=kept.append, keep_head=end)
++        else:
++            first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=resume,
++                            keep_at=point, keep=kept.append if sharing else self._remember)
+         prefill_s = time.perf_counter() - t0
+-        if sharing:
++        if self.grid:
++            if sharing and hit is not None:           # what it resumed from is used again
++                self.cache = [c for c in self.cache if c is not hit] + [hit]
++            for snap in kept:
++                self._remember(snap)
++            if not kept and draft and hit is not None:     # the resume point is the grid point: newest
++                self.cache = [c for c in self.cache if c is not hit] + [hit]
++        elif sharing:
+             if hit is not None:                       # what it resumed from is used again
+                 self.cache = [c for c in self.cache if c is not hit] + [hit]
+             for snap in kept:
+                 self._remember(snap)
+         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
+-        if stops:
+-            stats["shared"] = list(stops)
++        if shared_stops:
++            stats["shared"] = shared_stops
+         on_tokens = StopVote(on_tokens)             # rank 0's stop reaches every rank on the next verify sample
+         on_tokens([first])
+         if max_tokens <= 1 or (stop_eos and first in self.eos):
+@@ -1054,6 +1162,9 @@ class AfdEngine(GlmEngine):
+         from . import prefill_pairs
+ 
+         prefill_pairs.enabled()                   # TF_GLM_PREFILL_PAIRS read now: a typo fails before the wire opens
++        from tensorfold.cuda.geometry import PREFILL_ROWS
++
++        prompt_grid(PREFILL_ROWS)                 # TF_GLM_PROMPT_GRID / TF_GLM_KDA_CHUNKED too (0008, 0039)
+         afd = make_afd(master, port, model_dir)   # AFD rank 0: the store lives here; the experts join
+         super().__init__(model_dir, rank=0, master=master, port=port, policy=policy, drafter=drafter,
+                          context=context, context_explicit=context_explicit, serial_only=serial_only,
+diff --git a/src/tensorfold/families/glm5_next/cuda/forward.py b/src/tensorfold/families/glm5_next/cuda/forward.py
+index 0ddddda..653777a 100644
+--- a/src/tensorfold/families/glm5_next/cuda/forward.py
++++ b/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -461,10 +461,12 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, cut: Cut
+         else:                            # a cut only lies inside a prompt chunk (``compute``), which commits now
+             n = cut.point
+             first = kda_mod.chain(p[:n], k.b_off, b.ka[:n], b.kg[:n], st.conv[li], k.conv, st.rec[cur, li],
+-                                  k.a_log, k.dt_bias, k.norm, c.eps, c.lower, n, b.kscratch, cut.rec[li]).clone()
++                                  k.a_log, k.dt_bias, k.norm, c.eps, c.lower, n, b.kscratch, cut.rec[li],
++                                  **kda_mod.prompt_kw(st.pos)).clone()
+             _shift_conv(cut.conv[li:li + 1], b.kproj[:, :n], n)
+             rest = kda_mod.chain(p[n:], k.b_off, b.ka[n:R], b.kg[n:R], cut.conv[li], k.conv, cut.rec[li],
+-                                 k.a_log, k.dt_bias, k.norm, c.eps, c.lower, R - n, b.kscratch, st.rec[1 - cur, li])
++                                 k.a_log, k.dt_bias, k.norm, c.eps, c.lower, R - n, b.kscratch, st.rec[1 - cur, li],
++                                 **kda_mod.prompt_kw(st.pos + n))
+             out = torch.cat((first, rest))
+             st.cur[li] = 1 - cur
+             _shift_conv(st.conv[li:li + 1], b.kproj[:, :R], R)
+@@ -484,7 +486,7 @@ def kda_rows(layer: LayerW, w: Weights, st: State, b: Buffers, lo: int, n: int)
+     from its position: the chain into b.kscratch.out[lo:lo + n] (returned), the layer's state committed and its conv
+     window shifted. ``kda_block`` runs a chunk as rows 0 .. R; a chunk of several streams' prompts
+     (``multi_prefill``) runs each stream's rows through this on that stream's state: the call they get alone.
+-    (MiaAI-Lab recipe patch 0049)"""
++    (MiaAI-Lab recipe patch 0049; under TF_GLM_KDA_CHUNKED=1 the chain gets the rows' position, patches 0012, 0039)"""
+ 
+     c = w.cfg
+     k = layer.kda
+@@ -492,7 +494,8 @@ def kda_rows(layer: LayerW, w: Weights, st: State, b: Buffers, lo: int, n: int)
+     rs = slice(lo, lo + n)
+     cur = st.cur[li]
+     out = kda_mod.chain(b.kproj[0, rs], k.b_off, b.ka[rs], b.kg[rs], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
+-                        k.dt_bias, k.norm, c.eps, c.lower, n, _scratch_rows(b.kscratch, lo), st.rec[1 - cur, li])
++                        k.dt_bias, k.norm, c.eps, c.lower, n, _scratch_rows(b.kscratch, lo), st.rec[1 - cur, li],
++                        **kda_mod.prompt_kw(st.pos))
+     st.cur[li] = 1 - cur
+     _shift_conv(st.conv[li:li + 1], b.kproj[:, rs], n)
+     return out
+diff --git a/src/tensorfold/families/glm5_next/cuda/kda.py b/src/tensorfold/families/glm5_next/cuda/kda.py
+index 64d743c..8c3feb1 100644
+--- a/src/tensorfold/families/glm5_next/cuda/kda.py
++++ b/src/tensorfold/families/glm5_next/cuda/kda.py
+@@ -62,10 +62,21 @@ def replay_layers(state_in: torch.Tensor, scratch: KDAScratchSet, rows: int, sta
+ WIDE_ROWS = int(os.environ.get("TF_GLM_KDA_WIDE_ROWS", "64"))
+ if WIDE_ROWS < 1:
+     raise ValueError(f"TF_GLM_KDA_WIDE_ROWS is a row count from 1, not {WIDE_ROWS}")
++# prompt chunks in chunked (WY) form, 32-row sub-chunks at absolute positions (kda_chunked.py, kda_chunk.cu): close to
++# the serial kernels, not their bits; the engine then puts prompt chunks on a 64-token grid (TF_GLM_PROMPT_GRID)
++# (MiaAI-Lab recipe patches 0012, 0039)
++CHUNKED = os.environ.get("TF_GLM_KDA_CHUNKED", "0") == "1"
+ _tmp: dict = {}
+ _outgrown: list = []
+ 
+ 
++def prompt_kw(pos: int) -> dict:
++    """``chain``'s keywords for a prompt chunk whose first row sits at position ``pos``: ``pos`` under
++    TF_GLM_KDA_CHUNKED=1 (the chunked form), none otherwise, so the serial kernels' calls stay as they were."""
++
++    return {"pos": int(pos)} if CHUNKED else {}
++
++
+ def _wide_scratch(rows: int, heads: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+     """The normalized q and the read-out of a long window, shared by every layer (they run one after another).
+     A CUDA graph keeps the addresses it was captured with (``chain_segments`` in a multi-stream window's graphs):
+@@ -93,9 +104,14 @@ def reserve(rows: int, heads: int, device) -> None:
+ def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_state: torch.Tensor,
+           conv_w: torch.Tensor, state_in: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
+           norm_w: torch.Tensor, eps: float, lower: float, rows: int, scratch: KDAScratch,
+-          state_out: torch.Tensor, *, wide: bool | None = None) -> torch.Tensor:
+-    """Run projection rows p [q | k | v | ... | b at b_off ...] and bf16 gate rows a and g; windows of WIDE_ROWS rows or more take the three-kernel path, same bits."""
++          state_out: torch.Tensor, *, wide: bool | None = None, pos: int | None = None) -> torch.Tensor:
++    """Run projection rows p [q | k | v | ... | b at b_off ...] and bf16 gate rows a and g; windows of WIDE_ROWS rows or more take the three-kernel path, same bits; a prompt chunk (``pos``: its first row's position) takes the chunked form under TF_GLM_KDA_CHUNKED=1 (scratch's k/v/g/b are not written). (MiaAI-Lab recipe patches 0012, 0039)"""
++
++    if CHUNKED and pos is not None:
++        from . import kda_chunked
+ 
++        return kda_chunked.chain(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, eps, lower,
++                                 rows, scratch.out, state_out, pos)
+     if wide if wide is not None else rows >= WIDE_ROWS:
+         q_tmp, y_tmp = _wide_scratch(rows, a_log.numel(), p.device)
+         _ext().chain_wide(p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv_state, conv_w, state_in,
+diff --git a/src/tensorfold/families/glm5_next/cuda/kda_chunk.cpp b/src/tensorfold/families/glm5_next/cuda/kda_chunk.cpp
+new file mode 100644
+index 0000000..60d0a3b
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/kda_chunk.cpp
+@@ -0,0 +1,58 @@
++// Ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe @ 1576746, patch 0039-glm-kda-chunked-kernel
++// (Apache-2.0, Copyright 2026 MiaAI-Lab; THIRD_PARTY_NOTICES.md "GLM chunked KDA prompt kernel").
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++
++void kda_chunk_cuda(const at::Tensor&, int64_t, int64_t, const at::Tensor&, int64_t, const at::Tensor&, int64_t,
++                    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                    const at::Tensor&, double, double, int64_t, int64_t, at::Tensor&, at::Tensor&);
++
++static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == t, name, ": expected a CUDA tensor of the right dtype");
++}
++
++// A prompt chunk of ``rows`` rows whose first row sits ``off`` rows into its 32-row sub-chunk (kda_chunk.cu).
++void chain(const at::Tensor& P, int64_t p_stride, int64_t b_off, const at::Tensor& A, int64_t a_stride,
++           const at::Tensor& G, int64_t g_stride, const at::Tensor& cs, const at::Tensor& cw,
++           const at::Tensor& state_in, const at::Tensor& a_log, const at::Tensor& dt_bias, const at::Tensor& norm_w,
++           double eps, double lower, int64_t rows, int64_t off, at::Tensor out, at::Tensor state_out) {
++    check(P, at::kBFloat16, "P");
++    check(A, at::kBFloat16, "A");
++    check(G, at::kBFloat16, "G");
++    check(cs, at::kBFloat16, "conv state");
++    check(cw, at::kBFloat16, "conv weight");
++    check(state_in, at::kFloat, "state");
++    check(state_out, at::kFloat, "state out");
++    check(a_log, at::kFloat, "A_log");
++    check(dt_bias, at::kFloat, "dt_bias");
++    check(norm_w, at::kBFloat16, "norm");
++    check(out, at::kBFloat16, "out");
++    TORCH_CHECK(cs.is_contiguous() && cw.is_contiguous() && state_in.is_contiguous() && state_out.is_contiguous() &&
++                out.is_contiguous() && a_log.is_contiguous() && dt_bias.is_contiguous() && norm_w.is_contiguous(),
++                "conv state, conv weight, states, out and the per-head weights must be contiguous");
++    TORCH_CHECK(P.stride(1) == 1 && A.stride(1) == 1 && G.stride(1) == 1, "rows must be contiguous along channels");
++    const int64_t H = a_log.numel();
++    TORCH_CHECK(dt_bias.numel() == H * 128 && norm_w.numel() == 128, "dt_bias [H*128], norm [128]");
++    TORCH_CHECK(cw.size(0) == 3 * H * 128 && cw.size(1) == 4 && cs.size(0) == 3 && cs.size(1) == 3 * H * 128,
++                "4-tap convolutions of 3 x H x 128 channels");
++    TORCH_CHECK(state_in.numel() == H * 128 * 128 && state_out.numel() == H * 128 * 128, "states [H, 128, 128]");
++    TORCH_CHECK(state_in.data_ptr() != state_out.data_ptr(), "state_out must not alias state_in");
++    TORCH_CHECK(rows >= 1 && P.size(0) >= rows && A.size(0) >= rows && G.size(0) >= rows && out.size(0) >= rows,
++                "rows");
++    TORCH_CHECK(off >= 0 && off < 32, "off");
++    c10::cuda::CUDAGuard guard(P.device());
++    kda_chunk_cuda(P, p_stride, b_off, A, a_stride, G, g_stride, cs, cw, state_in, a_log, dt_bias, norm_w, eps, lower,
++                   rows, off, out, state_out);
++}
++
++#ifdef KDA_PROF
++void kda_chunk_prof(at::Tensor&);
++void prof(at::Tensor out) { kda_chunk_prof(out); }
++#endif
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("chain", &chain);
++#ifdef KDA_PROF
++    m.def("prof", &prof);
++#endif
++}
+diff --git a/src/tensorfold/families/glm5_next/cuda/kda_chunk.cu b/src/tensorfold/families/glm5_next/cuda/kda_chunk.cu
+new file mode 100644
+index 0000000..4b20ce2
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/kda_chunk.cu
+@@ -0,0 +1,747 @@
++// Ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe @ 1576746, patch 0039-glm-kda-chunked-kernel
++// (Apache-2.0, Copyright 2026 MiaAI-Lab; THIRD_PARTY_NOTICES.md "GLM chunked KDA prompt kernel").
++// GLM-5.3-Flash's KDA prompt chunks in chunked (WY) form: one block of 256 threads per head runs the prompt
++// chunk's 32-row sub-chunks in order (sub-chunks at absolute positions), the 128 x 128 state in registers.
++//
++// Per row the inputs are kda.cu's (this file is built like kda.cu, without FMA contraction, with CUDA's expf and
++// IEEE division): conv + SiLU rounded to bf16, fp32 L2 norms (q times 128^-0.5), beta = bf16(sigmoid(b)), the
++// per-channel decay g = expf(lower * sigmoid(exp(A_log) * (a + dt_bias))). A sub-chunk of rows 0..31 entering state
++// S0 [value, key]:
++//
++//     E(t -> s)  = g_{t+1} ... g_s per key channel: a running product multiplied in row order, as the serial chain
++//                  decays its state (empty: 1); E(s) = g_0 ... g_s from the sub-chunk's start;
++//                  E(s ->) = g_{s+1} ... g_31
++//     L[s, t]    = beta_s sum_c k_s k_t E(t -> s)                  t < s
++//     M[s, t]    =        sum_c q_s k_t E(t -> s)                  t <= s
++//     T          = (I + L)^-1                                     forward substitution (16-row blocks)
++//     Y          = beta (v - (k E(s)) S0^T),   V' = T Y             the delta rule's corrections ("v_new")
++//     O          = (q E(s)) S0^T + M V'                            read-outs, rounded to bf16, then the gated RMSNorm
++//     S_end      = S0 diag(E(31)) + V'^T (k E(s ->))
++//
++// Every factor is a product of decays <= 1 (no e^(+x), no difference of cumulative log-decays), so a decay carries
++// the serial chain's rounding; all sums run in fp32 with explicit FMAs and shuffle trees in a fixed order: the kernel
++// is deterministic, and a row's bits depend only on its sub-chunk's rows and the state entering it, so they are the
++// same whichever prefill chunk the row came in, as long as prompt chunks start on multiples of 32
++// (TF_GLM_PROMPT_GRID). Rows outside the prompt chunk (a short first or last sub-chunk) are zero rows: decay 1, no
++// key, no value, beta 0.
++//
++// Layout. The state: thread (vg, kp) = (tid / 8, tid % 8) holds value rows 4 vg .. 4 vg + 3 and key quads kp + 8 i
++// (i < 4): an 8-lane group reads 128 contiguous bytes of a key row per load, and products with S reduce over the 8
++// lanes by a transposing shuffle tree (7 shuffles for 8 sums). Read-outs and corrections: thread (vg, kp) finishes
++// value column 4 vg + kp % 4 of the rows of one parity (odd for kp < 4, even otherwise), 16 rows. The next
++// sub-chunk's projection, decay and beta rows are loaded into registers while this one computes, and staged into
++// shared memory that is free at the sub-chunk's start.
++
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++#include <cstdint>
++
++namespace {
++
++constexpr int DK = 128, DV = 128, TAPS = 4;
++constexpr int BT = 32;                  // rows of a sub-chunk
++constexpr int HALO = TAPS - 1;          // conv rows before a sub-chunk
++constexpr int NT = 256, NW = NT / 32;   // threads, warps
++constexpr int VPT = 4;                  // value rows of the state a thread holds
++constexpr int KP = NT * VPT / DV;       // threads sharing those value rows (8), each 16 keys
++constexpr int NQ = DK / 4 / KP;         // key quads a thread holds (4)
++constexpr int OWN = BT / 2;             // rows a thread finishes (16, one parity)
++constexpr int LS = BT + 4;              // row stride of L
++constexpr int PCH = 3 * DK;             // projection channels of a head (q | k | v)
++constexpr int PF_P = ((BT + HALO) * PCH / 8 + NT - 1) / NT;   // 16-byte loads a thread prefetches (7)
++constexpr int PF_A = BT * DK / 8 / NT;                         // (2)
++static_assert(KP == 8 && NQ == 4 && PF_A * NT * 8 == BT * DK, "layout");
++
++struct Smem {
++    float q[BT][DK];          // q -> q E(s) -> V'
++    float k[BT][DK];          // k -> k E(s) -> (q E) S0^T
++    float g[BT][DK];          // decays -> Y
++    union {                   // staged projection rows (conv input) -> k E(s ->), L, T, M
++        __nv_bfloat16 raw_p[BT + HALO][PCH];
++        struct {
++            float ke[BT][DK];         // k E(s ->)
++            float L[BT][LS];          // L[s][t]
++            float tt[BT][BT];         // T transposed: tt[t][s] = T[s][t]
++            float mt[BT][BT];         // M transposed: mt[t][s] = M[s][t]
++        } x;
++    } u;
++    __nv_bfloat16 v[BT][DV];
++    __nv_bfloat16 raw_a[BT][DK];      // staged decay rows
++    __nv_bfloat16 cw[PCH][TAPS];      // this head's conv weights
++    float raw_b[BT];
++    float beta[BT];
++    float egl[DK];            // E(31)
++};
++
++__device__ __forceinline__ float bf(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
++__device__ __forceinline__ float ldb(const __nv_bfloat16* p) { return __bfloat162float(*p); }
++__device__ __forceinline__ float fma_(float a, float b, float c) { return __fmaf_rn(a, b, c); }
++__device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
++
++// a / b with IEEE rounding, branch-free: the fast path of CUDA's division (a refined reciprocal, then one
++// correction), which is the correctly rounded quotient whenever ``div_ok`` holds (checked on 742 M operand pairs
++// against a / b); callers take a / b for the rare operands outside (a huge denominator, a tiny numerator).
++__device__ __forceinline__ float div_rn(float a, float b) {
++    float r;
++    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(b));
++    const float e = __fmaf_rn(-b, r, 1.0f);
++    r = __fmaf_rn(e, r, r);
++    const float q = a * r;
++    const float rem = __fmaf_rn(-b, q, a);
++    return __fmaf_rn(rem, r, q);
++}
++
++__device__ __forceinline__ bool div_ok(float a, float b) {
++    return (a == 0.0f || fabsf(a) > 1e-36f) && b >= 1.0f && b < 8e37f;
++}
++
++__device__ __forceinline__ float warp_sum(float x) {
++    for (int o = 16; o; o >>= 1) x += __shfl_xor_sync(0xffffffffu, x, o);
++    return x;
++}
++
++// 8 bf16 from p: one 16-byte load when aligned, else 8 loads.
++__device__ __forceinline__ uint4 ld8(const __nv_bfloat16* p, bool vec) {
++    if (vec) return *reinterpret_cast<const uint4*>(p);
++    const unsigned short* s = reinterpret_cast<const unsigned short*>(p);
++    uint4 r;
++    r.x = s[0] | ((unsigned)s[1] << 16); r.y = s[2] | ((unsigned)s[3] << 16);
++    r.z = s[4] | ((unsigned)s[5] << 16); r.w = s[6] | ((unsigned)s[7] << 16);
++    return r;
++}
++
++// One level of a transposing shuffle tree: this lane keeps the half of a[0..N) its ``hi`` bit selects, adds the
++// partner's (lane ^ mask) copy of that half, and sends the other half.
++template <int N>
++__device__ __forceinline__ void tree_level(float (&a)[N], int mask, bool hi) {
++#pragma unroll
++    for (int j = 0; j < N / 2; ++j) {
++        const float send = hi ? a[j] : a[j + N / 2];
++        const float keep = hi ? a[j + N / 2] : a[j];
++        a[j] = keep + __shfl_xor_sync(0xffffffffu, send, mask);
++    }
++}
++
++// Sums of a[0..8) over the lanes xor 4, 2, 1: lane bits (2, 1, 0) = i gets the sum of a[i].
++__device__ __forceinline__ float tree8(float (&a)[8], int lane) {
++    tree_level<8>(a, 4, lane & 4);
++    float b[4] = {a[0], a[1], a[2], a[3]};
++    tree_level<4>(b, 2, lane & 2);
++    float c[2] = {b[0], b[1]};
++    tree_level<2>(c, 1, lane & 1);
++    return c[0];
++}
++
++// Sums of a[0..16) over the lanes xor m0 > m1 > m2 > m3: the lane whose bits (m0, m1, m2, m3) spell i gets a[i]'s.
++__device__ __forceinline__ float tree16(float (&a)[16], int lane, int m0, int m1, int m2, int m3) {
++    tree_level<16>(a, m0, lane & m0);
++    float b[8];
++#pragma unroll
++    for (int j = 0; j < 8; ++j) b[j] = a[j];
++    tree_level<8>(b, m1, lane & m1);
++    float c[4] = {b[0], b[1], b[2], b[3]};
++    tree_level<4>(c, m2, lane & m2);
++    float d[2] = {c[0], c[1]};
++    tree_level<2>(d, m3, lane & m3);
++    return d[0];
++}
++
++#ifdef KDA_PROF
++__device__ unsigned long long g_prof[16];
++#define MARK(i) \
++    do { if (tid == 0 && h == 0) { const long long t1 = clock64(); g_prof[i] += t1 - t0_; t0_ = t1; } } while (0)
++#else
++#define MARK(i) do {} while (0)
++#endif
++
++__device__ __forceinline__ void prefetch_l2(const void* p) {
++    asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
++}
++
++__device__ __forceinline__ void cp16(void* dst, const void* src) {
++    const unsigned d = (unsigned)__cvta_generic_to_shared(dst);
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(d), "l"(src));
++}
++
++// Warm L2 with the rows of the sub-chunk whose row 0 is prompt-chunk row r0 (projection rows r0 - 3 .. r0 + 31 of
++// this head's q | k | v channels, its decay rows and beta logits; not when ``next`` is false) and the output gate
++// rows from gate_r0.
++__device__ __forceinline__ void warm(int tid, int h, int H, int r0, bool next, int rows, int gate_r0,
++                                     const __nv_bfloat16* __restrict__ P, int p_stride, int b_off,
++                                     const __nv_bfloat16* __restrict__ A, int a_stride,
++                                     const __nv_bfloat16* __restrict__ G, int g_stride) {
++    constexpr int LP = (BT + HALO) * 3 * 2, LA = BT * 2, LB = BT, LG = BT * 2;   // 128-byte lines
++    for (int x = next ? tid : tid + LP + LA + LB; x < LP + LA + LB + LG; x += NT) {
++        if (x < LP) {
++            const int row = x / 6, part = (x % 6) / 2, half = x % 2, r = r0 - HALO + row;
++            if (r >= 0 && r < rows) prefetch_l2(P + (size_t)r * p_stride + part * H * DK + h * DK + 64 * half);
++        } else if (x < LP + LA) {
++            const int y = x - LP, r = r0 + y / 2;
++            if (r >= 0 && r < rows) prefetch_l2(A + (size_t)r * a_stride + h * DK + 64 * (y % 2));
++        } else if (x < LP + LA + LB) {
++            const int r = r0 + (x - LP - LA);
++            if (r >= 0 && r < rows) prefetch_l2(P + (size_t)r * p_stride + b_off + h);
++        } else {
++            const int y = x - LP - LA - LB, r = gate_r0 + y / 2;
++            if (r >= 0 && r < rows) prefetch_l2(G + (size_t)r * g_stride + h * DV + 64 * (y % 2));
++        }
++    }
++}
++
++// Stage the rows of the sub-chunk whose row 0 is prompt-chunk row r0 into shared memory: projection rows r0 - 3 ..
++// r0 + 31 (the conv state before row 0, zero rows outside), decay rows and the beta logits. Global to shared
++// directly (cp.async) when the rows are 16-byte aligned; the caller waits (cp.async.wait_all) and syncs.
++__device__ __forceinline__ void stage(Smem& sm, int tid, int h, int H, int r0, int rows,
++                                      const __nv_bfloat16* __restrict__ P, int p_stride, int b_off,
++                                      const __nv_bfloat16* __restrict__ A, int a_stride,
++                                      const __nv_bfloat16* __restrict__ cs, bool vec_p, bool vec_a) {
++    const int C = 3 * H * DK;
++    for (int item = tid; item < (BT + HALO) * PCH / 8; item += NT) {
++        const int row = item / (PCH / 8), q8 = item % (PCH / 8);
++        const int ch = (q8 / (DK / 8)) * H * DK + h * DK + 8 * (q8 % (DK / 8));
++        const int r = r0 - HALO + row;
++        uint4* dst = reinterpret_cast<uint4*>(&sm.u.raw_p[row][0]) + q8;
++        const __nv_bfloat16* src = nullptr;
++        if (r >= 0 && r < rows) src = P + (size_t)r * p_stride + ch;
++        else if (r < 0 && r >= -HALO) src = cs + (size_t)(r + HALO) * C + ch;
++        if (src == nullptr) *dst = make_uint4(0, 0, 0, 0);
++        else if (vec_p) cp16(dst, src);
++        else *dst = ld8(src, false);
++    }
++    for (int item = tid; item < BT * DK / 8; item += NT) {
++        const int row = item / (DK / 8), c8 = item % (DK / 8);
++        const int r = r0 + row;
++        uint4* dst = reinterpret_cast<uint4*>(&sm.raw_a[row][0]) + c8;
++        const __nv_bfloat16* src = A + (size_t)r * a_stride + h * DK + 8 * c8;
++        if (r < 0 || r >= rows) *dst = make_uint4(0, 0, 0, 0);
++        else if (vec_a) cp16(dst, src);
++        else *dst = ld8(src, false);
++    }
++    if (tid < BT) {
++        const int r = r0 + tid;
++        sm.raw_b[tid] = (r >= 0 && r < rows) ? ldb(P + (size_t)r * p_stride + b_off + h) : 0.0f;
++    }
++}
++
++__global__ void __launch_bounds__(NT, 1) chunk_kernel(
++        int H, const __nv_bfloat16* __restrict__ P, int p_stride, int b_off,
++        const __nv_bfloat16* __restrict__ A, int a_stride, const __nv_bfloat16* __restrict__ G, int g_stride,
++        const __nv_bfloat16* __restrict__ cs, const __nv_bfloat16* __restrict__ cw,
++        const float* __restrict__ state_in, const float* __restrict__ a_log, const float* __restrict__ dt_bias,
++        const __nv_bfloat16* __restrict__ norm_w, float eps, float lower, int rows, int off,
++        __nv_bfloat16* __restrict__ out, float* __restrict__ state_out) {
++    extern __shared__ __align__(16) unsigned char smem_raw[];
++    Smem& sm = *reinterpret_cast<Smem*>(smem_raw);
++    const int h = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
++    const int vg = tid / KP, kp = tid % KP;
++    const int par = kp < 4 ? 1 : 0;                   // parity of the rows this thread finishes
++    const int ov = VPT * vg + (kp & 3);               // their value column
++    const size_t sbase = (size_t)h * DV * DK;
++    const bool vec_p = (p_stride % 8 == 0) && ((uintptr_t)P % 16 == 0) && ((uintptr_t)cs % 16 == 0);
++    const bool vec_a = (a_stride % 8 == 0) && ((uintptr_t)A % 16 == 0);
++
++    float s[VPT][NQ][4];
++#pragma unroll
++    for (int vv = 0; vv < VPT; ++vv)
++#pragma unroll
++        for (int i = 0; i < NQ; ++i) {
++            const float4 x =
++                reinterpret_cast<const float4*>(state_in + sbase + (size_t)(VPT * vg + vv) * DK)[kp + KP * i];
++            s[vv][i][0] = x.x; s[vv][i][1] = x.y; s[vv][i][2] = x.z; s[vv][i][3] = x.w;
++        }
++    const float rate = expf(a_log[h]);
++    const float dtb = dt_bias[h * DK + (tid & (DK - 1))];     // the decay channel this thread computes (tid % 128)
++    float nw[4];                                      // the norm weights of value columns 4 lane .. 4 lane + 3
++#pragma unroll
++    for (int x = 0; x < 4; ++x) nw[x] = ldb(norm_w + 4 * lane + x);
++    const bool vec_g = (g_stride % 4 == 0) && ((uintptr_t)G % 8 == 0);
++    const bool vec_o = ((H * DV) % 4 == 0) && ((uintptr_t)out % 8 == 0);
++    const int nsub = (rows + off + BT - 1) / BT;
++    for (int x = tid; x < PCH * TAPS; x += NT) {
++        const int ch = x / TAPS;
++        sm.cw[ch][x % TAPS] = cw[(size_t)((ch / DK) * H * DK + h * DK + ch % DK) * TAPS + x % TAPS];
++    }
++#ifdef KDA_PROF
++    long long t0_ = clock64();
++#endif
++
++    for (int c = 0; c < nsub; ++c) {
++        const int r0 = c * BT - off;                  // the prompt chunk's row at the sub-chunk's row 0
++
++        // 0. stage this sub-chunk's rows (warmed in L2 during the previous one), warm the next one's and this
++        // one's output gates
++        stage(sm, tid, h, H, r0, rows, P, p_stride, b_off, A, a_stride, cs, vec_p, vec_a);
++        asm volatile("cp.async.wait_all;" ::: "memory");
++        __syncthreads(); MARK(0);
++        warm(tid, h, H, r0 + BT, c + 1 < nsub, rows, r0, P, p_stride, b_off, A, a_stride, G, g_stride);
++
++        // 1. conv + SiLU (kda.cu's arithmetic) in 4-row blocks: warp w takes rows 4 w .. 4 w + 3 of q, then of k,
++        // then of v, lane l the channels 4 l .. 4 l + 3 (kda.cu's norm lanes), and the L2 norms of its q and k rows
++        // (kda.cu's sums); then the decays and beta.
++#pragma unroll 1
++        for (int part = 0; part < 3; ++part) {
++            const int rb = 4 * warp, ch = part * DK + 4 * lane;
++            float wt[4][TAPS];
++#pragma unroll
++            for (int x = 0; x < 4; ++x)
++#pragma unroll
++                for (int tap = 0; tap < TAPS; ++tap) wt[x][tap] = __bfloat162float(sm.cw[ch + x][tap]);
++            float xs[4 + HALO][4];
++#pragma unroll
++            for (int j = 0; j < 4 + HALO; ++j) {
++                const uint2 raw = *reinterpret_cast<const uint2*>(&sm.u.raw_p[rb + j][ch]);
++                const __nv_bfloat162 lo = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
++                const __nv_bfloat162 hi = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
++                xs[j][0] = __low2float(lo); xs[j][1] = __high2float(lo);
++                xs[j][2] = __low2float(hi); xs[j][3] = __high2float(hi);
++            }
++            float acc[4][4], act[4][4];
++            bool slow = false;
++#pragma unroll
++            for (int i = 0; i < 4; ++i)
++#pragma unroll
++                for (int x = 0; x < 4; ++x) {
++                    acc[i][x] = 0.0f;
++#pragma unroll
++                    for (int tap = 0; tap < TAPS; ++tap) acc[i][x] = acc[i][x] + wt[x][tap] * xs[i + tap][x];
++                    const float den = 1.0f + expf(-acc[i][x]);
++                    act[i][x] = div_rn(acc[i][x], den);
++                    slow |= !div_ok(acc[i][x], den);
++                }
++            if (slow) {                                       // kda.cu's IEEE division for the rare operands
++#pragma unroll
++                for (int i = 0; i < 4; ++i)
++#pragma unroll
++                    for (int x = 0; x < 4; ++x) act[i][x] = acc[i][x] / (1.0f + expf(-acc[i][x]));
++            }
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                const int r = r0 + rb + i;
++#pragma unroll
++                for (int x = 0; x < 4; ++x) act[i][x] = (r >= 0 && r < rows) ? bf(act[i][x]) : 0.0f;
++            }
++            if (part < 2) {                                   // warp-uniform
++                float ss[4];
++#pragma unroll
++                for (int i = 0; i < 4; ++i) {
++                    ss[i] = 0.0f;
++#pragma unroll
++                    for (int x = 0; x < 4; ++x) ss[i] = ss[i] + act[i][x] * act[i][x];
++                }
++#pragma unroll
++                for (int o = 16; o; o >>= 1)                  // warp_sum's tree, the rows interleaved
++#pragma unroll
++                    for (int i = 0; i < 4; ++i) ss[i] += __shfl_xor_sync(0xffffffffu, ss[i], o);
++                float (*dst)[DK] = part ? sm.k : sm.q;
++#pragma unroll
++                for (int i = 0; i < 4; ++i) {
++                    const float inv = 1.0f / sqrtf(ss[i] + 1e-6f);
++                    float y[4];
++#pragma unroll
++                    for (int x = 0; x < 4; ++x) {
++                        y[x] = act[i][x] * inv;
++                        if (part == 0) y[x] = y[x] * (1.0f / sqrtf((float)DK));
++                    }
++                    *reinterpret_cast<float4*>(&dst[rb + i][4 * lane]) = make_float4(y[0], y[1], y[2], y[3]);
++                }
++            } else {
++#pragma unroll
++                for (int i = 0; i < 4; ++i) {
++                    __nv_bfloat162 lo = __floats2bfloat162_rn(act[i][0], act[i][1]);
++                    __nv_bfloat162 hi = __floats2bfloat162_rn(act[i][2], act[i][3]);
++                    uint2 o;
++                    o.x = *reinterpret_cast<unsigned*>(&lo); o.y = *reinterpret_cast<unsigned*>(&hi);
++                    *reinterpret_cast<uint2*>(&sm.v[rb + i][4 * lane]) = o;
++                }
++            }
++        }
++        {
++            const int cc = tid & (DK - 1);
++#pragma unroll
++            for (int j = tid >> 7; j < BT; j += NT / DK) {
++                const int r = r0 + j;
++                float gv = 1.0f;
++                if (r >= 0 && r < rows) {
++                    const float a = __bfloat162float(sm.raw_a[j][cc]) + dtb;
++                    const float den = 1.0f + expf(-(rate * a));
++                    const float sg = div_ok(1.0f, den) ? div_rn(1.0f, den) : 1.0f / den;   // kda.cu's sigmoidf_
++                    gv = expf(lower * sg);
++                }
++                sm.g[j][cc] = gv;
++            }
++            if (tid < BT) {
++                const int r = r0 + tid;
++                sm.beta[tid] = (r >= 0 && r < rows) ? bf(sigmoidf_(sm.raw_b[tid])) : 0.0f;
++            }
++        }
++        __syncthreads(); MARK(1);
++
++        // 3. L and M. Group pr = tid / 16 takes column t = pr (rows s > pr), then t = 31 - pr (31 entries in all,
++        // every group alike), in batches of 8; lane cg holds the key quads cg and cg + 16, k_t E(t -> s) multiplied
++        // row after row; a batch's 16 sums reduce over the 16 lanes by a transposing tree.
++        {
++            const int pr = tid >> 4, cg = tid & 15;
++            const int n1 = BT - 1 - pr;               // entries of column pr
++            float kt[8], e[8];
++            auto load_t = [&](int tt) {
++#pragma unroll
++                for (int u = 0; u < 2; ++u) {
++                    const float4 x = reinterpret_cast<const float4*>(sm.k[tt])[cg + 16 * u];
++                    kt[4 * u] = x.x; kt[4 * u + 1] = x.y; kt[4 * u + 2] = x.z; kt[4 * u + 3] = x.w;
++                }
++#pragma unroll
++                for (int i = 0; i < 8; ++i) e[i] = kt[i];     // k_t E(t -> s), multiplied row after row
++            };
++            {   // the diagonal of M for both columns
++                float dg[2];
++#pragma unroll
++                for (int hh = 0; hh < 2; ++hh) {
++                    const int tt = hh ? BT - 1 - pr : pr;
++                    load_t(tt);
++                    float a = 0.0f;
++#pragma unroll
++                    for (int u = 0; u < 2; ++u) {
++                        const float4 x = reinterpret_cast<const float4*>(sm.q[tt])[cg + 16 * u];
++                        a = fma_(x.x, kt[4 * u], a); a = fma_(x.y, kt[4 * u + 1], a);
++                        a = fma_(x.z, kt[4 * u + 2], a); a = fma_(x.w, kt[4 * u + 3], a);
++                    }
++                    dg[hh] = a;
++                }
++#pragma unroll
++                for (int o = 8; o; o >>= 1) {
++                    dg[0] += __shfl_xor_sync(0xffffffffu, dg[0], o);
++                    dg[1] += __shfl_xor_sync(0xffffffffu, dg[1], o);
++                }
++                if (cg == 0) {
++                    sm.u.x.mt[pr][pr] = dg[0];
++                    sm.u.x.mt[BT - 1 - pr][BT - 1 - pr] = dg[1];
++                }
++            }
++            load_t(pr);
++#pragma unroll
++            for (int b = 0; b < 4; ++b) {
++                float val[16];
++#pragma unroll
++                for (int ii = 0; ii < 8; ++ii) {
++                    const int i = 8 * b + ii;
++                    if (i == n1 && n1 < BT - 1) load_t(BT - 1 - pr);
++                    const int s2 = i < n1 ? pr + 1 + i : BT - pr + (i - n1);
++                    float ak = 0.0f, aq = 0.0f;
++                    if (i < BT - 1) {
++#pragma unroll
++                        for (int u = 0; u < 2; ++u) {
++                            const float4 gx = reinterpret_cast<const float4*>(sm.g[s2])[cg + 16 * u];
++                            const float4 kx = reinterpret_cast<const float4*>(sm.k[s2])[cg + 16 * u];
++                            const float4 qx = reinterpret_cast<const float4*>(sm.q[s2])[cg + 16 * u];
++                            const float gg[4] = {gx.x, gx.y, gx.z, gx.w}, kk[4] = {kx.x, kx.y, kx.z, kx.w};
++                            const float qq[4] = {qx.x, qx.y, qx.z, qx.w};
++#pragma unroll
++                            for (int x = 0; x < 4; ++x) {
++                                e[4 * u + x] = e[4 * u + x] * gg[x];
++                                ak = fma_(kk[x], e[4 * u + x], ak);
++                                aq = fma_(qq[x], e[4 * u + x], aq);
++                            }
++                        }
++                    }
++                    val[2 * ii] = ak;
++                    val[2 * ii + 1] = aq;
++                }
++                const float sum = tree16(val, lane, 8, 4, 2, 1);        // entry cg / 2 of the batch, L (even) or M
++                const int i = 8 * b + (cg >> 1);
++                if (i < BT - 1) {
++                    const int tt = i < n1 ? pr : BT - 1 - pr;
++                    const int s2 = i < n1 ? pr + 1 + i : BT - pr + (i - n1);
++                    if (cg & 1) {
++                        sm.u.x.mt[tt][s2] = sum;
++                        sm.u.x.mt[s2][tt] = 0.0f;                        // M[tt][s2], above the diagonal
++                    } else {
++                        sm.u.x.L[s2][tt] = sm.beta[s2] * sum;
++                    }
++                }
++            }
++        }
++        __syncthreads(); MARK(3);
++
++        // 4. T = (I + L)^-1 by warp 0: lane l inverts column l % 16 of diagonal block l / 16 by forward
++        // substitution, then block (1, 0) = -T11 (L10 T00). Warps 1-7 per key channel: k E(s ->), then k E(s) in
++        // place, and E(31) (threads 32-159); q E(s) in place (threads 160-255, then 160-191 for the last 32 channels)
++        if (warp == 0) {
++            const int blk = lane >> 4, j = lane & 15, base = 16 * blk;
++            float col[16];
++#pragma unroll
++            for (int s2 = 0; s2 < 16; ++s2) {
++                float acc = 0.0f;
++#pragma unroll
++                for (int m = 0; m < s2; ++m) acc = fma_(sm.u.x.L[base + s2][base + m], col[m], acc);
++                col[s2] = s2 == j ? 1.0f : (s2 > j ? -acc : 0.0f);
++            }
++#pragma unroll
++            for (int s2 = 0; s2 < 16; ++s2) sm.u.x.tt[base + j][base + s2] = col[s2];
++            if (blk == 1) {                                    // block (0, 1), above the diagonal: zeros
++#pragma unroll
++                for (int s2 = 0; s2 < 16; ++s2) sm.u.x.tt[16 + j][s2] = 0.0f;
++            }
++            __syncwarp();
++            if (blk == 0) {
++                float xr[16];                                  // (L10 T00)[:, j]
++#pragma unroll
++                for (int s2 = 0; s2 < 16; ++s2) {
++                    float acc = 0.0f;
++#pragma unroll
++                    for (int m = 0; m < 16; ++m) acc = fma_(sm.u.x.L[16 + s2][m], col[m], acc);
++                    xr[s2] = acc;
++                }
++#pragma unroll
++                for (int s2 = 0; s2 < 16; ++s2) {
++                    float acc = 0.0f;
++#pragma unroll
++                    for (int m = 0; m <= s2; ++m)              // T11[s2][m]
++                        acc = fma_(sm.u.x.tt[16 + m][16 + s2], xr[m], acc);
++                    sm.u.x.tt[j][16 + s2] = -acc;
++                }
++            }
++        } else {
++            const int t2 = tid - 32;
++            if (t2 < DK) {
++                const int cc = t2;
++                float rr = 1.0f;
++#pragma unroll 8
++                for (int j = BT - 1; j >= 0; --j) { sm.u.x.ke[j][cc] = sm.k[j][cc] * rr; rr = rr * sm.g[j][cc]; }
++                float pp = 1.0f;
++#pragma unroll 8
++                for (int j = 0; j < BT; ++j) { pp = pp * sm.g[j][cc]; sm.k[j][cc] = sm.k[j][cc] * pp; }
++                sm.egl[cc] = pp;
++            } else {
++                for (int cc = t2 - DK; cc < DK; cc += NT - 32 - DK) {
++                    float pp = 1.0f;
++#pragma unroll 8
++                    for (int j = 0; j < BT; ++j) { pp = pp * sm.g[j][cc]; sm.q[j][cc] = sm.q[j][cc] * pp; }
++                }
++            }
++        }
++        __syncthreads(); MARK(4);
++
++        // 5. Every thread: its sums of (k E) S0^T and (q E) S0^T; Y = beta (v - (k E) S0^T) into g, the (q E) S0^T
++        // of the rows it finishes kept in o1.
++        float o1[OWN];
++        {
++            float4 ck[NQ], cq[NQ], nk[NQ], nq[NQ];
++            auto load_row = [&](float4 (&kx)[NQ], float4 (&qx)[NQ], int r) {
++#pragma unroll
++                for (int i = 0; i < NQ; ++i) {
++                    kx[i] = reinterpret_cast<const float4*>(sm.k[r])[kp + KP * i];
++                    qx[i] = reinterpret_cast<const float4*>(sm.q[r])[kp + KP * i];
++                }
++            };
++            // row r's 8 sums (k sums at ok, q sums at 4 - ok), reduced: entry kp, value column 4 vg + kp % 4
++            auto row_sums = [&](const float4 (&kx)[NQ], const float4 (&qx)[NQ], int ok) {
++                float a[8];
++#pragma unroll
++                for (int x = 0; x < 8; ++x) a[x] = 0.0f;
++                const int oq = 4 - ok;
++#pragma unroll
++                for (int i = 0; i < NQ; ++i)
++#pragma unroll
++                    for (int vv = 0; vv < VPT; ++vv) {
++                        a[ok + vv] = fma_(kx[i].x, s[vv][i][0], a[ok + vv]);
++                        a[ok + vv] = fma_(kx[i].y, s[vv][i][1], a[ok + vv]);
++                        a[ok + vv] = fma_(kx[i].z, s[vv][i][2], a[ok + vv]);
++                        a[ok + vv] = fma_(kx[i].w, s[vv][i][3], a[ok + vv]);
++                        a[oq + vv] = fma_(qx[i].x, s[vv][i][0], a[oq + vv]);
++                        a[oq + vv] = fma_(qx[i].y, s[vv][i][1], a[oq + vv]);
++                        a[oq + vv] = fma_(qx[i].z, s[vv][i][2], a[oq + vv]);
++                        a[oq + vv] = fma_(qx[i].w, s[vv][i][3], a[oq + vv]);
++                    }
++                return tree8(a, lane);
++            };
++            load_row(ck, cq, 0);
++#pragma unroll 1
++            for (int rg = 0; rg < BT / 8; ++rg) {             // 8 rows: pairs 2 rp (even: k sums first), 2 rp + 1
++#pragma unroll
++                for (int u = 0; u < 4; ++u) {
++                    const int r = 8 * rg + 2 * u;
++                    load_row(nk, nq, r + 1);
++                    const float se = row_sums(ck, cq, 0);
++                    load_row(ck, cq, r + 2 < BT ? r + 2 : r);        // (the last pair reloads a row: no predicate)
++                    const float so = row_sums(nk, nq, 4);
++                    // this thread keeps the q sum of its parity's row and writes Y of the other
++                    const float qs = par ? so : se, ks = par ? se : so;
++                    const int ry = par ? r : r + 1;
++                    sm.g[ry][ov] = (__bfloat162float(sm.v[ry][ov]) - ks) * sm.beta[ry];
++                    o1[OWN - 4 + u] = qs;
++                }
++                if (rg + 1 < BT / 8) {                        // after the loop o1[j] is row 2 j + par's
++#pragma unroll
++                    for (int j = 0; j + 4 < OWN; ++j) o1[j] = o1[j + 4];
++                }
++            }
++        }
++        __syncthreads(); MARK(5);
++
++        // 6. load this sub-chunk's output gates (warm in L2); (q E) S0^T into k (free now); V' = T Y into q. Tiles:
++        // warp w the rows 4 w' .. 4 w' + 3 with w' = w (w < 4) or 11 - w (the two warps of a scheduler, w and w + 4,
++        // then run 36 steps of t together), lane l the value columns 4 l .. 4 l + 3 (T is zero above its diagonal:
++        // t runs to the tile's last row)
++        const int rq = 4 * (warp < 4 ? warp : 11 - warp), vq = 4 * lane;
++        float gate[4][4];
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            const int r = r0 + rq + i;
++            const bool ok = r >= 0 && r < rows;
++            const __nv_bfloat16* gp = G + (size_t)(ok ? r : 0) * g_stride + h * DV + vq;
++            if (vec_g) {
++                const uint2 x = ok ? *reinterpret_cast<const uint2*>(gp) : make_uint2(0, 0);
++                const __nv_bfloat162 g0 = *reinterpret_cast<const __nv_bfloat162*>(&x.x);
++                const __nv_bfloat162 g1 = *reinterpret_cast<const __nv_bfloat162*>(&x.y);
++                gate[i][0] = __low2float(g0); gate[i][1] = __high2float(g0);
++                gate[i][2] = __low2float(g1); gate[i][3] = __high2float(g1);
++            } else {
++#pragma unroll
++                for (int x = 0; x < 4; ++x) gate[i][x] = ok ? ldb(gp + x) : 0.0f;
++            }
++        }
++#pragma unroll
++        for (int j = 0; j < OWN; ++j) sm.k[2 * j + par][ov] = o1[j];
++        {
++            float acc[4][4];
++#pragma unroll
++            for (int i = 0; i < 4; ++i)
++#pragma unroll
++                for (int x = 0; x < 4; ++x) acc[i][x] = 0.0f;
++#pragma unroll 4
++            for (int t = 0; t < rq + 4; ++t) {
++                const float4 tq = *reinterpret_cast<const float4*>(&sm.u.x.tt[t][rq]);
++                const float4 y = *reinterpret_cast<const float4*>(&sm.g[t][vq]);
++                const float tv[4] = {tq.x, tq.y, tq.z, tq.w}, yv[4] = {y.x, y.y, y.z, y.w};
++#pragma unroll
++                for (int i = 0; i < 4; ++i)
++#pragma unroll
++                    for (int x = 0; x < 4; ++x) acc[i][x] = fma_(tv[i], yv[x], acc[i][x]);
++            }
++#pragma unroll
++            for (int i = 0; i < 4; ++i)
++                *reinterpret_cast<float4*>(&sm.q[rq + i][vq]) = make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
++        }
++        __syncthreads(); MARK(6);
++
++        // 7. read-outs O = (q E) S0^T + M V' of the same tile, bf16, the gated RMSNorm (kda.cu's formula; a warp
++        // holds its rows' 128 values); the state update
++        {
++            float o[4][4];
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                const float4 x = *reinterpret_cast<const float4*>(&sm.k[rq + i][vq]);
++                o[i][0] = x.x; o[i][1] = x.y; o[i][2] = x.z; o[i][3] = x.w;
++            }
++#pragma unroll 4
++            for (int t = 0; t < rq + 4; ++t) {
++                const float4 mq = *reinterpret_cast<const float4*>(&sm.u.x.mt[t][rq]);
++                const float4 vn = *reinterpret_cast<const float4*>(&sm.q[t][vq]);
++                const float mv[4] = {mq.x, mq.y, mq.z, mq.w}, vv4[4] = {vn.x, vn.y, vn.z, vn.w};
++#pragma unroll
++                for (int i = 0; i < 4; ++i)
++#pragma unroll
++                    for (int x = 0; x < 4; ++x) o[i][x] = fma_(mv[i], vv4[x], o[i][x]);
++            }
++            float ss[4];
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                ss[i] = 0.0f;
++#pragma unroll
++                for (int x = 0; x < 4; ++x) { o[i][x] = bf(o[i][x]); ss[i] = ss[i] + o[i][x] * o[i][x]; }
++            }
++#pragma unroll
++            for (int m = 16; m; m >>= 1)
++#pragma unroll
++                for (int i = 0; i < 4; ++i) ss[i] += __shfl_xor_sync(0xffffffffu, ss[i], m);
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                const int r = r0 + rq + i;
++                if (r < 0 || r >= rows) continue;
++                const float rinv = 1.0f / sqrtf(ss[i] / (float)DV + eps);
++                __nv_bfloat16 ob[4];
++#pragma unroll
++                for (int x = 0; x < 4; ++x) {
++                    const float yn = o[i][x] * rinv;
++                    const float yw = nw[x] * yn;
++                    const float den = 1.0f + expf(-gate[i][x]);
++                    const float sg = div_ok(1.0f, den) ? div_rn(1.0f, den) : 1.0f / den;   // kda.cu's sigmoidf_
++                    ob[x] = __float2bfloat16_rn(yw * sg);
++                }
++                __nv_bfloat16* op = out + (size_t)r * H * DV + h * DV + vq;
++                if (vec_o) *reinterpret_cast<uint2*>(op) = *reinterpret_cast<const uint2*>(ob);
++                else {
++#pragma unroll
++                    for (int x = 0; x < 4; ++x) op[x] = ob[x];
++                }
++            }
++        }
++#pragma unroll
++        for (int i = 0; i < NQ; ++i) {
++            const float4 ge = reinterpret_cast<const float4*>(sm.egl)[kp + KP * i];
++#pragma unroll
++            for (int vv = 0; vv < VPT; ++vv) {
++                s[vv][i][0] = s[vv][i][0] * ge.x; s[vv][i][1] = s[vv][i][1] * ge.y;
++                s[vv][i][2] = s[vv][i][2] * ge.z; s[vv][i][3] = s[vv][i][3] * ge.w;
++            }
++        }
++#pragma unroll 4
++        for (int t = 0; t < BT; ++t) {
++            const float4 vn = *reinterpret_cast<const float4*>(&sm.q[t][VPT * vg]);
++            const float vs[4] = {vn.x, vn.y, vn.z, vn.w};
++#pragma unroll
++            for (int i = 0; i < NQ; ++i) {
++                const float4 kx = reinterpret_cast<const float4*>(sm.u.x.ke[t])[kp + KP * i];
++#pragma unroll
++                for (int vv = 0; vv < VPT; ++vv) {
++                    s[vv][i][0] = fma_(vs[vv], kx.x, s[vv][i][0]); s[vv][i][1] = fma_(vs[vv], kx.y, s[vv][i][1]);
++                    s[vv][i][2] = fma_(vs[vv], kx.z, s[vv][i][2]); s[vv][i][3] = fma_(vs[vv], kx.w, s[vv][i][3]);
++                }
++            }
++        }
++        __syncthreads(); MARK(7);
++    }
++#pragma unroll
++    for (int vv = 0; vv < VPT; ++vv)
++#pragma unroll
++        for (int i = 0; i < NQ; ++i)
++            reinterpret_cast<float4*>(state_out + sbase + (size_t)(VPT * vg + vv) * DK)[kp + KP * i] =
++                make_float4(s[vv][i][0], s[vv][i][1], s[vv][i][2], s[vv][i][3]);
++}
++
++}  // namespace
++
++#ifdef KDA_PROF
++void kda_chunk_prof(at::Tensor& outp) {
++    cudaMemcpyFromSymbol(outp.data_ptr(), g_prof, sizeof(unsigned long long) * 16);
++    unsigned long long z[16] = {};
++    cudaMemcpyToSymbol(g_prof, z, sizeof(z));
++}
++#endif
++
++template <typename T>
++static T* ptr(const at::Tensor& x) { return x.defined() && x.numel() ? (T*)x.data_ptr() : nullptr; }
++
++void kda_chunk_cuda(const at::Tensor& P, int64_t p_stride, int64_t b_off, const at::Tensor& A, int64_t a_stride,
++                    const at::Tensor& G, int64_t g_stride, const at::Tensor& cs, const at::Tensor& cw,
++                    const at::Tensor& state_in, const at::Tensor& a_log, const at::Tensor& dt_bias,
++                    const at::Tensor& norm_w, double eps, double lower, int64_t rows, int64_t off, at::Tensor& out,
++                    at::Tensor& state_out) {
++    auto stream = at::cuda::getCurrentCUDAStream();
++    const int H = (int)a_log.numel();
++    const int smem = (int)sizeof(Smem);
++    static int attr_device = -1;
++    const int device = P.get_device();
++    if (attr_device != device) {
++        C10_CUDA_CHECK(cudaFuncSetAttribute(chunk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
++        attr_device = device;
++    }
++    chunk_kernel<<<H, NT, smem, stream>>>(
++        H, ptr<__nv_bfloat16>(P), (int)p_stride, (int)b_off, ptr<__nv_bfloat16>(A), (int)a_stride,
++        ptr<__nv_bfloat16>(G), (int)g_stride, ptr<__nv_bfloat16>(cs), ptr<__nv_bfloat16>(cw), ptr<float>(state_in),
++        ptr<float>(a_log), ptr<float>(dt_bias), ptr<__nv_bfloat16>(norm_w), (float)eps, (float)lower, (int)rows,
++        (int)off, ptr<__nv_bfloat16>(out), ptr<float>(state_out));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
+diff --git a/src/tensorfold/families/glm5_next/cuda/kda_chunked.py b/src/tensorfold/families/glm5_next/cuda/kda_chunked.py
+new file mode 100644
+index 0000000..99ef55f
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/kda_chunked.py
+@@ -0,0 +1,186 @@
++# Ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe @ 1576746, patches 0012, 0014 and 0039 (end state)
++# (Apache-2.0, Copyright 2026 MiaAI-Lab; THIRD_PARTY_NOTICES.md "GLM chunked KDA prompt kernel").
++"""GLM-5.3-Flash's KDA prompt chunks in chunked (WY) form (kda_chunk.cu): 32-row sub-chunks at absolute positions,
++one CUDA block per head carrying the 128 x 128 state from sub-chunk to sub-chunk in registers.
++
++Per row the inputs are kda.cu's (conv + SiLU rounded to bf16, fp32 L2 norms, q times 128^-0.5, beta =
++bf16(sigmoid(b)), the per-channel decay g = e^l, l = lower * sigmoid(exp(A_log) * (a + dt_bias))); the delta rule
++S <- S diag(g); S <- S + beta (v - S k) k^T; o = S q, o rounded to bf16, then the gated RMSNorm. S is [value, key].
++
++A sub-chunk of rows 0..31 entering state S0, E(t -> s) = g_{t+1} ... g_s per key channel (empty: 1):
++
++    L[s, t]  = beta_s sum_c k_s k_t E(t -> s)      t < s          M[s, t] = sum_c q_s k_t E(t -> s)     t <= s
++    T        = (I + L)^-1                           Y = beta (v - (k E(0 -> row)) S0^T),   V' = T Y
++    O        = (q E(0 -> row)) S0^T + M V'           S_end = S0 diag(E(0 -> 31)) + V'^T (k E(row -> 31))
++
++Every decay is a running product of per-row decays <= 1, multiplied in row order as the serial chain decays its state
++(no exponent of a difference of cumulative sums: G reaches -160 in a sub-chunk, and ulp(160) = 1.5e-5 would land on
++decays near 1). All products run in fp32 FMAs in a fixed order, so the kernel is deterministic, and a row's bits
++depend only on its sub-chunk's rows and the entering state: the same whichever prefill chunk the row came in, as long
++as prompt chunks start on multiples of the sub-chunk (TF_GLM_PROMPT_GRID, which TF_GLM_KDA_CHUNKED=1 sets to 64).
++Rows outside the prompt chunk (a short first or last sub-chunk) are zero rows: decay 1, no key, no value, beta 0.
++It is not kda.cu's arithmetic (different sums, so bf16 outputs may round the other way and states differ at fp32
++rounding); its error against the float64 delta rule is the serial kernel's order (tests/cuda/test_glm_kda_chunked.py).
++
++The torch functions (``*_reference``) are the CPU references of the tests; ``chain`` runs the CUDA kernel.
++"""
++
++from __future__ import annotations
++
++import math
++from functools import lru_cache
++from pathlib import Path
++
++import torch
++
++DK = DV = 128
++TAPS = 4
++CHUNK = 32              # rows of a sub-chunk (the state is carried between sub-chunks); kda_chunk.cu's BT
++SCALE = 1.0 / math.sqrt(DK)
++
++
++# -- references (torch, CPU or GPU) ----------------------------------------------------------------------------
++def _bf(x: torch.Tensor) -> torch.Tensor:
++    return x.to(torch.bfloat16).to(x.dtype)
++
++
++def _sigmoid(x: torch.Tensor) -> torch.Tensor:
++    return 1.0 / (1.0 + torch.exp(-x))
++
++
++def prep_reference(p: torch.Tensor, b_off: int, a: torch.Tensor, conv_state: torch.Tensor, conv_w: torch.Tensor,
++                   a_log: torch.Tensor, dt_bias: torch.Tensor, lower: float, rows: int):
++    """kda.cu's per-row work in fp32: q, k [rows, H, 128] normalized (q scaled), v [rows, H, 128] (bf16 values),
++    the log-decay l [rows, H, 128] (kda.cu's decay is e^l) and beta [rows, H]."""
++
++    H = a_log.numel()
++    C = 3 * H * DK
++    x = torch.cat([conv_state.float(), p[:rows, :C].float()])
++    w = conv_w.float()
++    acc = torch.zeros((rows, C), dtype=torch.float32, device=p.device)
++    for tap in range(TAPS):
++        acc = acc + w[:, tap] * x[tap:tap + rows]
++    act = _bf(acc / (1.0 + torch.exp(-acc))).view(rows, 3, H, DK)
++
++    def l2(t: torch.Tensor) -> torch.Tensor:
++        return t * (1.0 / torch.sqrt((t * t).sum(-1, keepdim=True) + 1e-6))
++
++    q = l2(act[:, 0]) * torch.tensor(SCALE, dtype=torch.float32)
++    k = l2(act[:, 1])
++    v = act[:, 2].contiguous()
++    rate = torch.exp(a_log.float()).view(1, H, 1)
++    ga = a[:rows].float().view(rows, H, DK) + dt_bias.float().view(1, H, DK)
++    lg = torch.tensor(lower, dtype=torch.float32) * _sigmoid(rate * ga)
++    beta = _bf(_sigmoid(p[:rows, b_off:b_off + H].float()))
++    return q, k, v, lg, beta
++
++
++def recurrent_reference(q, k, v, lg, beta, state, dtype=torch.float64):
++    """The delta rule row by row (kda.cu's chain): read-outs [rows, H, 128] and the final state [H, 128, 128]."""
++
++    q, k, v, beta = (t.to(dtype) for t in (q, k, v, beta))
++    g = torch.exp(lg.to(dtype))
++    S = state.to(dtype).clone()
++    out = torch.empty(v.shape, dtype=dtype, device=v.device)
++    for r in range(q.shape[0]):
++        S = S * g[r][:, None, :]
++        kv = (S * k[r][:, None, :]).sum(-1)
++        delta = (v[r] - kv) * beta[r][:, None]
++        S = S + delta[:, :, None] * k[r][:, None, :]
++        out[r] = (S * q[r][:, None, :]).sum(-1)
++    return out, S
++
++
++def chunked_reference(q, k, v, lg, beta, state, pos: int = 0, dtype=torch.float64):
++    """The chunked algorithm as the kernel runs it (sub-chunks of CHUNK rows at absolute positions, decays as running
++    products, T by forward substitution): read-outs [rows, H, 128] and the final state [H, 128, 128]."""
++
++    rows, H, _ = q.shape
++    dev = q.device
++    off = pos % CHUNK
++    nc = -(-(rows + off) // CHUNK)
++    total = nc * CHUNK
++
++    def pad(t, fill=0.0):
++        t = t.to(dtype)
++        z = torch.full((total,) + tuple(t.shape[1:]), fill, dtype=dtype, device=dev)
++        z[off:off + rows] = t
++        return z.view((nc, CHUNK) + tuple(t.shape[1:])).transpose(1, 2)     # [nc, H, CHUNK, ...]
++
++    qc, kc, vc, bc = pad(q), pad(k), pad(v), pad(beta)
++    gc = pad(torch.exp(lg.to(dtype)), 1.0)
++    S = state.to(dtype).clone()                     # [H, V, K]
++    out = torch.empty((total, H, DV), dtype=dtype, device=dev)
++    for c in range(nc):
++        qx, kx, vx, gx, bx = qc[c], kc[c], vc[c], gc[c], bc[c]     # [H, T, 128] (beta [H, T])
++        E = torch.zeros((H, CHUNK, CHUNK, DK), dtype=dtype, device=dev)   # E[:, s, t] = E(t -> s), t <= s
++        for t in range(CHUNK):
++            e = torch.ones((H, DK), dtype=dtype, device=dev)
++            E[:, t, t] = e
++            for s in range(t + 1, CHUNK):
++                e = e * gx[:, s]
++                E[:, s, t] = e
++        Akk = torch.einsum("hsc,htc,hstc->hst", kx, kx, E)
++        Aqk = torch.einsum("hsc,htc,hstc->hst", qx, kx, E)
++        tri = torch.ones((CHUNK, CHUNK), dtype=torch.bool, device=dev)
++        L = torch.where(torch.tril(tri, -1), bx[:, :, None] * Akk, torch.zeros_like(Akk))
++        M = torch.where(torch.tril(tri), Aqk, torch.zeros_like(Aqk))
++        T = torch.eye(CHUNK, dtype=dtype, device=dev).expand(L.shape).clone()
++        for s in range(1, CHUNK):
++            T[:, s, :] = -(L[:, s, :, None] * T).sum(-2)
++            T[:, s, s] = 1.0
++        fwd = torch.cumprod(gx, dim=1)                              # E(0 -> row)
++        back = torch.cat([torch.flip(torch.cumprod(torch.flip(gx[:, 1:], [1]), 1), [1]),
++                          torch.ones_like(gx[:, :1])], 1)
++        ST = S.transpose(1, 2)                                      # [H, K, V]
++        Y = bx[:, :, None] * (vx - (kx * fwd) @ ST)
++        Vn = T @ Y
++        out[c * CHUNK:(c + 1) * CHUNK] = ((qx * fwd) @ ST + M @ Vn).transpose(0, 1)
++        S = S * fwd[:, -1:, :] + Vn.transpose(1, 2) @ (kx * back)
++    return out[off:off + rows], S
++
++
++def gate_norm_reference(y: torch.Tensor, gate: torch.Tensor, norm_w: torch.Tensor, eps: float) -> torch.Tensor:
++    """kda.cu's gated RMSNorm of bf16 read-outs y [rows, H, 128] with gate rows [rows, H * 128]: bf16 [rows, H*128]."""
++
++    rows, H, _ = y.shape
++    yb = _bf(y.float())
++    rinv = 1.0 / torch.sqrt((yb * yb).sum(-1, keepdim=True) / DV + eps)
++    yw = norm_w.float() * (yb * rinv)
++    return (yw * _sigmoid(gate[:rows].float().view(rows, H, DV))).to(torch.bfloat16).view(rows, H * DV)
++
++
++def chain_reference(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, eps, lower, rows, *,
++                    pos: int = 0, chunked: bool = True, dtype=torch.float32):
++    """A whole prompt chunk: (out bf16 [rows, H * 128], final state fp32 [H, 128, 128], read-outs y [rows, H, 128])."""
++
++    q, k, v, lg, beta = prep_reference(p, b_off, a, conv_state, conv_w, a_log, dt_bias, lower, rows)
++    if chunked:
++        y, S = chunked_reference(q, k, v, lg, beta, state_in, pos, dtype=dtype)
++    else:
++        y, S = recurrent_reference(q, k, v, lg, beta, state_in, dtype=dtype)
++    return gate_norm_reference(y, g, norm_w, eps), S.float(), y
++
++
++# -- the CUDA kernel --------------------------------------------------------------------------------------------
++@lru_cache(maxsize=1)
++def _ext():
++    from tensorfold.cuda.build import load
++
++    here = Path(__file__).parent
++    return load(name="tensorfold_glm_kda_chunk", sources=[str(here / "kda_chunk.cpp"), str(here / "kda_chunk.cu")],
++                extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
++
++
++def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_state: torch.Tensor,
++          conv_w: torch.Tensor, state_in: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
++          norm_w: torch.Tensor, eps: float, lower: float, rows: int, out: torch.Tensor, state_out: torch.Tensor,
++          pos: int = 0) -> torch.Tensor:
++    """kda.chain for a prompt chunk in chunked form: projection rows p [q | k | v | ... | b at b_off ...], bf16 gate
++    rows a (decay) and g (output gate), conv state [3, 3 H 128] (read, not shifted), state_in -> state_out
++    [H, 128, 128]; ``pos`` is the first row's absolute position. Writes out[:rows] (bf16 [rows, H * 128])."""
++
++    rows = int(rows)
++    _ext().chain(p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv_state, conv_w, state_in, a_log,
++                 dt_bias, norm_w, float(eps), float(lower), rows, int(pos) % CHUNK, out, state_out)
++    return out[:rows]
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index b22f096..83328e1 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -143,15 +143,19 @@ MTP_SAMPLED = [2, 3, 600000, 850000]     # ... and for sampled requests (a:0.6:0
+ 
+ 
+ # -- settings ------------------------------------------------------------------------------------------------------
+-def fill_rows(prefill_rows: int, value: str | None = None) -> int:
++def fill_rows(prefill_rows: int, value: str | None = None, *, grid: int = 0) -> int:
+     """TF_GLM_FILL_ROWS: rows of a prompt chunk while other streams decode (default 1,024 or the engine's prompt
+-    chunk if smaller): a multiple of 64, at most the prompt chunk (TF_GLM_PREFILL_ROWS)."""
++    chunk if smaller): a multiple of 64 (and of the prompt grid, ``grid``: MiaAI-Lab recipe patch 0008), at most the
++    prompt chunk (TF_GLM_PREFILL_ROWS)."""
+ 
+     value = os.environ.get("TF_GLM_FILL_ROWS", "") if value is None else value
+     value = value.strip()
+     rows = min(1024, prefill_rows) if value == "" else int(value) if value.isdecimal() else -1
+     if rows < 64 or rows % 64 or rows > prefill_rows:
+         raise ValueError(f"TF_GLM_FILL_ROWS: a multiple of 64 up to the {prefill_rows}-row prompt chunk, not {value!r}")
++    if grid and rows % grid:
++        raise ValueError(f"TF_GLM_FILL_ROWS: a multiple of the {grid}-token prompt grid (TF_GLM_PROMPT_GRID), not "
++                         f"{value!r}")
+     return rows
+ 
+ 
+@@ -369,6 +373,7 @@ class Lane:
+     stops: list[int] = field(default_factory=list)   # prompt positions whose states are kept (before the end)
+     point: int | None = None           # where the prompt's state is kept (``keep_point``), or None
+     shared: list[int] = field(default_factory=list)  # rank 0's shared-prefix points among ``stops`` (recipe 0015)
++    head: Any = None                   # a replay's first-token logits row (its kept prompt's, ``decode.whole``; 0042)
+     hidden: Any = None                 # MTP: the last committed rows' final-normed hidden rows, not absorbed yet
+     nexts: list[int] = field(default_factory=list)   # ... and the tokens after them
+     decoding: bool = False
+@@ -413,6 +418,7 @@ class MultiDecoder:
+     fill_budget = 0.0                    # TF_GLM_FILL_BUDGET_MS (``__init__`` reads it; 0: unsliced fills)
+     fill_drafts = decode_due = short_round_due = False
+     partial = fill_costs = None
++    grid = 0                           # TF_GLM_PROMPT_GRID (``engine.prompt_grid``; MiaAI-Lab recipe patch 0008): 0 off
+ 
+     def __init__(self, engine, streams: int, *, verify=None, drafts=None, draft_graphs: bool | None = None,
+                  tune: MultiSettings | None = None, row_ms: Sequence[float] | None = None, fill_costs=None) -> None:
+@@ -433,7 +439,10 @@ class MultiDecoder:
+         self.rows_max = e.rows                           # a stream's window (decode.MAX_ROWS)
+         self.pool = Pool(e.caches.rows)
+         self.arena = e.caches.arena
+-        self.fill_rows = fill_rows(e.prefill_rows)
++        # TF_GLM_PROMPT_GRID (MiaAI-Lab recipe patch 0008; 64 under TF_GLM_KDA_CHUNKED=1): prompt chunks start on it,
++        # kept prompt states sit on it (``engine.grid_point``); 0: off
++        self.grid = getattr(engine, "grid", 0)
++        self.fill_rows = fill_rows(e.prefill_rows, grid=self.grid)
+         # TF_GLM_FILL_BUDGET_MS (MiaAI-Lab recipe patch 0062): a prompt chunk started while others decode runs in
+         # layer slices of about this many ms, a decode round between two (drafted with TF_GLM_FILL_DRAFTS=1)
+         self.fill_budget = sliced_fill.budget_ms()
+@@ -453,7 +462,7 @@ class MultiDecoder:
+ 
+             if not latent.ENABLED:
+                 raise ValueError("TF_GLM_MULTI_PREFILL=1 needs the latent cache (TF_GLM_LATENT=1)")
+-        self.unit = fill_unit(getattr(engine, "grid", 0))
++        self.unit = fill_unit(self.grid)
+         self.grouped = {"chunks": 0, "pieces": 0, "rows": 0}           # rank 0's multi-prompt chunks, for /health
+         # TF_GLM_PREFILL_PAIRS (``prefill_pairs``, ours): the AFD attention node (world 1) fills two prompt chunks as a
+         # pair while no stream decodes
+@@ -800,10 +809,10 @@ class MultiDecoder:
+         cut = len(hit.ids) if hit is not None else 0
+         shared: list[int] = []
+         if draft and g.shared:
+-            from .engine import known_ids, shared_points
++            from .engine import keep_at, known_ids, shared_points
+ 
+-            shared = shared_points(prompt, cut, keep_point(len(prompt), cut), g.grid, g.shared, known_ids(self.kept),
+-                                   g.opener)
++            shared = shared_points(prompt, cut, keep_at(len(prompt), cut, self.grid), g.grid, g.shared,
++                                   known_ids(self.kept), g.opener)
+         sid = self.next_sid
+         payload = [sid, slot, base, need, hit.kid if hit is not None else -1, copy, s.count, int(s.stop_eos),
+                    int(draft), *pack_sampling(s.sampling), *(shared + [0] * SHARED_SLOTS)[:SHARED_SLOTS], *code,
+@@ -852,7 +861,10 @@ class MultiDecoder:
+         prompt = a["prompt"]
+         s.prompt = list(prompt)
+         cut = len(hit.ids) if hit is not None else 0
+-        if hit is not None and (hit.ids != prompt[:cut] or cut >= len(prompt)):
++        # TF_GLM_PROMPT_GRID (MiaAI-Lab recipe patch 0042): a kept prompt of the whole prompt with its head's logits
++        # row is a replay: the one FILL samples that row, prefilling nothing
++        replay = hit is not None and cut == len(prompt) and getattr(hit, "head", None) is not None
++        if hit is not None and (hit.ids != prompt[:cut] or (cut >= len(prompt) and not replay)):
+             raise RuntimeError(f"the kept prompt {a['kid']} is not a strict prefix of stream {a['sid']}'s prompt")
+         if hit is not None and not a["copy"]:
+             x = hit.extent
+@@ -892,16 +904,24 @@ class MultiDecoder:
+                 if hit.mtp_len != cut - 1 or hit.pending is None:
+                     raise RuntimeError("a kept prompt without the MTP head's rows was chosen for an MTP stream")
+                 st.set_mtp_len(hit.mtp_len)
+-                prev = e.use(st)
+-                try:
+-                    _absorb_rows(e, hit.pending, [prompt[cut]])
+-                finally:
+-                    e.use(prev)
++                if replay:                    # the prompt's last row waits for the first token, as a fill leaves it
++                    lane.hidden = hit.pending.clone()
++                else:
++                    prev = e.use(st)
++                    try:
++                        _absorb_rows(e, hit.pending, [prompt[cut]])
++                    finally:
++                        e.use(prev)
++            if replay:
++                lane.head = hit.head.clone()
+             self._touch(hit)
+-        # a drafted prompt keeps its state before its last token (``keep_point``), and at rank 0's shared-prefix points
+-        # (TF_GLM_SHARED_PREFIX, MiaAI-Lab recipe patches 0015, 0030)
++        # a drafted prompt keeps its state before its last token (``keep_point``; with TF_GLM_PROMPT_GRID at its grid
++        # point, ``engine.keep_at``), and at rank 0's shared-prefix points (TF_GLM_SHARED_PREFIX, MiaAI-Lab recipe
++        # patches 0015, 0030)
+         if a["draft"]:
+-            lane.point = keep_point(len(prompt), cut)
++            from .engine import keep_at
++
++            lane.point = keep_at(len(prompt), cut, self.grid)
+             lane.shared = sorted(p for p in set(a["shared"]) if lane.point is not None and cut < p < lane.point)
+             lane.stops = list(lane.shared) + ([lane.point] if lane.point is not None and lane.point < len(prompt)
+                                               else [])
+@@ -922,26 +942,31 @@ class MultiDecoder:
+ 
+     def _resume(self, prompt: list[int], dflash: bool = False, mtp: bool = False):
+         """The longest kept strict prefix of ``prompt`` that holds what the stream's drafter needs (DFlash2's window,
+-        or the MTP head's rows)."""
++        or the MTP head's rows); with TF_GLM_PROMPT_GRID, one on the grid, or the whole prompt when it kept its head's
++        logits row (a replay, MiaAI-Lab recipe patches 0008, 0042)."""
+ 
+         best = None
+         for c in self.kept:
+             n = len(c.ids)
+             fits = (not dflash or (c.drafter_end == n and c.drafter_rows is not None)) and (
+                 not mtp or (c.mtp_len == n - 1 and c.pending is not None))
+-            if fits and n < len(prompt) and prompt[:n] == c.ids and (best is None or n > len(best.ids)):
++            fits = fits and not (self.grid and n % self.grid)
++            short = n < len(prompt) or (n == len(prompt) and getattr(c, "head", None) is not None)
++            if fits and short and prompt[:n] == c.ids and (best is None or n > len(best.ids)):
+                 best = c
+         return best
+ 
+     def _touch(self, c) -> None:
+         self.kept = [k for k in self.kept if k is not c] + [c]
+ 
+-    def _keep(self, lane: Lane, n: int, held=None) -> None:
++    def _keep(self, lane: Lane, n: int, held=None, head=None) -> None:
+         """Both ranks: the lane's state at prompt position n (== its pos, a prompt chunk's end) becomes a kept prompt
+         in its extent; an MTP stream's keeps the last row's hidden state to absorb with the resuming prompt's next
+         token (its MTP cache row n - 1 holds this prompt's), as the single-stream prefill keeps it. ``held``: the KDA
+         states and convolution windows at n, taken by a prompt chunk pair (``prefill_pairs.Hold``) whose second
+-        chunk has since moved the lane's on."""
++        chunk has since moved the lane's on. ``head``: at the
++        prompt's end, the logits row its first token is sampled from (kept for a replay; MiaAI-Lab recipe patch
++        0042)."""
+ 
+         from .decode import take_snapshot
+ 
+@@ -961,6 +986,7 @@ class MultiDecoder:
+                 from .decode import _ring_tail
+ 
+                 snap.tail = _ring_tail(lane.st, n, snap.mtp_len)
++        snap.head = head
+         snap.kid = self.next_kid
+         self.next_kid += 1
+         snap.extent = lane.extent
+@@ -979,7 +1005,7 @@ class MultiDecoder:
+         x = c.extent
+         x.kept = [k for k in x.kept if k is not c]
+         c.rec = c.conv = c.pending = None
+-        c.tail = None
++        c.tail = c.head = None
+         c.drafter_rows = None
+         self._settle(x)
+ 
+@@ -1135,7 +1161,8 @@ class MultiDecoder:
+             return self._part_iteration()
+         group = self._group(lane) if lane is not None and getattr(self, "group", False) else None
+         busy = any(x.decoding and not x.s.done and not x.paused for x in self.lanes.values())
+-        if lane is not None and busy and self.fill_budget:     # a new chunk while others decode: in layer slices
++        # a new chunk while others decode: in layer slices; never a replay (TF_GLM_PROMPT_GRID, 0042: no rows)
++        if lane is not None and busy and self.fill_budget and lane.head is None:
+             self.partial = sliced_fill.PendingFill(group if group is not None else [(lane, self._stop(lane))],
+                                                   many=group is not None)
+             self.sliced["chunks"] += 1
+@@ -1350,11 +1377,11 @@ class MultiDecoder:
+         streams before background ones, then the fewest prompt rows left first (a short prompt's first token does not
+         wait behind a long prompt; the long one takes the rest of the budget), then admission order; each takes the
+         rows to its next stop (a kept point or its end) when they fit, else the budget left in whole ``fill_unit``s.
+-        Streams drafting with the MTP head fill alone (their rows also go through the head). (MiaAI-Lab recipe patch
+-        0049)"""
++        Streams drafting with the MTP head fill alone (their rows also go through the head), and so do replays of a
++        kept prompt's end (TF_GLM_PROMPT_GRID, MiaAI-Lab recipe patch 0042). (MiaAI-Lab recipe patch 0049)"""
+ 
+         def plain(x: Lane) -> bool:
+-            return not x.decoding and not x.mtp
++            return not x.decoding and not x.mtp and x.head is None
+ 
+         if not plain(first):
+             return None
+@@ -1393,12 +1420,15 @@ class MultiDecoder:
+         prompt = s.prompt
+         n = len(prompt)
+         start = lane.st.pos
+-        if not start < stop <= n or stop - start > e.prefill_rows:
++        replay = lane.head is not None           # resumed at the prompt's end: no rows, the kept head's row (0042)
++        if not (start < stop <= n or replay and start == stop == n) or stop - start > e.prefill_rows:
+             raise RuntimeError(f"stream {lane.sid}: a prompt chunk {start} .. {stop} of {n}")
+         t = time.perf_counter()
+         prev = e.use(lane.st)
+         try:
+-            if layers is None:
++            if replay:
++                out, lane.head = lane.head, None
++            elif layers is None:
+                 out = prefill_chunk(e, prompt, start, stop - start, drafter=self._ctx(lane) if lane.dflash else None,
+                                     mtp=lane.mtp, head=stop == n)
+             else:
+@@ -1415,9 +1445,10 @@ class MultiDecoder:
+                 if stop in lane.stops:
+                     self._keep(lane, stop)
+                 return None
+-            if lane.point == n:
+-                self._keep(lane, n)
+-            if lane.mtp:                                # the first draft absorbs the prompt's last row
++            if lane.point == n and not replay:
++                # with TF_GLM_PROMPT_GRID, the end state keeps the head's row (before a grammar's mask writes into it)
++                self._keep(lane, n, head=out[:1].clone() if self.grid else None)
++            if lane.mtp and not replay:                 # the first draft absorbs the prompt's last row
+                 lane.hidden = e.last_hidden.clone()
+             logits = out[:1]
+             if lane.constraint is not None:             # the first token's row, under the reply's grammar
+@@ -1455,7 +1486,7 @@ class MultiDecoder:
+         pieces = []
+         for lane, stop in group:
+             start, n = lane.st.pos, len(lane.s.prompt)
+-            if lane.decoding or lane.mtp:
++            if lane.decoding or lane.mtp or lane.head is not None:
+                 raise RuntimeError(f"stream {lane.sid} cannot join a multi-prompt chunk")
+             if not start < stop <= n or stop - start > e.prefill_rows:
+                 raise RuntimeError(f"stream {lane.sid}: a prompt chunk {start} .. {stop} of {n}")
+@@ -1484,7 +1515,7 @@ class MultiDecoder:
+                     self._keep(lane, stop)
+                 continue
+             if lane.point == n:
+-                self._keep(lane, n)
++                self._keep(lane, n, head=out[:1].clone() if self.grid else None)     # recipe 0042, as ``_fill``
+             logits = out[:1]
+             if lane.constraint is not None:             # the first token's row, under the reply's grammar
+                 lane.constraint.mask(logits, lane.constraint.window([0], [-1]), self.w.vocab_offset)
+@@ -1533,7 +1564,7 @@ class MultiDecoder:
+         finally:
+             for st, pos in saved:
+                 st.pos = pos
+-        if any(x.mtp for x, _ in second):
++        if any(x.mtp or x.head is not None for x, _ in second):     # a replay (0042) has no rows to pair
+             return None
+         return first, second
+ 
+@@ -1600,8 +1631,8 @@ class MultiDecoder:
+                 if stop in lane.stops:
+                     self._keep(lane, stop)
+                 continue
+-            if lane.point == n:
+-                self._keep(lane, n)
++            if lane.point == n:                         # with TF_GLM_PROMPT_GRID, with the head's row (0042)
++                self._keep(lane, n, head=out[:1].clone() if self.grid else None)
+             logits = out[:1]
+             if lane.constraint is not None:             # the first token's row, under the reply's grammar
+                 lane.constraint.mask(logits, lane.constraint.window([0], [-1]), self.w.vocab_offset)
+diff --git a/tests/cuda/test_glm_kda_chunked.py b/tests/cuda/test_glm_kda_chunked.py
+new file mode 100644
+index 0000000..0d62ec6
+--- /dev/null
++++ b/tests/cuda/test_glm_kda_chunked.py
+@@ -0,0 +1,76 @@
++"""TF_GLM_KDA_CHUNKED's CUDA kernel (``kda_chunk.cu``, MiaAI-Lab recipe patch 0039) on the GPU: against the recipe's
++torch references (``kda_chunked.chain_reference``, verbatim), deterministic, and a prompt cut on the 32-row sub-chunk
++grid keeping the bits of one chunk (the prompt grid's reason). GLM-5.3-Flash's KDA shapes: 128-wide heads, H heads
++of a rank (the AFD attention node holds them all). Byte identity with the recipe's own build of the kernel, per KDA
++layer shape, is checked by a separate GPU run outside this suite."""
++
++from __future__ import annotations
++
++import pytest
++import torch
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
++
++
++def _inputs(rows: int, H: int, seed: int, device="cuda"):
++    from tensorfold.families.glm5_next.cuda import kda_chunked as kc
++
++    g = torch.Generator().manual_seed(seed)
++    C = 3 * H * kc.DK
++    b_off = C + 2 * 128
++    p = (0.5 * torch.randn(rows, b_off + H, generator=g)).to(torch.bfloat16)
++    a = (0.5 * torch.randn(rows, H * kc.DK, generator=g)).to(torch.bfloat16)
++    gate = torch.randn(rows, H * kc.DV, generator=g).to(torch.bfloat16)
++    cs = (0.5 * torch.randn(kc.TAPS - 1, C, generator=g)).to(torch.bfloat16)
++    cw = (0.5 * torch.randn(C, kc.TAPS, generator=g)).to(torch.bfloat16)
++    state = 0.05 * torch.randn(H, kc.DV, kc.DK, generator=g)
++    a_log = 0.1 * torch.randn(H, generator=g)
++    dt_bias = 0.1 * torch.randn(H * kc.DK, generator=g)
++    norm_w = (1 + 0.1 * torch.randn(kc.DV, generator=g)).to(torch.bfloat16)
++    return [t.to(device) for t in (p, a, gate, cs, cw, state, a_log, dt_bias, norm_w)], b_off
++
++
++def _run(args, b_off, rows, pos, state=None, cs=None):
++    from tensorfold.families.glm5_next.cuda import kda_chunked as kc
++
++    p, a, gate, cs0, cw, state0, a_log, dt_bias, norm_w = args
++    H = a_log.numel()
++    out = torch.empty((rows, H * kc.DV), dtype=torch.bfloat16, device=p.device)
++    s_out = torch.empty_like(state0)
++    kc.chain(p, b_off, a, gate, cs0 if cs is None else cs, cw, state0 if state is None else state, a_log, dt_bias,
++             norm_w, 1e-6, -5.0, rows, out, s_out, pos)
++    torch.cuda.synchronize()
++    return out, s_out
++
++
++@pytest.mark.parametrize("H", [4, 16])
++@pytest.mark.parametrize("rows,pos", [(1, 0), (31, 1), (64, 0), (594, 37), (2048, 4096)])
++def test_the_kernel_against_the_recipes_references(H, rows, pos):
++    from tensorfold.families.glm5_next.cuda import kda_chunked as kc
++
++    args, b_off = _inputs(rows, H, seed=rows * 7 + H)
++    out, S = _run(args, b_off, rows, pos)
++    again, S2 = _run(args, b_off, rows, pos)
++    assert torch.equal(out, again) and torch.equal(S, S2)                       # deterministic
++    p, a, gate, cs, cw, state, a_log, dt_bias, norm_w = (t.cpu() for t in args)
++    ref, S_ref, _ = kc.chain_reference(p, b_off, a, gate, cs, cw, state, a_log, dt_bias, norm_w, 1e-6, -5.0, rows,
++                                       pos=pos, chunked=True, dtype=torch.float64)
++    assert torch.allclose(out.cpu().float(), ref.float(), rtol=2 ** -6, atol=2 ** -6)     # bf16 rounding apart
++    assert torch.allclose(S.cpu(), S_ref, rtol=1e-3, atol=1e-4)
++
++
++@pytest.mark.parametrize("cut", [64, 32 * 5])
++def test_a_cut_on_the_grid_keeps_the_bits(cut):
++    """Rows 0..R from pos 0 in one call == rows 0..cut then cut..R from the state between, the conv window the cut's
++    previous three rows: the same bits (prompt chunks and kept states on TF_GLM_PROMPT_GRID)."""
++    from tensorfold.families.glm5_next.cuda import kda_chunked as kc
++
++    rows, H = 256, 8
++    args, b_off = _inputs(rows, H, seed=cut)
++    out, S = _run(args, b_off, rows, 0)
++    p, a, gate, cs, cw, state, a_log, dt_bias, norm_w = args
++    first, Sa = _run(args, b_off, cut, 0)
++    C = 3 * H * kc.DK
++    rest_args = [p[cut:], a[cut:], gate[cut:], cs, cw, state, a_log, dt_bias, norm_w]
++    rest, Sb = _run(rest_args, b_off, rows - cut, cut, state=Sa, cs=p[cut - 3:cut, :C].contiguous())
++    assert torch.equal(torch.cat([first, rest]), out) and torch.equal(Sb, S)
+diff --git a/tests/test_glm_kda_chunked.py b/tests/test_glm_kda_chunked.py
+new file mode 100644
+index 0000000..76d1747
+--- /dev/null
++++ b/tests/test_glm_kda_chunked.py
+@@ -0,0 +1,271 @@
++"""TF_GLM_KDA_CHUNKED: GLM-5.3-Flash's KDA prompt chunks in chunked (WY) form (MiaAI-Lab recipe patches 0012, 0014 and
++0039's end state: ``kda_chunk.cu`` and the thin ``kda_chunked.py``), on the CPU.
++
++The CUDA kernel runs on the GPU only (tests/cuda/test_glm_kda_chunked.py, and an identity run outside this suite). Here:
++the torch references are the recipe's own (1576746, all patches applied), pinned by source hash; the chunked algorithm
++as the kernel runs it equals the delta rule row by row in float64; its rows depend only on their 32-row sub-chunk and
++the state entering it, so a prompt cut on a multiple of 32 gives the same bits as one chunk (the prompt grid's
++reason), and a cut elsewhere does not; ``kda.chain`` sends prompt chunks (``pos`` given) to the chunked kernel only
++under the setting, decode windows to the serial kernels always; ``kda_chunked.chain`` passes the row's offset in its
++sub-chunk; the forward gives ``kda.chain`` the rows' position only under the setting (so without it the recorded
++calls are the ones before); and the engine's settings (``prompt_grid``, ``grid_point``, ``keep_at``, ``fill_rows``).
++"""
++
++from __future__ import annotations
++
++import hashlib
++import importlib
++import inspect
++from types import SimpleNamespace
++
++import pytest
++
++from tests.test_cuda_geometry import allocations  # noqa: F401  (fixture: fake triton, so the forward imports)
++
++pytestmark = pytest.mark.torch
++
++# sha256 of each reference function's source in the recipe's kda_chunked.py at 1576746, all patches applied (for a name
++# defined twice, the definition Python keeps): ours are hers, verbatim
++PINS = {
++    "_bf": "dee3a8c9f8ceb0f11fd32296dec9597fb76f0e8e5f927407c9761ad8cda2749c",
++    "_sigmoid": "39dfd79c1e4359c1c51aa9d164849dae6502023e3094cc75f3a055f28122b3dc",
++    "prep_reference": "854dfd48cd56289b236cb081d0249c521a8fe693f2f4acc01127f28362074c9a",
++    "recurrent_reference": "d7d9c6218af90f94f888f9cdf90fe2f057f1cf7a8792229011fba2c1bda62d11",
++    "chunked_reference": "804b17ac9d47441b6d5b4ab0e516396c7ed6d5cdf21d4a1cca8ccce33eca5cf3",
++    "gate_norm_reference": "f113a9605b80e08a2fcde5f85f6e93c61483cbb7eb57fb93d1bc18c7837da092",
++    "chain_reference": "56b66d7f1fc3323e194762205fc58dda711abc85fefbdbc808f18648ece42bdf",
++}
++
++
++def _kc():
++    return importlib.import_module("tensorfold.families.glm5_next.cuda.kda_chunked")
++
++
++def _rows(torch, rows: int, H: int, seed: int):
++    """Delta-rule inputs as ``prep_reference`` leaves them: unit-norm keys, scaled queries, decays near 1."""
++    g = torch.Generator().manual_seed(seed)
++    kc = _kc()
++    q = torch.nn.functional.normalize(torch.randn(rows, H, kc.DK, generator=g), dim=-1) * kc.SCALE
++    k = torch.nn.functional.normalize(torch.randn(rows, H, kc.DK, generator=g), dim=-1)
++    v = torch.randn(rows, H, kc.DV, generator=g).to(torch.bfloat16).float()
++    lg = -0.05 * torch.rand(rows, H, kc.DK, generator=g)
++    beta = torch.rand(rows, H, generator=g).to(torch.bfloat16).float()
++    state = 0.1 * torch.randn(H, kc.DV, kc.DK, generator=g)
++    return q, k, v, lg, beta, state
++
++
++def test_the_references_are_the_recipes():
++    kc = _kc()
++    got = {name: hashlib.sha256(inspect.getsource(getattr(kc, name)).rstrip("\n").encode()).hexdigest()
++           for name in PINS}
++    assert got == PINS
++    assert kc.CHUNK == 32 and kc.DK == kc.DV == 128 and kc.TAPS == 4
++
++
++@pytest.mark.parametrize("pos,rows", [(0, 64), (5, 70), (37, 3)])
++def test_chunked_equals_the_delta_rule(pos, rows):
++    import torch
++
++    kc = _kc()
++    q, k, v, lg, beta, state = _rows(torch, rows, 2, seed=pos * 1000 + rows)
++    y, S = kc.chunked_reference(q, k, v, lg, beta, state, pos, dtype=torch.float64)
++    y0, S0 = kc.recurrent_reference(q, k, v, lg, beta, state, dtype=torch.float64)
++    assert y.shape == y0.shape == (rows, 2, kc.DV) and S.shape == S0.shape == (2, kc.DV, kc.DK)
++    assert torch.allclose(y, y0, rtol=0, atol=1e-10) and torch.allclose(S, S0, rtol=0, atol=1e-10)
++
++
++def test_a_cut_on_the_sub_chunk_grid_keeps_the_bits():
++    """fp32 as the kernel: rows 0..96 in one chunk == rows 0..64 then 64..96 from the state between (the same
++    sub-chunks); a cut at row 50 (a sub-chunk split differently) is close but not the same bits."""
++    import torch
++
++    kc = _kc()
++    q, k, v, lg, beta, state = _rows(torch, 96, 2, seed=7)
++    y, S = kc.chunked_reference(q, k, v, lg, beta, state, 0, dtype=torch.float32)
++
++    def two(cut):
++        ya, Sa = kc.chunked_reference(q[:cut], k[:cut], v[:cut], lg[:cut], beta[:cut], state, 0, dtype=torch.float32)
++        yb, Sb = kc.chunked_reference(q[cut:], k[cut:], v[cut:], lg[cut:], beta[cut:], Sa, cut, dtype=torch.float32)
++        return torch.cat([ya, yb]), Sb
++
++    y64, S64 = two(64)
++    assert torch.equal(y64, y) and torch.equal(S64, S)
++    y50, S50 = two(50)
++    assert torch.allclose(y50, y, rtol=0, atol=1e-4) and torch.allclose(S50, S, rtol=0, atol=1e-4)
++    assert not torch.equal(S50, S)
++
++
++def _chain_inputs(torch, rows: int, H: int, seed: int):
++    g = torch.Generator().manual_seed(seed)
++    kc = _kc()
++    C = 3 * H * kc.DK
++    b_off = C + 2 * 128                                   # [q | k | v | fa | ga | b] as the projection rows hold them
++    p = (0.5 * torch.randn(rows, b_off + H, generator=g)).to(torch.bfloat16)
++    a = (0.5 * torch.randn(rows, H * kc.DK, generator=g)).to(torch.bfloat16)
++    gate = torch.randn(rows, H * kc.DV, generator=g).to(torch.bfloat16)
++    conv_state = (0.5 * torch.randn(kc.TAPS - 1, C, generator=g)).to(torch.bfloat16)
++    conv_w = (0.5 * torch.randn(C, kc.TAPS, generator=g)).to(torch.bfloat16)
++    state = 0.05 * torch.randn(H, kc.DV, kc.DK, generator=g)
++    a_log = 0.1 * torch.randn(H, generator=g)
++    dt_bias = 0.1 * torch.randn(H * kc.DK, generator=g)
++    norm_w = (1 + 0.1 * torch.randn(kc.DV, generator=g)).to(torch.bfloat16)
++    return p, b_off, a, gate, conv_state, conv_w, state, a_log, dt_bias, norm_w
++
++
++def test_the_chain_reference_chunked_and_serial_agree():
++    import torch
++
++    kc = _kc()
++    args = _chain_inputs(torch, 40, 2, seed=3)
++    p, b_off, a, gate, conv_state, conv_w, state, a_log, dt_bias, norm_w = args
++    out, S, y = kc.chain_reference(p, b_off, a, gate, conv_state, conv_w, state, a_log, dt_bias, norm_w, 1e-6, -5.0,
++                                   40, pos=9, chunked=True, dtype=torch.float64)
++    out0, S0, y0 = kc.chain_reference(p, b_off, a, gate, conv_state, conv_w, state, a_log, dt_bias, norm_w, 1e-6,
++                                      -5.0, 40, chunked=False, dtype=torch.float64)
++    assert out.dtype == torch.bfloat16 and out.shape == (40, 2 * kc.DV) and S.dtype == torch.float32
++    assert torch.allclose(y, y0, rtol=0, atol=1e-10) and torch.allclose(S, S0, rtol=0, atol=1e-7)
++    assert (out.float() - out0.float()).abs().max().item() <= 2 ** -6        # bf16 rounding of equal read-outs
++
++
++# -- the dispatch ---------------------------------------------------------------------------------------------------
++class _Ext:
++    def __init__(self):
++        self.calls = []
++
++    def __getattr__(self, name):
++        return lambda *a: self.calls.append((name, a))
++
++
++def test_kda_chain_sends_prompt_chunks_to_the_chunked_kernel_under_the_setting(monkeypatch):
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import kda
++
++    kc = _kc()
++    sent = []
++    monkeypatch.setattr(kc, "chain", lambda *a: sent.append(a) or "chunked")
++    ext = _Ext()
++    monkeypatch.setattr(kda, "_ext", lambda: ext)
++    scratch = SimpleNamespace(out=torch.zeros(80, 8), k=None, v=None, g=None, b=None)
++    p, a_log = torch.zeros(80, 16), torch.zeros(2)
++    args = (p, 4, p, p, "conv", "conv_w", "s_in", a_log, "dt", "norm", 1e-6, -5.0, 70, scratch, "s_out")
++    for chunked in (False, True):
++        monkeypatch.setattr(kda, "CHUNKED", chunked)
++        sent.clear()
++        ext.calls.clear()
++        assert kda.prompt_kw(70) == ({"pos": 70} if chunked else {})
++        got = kda.chain(*args, **kda.prompt_kw(70))
++        if chunked:
++            assert got == "chunked" and not ext.calls and len(sent) == 1
++            want = args[:13] + (scratch.out, "s_out", 70)
++            assert len(sent[0]) == len(want) and all(x is y for x, y in zip(sent[0], want))
++        else:
++            assert [c[0] for c in ext.calls] == ["chain_wide"] and not sent
++        ext.calls.clear()
++        kda.chain(*args[:12], 4, scratch, "s_out")        # a decode window: the serial kernel either way
++        assert [c[0] for c in ext.calls] == ["chain"]
++
++
++def test_kda_chunked_chain_passes_the_offset_in_its_sub_chunk(monkeypatch):
++    import torch
++
++    kc = _kc()
++    ext = _Ext()
++    monkeypatch.setattr(kc, "_ext", lambda: ext)
++    p, a, g = torch.zeros(9, 40), torch.zeros(9, 16), torch.zeros(9, 16)
++    out = torch.zeros(9, 16)
++    for pos, off in [(0, 0), (70, 6), (96, 0), (127, 31)]:
++        ext.calls.clear()
++        got = kc.chain(p, 33, a, g, "cs", "cw", "si", "al", "dt", "nw", 1e-6, -5.0, 5, out, "so", pos)
++        assert got.shape == (5, 16)
++        (name, call), = ext.calls
++        assert name == "chain" and call[1] == 40 and call[2] == 33 and call[4] == 16 and call[6] == 16
++        assert call[15:18] == (5, off, out) and call[18] == "so"
++
++
++@pytest.mark.parametrize("chunked", [False, True], ids=["off", "on"])
++def test_the_forward_gives_prompt_rows_their_position_only_under_the_setting(allocations, monkeypatch,  # noqa: F811
++                                                                            chunked):
++    """The recorded kernel calls of prompt chunks (alone, with a kept cut inside) and of a decode window
++    (tests/test_glm_multi_prefill.py's recorder): ``kda.chain`` gets ``pos`` (the chunk's first row; after a cut, the
++    cut row) only under the setting; everything else is the same call either way."""
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import decode, kda
++    from tests import test_glm_multi_prefill as h
++
++    forward = importlib.import_module("tensorfold.families.glm5_next.cuda.forward")
++    monkeypatch.setattr(kda, "CHUNKED", chunked)
++    rec = h.Rec(torch)
++    w, b = h.build_forward(torch, rec, dense_limit=10**6)
++    h.patch_kernels(monkeypatch, rec, forward)
++    monkeypatch.setattr(decode, "commit", forward.commit)
++    alive, seen = [], {}
++    for slot, pos, n in [(0, 500, 7), (1, 64, 40)]:
++        st = h.TraceState(torch, rec, slot, pos)
++        alive.append(st)
++        e = SimpleNamespace(w=w, st=st, pbuf=b, prefill_rows=64, last_hidden=None,
++                            tap_rows=lambda k, bb: torch.cat([t[:k] for t in bb.taps], dim=1))
++        rec.calls = []
++        decode.prefill_chunk(e, list(range(1, pos + n + 1)), pos, n, head=True)
++        seen[f"chunk {pos}"] = [c[2] for c in rec.calls if c[0] == "kda.chain"]
++    st = h.TraceState(torch, rec, 5, 20)
++    cut = forward.Cut(10, torch.empty_like(st.rec[0]), st.conv.clone())
++    alive += [st, cut]
++    rec.calls = []
++    R = forward.stage(w, st, b, list(range(7, 7 + 32)))
++    forward.compute(w, st, b, R, nch=forward.chunks_for(st, R), host_pos=st.pos, cut=cut)
++    seen["cut"] = [c[2] for c in rec.calls if c[0] == "kda.chain"]
++    layers = len(seen["chunk 500"])
++    assert layers >= 1 and len(seen["cut"]) == 2 * layers
++    if chunked:
++        assert seen["chunk 500"] == [(("pos", 500),)] * layers and seen["chunk 64"] == [(("pos", 64),)] * layers
++        assert seen["cut"] == [(("pos", 20),), (("pos", 30),)] * layers
++    else:
++        assert all(kw == () for calls in seen.values() for kw in calls)
++
++
++# -- the engine's settings --------------------------------------------------------------------------------------------
++def test_the_prompt_grid_setting(monkeypatch):
++    from tensorfold.families.glm5_next.cuda import engine, kda
++    from tensorfold.families.glm5_next.cuda.multi import fill_rows, keep_point
++
++    monkeypatch.delenv("TF_GLM_PROMPT_GRID", raising=False)
++    monkeypatch.setattr(kda, "CHUNKED", False)
++    assert engine.prompt_grid(2048) == 0 and not engine.kda_chunked_on() and engine.GlmEngine.grid == 0
++    for value, chunked, want in [("", False, 0), ("0", False, 0), ("16", False, 16), (" 128 ", False, 128),
++                                 ("", True, 64), ("0", True, 64), ("32", True, 32), ("128", True, 128)]:
++        assert engine.prompt_grid(2048, value, chunked) == want, (value, chunked)
++    for value, chunked, match in [("48", False, "one of 16, 32, 64, 128"), ("x", False, "one of"),
++                                  ("16", True, "grid of 32, 64 or 128"), ("128", False, "multiple of it")]:
++        with pytest.raises(ValueError, match=match):
++            engine.prompt_grid(2048 if match != "multiple of it" else 64 * 3, value, chunked)
++    monkeypatch.setattr(kda, "CHUNKED", True)
++    assert engine.kda_chunked_on() and engine.prompt_grid(2048) == 64
++    monkeypatch.setenv("TF_GLM_PROMPT_GRID", "32")
++    assert engine.prompt_grid(2048) == 32
++    # kept points: the recipe's grid point with a grid, before the last token without one (as before)
++    assert [engine.grid_point(n, c, 64) for n, c in [(640, 0), (650, 0), (650, 640), (63, 0), (700, 600)]] == \
++        [640, 640, None, None, 640]
++    assert engine.grid_point(650, 0, 0) == 650
++    assert [engine.keep_at(n, c, 0) for n, c in [(650, 0), (1, 0), (650, 649)]] == \
++        [keep_point(650, 0), keep_point(1, 0), keep_point(650, 649)] == [649, 1, None]
++    assert engine.keep_at(650, 0, 64) == 640 and engine.keep_at(640, 0, 64) == 640
++    # TF_GLM_FILL_ROWS stays on the grid
++    assert fill_rows(2048, "") == 1024 and fill_rows(2048, "", grid=128) == 1024
++    with pytest.raises(ValueError, match="prompt grid"):
++        fill_rows(2048, "192", grid=128)
++    assert fill_rows(2048, "192", grid=64) == 192
++
++
++def test_the_startup_reads_the_settings_before_the_wire(monkeypatch):
++    """The AFD attention node reads TF_GLM_PROMPT_GRID (and TF_GLM_KDA_CHUNKED's grid) before the wire opens."""
++    from tensorfold.families.glm5_next.cuda import engine
++
++    monkeypatch.setenv("TF_GLM_PROMPT_GRID", "48")
++    opened = []
++    afd = importlib.import_module("tensorfold.families.glm5_next.cuda.afd")
++    monkeypatch.setattr(afd, "make_afd", lambda *a, **k: opened.append(a))
++    with pytest.raises(ValueError, match="TF_GLM_PROMPT_GRID"):
++        engine.AfdEngine(None, master="x", port=1)
++    assert opened == []
+diff --git a/tests/test_glm_prompt_grid.py b/tests/test_glm_prompt_grid.py
+new file mode 100644
+index 0000000..2ed1c30
+--- /dev/null
++++ b/tests/test_glm_prompt_grid.py
+@@ -0,0 +1,193 @@
++"""TF_GLM_PROMPT_GRID (MiaAI-Lab recipe patch 0008) and the prompt replay (0042), on the CPU: the grid
++TF_GLM_KDA_CHUNKED=1 runs on (64 tokens), on #243's fake model.
++
++With a grid, a drafted prompt keeps its state at its grid point: its end when that is on the grid (with the head's
++logits row its first token was sampled from), else the last grid multiple in it, which the prompt prefills to as a
++prompt of that length and resumes from. Every kept state, resume and chunk start then sits on the grid, so the
++chunked KDA kernel (whose rows depend on their 32-row sub-chunks at absolute positions) gives a resumed prompt the bits
++of a fresh one; the same prompt again resumes at its grid point, and an on-grid prompt again replays its kept end
++state, prefilling nothing (0042). Covered: the multi-stream engine at two ranks (DFlash2 and MTP drafts, both ranks
++alike), at world 1 over the fake AFD wire, with TF_GLM_KV=fp8's rings, with shared-prefix points (they round down to
++the grid) and with TF_GLM_MULTI_PREFILL's multi-prompt chunks; the single-stream engine (MTP drafts). Replies equal
++their requests served alone. Without a grid nothing changes (the other test files, unchanged, run on this tree).
++"""
++
++from __future__ import annotations
++
++import importlib
++
++import pytest
++
++from tests import test_glm_kv8_multi as tk
++from tests import test_glm_multi as tm
++from tests import test_glm_multi_afd as ta
++from tests import test_glm_multi_prefill as tp
++from tests import test_glm_shared_prefix as sp
++from tests.test_cuda_geometry import allocations  # noqa: F401  (fixture: fake triton, so decode imports)
++
++pytestmark = pytest.mark.torch
++
++fake = tm.fake
++afd_fake = ta.afd_fake
++rings = tk.rings
++GRID = 64
++
++
++@pytest.fixture
++def grid(monkeypatch):
++    """TF_GLM_PROMPT_GRID=64 on every engine the test builds (``GlmEngine.grid``, which ``MultiDecoder`` reads)."""
++    from tensorfold.families.glm5_next.cuda import engine
++
++    monkeypatch.setattr(engine.GlmEngine, "grid", GRID)
++    return GRID
++
++
++class Rows:
++    """The prompt rows rank 0's engine prefills, as (start, rows) per prompt chunk (``decode.prefill_chunk``)."""
++
++    def __init__(self, monkeypatch, e0) -> None:
++        decode = importlib.import_module("tensorfold.families.glm5_next.cuda.decode")
++        real = decode.prefill_chunk
++        self.rows: list[tuple[int, int]] = []
++
++        def chunk(e, prompt, start, R, **kw):
++            if e is e0:
++                self.rows.append((start, R))
++            return real(e, prompt, start, R, **kw)
++
++        monkeypatch.setattr(decode, "prefill_chunk", chunk)
++
++
++def scenario(torch, node, policy: str, rows: Rows) -> None:
++    d = node.d[0] if isinstance(node.d, list) else node.d
++    off_grid, on_grid = tm._prompt(650, 61), tm._prompt(640, 62)     # 650 = 10 x 64 + 10
++    topk = tm._sampling("topk", 3)
++    a = node.submit(off_grid, 12, None, policy=policy)
++    node.run()
++    assert a.cached == 0 and a.got == tm.solo(torch, off_grid, 12, None)
++    assert [(len(k.ids), k.head is None) for k in d.kept] == [(640, True)]      # its grid point, not 649
++    assert rows.rows[-2:] == [(576, 64), (640, 10)]
++    rows.rows.clear()
++    b = node.submit(off_grid, 12, None, policy=policy)                 # the same prompt: from its grid point
++    node.run()
++    assert b.cached == 640 and rows.rows == [(640, 10)] and b.got == a.got
++    c = node.submit(on_grid, 12, topk, policy=policy)
++    node.run()
++    assert c.cached == 0 and c.got == tm.solo(torch, on_grid, 12, topk)
++    end = [k for k in d.kept if k.ids == on_grid]
++    assert len(end) == 1 and end[0].head is not None and end[0].head.shape[0] == 1      # with its head's row
++    rows.rows.clear()
++    r = node.submit(on_grid, 12, topk, policy=policy)                  # an on-grid prompt again: a replay
++    node.run()
++    assert r.cached == 640 and rows.rows == [] and r.got == c.got
++    turn = on_grid + c.got + tm._prompt(30, 63)                        # its next turn resumes the end state
++    t = node.submit(turn, 10, None, policy=policy)
++    node.run()
++    assert t.cached == 640 and t.got == tm.solo(torch, turn, 10, None)
++    assert all(len(k.ids) % GRID == 0 for k in d.kept)
++
++
++@pytest.mark.parametrize("policy,mtp", [("f3", False), ("2", True)], ids=["dflash2", "mtp"])
++def test_two_ranks(fake, grid, monkeypatch, policy, mtp):
++    p = tm.Pair(fake, streams=2, blocks=8, mtp=mtp)
++    assert [d.grid for d in p.d] == [GRID, GRID]
++    scenario(fake, p, policy, Rows(monkeypatch, p.d[0].e))
++    p.check()
++    assert [(c.kid, c.ids, c.head is None) for c in p.d[0].kept] == [(c.kid, c.ids, c.head is None)
++                                                                       for c in p.d[1].kept]
++
++
++def test_two_ranks_fp8_rings(fake, grid, monkeypatch, rings):
++    tk._ringed(fake)
++    p = tm.Pair(fake, streams=2, blocks=8)
++    scenario(fake, p, "f3", Rows(monkeypatch, p.d[0].e))
++    p.check()
++
++
++def test_world1_afd(afd_fake, grid, monkeypatch):
++    n1 = ta.World1(afd_fake, streams=2)
++    assert n1.d.grid == GRID and n1.d.world == 1
++    scenario(afd_fake.torch, n1, "f3", Rows(monkeypatch, n1.d.e))
++
++
++def test_shared_prefix_points_round_down_to_the_grid(fake, grid):
++    """TF_GLM_SHARED_PREFIX: the system block's end rounds down to the grid; the inference request resumes there."""
++    p = tm.Pair(fake, streams=2, blocks=8)
++    sp.sharing(p.g)
++    context = tm._prompt(600, 500)
++    load, inference = sp.benchy(context, tm._prompt(100, 501)), sp.benchy(context, tm._prompt(64, 502))
++    at = (len(sp.HEAD) + 600) // GRID * GRID                          # 603 -> 576; load's own grid point 704
++    first = p.submit(load, 8, None)
++    p.run()
++    assert sorted((len(k.ids), k.shared) for k in p.d[0].kept) == [(at, True), (len(load) // GRID * GRID, False)]
++    phase2 = p.submit(inference, 12, None)
++    assert phase2.cached == at
++    p.run()
++    p.check()
++    assert phase2.got == tm.solo(fake, inference, 12, None) and first.got == tm.solo(fake, load, 8, None)
++    assert all(len(k.ids) % GRID == 0 for k in p.d[0].kept)
++
++
++def test_multi_prompt_chunks_on_the_grid(fake, grid, monkeypatch):
++    """TF_GLM_MULTI_PREFILL=1: a burst of four short prompts groups into multi-prompt chunks whose pieces start and
++    stop on the grid (or at a prompt's end); replies equal their solo ones; an on-grid prompt again replays alone."""
++    pieces = []
++    mp = importlib.import_module("tensorfold.families.glm5_next.cuda.multi_prefill")
++    real = mp.prefill_pieces
++
++    def record(e, ps):
++        pieces.append([(p.st.pos, len(p.tokens), p.head) for p in ps])
++        return real(e, ps)
++
++    monkeypatch.setattr(mp, "prefill_pieces", record)
++    p, log, streams = tp.burst_pair(fake, monkeypatch, True)
++    assert pieces and tp._fills(log)[1] >= 1
++    for group in pieces:
++        assert len(group) > 1
++        for start, n, ends in group:
++            assert start % GRID == 0 and (ends or (start + n) % GRID == 0)
++    assert all(len(k.ids) % GRID == 0 for k in p.d[0].kept)
++    p.check()
++    on = next((s for s in streams if len(s.prompt) % GRID == 0), None)
++    if on is not None:
++        again = p.submit(on.prompt, 6, None)
++        assert again.cached == len(on.prompt)
++        p.run()
++        assert again.got == tm.solo(fake, on.prompt, 6, None)
++
++
++# -- the single-stream engine ---------------------------------------------------------------------------------------
++def test_single_stream(fake, grid, monkeypatch):
++    """MTP drafts: the grid point is kept by prefilling to it (no cut inside a chunk), the same prompt resumes there,
++    an on-grid prompt's end state keeps the head's row and replays (no chunk at all), and the next turn resumes it."""
++    torch = fake
++    sp._cut_compute(monkeypatch)
++    decode = importlib.import_module("tensorfold.families.glm5_next.cuda.decode")
++    chunk = decode.compute
++    calls = []
++
++    def compute(w, st, b, R, *, cut=None, **kw):
++        calls.append((st.pos, R, cut is not None))
++        return chunk(w, st, b, R, cut=cut, **kw)
++
++    monkeypatch.setattr(decode, "compute", compute)
++    g = sp._engine(torch)
++    g.e.grid = GRID
++    assert g.grid == GRID
++    off_grid, on_grid = tm._prompt(650, 71), tm._prompt(640, 72)
++    cached, got = sp._ask(g, off_grid, 12)
++    assert cached == 0 and got == tm.solo(torch, off_grid, 12, None)
++    assert [(len(c.ids), c.head is None) for c in g.cache] == [(640, True)] and not any(x[2] for x in calls)
++    calls.clear()
++    assert sp._ask(g, off_grid, 12) == (640, got) and calls == [(640, 10, False)]
++    cached, first = sp._ask(g, on_grid, 12, tm._sampling("topk", 5))
++    assert cached == 0 and first == tm.solo(torch, on_grid, 12, tm._sampling("topk", 5))
++    assert [(len(c.ids), c.head is None) for c in g.cache] == [(640, True), (640, False)]
++    calls.clear()
++    assert sp._ask(g, on_grid, 12, tm._sampling("topk", 5)) == (640, first) and calls == []
++    turn = on_grid + first + tm._prompt(20, 73)
++    cached, got = sp._ask(g, turn, 8)
++    assert cached == 640 and got == tm.solo(torch, turn, 8, None)
++    assert all(len(c.ids) % GRID == 0 for c in g.cache)
++    with pytest.raises(ValueError, match="grid"):                 # a resume off the grid is refused
++        decode.prefill(g.e, off_grid, None, resume=decode.Snapshot(off_grid[:100], None, None, None, -1, -1))

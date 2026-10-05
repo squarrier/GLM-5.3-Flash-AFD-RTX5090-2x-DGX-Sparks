@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 22:37:14 -0400
+Subject: [PATCH] tests/cuda: pass the FP8 KV kernel arguments in
+ test_glm_latent's selection test
+
+test_select_tokens_vectorized_equals_loop launches sparse._scores itself, so that the reference loop gets the pool
+choice select_tokens made. The FP8 KV commit (TF_GLM_KV=fp8, MiaAI-Lab recipe patch 0038) gave that kernel three more
+parameters: the pooled keys' scale view PKS, the row stride RS and the switch FP8. The test still made the old call, so
+all four cases failed on a GPU before reaching their checks:
+
+    TypeError: dynamic_func() missing 3 required positional arguments: 'wscale', 'RS', and 'FP8'
+
+The test now passes the keys the way select_tokens does for bf16 pooled keys, through kv8.parts(pk): the keys again for
+the unused scale view, rows of 128, FP8 off. With those values the kernel takes its path from before the FP8 commit
+(the same loads and dots, no scales), so the test checks what it checked before. Only the test changes.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+ tests/cuda/test_glm_latent.py | 16 +++++++++-------
+ 1 file changed, 9 insertions(+), 7 deletions(-)
+
+diff --git a/tests/cuda/test_glm_latent.py b/tests/cuda/test_glm_latent.py
+index 7e4347c..a89d48d 100644
+--- a/tests/cuda/test_glm_latent.py
++++ b/tests/cuda/test_glm_latent.py
+@@ -159,7 +159,7 @@ def _select_tokens_loop(pools, pos, R, POOL=4, TOPK=512):
+ @cuda
+ @pytest.mark.parametrize("pos,R", [(2040, 16), (2047, 64), (9000, 5), (130000, 257)])
+ def test_select_tokens_vectorized_equals_loop(pos, R):
+-    from tensorfold.families.glm5_next.cuda import sparse
++    from tensorfold.families.glm5_next.cuda import kv8, sparse
+ 
+     gen = torch.Generator().manual_seed(pos + R)
+     H, D = 32, 128
+@@ -169,15 +169,17 @@ def test_select_tokens_vectorized_equals_loop(pos, R):
+     pk = torch.randn((npool_max, D), generator=gen).to(torch.bfloat16).cuda()
+     pos_dev = torch.tensor([pos], dtype=torch.int32, device="cuda")
+     tokens, counts = sparse.select_tokens(qi, wts, pk, pos, R, npool_max - 2, pos_dev)
+-    # the same pool choice the function made, fed to the reference loop
++    # the same pool choice the function made, fed to the reference loop; the bf16 pooled keys go in as select_tokens
++    # passes them (kv8.parts: the keys again for the unused scale view, rows of 128, FP8 off)
++    pkv, pks, rs, fp8 = kv8.parts(pk)
+     scores = torch.empty((R, npool_max - 2), dtype=torch.float32, device="cuda")
+-    sparse._scores[(R, -(-(npool_max - 2) // 64))](qi, wts, wts.stride(0), pk, scores, pos_dev, R, npool_max - 2,
+-                                                    128 ** -0.5, 1.0 / 5.656854249492381, H=32, HP=32, D=128, BP=64,
+-                                                    RB=1, num_warps=4)
++    sparse._scores[(R, -(-(npool_max - 2) // 64))](qi, wts, wts.stride(0), pkv, pks, scores, pos_dev, R,
++                                                    npool_max - 2, 128 ** -0.5, 1.0 / 5.656854249492381, H=32, HP=32,
++                                                    D=128, BP=64, RB=1, RS=rs, FP8=fp8, num_warps=4)
+     blocked = torch.empty_like(scores)
+-    sparse._scores[(-(-R // 16), -(-(npool_max - 2) // 64))](qi, wts, wts.stride(0), pk, blocked, pos_dev, R,
++    sparse._scores[(-(-R // 16), -(-(npool_max - 2) // 64))](qi, wts, wts.stride(0), pkv, pks, blocked, pos_dev, R,
+                                                               npool_max - 2, 128 ** -0.5, 1.0 / 5.656854249492381, H=32,
+-                                                              HP=32, D=128, BP=64, RB=16,
++                                                              HP=32, D=128, BP=64, RB=16, RS=rs, FP8=fp8,
+                                                               num_warps=4)
+     assert torch.equal(scores, blocked), "row-blocked scores differ from one row a program"
+     order = torch.sort(scores, dim=1, descending=True, stable=True).indices[:, :512]

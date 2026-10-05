@@ -24,9 +24,15 @@ A tenant is the cgroup of a process holding `/dev/nvidia*`. Only docker scopes a
 
 ```bash
 sudo ./install.sh gb10     # on each DGX Spark
-sudo ./install.sh rtx      # on the RTX coordinator (optional)
+sudo ./install.sh rtx      # on the RTX 5090 attention host (optional)
 ```
 
-Tested on our kit with a CUDA memory hog allocating ~7 GiB/s. The guard killed it at 5.8 GiB free, with no kernel OOM and SSH answering in 0.35 s. Serving this model, each Spark keeps 27–35 GiB free, far above the floors.
+Tested on our kit with a CUDA memory hog allocating ~7 GiB/s. The guard killed it at 5.8 GiB free, with no kernel OOM and SSH answering in 0.35 s.
 
-Set `REQUIRE_GUARD=1` in `.env` to make preflight refuse to start without it.
+## With this version
+
+The guard comes from [v1.0](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/tree/v1.0); `gb10-hostguard.py` and `install.sh` are unchanged. It needs nothing from the recipe, and this version runs as it expects:
+
+- **One GPU tenant per host:** the expert container on each Spark, the attention container on the 5090 host. MCDMA's link daemons run outside docker, as the SSH user, but they never open the GPU (MCDMA's `rpc/` daemon and library have no CUDA code), so the single-tenant rule does not count them.
+- **Head room:** with the experts loaded, each Spark had 28.8 and 29.5 GiB available, far above the floors. Under v1.0 each Spark kept 27–35 GiB free.
+- **Not required:** `./start.sh` neither installs nor checks for the guard. Its own preflight refuses to start beside another GPU process and waits for `MIN_FREE_GIB_EXPERT` (100 GiB) of available memory before an expert starts, but it cannot act once the stack runs; the guard can. v1.0's `REQUIRE_GUARD` setting does not exist in this version.

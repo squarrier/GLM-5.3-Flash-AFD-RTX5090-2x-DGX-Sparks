@@ -1,0 +1,14 @@
+# gitleaks: the default rules, plus one allowlist. Patches 0009 and 0010 carry two test-data files
+# (tests/data/glm_q4dense_mia_digests.json, tests/data/glm_kv8_golden.json) whose lines are sha256 digests of test
+# tensors under names like "R4.sel_tokens" or "W3.index_keys", and a tensor name under "key": generic-api-key false
+# positives. Only those exact line shapes are allowed; every file is still scanned.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "test-tensor digests and tensor names in the test data that patches 0009 and 0010 add"
+regexTarget = "line"
+regexes = [
+  '''\+\s*"(R[0-9]+|W[0-9]+|sparse)\.[a-z_]+": "[0-9a-f]{64}",?\s*$''',
+  '''\+\s*"key": "[a-z_.]+\.weight\.rows[0-9]+-[0-9]+",?\s*$''',
+]

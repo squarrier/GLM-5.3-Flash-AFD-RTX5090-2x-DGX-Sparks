@@ -1,0 +1,2396 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 01:33:00 -0400
+Subject: [PATCH] glm5_next/cuda: overlap prompt chunk pairs across the AFD
+ wire (one chunk's attention during the other's experts)
+
+TF_GLM_PREFILL_PAIRS=1 on the AFD attention node runs two consecutive prompt chunks through the layers together while
+no stream decodes: chunk k's MoE exchange of layer L goes out, chunk k + 1's attention of layer L runs while the expert
+nodes compute k's, k's reply comes in, k + 1's exchange goes out, k's attention of layer L + 1 runs while they compute
+k + 1's, and so on. Unset or 0 (the default) keeps the schedule and every message as before.
+
+Exact by construction: each chunk keeps its rows, its row count and its kernels; only the order of the two chunks'
+kernels changes (attention(k + 1, L) after attention(k, L), whose latents, indexer keys and KDA state it reads;
+attention(k, L + 1) after k's layer-L reply). Each MoE exchange keeps its rows, so the experts' grouping and every bit
+are the chunks' alone.
+
+- prefill_pairs.py: the pair scheduler (each chunk's layer loop stops before its exchange, before its collect and
+  after it; one request on the wire at a time), the second chunk's own buffers (token ids, residual streams,
+  hyper-connection weights, DFlash2 taps: 144 MiB at 2,048 rows), its view of a stream continuing from the first
+  chunk (At), kept states at the first chunk's end taken layer by layer (Hold), each chunk's taps and commits in order.
+- forward.py: layer_forward as layer_front, the FFN block and hc_post; moe_block as moe_route, moe_send (the wire out,
+  then the shared expert) and the wire's collect. The same calls in the same order as before.
+- afd.py: MODE_PAIR = 7 beside the slice wire's MODE_SLICE = 5 (the wire version stays 2); begin_pair writes both
+  windows' headers (words 7 slot, 8 the other window's rows, 9 the pair's first seq); exchange / collect refuse a
+  reply out of order or a second request on the wire; a pair that stops early is refused at the next header;
+  TF_AFD_CHECK checks paired forwards and names them; TF_AFD_TIME samples each paired exchange's window, wait and
+  in-window work and prints them by window size every 8 pairs. settings_for adds "pairs": 1 only with the setting on.
+- afd_mcdma.py / experts_node.py: the expert takes a pair's second window after the first's layer-0 reply and serves
+  the windows' layers in arrival order; MODE_PAIR only when the settings handshake carried "pairs" (an older expert
+  refuses the settings, and any mode it does not know). A pair's header tables carry no slice count, and a slice
+  after a pair no pair words.
+- multi.py: rank 0 at world 1 pairs this iteration's chunk with the one the next would fill, when no stream decodes,
+  no layer-sliced chunk (TF_GLM_FILL_BUDGET_MS) is suspended, the first chunk ends no prompt and no stream drafts with
+  the MTP head (TF_GLM_MULTI_PREFILL's grouped chunks pair too); a chunk started while others decode still goes in
+  layer slices, unpaired. /health's prefill_pairs counters. decode.take_snapshot takes held KDA states. engine.py:
+  the setting read before the wire opens, the second chunk's buffers and their bytes in the capacity plan.
+
+Tests: tests/test_glm_prefill_pairs.py (each chunk's recorded kernel calls in a pair equal its solo chunk's, dense, at
+and past a dense limit, odd sizes, grouped chunks; the schedule interleaves; the real scheduler over the real wire and
+the fake MCDMA pair, CPU- and GPU-driven; pair headers, out-of-order and second requests refused, an old peer refused,
+a pair stopped early, a stalled link, the check's names, the pair timer line; pairs and layer slices on one wire in
+either order; at world 1, the setting on equals off in replies, cached counts, kept states and their pool rows for
+prompts of 1, 2, 3 and 5 chunks and odd remainders, with TF_GLM_SHARED_PREFIX, TF_GLM_MULTI_PREFILL and fp8 rings, a
+cancellation after a pair and a client leaving mid-pair, no pair while a stream decodes, and the sliced fills unchanged
+with the setting on); tests/test_glm_multi_afd.py's afd_fake runs pairs on the fake model, so its world-1 tests also
+run with the setting on; tests/test_glm_sliced_fill.py's checked wire logs a pair and checks its chunks as whole-chunk
+forwards, so its world-1 tests run with the setting on too.
+
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+ src/tensorfold/families/glm5_next/cuda/afd.py | 180 +++-
+ .../families/glm5_next/cuda/afd_mcdma.py      | 111 +-
+ .../families/glm5_next/cuda/decode.py         |  15 +-
+ .../families/glm5_next/cuda/engine.py         |  20 +-
+ .../families/glm5_next/cuda/experts_node.py   |  41 +-
+ .../families/glm5_next/cuda/forward.py        |  57 +-
+ .../families/glm5_next/cuda/multi.py          | 137 ++-
+ .../families/glm5_next/cuda/prefill_pairs.py  | 357 +++++++
+ tests/test_glm_multi_afd.py                   |  60 ++
+ tests/test_glm_prefill_pairs.py               | 966 ++++++++++++++++++
+ tests/test_glm_sliced_fill.py                 |  10 +
+ 11 files changed, 1909 insertions(+), 45 deletions(-)
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/prefill_pairs.py
+ create mode 100644 tests/test_glm_prefill_pairs.py
+
+diff --git a/src/tensorfold/families/glm5_next/cuda/afd.py b/src/tensorfold/families/glm5_next/cuda/afd.py
+index 80d6292..4d11bcc 100644
+--- a/src/tensorfold/families/glm5_next/cuda/afd.py
++++ b/src/tensorfold/families/glm5_next/cuda/afd.py
+@@ -12,6 +12,10 @@ A forward is every MoE layer's exchange in order (MODE_EAGER, MODE_CHUNK), or a
+ (MODE_SLICE, wire 2: TF_GLM_FILL_BUDGET_MS's sliced fills, MiaAI-Lab recipe patch 0062 over this wire): MoE positions
+ a .. a + n - 1 only, so a decode round's forward can run between two slices of a chunk. The slice mode is this
+ tree's own wire design, not part of the recipe.
++
++Prompt chunk pairs (MODE_PAIR, TF_GLM_PREFILL_PAIRS, ``prefill_pairs``; ours) open two whole-chunk forwards at once
++(``begin_pair``): their MoE exchanges alternate, window 0's layer, window 1's, window 0's next ..., with one request
++on each link at a time, so one chunk's attention runs while the experts compute the other's exchange.
+ """
+ 
+ from __future__ import annotations
+@@ -25,10 +29,15 @@ from datetime import timedelta
+ 
+ from .afd_transport import WireError
+ 
+-# the header's mode word: the attention sends only these three, and the experts refuse any other value
++# the header's mode word: the attention sends only these, and the experts refuse any other value
+ MODE_EAGER = 1          # an eager window
+ MODE_CHUNK = 3          # a prompt chunk: eager, the expert's wide scratch
+ MODE_SLICE = 5          # MoE positions a .. a + n - 1 of a prompt chunk (TF_GLM_FILL_BUDGET_MS's layer slices)
++MODE_PAIR = 7           # a prompt chunk of a pair (TF_GLM_PREFILL_PAIRS, ``prefill_pairs``): eager, the wide scratch, its
++#                         MoE exchanges alternating with the other window's; the experts take it only after the
++#                         settings handshake's ``pairs``
++PAIR_SLOT, PAIR_OTHER, PAIR_FIRST = 7, 8, 9    # a MODE_PAIR header's words: its slot (0, 1), the other window's rows,
++#                                                the pair's first forward seq (words 6 and 10-63 stay 0)
+ WIRE = 2                # the wire's version in the settings handshake: 2 adds MODE_SLICE (an older node refuses)
+ CHECK_ENV = "TF_AFD_CHECK"
+ TIME_ENV = "TF_AFD_TIME"
+@@ -44,15 +53,20 @@ def moe_layers(cfg) -> list[int]:
+     return [i for i, kind in enumerate(cfg.mlp_kinds) if kind == "moe"]
+ 
+ 
+-def settings_for(model_dir, cfg, *, prefill_rows: int) -> dict:
+-    """Everything both sides must agree on before the first forward; a mismatch refuses to start."""
++def settings_for(model_dir, cfg, *, prefill_rows: int, pairs: bool = False) -> dict:
++    """Everything both sides must agree on before the first forward; a mismatch refuses to start. ``pairs``
++    (TF_GLM_PREFILL_PAIRS on the attention node) adds ``"pairs": 1``: expert nodes of a tree without MODE_PAIR refuse
++    it here; without it the settings are unchanged."""
+ 
+     from pathlib import Path
+ 
+     index = Path(model_dir) / "model.safetensors.index.json"
+     digest = hashlib.sha256(index.read_bytes()).hexdigest() if index.is_file() else ""
+-    return {"digest": digest, "layers": moe_layers(cfg), "max_rows": 8, "mtp": 0, "prefill_rows": int(prefill_rows),
+-            "quant": cfg.quant, "experts": cfg.experts, "top_k": cfg.top_k, "wire": WIRE}
++    out = {"digest": digest, "layers": moe_layers(cfg), "max_rows": 8, "mtp": 0, "prefill_rows": int(prefill_rows),
++           "quant": cfg.quant, "experts": cfg.experts, "top_k": cfg.top_k, "wire": WIRE}
++    if pairs:
++        out["pairs"] = 1
++    return out
+ 
+ 
+ def moe_span(cfg, lo: int, hi: int) -> tuple[int, int]:
+@@ -205,6 +219,19 @@ class AfdWire:
+     start = end = 0                              # the current forward's MoE positions (set by ``begin``)
+     span: tuple[int, int] | None = None          # a MODE_SLICE forward's (a, n)
+     _sliced = 0
++    # TF_GLM_PREFILL_PAIRS (``begin_pair``): an open pair's two windows (the inactive one's fields saved there), the
++    # active one, its offset among the check's forwards, the request on the wire (window, layer), the checked paired
++    # forwards' seqs, TF_AFD_TIME's pair events (per window and MoE layer: send / collect / reply), the sampled pairs'
++    # (window, wait) ms by window rows and how many pairs it sampled. Class defaults: no pair (replaced, never
++    # appended to, here).
++    _pair: list[dict] | None = None
++    _slot = 0
++    _ahead = 0
++    _busy: tuple[int, int] | None = None
++    _paired: list[int] | tuple = ()
++    _pev: list | None = None
++    _overlap: dict[int, list[tuple[float, float]]] | None = None
++    _pairs_timed = 0
+ 
+     def __init__(self, master: str, port: int, model_dir=None, transport=None) -> None:
+         import torch
+@@ -316,6 +343,8 @@ class AfdWire:
+ 
+         if self.dead is not None:
+             raise self._cap(f"the AFD expert nodes are gone ({self.dead}); restart the serving stack")
++        if self._pair is not None:
++            self._close_pair()
+         if self.layer not in (self.start, self.end):
+             what = "a forward" if self.span is None else f"a slice of MoE layers {self.start} .. {self.end - 1}"
+             why = (f"{what} stopped after {self.layer - self.start} of {self.end - self.start} MoE exchanges; the experts "
+@@ -352,12 +381,87 @@ class AfdWire:
+ 
+         return True
+ 
++    # -- prompt chunk pairs (TF_GLM_PREFILL_PAIRS, ``prefill_pairs``) --------------------------------------------
++    _WIN = ("seq", "rows", "mode", "layer", "_chk", "_ahead")
++
++    def begin_pair(self, rows) -> None:
++        """Two prompt chunks' headers, before either's eager kernels: forwards seq + 1 (slot 0) and seq + 2 (slot 1),
++        both MODE_PAIR. Their MoE exchanges alternate on the wire, slot 0's layer L, then slot 1's layer L, then slot
++        0's layer L + 1 ...: each link still carries one request at a time (``exchange`` refuses a second before the
++        first's ``collect``); ``use`` picks the window ``exchange`` and ``collect`` act for. The next ``begin`` (or
++        ``begin_pair``) closes the pair: both windows must have made all their exchanges."""
++
++        ra, rb = (int(r) for r in rows)
++        self.begin(ra, chunk=True)               # the refusals and the last forward's check and timing, as begin's
++        first = self.seq                         # (begin wrote slot 0's seq; the header tables are rewritten below)
++        win = {"seq": first, "rows": ra, "mode": MODE_PAIR, "layer": 0, "_chk": None, "_ahead": 0}
++        self._pair = [win, dict(win, seq=first + 1, rows=rb, _ahead=1)]
++        self._slot, self._busy = 0, None
++        self._load(win)
++        self.tr.header_pair((first, first + 1), (ra, rb))
++        if self.timing and self._pev is None:
++            self._pev = [[[self.torch.cuda.Event(enable_timing=True) for _ in range(3)] for _ in range(self.nlayers)]
++                         for _ in range(2)]
++
++    def use(self, slot: int) -> None:
++        """The open pair's window that the next ``exchange`` / ``collect`` act for."""
++
++        if self._pair is None or slot not in (0, 1):
++            raise RuntimeError(f"no prompt chunk pair window {slot} is open")
++        if slot != self._slot:
++            self._pair[self._slot] = {k: getattr(self, k) for k in self._WIN}
++            self._load(self._pair[slot])
++            self._slot = slot
++            self.tr.use(slot)
++
++    def _load(self, win: dict) -> None:
++        for k in self._WIN:
++            setattr(self, k, win[k])
++
++    def _close_pair(self) -> None:
++        """The open pair's end (at the next header): both windows complete, their checks and timing; then the
++        single-window fields as after a forward (seq the pair's last)."""
++
++        self._pair[self._slot] = {k: getattr(self, k) for k in self._WIN}
++        wins, self._pair = self._pair, None
++        self._slot, self._busy = 0, None
++        self.tr.close_pair()
++        for k, win in enumerate(wins):
++            if win["layer"] != self.nlayers:
++                why = (f"a prompt chunk pair's window {k} (seq {win['seq']}) stopped after {win['layer']} of "
++                       f"{self.nlayers} MoE exchanges; the experts are out of step")
++                self.die(why)
++                raise self._cap(f"the AFD expert nodes are gone ({why}); restart the serving stack")
++        if self.check:
++            for win in wins:
++                self._load(win)
++                self._finish_check()
++        if self.timing:
++            self._sample_pair(rows=(wins[0]["rows"], wins[1]["rows"]))
++        self._load(dict(wins[1], layer=0, _chk=None, _ahead=0))
++
++    def _named(self) -> str:
++        """A paired window's name in the check's lines."""
++
++        if self.mode != MODE_PAIR:
++            return ""
++        other = self.seq + 1 if self._ahead == 0 else self.seq - 1
++        return f" (prompt chunk pair, slot {self._ahead}, with seq {other})"
++
+     def exchange(self, b, rows: int) -> None:
+         """The send half: ``normed/pick/wts`` to each expert; the layer's shared expert runs while it flies."""
+ 
+-        if self.timing and self.ev is not None and self.layer < len(self.ev):
++        if self._pair is not None:
++            if self._busy is not None:
++                self._fail(WireError("two requests on one link", f"a prompt chunk pair's window {self._slot} sent "
++                                     f"layer {self.layer} while window {self._busy[0]}'s layer {self._busy[1]} is "
++                                     "unanswered (one request on each link at a time)"))
++            self._busy = (self._slot, self.layer)
++            if self._pev is not None and self.layer < self.nlayers:
++                self._pev[self._slot][self.layer][0].record()
++        elif self.timing and self.ev is not None and self.layer < len(self.ev):
+             self.ev[self.layer][0].record()
+-        if self.check and self.checked < CHECK_FORWARDS:
++        if self.check and self.checked + self._ahead < CHECK_FORWARDS:
+             self._chk = self._chk or []
+             self._chk.append([b.normed[:rows].clone(), b.pick[:rows].clone(), b.wts[:rows].clone(), None, None])
+         try:
+@@ -369,7 +473,16 @@ class AfdWire:
+     def collect(self, b, rows: int, d: int):
+         """The receive half: both routed partial, slot 2 = the shared expert; ``[3, rows, D]`` for ``hc_post``."""
+ 
+-        if self.timing and self.ev is not None and 0 < self.layer <= len(self.ev):
++        pev = None
++        if self._pair is not None:
++            if self._busy != (self._slot, self.layer - 1):
++                self._fail(WireError("a reply out of order", f"a prompt chunk pair's window {self._slot} collected "
++                                     f"layer {self.layer - 1} while the request on the wire is {self._busy} "
++                                     "((window, layer); replies come in the order the requests went)"))
++            if self._pev is not None and 0 < self.layer <= self.nlayers:
++                pev = self._pev[self._slot][self.layer - 1]
++                pev[1].record()
++        elif self.timing and self.ev is not None and 0 < self.layer <= len(self.ev):
+             self.ev[self.layer - 1][1].record()
+         n = rows * d
+         flat = b.afd_recv.view(-1)
+@@ -377,6 +490,10 @@ class AfdWire:
+             self.tr.recv(flat[:n].view(rows, d), flat[n:2 * n].view(rows, d), self.layer - 1)
+         except WireError as exc:
+             self._fail(exc)
++        if self._pair is not None:
++            self._busy = None
++            if pev is not None:
++                pev[2].record()
+         flat[2 * n:3 * n].view(rows, d).copy_(b.sy[:rows])
+         if self.check and self._chk is not None:
+             self._chk[-1][3] = flat[:n].clone()          # rank 1's partial, to meet that expert's sent hash
+@@ -428,18 +545,26 @@ class AfdWire:
+         self.mismatches += bad
+         if bad and not self._why:
+             self._why = first          # the first difference, printed once, naming the cause
+-            print(f"[tensorfold] afd-check first mismatch: {first}", flush=True)
++            lead = f"seq {self.seq}{self._named()}: " if self.mode == MODE_PAIR else ""
++            print(f"[tensorfold] afd-check first mismatch: {lead}{first}", flush=True)
++        if self.mode == MODE_PAIR:
++            self._paired = [*self._paired, self.seq]
+         if self.checked == CHECK_FORWARDS:
+             sliced = ""
+             if self._sliced:            # MODE_SLICE forwards among the checked ones, named by their MoE positions
+                 sliced = (f"; {self._sliced} of them layer slices (MoE positions from "
+                           f"{sorted({a for a, _ in self._spans})}, {len(self._spans)} distinct slices)")
+-            print(f"[tensorfold] afd-check: window complete, {CHECK_FORWARDS} forwards, "
++            named = ""
++            if self._paired:            # MODE_PAIR forwards among the checked ones, named by their pairs' seqs
++                firsts = [s for s in self._paired if s + 1 in self._paired]
++                named = (f" ({len(self._paired)} of them in prompt chunk pairs, seqs "
++                         f"{', '.join(f'{s}-{s + 1}' for s in firsts[:8])}{' ...' if len(firsts) > 8 else ''})")
++            print(f"[tensorfold] afd-check: window complete, {CHECK_FORWARDS} forwards{named}, "
+                   f"{self.mismatches} mismatches total, rows checked {sorted(self._seen)}{sliced}", flush=True)
+         if bad:
+             what = "" if self.span is None else f" (slice of MoE layers {self.start} .. {self.end - 1})"
+-            print(f"[tensorfold] afd-check seq {self.seq}{what}: {bad} mismatches over {layers} layers x 4 hashes",
+-                  flush=True)
++            print(f"[tensorfold] afd-check seq {self.seq}{what}{self._named()}: {bad} mismatches over {layers} layers "
++                  "x 4 hashes", flush=True)
+ 
+     # -- TF_AFD_TIME: the exchange's device time per layer -------------------------------------------------------
+     def _sample_times(self) -> None:
+@@ -456,3 +581,34 @@ class AfdWire:
+             parts = ", ".join(f"R{r} p50 {p50_p90(v)[0]:.1f}us n{len(v)} p90 {p50_p90(v)[1]:.1f}"
+                               for r, v in sorted(self._times.items()))
+             print(f"[tensorfold] afd exchange per layer: {parts}", flush=True)
++
++    # -- TF_AFD_TIME with prompt chunk pairs: the overlap -----------------------------------------------------------
++    def _sample_pair(self, rows: tuple[int, int], every: int = 8) -> None:
++        """Per paired MoE exchange of a pair whose windows both completed (``_close_pair``), from its events on the
++        compute stream, by the window's rows R: the window (send to the reply copied in) and the wait (the stream
++        reaching the collect to the reply copied in: the GPU idle for the reply, plus the reply's copy). Between a
++        window's send and its collect the stream runs that layer's shared expert and the other chunk's work (its
++        attention and routing, the next exchange's); the window less the wait is that work, which ran while the
++        experts computed. Every ``every`` pairs, per R over those pairs' exchanges: the count and the window, wait and
++        in-window p50 / p90 (the overlap gate compares the window with TF_AFD_TIME's serial exchange at the same R, on
++        the same boot)."""
++
++        if self._pev is None:
++            return
++        self.torch.cuda.synchronize()
++        ov = dict(self._overlap or {})
++        for r, win in zip(rows, self._pev):
++            ov[r] = [*ov.get(r, ()), *((send.elapsed_time(w1), w0.elapsed_time(w1)) for send, w0, w1 in win)]
++        self._overlap = ov
++        self._pairs_timed += 1
++        if self._pairs_timed % every == 0 and ov:
++            parts = []
++            for r, v in sorted(ov.items()):
++                spans, waits, work = [s for s, _ in v], [wt for _, wt in v], [s - wt for s, wt in v]
++                parts.append(f"R{r} n{len(v)} window p50 {p50_p90(spans)[0]:.2f} ms p90 {p50_p90(spans)[1]:.2f}, wait "
++                             f"for the reply p50 {p50_p90(waits)[0]:.2f} ms p90 {p50_p90(waits)[1]:.2f}, in-window "
++                             f"work p50 {p50_p90(work)[0]:.2f} ms p90 {p50_p90(work)[1]:.2f}")
++            print(f"[tensorfold] afd pair overlap: {sum(len(v) for v in ov.values())} paired MoE exchanges over the "
++                  f"last {every} pairs ({self._pairs_timed} so far; in-window work: the shared expert + the other "
++                  f"chunk's attention); {'; '.join(parts)}", flush=True)
++            self._overlap = {}
+diff --git a/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py b/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py
+index c36594d..922723a 100644
+--- a/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py
++++ b/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py
+@@ -10,10 +10,14 @@ check and timer are ``afd.AfdWire``'s and ``experts_node.serve``'s.
+ 
+ from __future__ import annotations
+ 
++import struct
++
+ from . import mcdma, mcdma_cuda
+-from .afd import MODE_CHUNK, MODE_EAGER, MODE_SLICE, get_store
++from .afd import MODE_CHUNK, MODE_EAGER, MODE_PAIR, MODE_SLICE, PAIR_FIRST, PAIR_OTHER, PAIR_SLOT, get_store
+ from .afd_transport import WireError
+ 
++PAIR_WORDS = "<10i"             # a request header's words 0-9 (mcdma.HDR_FMT reads 0-7; a MODE_PAIR's are 7-9)
++
+ 
+ def _bytes(t):
+     """A contiguous tensor's bytes as a flat uint8 view (no copy)."""
+@@ -75,6 +79,7 @@ class McdmaTransport:
+         self.layout = None
+         self.hdr_tab = self.hdr_tab_cpu = self.req_dev = self.zeros = None
+         self.sliced: int | None = None                     # the header row whose word 6 holds a slice's count
++        self._tabs = None                                  # a prompt chunk pair's two windows' header tables
+         self.down = False                                  # aborted: the forward in flight runs on without the wire
+         # rank 0 hosts the store and waits for both experts' clients
+         self.comm = comm if comm is not None else StoreComm(0, 3, master, port, links)
+@@ -122,6 +127,38 @@ class McdmaTransport:
+             self.sliced = slice[0]
+         self.hdr_tab.copy_(tab)                  # blocking: the next forward's rewrite must not race this copy
+ 
++    def header_pair(self, seqs, rows) -> None:
++        """A prompt chunk pair's two forwards (``AfdWire.begin_pair``): each window's request headers as ``header``
++        writes them with MODE_PAIR, plus word 7 its slot, word 8 the other window's rows and word 9 the pair's first
++        seq; one blocking copy each (the second window's tables are made at the first pair)."""
++
++        torch = self.torch
++        if self._tabs is None:
++            cpu = torch.zeros(self.hdr_tab_cpu.shape, dtype=torch.int32, pin_memory=self.device != "cpu")
++            cpu.copy_(self.hdr_tab_cpu)
++            self._tabs = [(self.hdr_tab, self.hdr_tab_cpu), (torch.zeros_like(self.hdr_tab), cpu)]
++        for k, (dev, tab) in enumerate(self._tabs):
++            tab[:, 1] = seqs[k] & 0x7FFFFFFF
++            tab[:, 2] = rows[k]
++            tab[:, 4] = MODE_PAIR
++            tab[:, PAIR_SLOT] = k
++            tab[:, PAIR_OTHER] = rows[1 - k]
++            tab[:, PAIR_FIRST] = seqs[0] & 0x7FFFFFFF
++            dev.copy_(tab)                       # blocking, as header's
++        self.use(0)
++
++    def use(self, slot: int) -> None:
++        """The pair window whose header tables the next ``send`` packs."""
++
++        self.hdr_tab, self.hdr_tab_cpu = self._tabs[slot]
++
++    def close_pair(self) -> None:
++        """Back to one window: the first tables, their pair words cleared (the next ``header`` copies them over)."""
++
++        if self._tabs is not None:
++            self.use(0)
++            self.hdr_tab_cpu[:, PAIR_SLOT:PAIR_FIRST + 1] = 0
++
+     def send(self, b, rows: int, layer: int) -> None:
+         """[header | normed | pick | pad | wts] packed on the device, then into both mailboxes."""
+ 
+@@ -200,16 +237,19 @@ def open_expert_link(theirs: dict, rank: int, cfg, store, device: str = "cuda",
+     log(f"[tensorfold] afd expert {rank}: MCDMA link {name}, {mode}-driven{' +flush' if flags else ''}, mailbox "
+         f"{link.box.req >> 20}+{link.box.rep >> 20} MiB, socket {link.socket_path}, first sequence {link.base}",
+         flush=True)
+-    return McdmaExpertLink(link, cfg.hidden, cfg.top_k + 1, len(theirs["layers"]), rows, device)
++    return McdmaExpertLink(link, cfg.hidden, cfg.top_k + 1, len(theirs["layers"]), rows, device,
++                           pairs=theirs.get("pairs") == 1)
+ 
+ 
+ class McdmaExpertLink:
+     """An expert node's end (``afd_transport.ExpertLink``) over its listen-end ``mcdma.ExpertLink``. A forward's first
+     request is awaited on the host: its header gives rows and mode. Every layer then lands the request (one copy)
+     and stages the partial back: as stream operations (GPU-driven: the later layers' requests are stream waits) or
+-    with a host wait and one sync per layer (CPU-driven)."""
++    with a host wait and one sync per layer (CPU-driven). ``pairs`` (the handshake's): MODE_PAIR forwards come two at
++    a time, their layers alternating (``next_partner``, ``use``); the link still carries one request at a time."""
+ 
+-    def __init__(self, link, hidden: int, slots: int, layers: int, prefill_rows: int, device: str = "cuda") -> None:
++    def __init__(self, link, hidden: int, slots: int, layers: int, prefill_rows: int, device: str = "cuda", *,
++                 pairs: bool = False) -> None:
+         self.link, self.lay = link, mcdma.Layout(hidden, slots)
+         self.layers, self.prefill_rows, self.device = layers, prefill_rows, device
+         self.gpu = link.mode == "gpu"
+@@ -218,6 +258,13 @@ class McdmaExpertLink:
+         self.fseq = self.rows = self.n_req = self.n_rep = 0
+         self.first, self.count = 0, layers       # the forward's MoE positions: every layer, or a slice's (MODE_SLICE)
+         self.x = self.src = self.dst = self.rep = self._routed = self._out = None
++        self.pairs = pairs
++        self.slot: int | None = None             # a pair's active window, else None
++        self.partner = 0                         # a pair's second window's rows
++        self._wins: list = [None, None]
++
++    def _words(self) -> tuple:
++        return struct.unpack_from(PAIR_WORDS, self.link.box.mm, mcdma.CTRL)
+ 
+     @property
+     def span(self) -> tuple[int, int]:
+@@ -244,15 +291,59 @@ class McdmaExpertLink:
+                                   f"{f' slice of {count}' if mode == MODE_SLICE else ''} (expected layer 0 of {L}, or "
+                                   f"a slice's first within it, rows 1..{self.prefill_rows}, "
+                                   f"{lay.req(rows) if 0 < rows else '?'} bytes)")
+-        if mode not in (MODE_EAGER, MODE_CHUNK, MODE_SLICE):
++        self.slot = None
++        if mode == MODE_PAIR and self.pairs:
++            h = self._words()
++            if h[PAIR_SLOT] != 0 or h[PAIR_FIRST] != fseq or not 1 <= h[PAIR_OTHER] <= self.prefill_rows:
++                raise mcdma.LinkError(f"link {link.name}: request {self.seq} opens no prompt chunk pair: slot "
++                                      f"{h[PAIR_SLOT]}, first seq {h[PAIR_FIRST]} (forward {fseq}), the other "
++                                      f"window's rows {h[PAIR_OTHER]}")
++            self.partner = h[PAIR_OTHER]
++        elif mode not in (MODE_EAGER, MODE_CHUNK, MODE_SLICE):
+             raise mcdma.LinkError(f"link {link.name}: forward mode {mode}: the MCDMA wire carries eager windows only")
++        self._open(fseq, rows, first, count)
++        if mode == MODE_PAIR:
++            self.slot, self._wins = 0, [self._win(), None]
++        return fseq, rows, mode
++
++    def _open(self, fseq: int, rows: int, first: int = 0, count: int | None = None) -> None:
++        lay, link = self.lay, self.link
+         self.fseq, self.rows = fseq, rows
+-        self.first, self.count = first, count
++        self.first, self.count = first, self.layers if count is None else count
+         self.n_req, self.n_rep = lay.req(rows), lay.rep(rows)
+         self.x = lay.views(self.landing, rows)
+         self.src, self.dst = link.box.req_bytes[mcdma.HDR_BYTES:self.n_req], self.landing[:self.n_req - mcdma.HDR_BYTES]
+         self.rep = link.box.rep_bytes[:self.n_rep]
+-        return fseq, rows, mode
++
++    _FIELDS = ("fseq", "rows", "first", "count", "n_req", "n_rep", "x", "src", "dst", "rep")
++
++    def _win(self) -> dict:
++        return {k: getattr(self, k) for k in self._FIELDS}
++
++    def next_partner(self) -> tuple[int, int]:
++        """A pair's second window: its first request (after the first window's layer-0 reply) awaited on the host and
++        its header checked against the first's; then it is the active window. Returns (seq, rows)."""
++
++        link, first = self.link, self._wins[0]
++        w = link.wait(self.seq)
++        h = self._words()
++        want = (mcdma.WIRE_MAGIC, first["fseq"] + 1, self.partner, 0, MODE_PAIR, self.layers)
++        if (tuple(h[:6]) != want or h[PAIR_SLOT] != 1 or h[PAIR_OTHER] != first["rows"]
++                or h[PAIR_FIRST] != first["fseq"] or mcdma.word_len(w) != self.lay.req(self.partner)):
++            raise mcdma.LinkError(f"link {link.name}: request {self.seq} header {list(h)} is not the second window of "
++                                  f"the pair that forward {first['fseq']} opened ({first['rows']} + {self.partner} rows)")
++        self._open(h[1], h[2])
++        self._wins[1] = self._win()
++        self.slot = 1
++        return h[1], h[2]
++
++    def use(self, slot: int) -> None:
++        """The pair window the next ``land`` / ``reply`` act for."""
++
++        if self.slot != slot:
++            for k, v in self._wins[slot].items():
++                setattr(self, k, v)
++            self.slot = slot
+ 
+     def land(self, layer: int, views):
+         """The request into the landing buffer, one copy; the compute reads its sections there (not ``views``)."""
+@@ -265,9 +356,11 @@ class McdmaExpertLink:
+                 w = link.wait(self.seq)
+                 h = link.box.header()
+                 if (h[0] != mcdma.WIRE_MAGIC or h[1] != self.fseq or h[2] != self.rows or h[3] != layer
+-                        or mcdma.word_len(w) != self.n_req):
++                        or mcdma.word_len(w) != self.n_req
++                        or (self.slot is not None and (h[4] != MODE_PAIR or h[PAIR_SLOT] != self.slot))):
+                     raise mcdma.LinkError(f"link {link.name}: request {self.seq} header {h[:6]} is not layer {layer} "
+-                                          f"of forward {self.fseq} ({self.rows} rows, {self.n_req} bytes)")
++                                          f"of forward {self.fseq} ({self.rows} rows, {self.n_req} bytes"
++                                          f"{'' if self.slot is None else f', pair window {self.slot}'})")
+         self.dst.copy_(self.src, non_blocking=True)    # the request, header slot skipped: normed | pick | pad | wts
+         return self.x
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index 4a78f26..e276618 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -348,13 +348,20 @@ def put_ring_tail(st, snap: Snapshot) -> None:
+ 
+ 
+ def take_snapshot(e: Engine, ids: Sequence[int], pending: torch.Tensor | None, *, mtp: bool,
+-                  drafter=None) -> Snapshot:
++                  drafter=None, held=None) -> Snapshot:
+     """A ring drafter's window rows are copied now (``_ring_window``): its next rows overwrite them in the ring; so
+-    are the indexer rings' rows of the pools still filling (``_ring_tail``)."""
++    are the indexer rings' rows of the pools still filling (``_ring_tail``). ``held``: (rec, conv) at len(ids) taken
++    earlier (a prompt chunk pair's first chunk's end, ``prefill_pairs.Hold``), the snapshot's own, instead of e.st's
++    (its rings' rows there are still the ones at len(ids): the later chunk's rows land past them in a ring of at least
++    a chunk + 3 rows, ``forward.index_ring``)."""
+     st = e.st
+-    rec = st.rec[st.cur[0]].clone() if st.cur else st.rec[0].clone()
++    if held is not None:
++        rec, conv = held
++    else:
++        rec = st.rec[st.cur[0]].clone() if st.cur else st.rec[0].clone()
++        conv = st.conv.clone()
+     mtp_len = st.mtp_len - st.mtp_drafted if mtp and pending is not None else -1
+-    snap = Snapshot(list(ids), rec, st.conv.clone(), pending.clone() if pending is not None else None,
++    snap = Snapshot(list(ids), rec, conv, pending.clone() if pending is not None else None,
+                     mtp_len, drafter.context_end if drafter is not None else -1,
+                     tail=_ring_tail(st, len(ids), max(mtp_len, 0)))
+     if drafter is not None and getattr(drafter, "ring", 0) and snap.drafter_end == len(snap.ids):
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 01afe35..e906e6f 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -401,6 +401,11 @@ class GlmEngine:
+             extra = (parallel - 1) * slot_bytes(text, world)
+             if kv != "bf16":                    # TF_GLM_KV=fp8: each slot's indexer rings (0038)
+                 extra += (parallel - 1) * mla_ring_bytes(text, ring_rows)
++            if afd is not None:                 # TF_GLM_PREFILL_PAIRS: the second prompt chunk's buffers
++                from . import prefill_pairs
++
++                if prefill_pairs.enabled():
++                    extra += prefill_pairs.plan_bytes(text, ring_rows, taps=5 if drafter is not None else 0)
+             per = 4 * MULTI_WINDOW // 4
+             return Geometry(lambda slots: g.bytes_at(slots) + extra + per * slots, g.reserve, g.minimum_slots)
+ 
+@@ -422,9 +427,11 @@ class GlmEngine:
+         # both ranks must run the same calls: refuse to start when they were given different settings
+         prefill_rows = PREFILL_ROWS if prefill_rows is None else int(prefill_rows)
+         if afd is not None:
++            from . import prefill_pairs
+             from .afd import settings_for
+ 
+-            afd.announce(settings_for(model_dir, cfg, prefill_rows=prefill_rows))  # the experts size off this
++            # the experts size off this; TF_GLM_PREFILL_PAIRS adds "pairs" (expert nodes without MODE_PAIR refuse it)
++            afd.announce(settings_for(model_dir, cfg, prefill_rows=prefill_rows, pairs=prefill_pairs.enabled()))
+         multi_code = [0]
+         if parallel > 1:                      # serial and batched verify windows make different collectives
+             from .multi import verify_kind
+@@ -512,6 +519,14 @@ class GlmEngine:
+                         graph_rows=GRAPH_ROWS, long_context=long_context,
+                         taps=self.drafter.tap_layers if self.drafter is not None else (), streams=parallel,
+                         pool_rows=pool_rows, kv=kv)
++        if afd is not None and parallel > 1:
++            from . import prefill_pairs
++
++            if prefill_pairs.enabled():          # the second chunk's prompt buffers now, before the caches fill the GPU
++                self.e.pbuf2 = prefill_pairs.slot_buffers(self.e.pbuf)
++                print(f"[tensorfold] TF_GLM_PREFILL_PAIRS=1: prompt chunks fill in pairs while no stream decodes (one "
++                      f"chunk's attention while the experts compute the other's); the second chunk's buffers "
++                      f"{prefill_pairs.slot_bytes(self.e.pbuf) / 2 ** 20:.0f} MiB", flush=True)
+         if rank == 0 and kv != "bf16":
+             c = self.e.caches
+             rings = (f"indexer rings {c.ring_bytes() / 2 ** 30:.3f} GiB ({parallel} x {c.ring} rows)"
+@@ -1036,6 +1051,9 @@ class AfdEngine(GlmEngine):
+             afd_parallel_check()
+         shared_prefix()                           # TF_GLM_SHARED_PREFIX read now: a typo fails before the wire opens
+         dflash_policy_check()                     # and TF_GLM_DFLASH_POLICY (0021)
++        from . import prefill_pairs
++
++        prefill_pairs.enabled()                   # TF_GLM_PREFILL_PAIRS read now: a typo fails before the wire opens
+         afd = make_afd(master, port, model_dir)   # AFD rank 0: the store lives here; the experts join
+         super().__init__(model_dir, rank=0, master=master, port=port, policy=policy, drafter=drafter,
+                          context=context, context_explicit=context_explicit, serial_only=serial_only,
+diff --git a/src/tensorfold/families/glm5_next/cuda/experts_node.py b/src/tensorfold/families/glm5_next/cuda/experts_node.py
+index 3635d42..693c8e6 100644
+--- a/src/tensorfold/families/glm5_next/cuda/experts_node.py
++++ b/src/tensorfold/families/glm5_next/cuda/experts_node.py
+@@ -10,7 +10,8 @@ import torch
+ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
+ 
+ from . import exl3_generic, glue
+-from .afd import ALIVE_EVERY, CHECK_ENV, CHECK_FORWARDS, MODE_CHUNK, MODE_EAGER, MODE_SLICE, Store, check_key, get_store
++from .afd import (ALIVE_EVERY, CHECK_ENV, CHECK_FORWARDS, MODE_CHUNK, MODE_EAGER, MODE_PAIR, MODE_SLICE, Store,
++                  check_key, get_store)
+ from .afd import settings_for, settings_mismatch, sha
+ from .split import RankReader
+ from .weights import PREFIX, Config
+@@ -134,6 +135,30 @@ def _window(node: ExpertNode, link, R: int, collect: tuple[list, list] | None =
+         link.reply(pos, routed)
+ 
+ 
++def _pair(node: ExpertNode, link, collect: list) -> int:
++    """A prompt chunk pair's device body (MODE_PAIR, TF_GLM_PREFILL_PAIRS): the two windows' layers in the order
++    their requests come, window 0's layer, window 1's, the next layer's ...; the second window's first request is
++    awaited after the first window's layer-0 reply. Each window's land, compute and reply are ``_window``'s for its
++    rows; ``collect``: per window its hashes, or None. Returns the second window's seq."""
++
++    b = node.buf
++    seq = 0
++    for pos, i in enumerate(node.layers):
++        for slot in (0, 1):
++            if pos == 0 and slot == 1:
++                seq = link.next_partner()[0]
++            link.use(slot)
++            R = link.rows
++            x = link.land(pos, (b.normed[:R], b.pick[:R], b.wts[:R]))
++            if collect[slot] is not None:
++                collect[slot][0].append([sha(x[0]), sha(x[1]), sha(x[2])])
++            routed = node.compute(i, R, x)
++            if collect[slot] is not None:
++                collect[slot][1].append(sha(routed))
++            link.reply(pos, routed)
++    return seq
++
++
+ def forwards(node: ExpertNode, link, store, rank: int, *, check_on: bool = False) -> None:
+     """The per-forward loop over the expert's end of the wire (returns only by raising): every forward eager, the
+     wire check's hashes to the store (a layer slice's under a key with its MoE positions)."""
+@@ -141,6 +166,14 @@ def forwards(node: ExpertNode, link, store, rank: int, *, check_on: bool = False
+     checked = 0
+     while True:
+         seq, rows, mode = link.next_forward()
++        if mode == MODE_PAIR and getattr(link, "pairs", False):
++            both = [([], []) if check_on and checked + k < CHECK_FORWARDS else None for k in (0, 1)]
++            second = _pair(node, link, both)
++            for s, collect in zip((seq, second), both):
++                if collect is not None:
++                    checked += 1
++                    store.set(check_key(s, rank, None), json.dumps({"in": collect[0], "out": collect[1]}).encode())
++            continue
+         if mode not in (MODE_EAGER, MODE_CHUNK, MODE_SLICE):
+             raise RuntimeError(f"forward mode {mode}: the expert runs eager windows only")
+         span = link.span if mode == MODE_SLICE else None
+@@ -186,8 +219,10 @@ def serve(model_dir, half: int, master: str, port: int, *, device: str = "cuda")
+         while theirs is None:                            # the attention publishes before its own load
+             raw = get_store(store, "afd_settings", 3600.0)
+             theirs = json.loads(bytes(raw).decode()) if raw else None
+-        # the attention's wire must be this one; its link map is checked by open_expert_link
+-        mine = dict(settings_for(model_dir, cfg, prefill_rows=int(theirs["prefill_rows"])), transport="mcdma",
++        # the attention's wire must be this one; its link map is checked by open_expert_link; this tree serves
++        # prompt chunk pairs (MODE_PAIR) when the attention asks for them
++        mine = dict(settings_for(model_dir, cfg, prefill_rows=int(theirs["prefill_rows"]),
++                                 pairs=theirs.get("pairs") == 1), transport="mcdma",
+                     mcdma_links=theirs.get("mcdma_links"))
+         bad = settings_mismatch(mine, theirs)
+         if bad:
+diff --git a/src/tensorfold/families/glm5_next/cuda/forward.py b/src/tensorfold/families/glm5_next/cuda/forward.py
+index 59df9ed..0ddddda 100644
+--- a/src/tensorfold/families/glm5_next/cuda/forward.py
++++ b/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -687,27 +687,49 @@ def mlp_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+     return out_proj(w, b, b.act[:R], m.down, b.xs_act[:R], R)
+ 
+ 
+-def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
++def moe_route(layer: LayerW, w: Weights, b: Buffers, R: int) -> None:
++    """``moe_block``'s routing: the router's logits, each row's top-k experts and weights (and the grouped plan when
++    the checkpoint has no shared expert)."""
++
+     c = w.cfg
+     m = layer.moe
+-    afd = w.afd
+     with prof.timed("moe: route"):
+         glue.router(b.normed[:R], m.router, b.mlog[:R])
+         glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
+         if m.shared is None:
+             grouped.route(b.pick[:R], b.plan)
++
++
++def moe_send(layer: LayerW, w: Weights, b: Buffers, R: int) -> None:
++    """The AFD attention node's half of ``moe_block`` before the experts reply: the routed rows out on the wire
++    first, then this layer's shared expert (into b.sy), which runs while they fly. ``prefill_pairs`` runs the other
++    chunk's attention between this and the layer's ``afd.collect``."""
++
++    c = w.cfg
++    s = layer.moe.shared
++    w.afd.exchange(b, R)                         # the wire out first; this layer's shared expert overlaps it
++    mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
++    glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
++    mm(b, b.sact[:R], s.down, b.sxs[:R], b.sy[:R], f32=True)
++
++
++def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
++    c = w.cfg
++    m = layer.moe
++    afd = w.afd
++    moe_route(layer, w, b, R)
++    if afd is not None and m.shared is not None:
++        moe_send(layer, w, b, R)
++        return afd.collect(b, R, c.hidden)       # [3, R, D]: rank 1's and 2's partials, the shared last; hc_post sums
+     if afd is not None:
+-        afd.exchange(b, R)                       # the wire out first; this layer's shared expert overlaps it
++        afd.exchange(b, R)
+     if m.shared is not None:
+-        if afd is None:
+-            # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
+-            exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
++        # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
++        exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
+         s = m.shared
+         mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
+         glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
+         mm(b, b.sact[:R], s.down, b.sxs[:R], b.sy[:R], f32=True)
+-        if afd is not None:
+-            return afd.collect(b, R, c.hidden)   # [3, R, D]: rank 1's and 2's partials, the shared last; hc_post sums
+         b.ey[:R, c.top_k].copy_(b.sy[:R])
+         glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
+         return gather(w, b, R)
+@@ -726,7 +748,21 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+                   mixer=None) -> None:
+     """``mixer``: the layer's KDA / DSA block as ``mixer(layer)`` instead of on ``st`` (a multi-stream window's
+     segmented blocks, ``verify.BatchedVerify``; a multi-prompt chunk's pieces, ``multi_prefill.PieceMixer``);
+-    everything else is the same calls."""
++    everything else is the same calls. ``layer_front``, the FFN block, then the FFN's ``hc_post``."""
++
++    layer_front(layer, w, st, b, R, nch, host_pos, sparse_np, cut, mixer)
++    x = b.x[:R]
++    with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
++        g = mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
++    glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
++
++
++def layer_front(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
++                host_pos: int | None = None, sparse_np: int | None = None, cut: Cut | None = None,
++                mixer=None) -> None:
++    """``layer_forward`` up to its FFN block: the attention's hyper-connection in, the KDA / DSA block (on ``st`` or
++    ``mixer``), its hyper-connection out and the FFN's in (b.normed, b.xs, b.post, b.comb). Prompt chunk pairs
++    (``prefill_pairs``) run a layer as this, ``moe_route``, ``moe_send``, the wire's ``collect`` and ``hc_post``."""
+ 
+     c = w.cfg
+     x = b.x[:R]
+@@ -748,9 +784,6 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+         h = layer.ffn_hc
+         glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
+                     b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
+-    with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
+-        g = mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
+-    glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
+ 
+ 
+ def check_room(w: Weights, st: State, R: int, pos: int | None = None) -> None:
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index 02f490a..b22f096 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -53,7 +53,7 @@ from tensorfold.cuda.memory_gate import NoRoom as _NoRoom
+ from tensorfold.cuda.scheduler import Scheduler
+ from tensorfold.cuda.streams import Stream, next_fill
+ 
+-from . import multi_prefill, sliced_fill
++from . import multi_prefill, prefill_pairs, sliced_fill
+ from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
+ from .pool import ALIGN, Pool, align_up
+ from .verify import BatchedVerify, Segment, SerialVerify, Verified
+@@ -455,6 +455,10 @@ class MultiDecoder:
+                 raise ValueError("TF_GLM_MULTI_PREFILL=1 needs the latent cache (TF_GLM_LATENT=1)")
+         self.unit = fill_unit(getattr(engine, "grid", 0))
+         self.grouped = {"chunks": 0, "pieces": 0, "rows": 0}           # rank 0's multi-prompt chunks, for /health
++        # TF_GLM_PREFILL_PAIRS (``prefill_pairs``, ours): the AFD attention node (world 1) fills two prompt chunks as a
++        # pair while no stream decodes
++        self.pairs = (prefill_pairs.enabled() and self.world == 1 and getattr(self.w, "afd", None) is not None)
++        self.paired = {"pairs": 0, "rows": 0}
+         self.mtp = self.w.mtp is not None                # MTP drafts: the head is loaded (engine.mtp_head)
+         self.drafts = drafts
+         if self.drafts is None and engine.drafter is not None:
+@@ -532,6 +536,7 @@ class MultiDecoder:
+                 "kept_prompts": len(self.kept),
+                 **({"multi_prefill": dict(self.grouped)} if getattr(self, "group", False) else {}),
+                 **({"sliced_fill": dict(self.sliced)} if getattr(self, "fill_budget", 0) else {}),
++                **({"prefill_pairs": dict(self.paired)} if getattr(self, "pairs", False) else {}),
+                 # how long rank 0's current iteration has run (0 between iterations): a stalled server keeps growing it
+                 "iteration_s": round(time.monotonic() - since, 1)
+                 if (since := getattr(self, "iteration_since", None)) is not None else 0.0}
+@@ -931,16 +936,18 @@ class MultiDecoder:
+     def _touch(self, c) -> None:
+         self.kept = [k for k in self.kept if k is not c] + [c]
+ 
+-    def _keep(self, lane: Lane, n: int) -> None:
++    def _keep(self, lane: Lane, n: int, held=None) -> None:
+         """Both ranks: the lane's state at prompt position n (== its pos, a prompt chunk's end) becomes a kept prompt
+         in its extent; an MTP stream's keeps the last row's hidden state to absorb with the resuming prompt's next
+-        token (its MTP cache row n - 1 holds this prompt's), as the single-stream prefill keeps it."""
++        token (its MTP cache row n - 1 holds this prompt's), as the single-stream prefill keeps it. ``held``: the KDA
++        states and convolution windows at n, taken by a prompt chunk pair (``prefill_pairs.Hold``) whose second
++        chunk has since moved the lane's on."""
+ 
+         from .decode import take_snapshot
+ 
+         prev = self.e.use(lane.st)
+         try:
+-            snap = take_snapshot(self.e, lane.s.prompt[:n], None, mtp=False, drafter=None)
++            snap = take_snapshot(self.e, lane.s.prompt[:n], None, mtp=False, drafter=None, held=held)
+         finally:
+             self.e.use(prev)
+         snap.drafter_end = -1
+@@ -1133,6 +1140,13 @@ class MultiDecoder:
+                                                   many=group is not None)
+             self.sliced["chunks"] += 1
+             return self._part_iteration()
++        pair = self._pair_plan(lane, group) if lane is not None and getattr(self, "pairs", False) else None
++        if pair is not None:                  # TF_GLM_PREFILL_PAIRS: this chunk and the next one as a pair
++            t = time.perf_counter()
++            done = self._fill_pair(*pair)
++            if prof is not None:
++                prof.fill(time.perf_counter() - t)
++            return done
+         if group is not None:                 # TF_GLM_MULTI_PREFILL: several streams' rows in one chunk (0049)
+             t = time.perf_counter()
+             rows = sum(stop - x.st.pos for x, stop in group)
+@@ -1490,6 +1504,121 @@ class MultiDecoder:
+                 self._started(lane, first)
+         return firsts
+ 
++    # -- TF_GLM_PREFILL_PAIRS: prompt chunk pairs on the AFD attention node (``prefill_pairs``; ours) --------------
++    def _pair_plan(self, lane: Lane, group) -> tuple[list, list] | None:
++        """Rank 0 at world 1: this iteration's prompt chunk and the one the next iteration would fill, as
++        [(lane, stop)] each, when they can run as a pair, else None. Only while no stream decodes (a decode round
++        would come between them; the sliced fills and the decode rounds run as before), when the first chunk ends
++        no prompt (its stream would start decoding) and no stream in either drafts with the MTP head. Never while a
++        layer-sliced chunk (TF_GLM_FILL_BUDGET_MS) is suspended: that chunk goes on alone, slice by slice. The second
++        is what ``_iterate`` picks next (``_fill_turn``, ``_group``, ``_stop``) with the first's streams at their
++        stops."""
++
++        if getattr(self, "partial", None) is not None:
++            return None
++        if any(x.decoding and not x.s.done for x in self.lanes.values()):
++            return None
++        first = list(group) if group is not None else [(lane, self._stop(lane))]
++        if any(x.mtp or stop >= len(x.s.prompt) for x, stop in first):
++            return None
++        saved = [(x.st, x.st.pos) for x, _ in first]
++        try:
++            for x, stop in first:                 # host positions only, for the plan: no state or cache moves
++                x.st.pos = stop
++            nxt = self._fill_turn()
++            if nxt is None:
++                return None
++            second = self._group(nxt) if getattr(self, "group", False) else None
++            second = list(second) if second is not None else [(nxt, self._stop(nxt))]
++        finally:
++            for st, pos in saved:
++                st.pos = pos
++        if any(x.mtp for x, _ in second):
++            return None
++        return first, second
++
++    @torch.no_grad()
++    def _fill_pair(self, first: Sequence[tuple[Lane, int]], second: Sequence[tuple[Lane, int]]) -> list[Stream]:
++        """Rank 0 at world 1, TF_GLM_PREFILL_PAIRS: two prompt chunks (``_pair_plan``) as a pair
++        (``prefill_pairs.run_pair``), each told as ``_iterate`` tells a chunk (FILL or MFILL); then each chunk's host
++        work in order, as ``_fill`` / ``_fill_many`` do it after their chunk: its taps and commits
++        (``prefill_pairs.finish``), its kept states (the first chunk's for a stream in both chunks as the pair held
++        them at the first chunk's end), the second chunk's first tokens. Returns the streams that finished."""
++
++        e = self.e
++        for plan in (first, second):
++            if len(plan) > 1:
++                self._emit(MFILL, [len(plan), *[v for x, stop in plan for v in (x.sid, stop)]])
++            else:
++                self._emit(FILL, [plan[0][0].sid, plan[0][1]])
++            self._flush()
++        ends = {id(x): stop for x, stop in first}
++        pieces = []
++        for plan in (first, second):
++            mine = []
++            for lane, stop in plan:
++                n = len(lane.s.prompt)
++                start = ends.get(id(lane), lane.st.pos) if plan is second else lane.st.pos
++                if lane.decoding or lane.mtp or not start < stop <= n or stop - start > e.prefill_rows:
++                    raise RuntimeError(f"stream {lane.sid}: a paired prompt chunk {start} .. {stop} of {n}")
++                mine.append(multi_prefill.Piece(lane.st, list(lane.s.prompt[start:stop]),
++                                                drafter=self._ctx(lane) if lane.dflash else None, head=stop == n))
++            pieces.append(mine)
++        hold = [x.st for x, stop in first if stop in x.stops and any(y is x for y, _ in second)]
++        t = time.perf_counter()
++        a, b = prefill_pairs.run_pair(e, pieces[0], pieces[1], hold=hold)
++        prefill_pairs.finish(e, a)
++        for x, stop in first:
++            if stop in x.stops:
++                self._keep(x, stop, held=a.held(x.st))
++        prefill_pairs.finish(e, b)
++        firsts = self._pair_firsts(second, b.heads)
++        dt = time.perf_counter() - t
++        lanes = list(dict.fromkeys(x for plan in (first, second) for x, _ in plan))
++        for x in lanes:
++            x.s.prefill_s += dt
++        for plan in (first, second):
++            if len(plan) > 1:                    # counted as _iterate counts a multi-prompt chunk
++                self.grouped["chunks"] += 1
++                self.grouped["pieces"] += len(plan)
++                self.grouped["rows"] += sum(p.rows for p in (pieces[0] if plan is first else pieces[1]))
++        self.paired["pairs"] += 1
++        self.paired["rows"] += a.R + b.R
++        for (x, _), tok in zip(second, firsts):
++            if tok is not None:
++                x.s.take([tok], self._ends(x))
++        return [x.s for x in lanes if x.s.done]
++
++    def _pair_firsts(self, plan: Sequence[tuple[Lane, int]], heads: Sequence) -> list[int | None]:
++        """After a pair's second chunk, per (lane, stop) what ``_fill_many`` does after its chunk: the kept state at a
++        kept point, or at the prompt's end its kept state and first token (all sampled together, each as alone)."""
++
++        parts, who = [], []
++        for k, ((lane, stop), out) in enumerate(zip(plan, heads)):
++            n = len(lane.s.prompt)
++            if stop < n:
++                if stop in lane.stops:
++                    self._keep(lane, stop)
++                continue
++            if lane.point == n:
++                self._keep(lane, n)
++            logits = out[:1]
++            if lane.constraint is not None:             # the first token's row, under the reply's grammar
++                lane.constraint.mask(logits, lane.constraint.window([0], [-1]), self.w.vocab_offset)
++            parts.append((logits, [n], lane.s.sampling))
++            who.append(k)
++        firsts: list[int | None] = [None] * len(plan)
++        if parts:
++            for k, rows in zip(who, sample_streams(self.w, parts)):
++                lane = plan[k][0]
++                firsts[k] = rows[0]
++                if lane.constraint is not None:
++                    lane.constraint.advance([rows[0]])
++        for (lane, _), tok in zip(plan, firsts):
++            if tok is not None:
++                self._started(lane, tok)
++        return firsts
++
+     def _mtp_draft(self, l: Lane) -> list[int]:
+         """Both ranks: an MTP stream's drafts for this round, as ``decode.mtp_decode`` drafts alone: its last rows
+         absorbed into its MTP cache, then its chain (on the head's graphs at home, else eagerly)."""
+diff --git a/src/tensorfold/families/glm5_next/cuda/prefill_pairs.py b/src/tensorfold/families/glm5_next/cuda/prefill_pairs.py
+new file mode 100644
+index 0000000..4274b1c
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/prefill_pairs.py
+@@ -0,0 +1,357 @@
++"""Prompt chunk pairs on the AFD attention node (``TF_GLM_PREFILL_PAIRS=1``): two prompt chunks in flight at once, so
++the attention GPU runs one chunk's attention while the expert nodes compute the other chunk's routed experts.
++
++A prompt fills chunk by chunk, and a chunk runs layer by layer: the attention node's attention, the MoE exchange
++with both expert nodes, their reply, the next layer. Alone, the attention GPU idles while the experts compute and the
++experts idle while it runs attention. A pair runs two consecutive prompt chunks k and k + 1 through the layers
++interleaved: attention(k, L) and k's exchange out, attention(k + 1, L) while the experts compute k's layer L, k's
++reply in, k + 1's exchange out, attention(k, L + 1) while they compute k + 1's, and so on.
++
++Exact by construction. Each chunk keeps its rows, its row count and its kernels; only the order of the two chunks'
++kernels changes. attention(k + 1, L) reads what attention(k, L) wrote (the layer's latents or keys, its indexer keys,
++its KDA recurrent state), and it runs after it; attention(k, L + 1) reads k's layer-L reply, collected before it.
++Each MoE exchange keeps its rows (at most the experts' prompt chunk), so the experts' grouping, and every bit, is the
++same as the chunks' alone.
++
++- The wire (``afd.AfdWire.begin_pair``, MODE_PAIR): two forwards open, their MoE exchanges alternating, one request
++  in flight on each MCDMA link at a time (protocol 1's one-mailbox rule, unchanged), so the experts serve them in
++  arrival order. The expert nodes accept MODE_PAIR only when the settings handshake carries ``pairs``.
++- Buffers: the second chunk's own residual streams, hyper-connection weights, DFlash2 taps and token ids
++  (``slot_buffers``); everything else is scratch one phase uses and leaves before the other chunk's next phase
++  (``SLOT_FIELDS`` says why each is enough).
++- Kept states: a state kept at the first chunk's end (a kept point, a shared-prefix point) is taken layer by layer
++  (``Hold``): each KDA layer's recurrent state and convolution window right after the first chunk's attention there,
++  before the second chunk's; the latents, indexer pools and rings up to that point are not written by the second chunk.
++- Phase 1 pairs only when no stream needs a decode round (``multi.MultiDecoder``): a cold prompt alone, or several
++  prompts filling together (TF_GLM_MULTI_PREFILL's grouped chunks too); the first chunk ends no prompt and no chunk
++  holds a stream drafting with the MTP head.
++
++This tree's own design for the attention/expert split; not a MiaAI-Lab recipe patch.
++"""
++
++from __future__ import annotations
++
++import copy
++import os
++from collections.abc import Sequence
++from dataclasses import dataclass, field
++from typing import Any
++
++import torch
++
++ENV = "TF_GLM_PREFILL_PAIRS"
++
++# the second chunk's own buffers (``slot_buffers``); every other prompt buffer is shared, being scratch that one
++# phase writes and reads before the other chunk's next phase (``_steps``): the KDA / DSA / indexer / dense-MLP / split-K
++# / latent scratch inside ``layer_front`` and ``mlp_block``; normed, xs, pick and wts from ``layer_front`` /
++# ``moe_route`` to ``moe_send`` (only the other chunk's collect runs between); sy from ``moe_send`` to ``collect`` and
++# afd_recv from ``collect`` to ``hc_post`` (only the other chunk's hc_post / attention, or its moe_send, between);
++# hidden, fnormed, fxs and logits within a chunk's tail (its heads and last row copied there)
++SLOT_FIELDS = ("ids", "x", "post", "comb")
++
++SEND, WAIT, DONE = "send", "wait", "done"   # what a chunk's layer loop stops for (``_steps``)
++
++
++def enabled(value: str | None = None) -> bool:
++    """TF_GLM_PREFILL_PAIRS: 1 runs prompt chunks in pairs on the AFD attention node; unset or 0 (the default) one
++    chunk at a time."""
++
++    value = (os.environ.get(ENV, "") if value is None else value).strip() or "0"
++    if value not in ("0", "1"):
++        raise ValueError(f"{ENV}: 0 or 1, not {value!r}")
++    return value == "1"
++
++
++def slot_buffers(b):
++    """The second chunk's prompt buffers: ``b`` (forward.Buffers, prefill) with its own token ids, residual streams,
++    hyper-connection weights and DFlash2 taps (``SLOT_FIELDS``), the rest shared."""
++
++    two = copy.copy(b)
++    for name in SLOT_FIELDS:
++        setattr(two, name, torch.empty_like(getattr(b, name)))
++    two.ids_host = torch.zeros_like(b.ids_host, pin_memory=torch.cuda.is_available())
++    two.staged = torch.cuda.Event() if torch.cuda.is_available() else b.staged
++    two.taps = [torch.empty_like(t) for t in b.taps]
++    two.pair_of = b
++    return two
++
++
++def slot_bytes(b) -> int:
++    """What ``slot_buffers`` adds on the device (the startup line's)."""
++
++    held = [getattr(b, name) for name in SLOT_FIELDS] + list(b.taps)
++    return sum(t.numel() * t.element_size() for t in held)
++
++
++def plan_bytes(text: dict, rows: int, *, taps: int) -> int:
++    """``slot_bytes`` before the buffers exist, for the capacity plan (``text``: the checkpoint's text config; ``rows``:
++    the prompt chunk's; ``taps``: DFlash2's tapped layers, 0 without a drafter): token ids, the residual streams
++    and DFlash2 taps (bf16), the hyper-connection weights (fp32). 144 MiB for GLM-5.3-Flash at 2,048 rows."""
++
++    d, s = int(text["hidden_size"]), int(text.get("hc_mult", 4))
++    return rows * (4 + 2 * s * d + 4 * s + 4 * s * s + 2 * taps * d)
++
++
++class At:
++    """A stream's state as a later chunk of a pair sees it: the position its rows start at (host and device), every
++    cache, state and table the stream's. The forward reads states only; the pair's commits go to the stream."""
++
++    def __init__(self, st, pos: int, pos_dev) -> None:
++        object.__setattr__(self, "_st", st)
++        object.__setattr__(self, "pos", pos)
++        object.__setattr__(self, "pos_dev", pos_dev)
++
++    def __getattr__(self, name: str):
++        return getattr(self._st, name)
++
++    def __setattr__(self, name: str, value) -> None:
++        raise AttributeError(f"a prompt chunk pair's later chunk does not set the stream state's {name!r}")
++
++
++def _pos_tensor(st, pos: int):
++    """The device position a pair's later chunk of ``st`` starts at (its own tensor: the first chunk reads st's)."""
++
++    return torch.full_like(st.pos_dev, pos)
++
++
++class Hold:
++    """A kept state at a pair's first chunk's end for ``st``: each KDA layer's recurrent state and convolution window
++    copied right after that chunk's attention there, before the second chunk's (``take``)."""
++
++    def __init__(self, st) -> None:
++        self.st = st
++        self.rec = torch.empty_like(st.rec[0])
++        self.conv = torch.empty_like(st.conv)
++
++    def take(self, layer) -> None:
++        st = self.st
++        li = st.kda_index.get(layer.index) if layer.kind == "kda" else None
++        if li is not None:
++            self.rec[li].copy_(st.rec[st.cur[li], li])
++            self.conv[li].copy_(st.conv[li])
++
++
++@dataclass(eq=False)
++class Chunk:
++    """One chunk of a pair: its pieces (``multi_prefill.Piece``: one stream's rows, or several streams' as a
++    TF_GLM_MULTI_PREFILL chunk), what the forward runs it on, and after it its heads and kept states."""
++
++    pieces: list
++    slot: int
++    b: Any = None
++    R: int = 0
++    st: Any = None                     # a one-piece chunk's state (At for a pair's later chunk of the same stream)
++    mixer: Any = None                  # several pieces: multi_prefill.PieceMixer
++    nch: int | None = None
++    host_pos: int | None = None
++    holds: list = field(default_factory=list)
++    heads: list = field(default_factory=list)
++    last_hidden: Any = None
++
++    @property
++    def single(self) -> bool:
++        return len(self.pieces) == 1
++
++    def held(self, st):
++        """(rec, conv) kept at this chunk's end for ``st`` (``Hold``), or None."""
++
++        for h in self.holds:
++            if h.st is st:
++                return h.rec, h.conv
++        return None
++
++
++def _stage_chunk(e, ch: Chunk) -> None:
++    """The chunk's room checked and its token ids into its prompt buffers (``forward.stage`` /
++    ``multi_prefill._stage``)."""
++
++    from . import forward, multi_prefill
++
++    if ch.single:
++        forward.stage(e.w, ch.st, ch.b, ch.pieces[0].tokens)
++    else:
++        multi_prefill._stage(e.w, ch.b, ch.mixer.pieces, ch.R)
++
++
++def run_pair(e, first: Sequence, second: Sequence, *, hold: Sequence = ()) -> tuple[Chunk, Chunk]:
++    """Two consecutive prompt chunks' forwards as a pair: ``first`` and ``second`` each a list of
++    ``multi_prefill.Piece`` (one stream's rows, or several streams' back to back); a stream in both has its rows in
++    ``second`` start where ``first``'s end. ``hold``: states of ``first``'s streams to keep at its end (``Hold``).
++    Returns both chunks with their heads (a one-piece chunk's head logits copy, as ``decode.prefill_chunk`` returns
++    it; per piece ending its prompt, as ``multi_prefill.prefill_pieces``); their taps and commits are ``finish``'s,
++    each chunk's in order. Positions are not committed here."""
++
++    from . import latent, multi_prefill
++    from .forward import chunks_for
++
++    w = e.w
++    afd = getattr(w, "afd", None)
++    if afd is None or not hasattr(afd, "begin_pair"):
++        raise RuntimeError("prompt chunk pairs run on the AFD attention node (--experts remote)")
++    b2 = getattr(e, "pbuf2", None)
++    if b2 is None:
++        b2 = e.pbuf2 = slot_buffers(e.pbuf)
++    rows = min(e.pbuf.rows, e.prefill_rows)
++    chunks = []
++    ends: dict[int, tuple[Any, int]] = {}
++    for slot, (pieces, b) in enumerate(((list(first), e.pbuf), (list(second), b2))):
++        if not pieces:
++            raise ValueError("a prompt chunk pair needs two chunks")
++        ch = Chunk(pieces, slot, b)
++        mine = []
++        for p in pieces:
++            if any(q.st is p.st for q in mine):
++                raise ValueError("a stream has one piece in a chunk")
++            mine.append(p)
++            seen = ends.get(id(p.st))
++            if slot == 1 and seen is not None:   # the stream's next rows: from where its rows in the first chunk end
++                p.st = At(seen[0], seen[1], _pos_tensor(seen[0], seen[1]))
++        if not ch.single and not latent.ENABLED:
++            raise ValueError("multi-prompt chunks need the latent cache (TF_GLM_LATENT=1)")
++        ch.R = multi_prefill.layout(pieces, rows) if not ch.single else len(pieces[0].tokens)
++        if not 0 < ch.R <= rows:
++            raise ValueError(f"a prompt chunk of {ch.R} rows, the prompt buffers hold {rows}")
++        if ch.single:
++            ch.st = pieces[0].st
++            ch.nch, ch.host_pos = chunks_for(ch.st, ch.R), ch.st.pos
++        else:
++            ch.mixer = multi_prefill.PieceMixer(w, b, pieces, ch.R)
++        if slot == 0:
++            for p in pieces:
++                ends[id(p.st)] = (p.st, p.st.pos + p.rows)
++        chunks.append(ch)
++    a, b = chunks
++    for st in hold:
++        if not any(p.st is st for p in a.pieces):
++            raise ValueError("a held state belongs to the pair's first chunk")
++        a.holds.append(Hold(st))
++    for ch in chunks:
++        _stage_chunk(e, ch)
++    afd.begin_pair((a.R, b.R))           # both windows' headers, before either's eager kernels
++    _forward_pair(e, a, b)
++    return a, b
++
++
++def _mark(slot: int) -> None:
++    """Each time the pair's schedule resumes a chunk (tests record the interleaving)."""
++
++
++def _forward_pair(e, a: Chunk, b: Chunk) -> None:
++    """Both chunks' layer loops, interleaved: a chunk runs until it would wait (to send while the other's request
++    is in flight, or for its own reply while the other can work); the first chunk goes first."""
++
++    gens = [_steps(e, a), _steps(e, b)]
++    at: list[Any] = [None, None]          # where each loop stopped: None (not started), SEND, WAIT, DONE, or END
++    end = object()
++    owner = None                          # the chunk whose request is on the wire
++
++    def step(k: int):
++        _mark(k)
++        try:
++            return next(gens[k])
++        except StopIteration:
++            return end
++
++    k = 0
++    at[0] = step(0)
++    while at[0] is not end or at[1] is not end:
++        here, there = at[k], at[1 - k]
++        if here is end:
++            k = 1 - k
++            if at[k] is None:
++                at[k] = step(k)
++            continue
++        if here is SEND:
++            if owner is None:             # the link is free: this chunk's exchange goes out now
++                owner = k
++                at[k] = step(k)
++            else:
++                k = 1 - k
++                if at[k] is None:
++                    at[k] = step(k)
++            continue
++        if here is WAIT:
++            if there is None or there is DONE:    # the other chunk works while this one's experts compute
++                k = 1 - k
++                at[k] = step(k)
++            else:
++                at[k] = step(k)           # collect
++                if at[k] is DONE:
++                    owner = None
++            continue
++        if here is DONE:
++            owner = None
++            if there is SEND:             # the link is free: the other chunk's exchange first
++                k = 1 - k
++                owner = k
++                at[k] = step(k)
++            else:
++                at[k] = step(k)
++            continue
++        raise AssertionError(f"a pair's chunk stopped at {here!r}")
++
++
++def _steps(e, ch: Chunk):
++    """One chunk's forward as ``forward.compute`` runs it, layer by layer (``forward.layer_forward``'s calls in its
++    order), stopping before each MoE exchange's send (``SEND``), before its collect (``WAIT``) and after it (``DONE``),
++    then its tail: the final norm and the head (a one-piece chunk's on its last row, as ``decode.prefill_chunk``; per
++    piece ending its prompt, as ``multi_prefill.prefill_pieces``), copied here, before the other chunk's tail reuses
++    the shared rows."""
++
++    from . import forward, glue
++
++    w, b, R, slot = e.w, ch.b, ch.R, ch.slot
++    afd, c = w.afd, w.cfg
++    x = b.x[:R]
++    glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, x)
++    for layer in w.layers:
++        forward.layer_front(layer, w, ch.st, b, R, ch.nch, ch.host_pos, None, None, ch.mixer)
++        for h in ch.holds:
++            h.take(layer)
++        if layer.mlp is not None:
++            g = forward.mlp_block(layer, w, b, R)
++        else:
++            forward.moe_route(layer, w, b, R)
++            yield SEND
++            afd.use(slot)
++            forward.moe_send(layer, w, b, R)
++            yield WAIT
++            afd.use(slot)
++            g = afd.collect(b, R, c.hidden)
++            yield DONE
++        glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
++        for t in b.tap_at.get(layer.index, ()):
++            glue.stream_mean(x, b.taps[t][:R])
++    glue.stream_mean(x, b.hidden[:R])
++    glue.rmsnorm(b.hidden[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
++    if ch.single:
++        p = ch.pieces[0]
++        out = forward.mm(b, b.fnormed[R - 1:R], w.head, b.fxs[R - 1:R], b.logits[:1])
++        ch.heads = [out.clone() if p.head else None]
++        ch.last_hidden = b.fnormed[R - 1:R].clone()
++    else:
++        for p in ch.pieces:
++            r = p.lo + p.rows - 1
++            ch.heads.append(forward.mm(b, b.fnormed[r:r + 1], w.head, b.fxs[r:r + 1], b.logits[:1]).clone()
++                            if p.head else None)
++
++
++def finish(e, ch: Chunk) -> None:
++    """After the pair's forward, one chunk's host work as its forward alone does it, chunks in order: its last row's
++    hidden state (a one-piece chunk's), its DFlash2 taps, its commits (each stream's position past its rows)."""
++
++    from . import forward
++
++    w, b = e.w, ch.b
++    if ch.single:
++        p = ch.pieces[0]
++        e.last_hidden = ch.last_hidden
++        if p.drafter is not None:
++            p.drafter.add_taps(e.tap_rows(ch.R, b))
++    else:
++        for p in ch.pieces:
++            if p.drafter is not None:
++                p.drafter.add_taps(torch.cat([t[p.lo:p.lo + p.rows] for t in b.taps], dim=1))
++    for p in ch.pieces:
++        st = p.st._st if isinstance(p.st, At) else p.st
++        forward.commit(w, st, b, p.rows, p.rows)
+diff --git a/tests/test_glm_multi_afd.py b/tests/test_glm_multi_afd.py
+index 713effc..6178487 100644
+--- a/tests/test_glm_multi_afd.py
++++ b/tests/test_glm_multi_afd.py
+@@ -61,6 +61,15 @@ class WireLog:
+     def forward(self, kind: str, rows: int) -> None:
+         self.calls.append((kind, int(rows)))
+ 
++    def begin_pair(self, rows) -> None:
++        """TF_GLM_PREFILL_PAIRS (``prefill_pairs``): the pair's two windows; its chunks then log as forwards of their
++        own (``fake_pairs``), so ``pairs`` reads the same with the setting on as off."""
++
++        self.paired = getattr(self, "paired", []) + [(int(rows[0]), int(rows[1]))]
++
++    def use(self, slot: int) -> None:
++        pass
++
+     def pairs(self) -> list[tuple[str, int]]:
+         """Every forward right after its own ``begin`` of the same rows, ``chunk`` exactly for prompt chunks;
+         returns [(kind, rows)]."""
+@@ -156,9 +165,60 @@ def afd_fake(fake, monkeypatch):  # noqa: F811
+ 
+     monkeypatch.setattr(decode, "compute", chunk_logged)
+     monkeypatch.setattr(forward, "check_room", lambda w, st, R: None)
++    fake_pairs(torch, monkeypatch)
+     return SimpleNamespace(torch=torch, forward=forward, monkeypatch=monkeypatch)
+ 
+ 
++def fake_pairs(torch, monkeypatch) -> None:
++    """TF_GLM_PREFILL_PAIRS (``prefill_pairs``) on the fake model: the real ``run_pair`` (the second chunk's
++    states, the first chunk's holds) and ``finish``, over a pair forward that runs each chunk's rows as
++    ``fake_compute`` / ``fake_pieces_compute`` would, the first chunk's, its holds taken at its end, then the second's;
++    each chunk logged on the wire as a forward of its own (its begin, then the chunk)."""
++
++    from tensorfold.families.glm5_next.cuda import forward
++    from tensorfold.families.glm5_next.cuda import prefill_pairs as pp
++    from tests.test_glm_multi import fold
++
++    def stage(e, ch):
++        for p in ch.pieces:
++            forward.check_room(e.w, p.st, p.rows)
++
++    def run(e, a, b):
++        for ch in (a, b):
++            e.w.afd.begin(ch.R, chunk=True)
++            e.w.afd.forward("chunk", ch.R)
++            if not ch.single:                            # as fake_pieces_compute records a multi-prompt chunk
++                e.chunks.append([(p.st.slot, p.st.pos, p.rows) for p in ch.pieces])
++            taps, ch.heads = [], []
++            for p in ch.pieces:
++                st = p.st._st if isinstance(p.st, pp.At) else p.st
++                h = st.h()
++                for i, t in enumerate(p.tokens):
++                    q = p.st.pos + i
++                    st.write(q, int(t))
++                    h = fold(h, q, int(t))
++                cur = st.cur[0]
++                st.rec[1 - cur][0] = h
++                st.cur = [1 - cur]
++                st.conv.copy_(torch.tensor(([0, 0, 0] + list(st.conv.tolist()) + [int(t) for t in p.tokens])[-3:]))
++                taps += [[p.st.pos + i, int(t)] for i, t in enumerate(p.tokens)]
++                ch.heads.append(st.logits(p.st.pos + p.rows - 1, h)[None] if p.head else None)
++            t = torch.tensor(taps, dtype=torch.int64)
++            ch.b.taps = t if ch.single else [t]
++            ch.last_hidden = t[-1:].clone()
++            for hold in ch.holds:
++                hold.rec.copy_(hold.st.rec[hold.st.cur[0]])
++                hold.conv.copy_(hold.st.conv)
++
++    def slot_buffers(b):
++        return SimpleNamespace(**{**vars(b), "ids": [], "taps": None, "fnormed": None, "pair_of": b})
++
++    monkeypatch.setattr(pp, "_stage_chunk", stage)
++    monkeypatch.setattr(pp, "_forward_pair", run)
++    monkeypatch.setattr(pp, "_pos_tensor", lambda st, pos: None)         # the fake states keep no device position
++    monkeypatch.setattr(pp, "slot_buffers", slot_buffers)
++
++
+ class World1:
+     """The AFD attention node's decoder: one rank, ``afd.Solo`` (world 1), the AFD wire on its weights."""
+ 
+diff --git a/tests/test_glm_prefill_pairs.py b/tests/test_glm_prefill_pairs.py
+new file mode 100644
+index 0000000..6829b45
+--- /dev/null
++++ b/tests/test_glm_prefill_pairs.py
+@@ -0,0 +1,966 @@
++"""TF_GLM_PREFILL_PAIRS (``prefill_pairs``, ours) on CPU: two prompt chunks in flight on the AFD attention node.
++
++- The forward seam: the real ``prefill_pairs.run_pair`` over the real forward (tests/test_glm_multi_prefill.py's
++  recorded kernels, every tensor named by its buffer, state or weight): each chunk's calls are its solo
++  ``decode.prefill_chunk``'s (or ``multi_prefill.prefill_pieces``'s), the second chunk's own buffers and device
++  position aside; the schedule really interleaves (the second chunk's attention of layer L inside the first's
++  exchange window of layer L, the first's layer L + 1 inside the second's); one request on the wire at a time; a
++  state kept at the first chunk's end is the one the solo chunk leaves, though the second chunk moves the stream on.
++- The wire: the real ``AfdWire`` + ``McdmaTransport`` and both expert loops (``experts_node.forwards``) over the
++  fake mcdma-rpcd pair (tests/glm_afd_fakes.py), CPU- and GPU-driven: a pair's replies, the experts' order, its
++  headers (round trip, the second window checked against the first), a plain forward after it; an expert node
++  without ``pairs`` refuses MODE_PAIR, and an old peer refuses the settings; a reply out of order, a second request
++  on a link and a pair that stops early are refused; a stalled link times out; TF_AFD_CHECK checks paired forwards
++  and names them; pairs and TF_GLM_FILL_BUDGET_MS's layer slices (MODE_SLICE) share one wire, in either order.
++- The engine (tests/test_glm_multi.py's fake model at world 1, ``afd_fake``): with the setting on, replies, cached
++  counts, kept states and their pool rows equal the setting off, for prompts of 1, 2, 3 and 5 chunks and odd
++  remainders, with and without TF_GLM_SHARED_PREFIX and TF_GLM_MULTI_PREFILL, and with fp8 rings; a stream cancelled
++  after a pair frees its extent as after the same chunks alone; while a stream decodes no pair runs. With
++  TF_GLM_FILL_BUDGET_MS (tests/test_glm_sliced_fill.py's checked wire): a chunk started while a stream decodes still
++  goes in layer slices, no pair runs while a sliced chunk is suspended, and a client leaving mid-pair (the server's
++  poll) frees the extent as when it leaves during the same chunk alone.
++"""
++
++from __future__ import annotations
++
++import importlib
++import threading
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from tests import test_glm_kv8_multi as tk
++from tests import test_glm_multi as tm
++from tests import test_glm_multi_afd as ta
++from tests import test_glm_multi_prefill as hp
++from tests.glm_afd_fakes import (  # noqa: F401
++    LAYERS,
++    PREFILL,
++    D,
++    DictStore,
++    FakeDriver,
++    FakeNode,
++    S,
++    daemon_fixture,
++    env_fixture,
++    libpath_fixture,
++    master_fixture,
++    mcdma_attention,
++    partial,
++    wait_attached,
++    words_fixture,
++)
++from tests.test_cuda_geometry import allocations  # noqa: F401
++from tests.test_glm_multi import fake  # noqa: F401
++
++pytestmark = pytest.mark.torch
++afd_fake = ta.afd_fake
++rings = tk.rings
++ENV = "TF_GLM_PREFILL_PAIRS"
++
++
++def _mp():
++    from tensorfold.families.glm5_next.cuda import multi_prefill
++
++    return multi_prefill
++
++
++# -- the setting -----------------------------------------------------------------------------------------------------
++def test_the_setting_and_the_handshake(monkeypatch):
++    from tensorfold.families.glm5_next.cuda import afd
++    from tensorfold.families.glm5_next.cuda import prefill_pairs as pp
++
++    monkeypatch.delenv(ENV, raising=False)
++    assert not pp.enabled() and not pp.enabled("0") and not pp.enabled(" ") and pp.enabled("1")
++    for bad in ("2", "on", "true", "yes"):
++        with pytest.raises(ValueError, match=ENV):
++            pp.enabled(bad)
++    cfg = SimpleNamespace(mlp_kinds=["dense"] * 3 + ["moe"] * 4, quant="exl3", experts=16, top_k=8)
++    plain = afd.settings_for("/nonexistent", cfg, prefill_rows=2048)
++    paired = afd.settings_for("/nonexistent", cfg, prefill_rows=2048, pairs=True)
++    assert "pairs" not in plain and paired == dict(plain, pairs=1)       # off: the settings exactly as before
++    assert afd.settings_mismatch(plain, paired) == "pairs: attention 1 != expert None"   # an old expert refuses
++    assert afd.settings_mismatch(paired, paired) == ""
++    # the capacity plan's bytes for the second chunk's buffers at GLM-5.3-Flash's shapes, DFlash2's 5 taps
++    assert pp.plan_bytes({"hidden_size": 4096, "hc_mult": 4}, 2048, taps=5) == 151_166_976    # 144.2 MiB
++
++
++# -- the forward seam: recorded kernels -----------------------------------------------------------------------------
++def _seam(monkeypatch, dense_limit=10**6):
++    """build_forward's weights and buffers, the second chunk's buffers (``slot_buffers``) named b2.*, the wire's
++    pair calls and the schedule's resumptions recorded, KDA chains and conv shifts that move the state (so a kept
++    state taken after the second chunk would differ)."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import decode, kda
++    from tensorfold.families.glm5_next.cuda import prefill_pairs as pp
++
++    forward = importlib.import_module("tensorfold.families.glm5_next.cuda.forward")
++    rec = hp.Rec(torch)
++    w, b = hp.build_forward(torch, rec, dense_limit=dense_limit)
++    hp.patch_kernels(monkeypatch, rec, forward)
++    monkeypatch.setattr(decode, "commit", forward.commit)
++    chain, shift = kda.chain, forward._shift_conv
++
++    def moving_chain(*a, **k):
++        a[14].copy_(a[6] * 3 + a[12])                 # rec_out from rec_in and the rows
++        return chain(*a, **k)
++
++    def moving_shift(conv, proj, keep):
++        conv.add_(keep)
++        return shift(conv, proj, keep)
++
++    monkeypatch.setattr(kda, "chain", moving_chain)
++    monkeypatch.setattr(forward, "_shift_conv", moving_shift)
++    w.afd.begin_pair = rec.fn("afd.begin_pair")
++    w.afd.use = rec.fn("afd.use")
++    b2 = pp.slot_buffers(b)
++    for name in pp.SLOT_FIELDS:
++        rec.register("b2." + name, getattr(b2, name))
++    for i, t in enumerate(b2.taps):
++        rec.register(f"b2.tap{i}", t)
++    rec.aliases[id(b2)] = "B2"
++    alive = []
++
++    def pos_tensor(st, pos):
++        t = torch.full_like(st.pos_dev, pos)
++        rec.register(f"st{st.slot}.pos_dev@", t)
++        alive.append(t)
++        return t
++
++    monkeypatch.setattr(pp, "_pos_tensor", pos_tensor)
++    monkeypatch.setattr(pp, "_mark", lambda k: rec.calls.append(("slot", k)))
++    return SimpleNamespace(torch=torch, rec=rec, w=w, b=b, b2=b2, pp=pp, decode=decode, forward=forward, alive=alive)
++
++
++def _canon(x):
++    if isinstance(x, str):
++        return {"B2": "B"}.get(x, x.replace("b2.", "b.").replace(".pos_dev@", ".pos_dev"))
++    if isinstance(x, tuple):
++        return tuple(_canon(v) for v in x)
++    return x
++
++
++def _engine(s, st=None):
++    torch = s.torch
++    return SimpleNamespace(w=s.w, st=st, pbuf=s.b, pbuf2=s.b2, prefill_rows=64, last_hidden=None,
++                           tap_rows=lambda k, bb: torch.cat([t[:k] for t in bb.taps], dim=1))
++
++
++def _kernel(c) -> bool:
++    return c[0] not in ("slot", "enter", "exit") and not c[0].startswith("afd.")
++
++
++def _by_slot(calls) -> tuple[list, list]:
++    out, k = ([], []), 0
++    for c in calls:
++        if c[0] == "slot":
++            k = c[1]
++        elif _kernel(c):
++            out[k].append(_canon(c))
++    return out
++
++
++def _drafter(got, rec):
++    return SimpleNamespace(add_taps=lambda t: got.append(rec.norm(t)))
++
++
++@pytest.mark.parametrize("dense_limit", [10**6, 100], ids=["dense", "sparse-past-100"])
++@pytest.mark.parametrize("pos,na,nb,hold", [(0, 64, 64, False), (3, 40, 1, True), (90, 64, 23, True),
++                                            (500, 7, 64, False)])
++def test_a_pair_gives_each_chunk_its_solo_calls(allocations, monkeypatch, dense_limit, pos, na, nb, hold):  # noqa: F811
++    """One stream's two consecutive chunks (positions dense, crossing the dense limit and past it, odd sizes, the
++    second ending the prompt): every kernel call of each chunk in the pair is its solo prefill_chunk's (the second
++    chunk's b2.* buffers and its own device position named as the solo's), taps and heads included; the wire saw
++    one begin_pair and per MoE layer the first chunk's exchange and collect, then the second's; a state kept at the
++    first chunk's end equals the solo chunk's end state."""
++
++    s = _seam(monkeypatch, dense_limit)
++    torch, rec = s.torch, s.rec
++    prompt = list(range(1, pos + na + nb + 1))
++    st = hp.TraceState(torch, rec, 1, pos)
++    e = _engine(s, st)
++    solo, taps0 = [], []
++    rec.calls = []
++    s.decode.prefill_chunk(e, prompt, pos, na, drafter=_drafter(taps0, rec), head=False)
++    solo.append([_canon(c) for c in rec.calls if _kernel(c)])
++    kept = (st.rec[st.cur[0]].clone(), st.conv.clone())
++    rec.calls = []
++    out_solo = s.decode.prefill_chunk(e, prompt, pos + na, nb, drafter=_drafter(taps0, rec), head=True)
++    solo.append([_canon(c) for c in rec.calls if _kernel(c)])
++    end_solo = (st.rec.clone(), st.conv.clone(), list(st.cur), st.pos)
++
++    st2 = hp.TraceState(torch, rec, 1, pos)
++    eng = _engine(s)
++    taps1 = []
++    rec.calls = []
++    a, b = s.pp.run_pair(eng, [_mp().Piece(st2, prompt[pos:pos + na], drafter=_drafter(taps1, rec))],
++                         [_mp().Piece(st2, prompt[pos + na:pos + na + nb], drafter=_drafter(taps1, rec), head=True)],
++                         hold=[st2] if hold else [])
++    calls = list(rec.calls)
++    assert st2.pos == pos                                # positions are finish's
++    s.pp.finish(eng, a)
++    s.pp.finish(eng, b)
++    assert _by_slot(calls) == (solo[0], solo[1])
++    assert taps1 == taps0 and st2.pos == pos + na + nb
++    assert st2.rec.tolist() == end_solo[0].tolist() and st2.conv.tolist() == end_solo[1].tolist()
++    assert list(st2.cur) == end_solo[2]
++    assert a.heads == [None] and b.heads[0].shape == out_solo.shape
++    if hold:
++        rec_h, conv_h = a.held(st2)
++        assert torch.equal(rec_h, kept[0]) and torch.equal(conv_h, kept[1])
++        assert not torch.equal(rec_h, st2.rec[st2.cur[0]])     # the stream has moved on since
++    else:
++        assert a.held(st2) is None
++    wire = [c for c in calls if c[0].startswith("afd.")]
++    assert wire[0] == ("afd.begin_pair", ((na, nb),), ())
++    moe = 3                                              # build_forward: layers 1, 2, 3 are MoE
++    ops, slot = [], 0
++    for c in wire[1:]:
++        if c[0] == "afd.use":
++            slot = c[1][0]
++        else:
++            ops.append((c[0][4:], slot, c[1][1]))
++    assert ops == [(op, k, (na, nb)[k]) for _ in range(moe) for k in (0, 1) for op in ("exchange", "collect")]
++
++
++def test_the_schedule_interleaves(allocations, monkeypatch):  # noqa: F811
++    """The recorded order: the second chunk's attention of MoE layer L (its mixer's stream-state calls) runs after
++    the first chunk's exchange of layer L and before its collect; the first chunk's attention of layer L + 1 runs
++    inside the second chunk's window of layer L; never two exchanges without a collect between."""
++
++    s = _seam(monkeypatch)
++    torch, rec = s.torch, s.rec
++    st = hp.TraceState(torch, rec, 2, 10)
++    prompt = list(range(1, 200))
++    rec.calls = []
++    s.pp.run_pair(_engine(s), [_mp().Piece(st, prompt[10:74])], [_mp().Piece(st, prompt[74:120], head=True)])
++    events, slot, cur = [], 0, 0
++    for c in rec.calls:
++        if c[0] == "slot":
++            slot = c[1]
++        elif c[0] == "afd.use":
++            cur = c[1][0]
++        elif c[0] in ("afd.exchange", "afd.collect"):
++            events.append((c[0][4], cur))
++        elif c[0] == "enter":                            # a layer's KDA / DSA stream-state work
++            events.append(("m", slot))
++    xs = [i for i, ev in enumerate(events) if ev[0] == "e"]
++    cs = [i for i, ev in enumerate(events) if ev[0] == "c"]
++    assert len(xs) == len(cs) == 6 and all(x < c for x, c in zip(xs, cs))
++    assert all(c < x for c, x in zip(cs, xs[1:]))         # one request on the wire at a time
++    for n, (x, c) in enumerate(zip(xs, cs)):
++        k = events[x][1]
++        between = [ev for ev in events[x + 1:c] if ev[0] == "m"]
++        if n < 5:                                        # every window but the last holds the other chunk's attention
++            assert between and all(ev[1] == 1 - k for ev in between), (n, events[x:c + 1])
++    mixers = [ev[1] for ev in events if ev[0] == "m"]
++    assert mixers.count(0) == mixers.count(1) == 4
++
++
++def test_grouped_chunks_pair(allocations, monkeypatch):  # noqa: F811
++    """TF_GLM_MULTI_PREFILL's chunks as a pair: the first of two streams' pieces, the second of the same two streams'
++    next rows and a third stream's: each chunk's calls are its solo prefill_pieces', the continuing streams' rows
++    from their first-chunk ends (their own device positions), their kept states held."""
++
++    s = _seam(monkeypatch)
++    torch, rec = s.torch, s.rec
++    plan = [(0, 30, 20, 9), (1, 4, 30, 12), (2, 7, 0, 21)]      # (slot, position, first rows, second rows)
++
++    def run(paired):
++        sts = {k: hp.TraceState(torch, rec, k, pos) for k, pos, _, _ in plan}
++        prompts = {k: list(range(1, pos + n1 + n2 + 1)) for k, pos, n1, n2 in plan}
++        first = [_mp().Piece(sts[k], prompts[k][pos:pos + n1]) for k, pos, n1, _ in plan if n1]
++        second = [_mp().Piece(sts[k], prompts[k][pos + n1:pos + n1 + n2], head=True) for k, pos, n1, n2 in plan]
++        e = _engine(s)
++        rec.calls = []
++        if paired:
++            a, b = s.pp.run_pair(e, first, second, hold=[sts[0], sts[1]])
++            calls = list(rec.calls)
++            s.pp.finish(e, a)
++            s.pp.finish(e, b)
++            return _by_slot(calls), {k: (st.rec.tolist(), st.conv.tolist(), st.pos) for k, st in sts.items()}, a
++        _mp().prefill_pieces(e, first)
++        one = [_canon(c) for c in rec.calls if _kernel(c)]
++        held = {k: (sts[k].rec[sts[k].cur[0]].clone(), sts[k].conv.clone()) for k in (0, 1)}
++        rec.calls = []
++        _mp().prefill_pieces(e, second)
++        two = [_canon(c) for c in rec.calls if _kernel(c)]
++        return (one, two), {k: (st.rec.tolist(), st.conv.tolist(), st.pos) for k, st in sts.items()}, held
++
++    calls0, states0, held0 = run(False)
++    calls1, states1, a = run(True)
++    assert calls1 == calls0 and states1 == states0
++    for k in (0, 1):
++        assert all(torch.equal(x, y) for x, y in zip(a.held(next(p.st for p in a.pieces if p.st.slot == k)),
++                                                     held0[k]))
++
++
++def test_slot_buffers_share_the_scratch(allocations):  # noqa: F811
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import prefill_pairs as pp
++
++    rec = hp.Rec(torch)
++    _, b = hp.build_forward(torch, rec)
++    two = pp.slot_buffers(b)
++    for name in vars(b):
++        x, y = getattr(b, name), getattr(two, name)
++        if name in pp.SLOT_FIELDS or name in ("ids_host", "taps"):
++            assert x is not y
++        elif isinstance(x, torch.Tensor):
++            assert x is y, name
++    assert all(t.shape == u.shape and t is not u for t, u in zip(b.taps, two.taps))
++    assert pp.slot_bytes(b) == sum(getattr(b, n).numel() * 4 for n in ("x", "post", "comb")) + \
++        b.ids.numel() * 4 + sum(t.numel() * 4 for t in b.taps)
++
++
++# -- the wire: the fake mcdma-rpcd pair --------------------------------------------------------------------------
++def _links(daemon, words, *, attn="cpu", experts=("cpu", "cpu"), timeout=10.0, pairs=True, check=False, store=None):
++    from tensorfold.families.glm5_next.cuda import afd_mcdma, experts_node, mcdma
++
++    drv = FakeDriver(words)
++    links = mcdma.AttentionLinks(["a2", "a1"], words=words, driver=drv if attn == "gpu" else None, mode=attn,
++                                 stream=lambda: 0, timeout=timeout, shm_dir=str(daemon.shm), linkup_wait=2)
++    eps = []
++    for half, (name, mode) in enumerate(zip(["a2", "a1"], experts)):
++        link = mcdma.ExpertLink(name, words=words, driver=drv if mode == "gpu" else None, mode=mode,
++                                socket_path=daemon.sock(name), shm_dir=str(daemon.shm), stream=lambda: 0)
++        link.base = links.base[half]
++        end = afd_mcdma.McdmaExpertLink(link, D, S, len(LAYERS), PREFILL, device="cpu", pairs=pairs)
++        node = FakeNode(LAYERS, half)
++        ep = SimpleNamespace(link=end, node=node, error=None)
++
++        def run(ep=ep, half=half):
++            try:
++                experts_node.forwards(ep.node, ep.link, store if store is not None else DictStore(), half + 1,
++                                      check_on=check)
++            except BaseException as exc:  # noqa: BLE001
++                ep.error = exc
++
++        ep.t = threading.Thread(target=run, daemon=True)
++        ep.t.start()
++        eps.append(ep)
++    return links, eps
++
++
++def _close(daemon, eps) -> None:
++    for n in ("a2", "a1"):
++        daemon.bye(n)
++    for ep in eps:
++        ep.t.join(5)
++        assert not ep.t.is_alive()
++
++
++def _bufs(rows=PREFILL):
++    import torch
++
++    return SimpleNamespace(normed=torch.zeros((rows, D), dtype=torch.bfloat16),
++                           pick=torch.zeros((rows, S), dtype=torch.int32),
++                           wts=torch.zeros((rows, S), dtype=torch.float32), sy=torch.zeros((rows, D)),
++                           afd_recv=torch.zeros((3 * rows * D,)))
++
++
++def _fill(b, rows, gen) -> None:
++    import torch
++
++    b.normed[:rows] = torch.randn((rows, D), generator=gen).to(torch.bfloat16)
++    b.pick[:rows] = torch.randint(0, 16, (rows, S), generator=gen, dtype=torch.int32)
++    b.wts[:rows] = torch.rand((rows, S), generator=gen)
++    b.sy[:rows] = torch.randn((rows, D), generator=gen)
++
++
++def _pair(a, rows, gen, *, stop_after=None) -> None:
++    """A pair's exchanges in the schedule's wire order (window 0's layer, window 1's, ...), each reply checked."""
++
++    import torch
++
++    bufs = [_bufs(), _bufs()]
++    a.begin_pair(rows)
++    for pos, layer in enumerate(LAYERS):
++        for k in (0, 1):
++            if stop_after is not None and (pos, k) == stop_after:
++                return
++            _fill(bufs[k], rows[k], gen)
++            a.use(k)
++            a.exchange(bufs[k], rows[k])
++            got = a.collect(bufs[k], rows[k], D)
++            for half in (0, 1):
++                want = partial(bufs[k].normed[:rows[k]], bufs[k].pick[:rows[k]], bufs[k].wts[:rows[k]], layer, half)
++                assert torch.equal(got[half], want), (layer, k, half)
++            assert torch.equal(got[2], bufs[k].sy[:rows[k]])
++
++
++def _plain(a, rows, gen) -> None:
++    import torch
++
++    b = _bufs()
++    a.begin(rows, chunk=True)
++    for layer in LAYERS:
++        _fill(b, rows, gen)
++        a.exchange(b, rows)
++        got = a.collect(b, rows, D)
++        assert torch.equal(got[0], partial(b.normed[:rows], b.pick[:rows], b.wts[:rows], layer, 0))
++
++
++@pytest.mark.parametrize("modes", [("cpu", ("cpu", "cpu")), ("gpu", ("gpu", "gpu")), ("gpu", ("cpu", "gpu"))],
++                         ids=["cpu", "gpu", "mixed"])
++def test_a_pair_over_the_mcdma_wire(env, daemon, words, master, modes):
++    """Two pairs (48 + 7 and 5 + 48 rows) then a plain chunk: every reply is the experts' function of its own
++    window's request; each expert served A's layer, B's layer, A's next ... (two windows open, one request at a
++    time); the second window's header was checked against the first (next_partner); the plain forward after the
++    pairs carries no pair words."""
++
++    import torch
++
++    links, eps = _links(daemon, words, attn=modes[0], experts=modes[1])
++    wait_attached(daemon)
++    a = mcdma_attention(links, master)
++    gen = torch.Generator().manual_seed(5)
++    _pair(a, (PREFILL, 7), gen)
++    _pair(a, (5, PREFILL), gen)
++    _plain(a, 11, gen)
++    for ep in eps:
++        want = [(layer, r) for rows in ((PREFILL, 7), (5, PREFILL)) for layer in LAYERS for r in rows]
++        assert ep.node.seen == want + [(layer, 11) for layer in LAYERS], ep.node.seen
++        assert ep.error is None
++    assert a.seq == 5 and a.dead is None
++    _close(daemon, eps)
++
++
++def test_an_expert_without_pairs_and_an_old_peer_refuse(env, daemon, words, master):
++    """An expert link opened without the handshake's ``pairs`` refuses MODE_PAIR (as an older tree refuses any mode
++    it does not know); the attention's next exchange then fails on the dead link."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import mcdma
++
++    links, eps = _links(daemon, words, pairs=False, timeout=2.0)
++    wait_attached(daemon)
++    a = mcdma_attention(links, master)
++    gen = torch.Generator().manual_seed(1)
++    with pytest.raises(Exception):  # noqa: B017  the reply never comes: CapacityError after the link timeout
++        _pair(a, (8, 8), gen)
++    for ep in eps:
++        assert isinstance(ep.error, mcdma.LinkError) and "forward mode 7" in str(ep.error), repr(ep.error)
++
++
++def test_out_of_order_is_refused(env, daemon, words, master, monkeypatch):
++    """On the attention node: a collect for the window whose request is not on the wire, and a second request
++    before the first's reply, are refused (the node dies: the experts are out of step). On the wire: a reply whose
++    length is not the request's window's (an expert answering for the other window) is refused."""
++
++    import torch
++
++    from tensorfold.server.errors import CapacityError
++
++    links, eps = _links(daemon, words)
++    wait_attached(daemon)
++    a = mcdma_attention(links, master)
++    gen = torch.Generator().manual_seed(2)
++    b0, b1 = _bufs(), _bufs()
++    a.begin_pair((6, 9))
++    _fill(b0, 6, gen)
++    a.use(0)
++    a.exchange(b0, 6)
++    a.use(1)
++    with pytest.raises(CapacityError, match="out of order|unanswered|failed"):
++        a.collect(b1, 9, D)
++    assert a.dead and "window 1 collected layer -1" in a.dead
++    _close(daemon, eps)
++
++
++def test_a_second_request_on_the_link_is_refused(env, daemon, words, master):
++    import torch
++
++    from tensorfold.server.errors import CapacityError
++
++    links, eps = _links(daemon, words)
++    wait_attached(daemon)
++    a = mcdma_attention(links, master)
++    gen = torch.Generator().manual_seed(3)
++    b0, b1 = _bufs(), _bufs()
++    a.begin_pair((6, 9))
++    _fill(b0, 6, gen)
++    _fill(b1, 9, gen)
++    a.use(0)
++    a.exchange(b0, 6)
++    a.use(1)
++    with pytest.raises(CapacityError):
++        a.exchange(b1, 9)
++    assert "one request on each link at a time" in a.dead
++    _close(daemon, eps)
++
++
++def test_a_reply_for_the_other_window_is_refused(env, daemon, words, master, monkeypatch):
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import afd_mcdma
++    from tensorfold.server.errors import CapacityError
++
++    real = afd_mcdma.McdmaExpertLink.reply
++
++    def wrong(self, layer, routed):                      # window 1's layer 0 answered with window 0's length
++        if self.slot == 1 and layer == 0:
++            self.n_rep = self._wins[0]["n_rep"]
++        return real(self, layer, routed)
++
++    monkeypatch.setattr(afd_mcdma.McdmaExpertLink, "reply", wrong)
++    links, eps = _links(daemon, words, timeout=3.0)
++    wait_attached(daemon)
++    a = mcdma_attention(links, master)
++    with pytest.raises(CapacityError, match="bytes, not"):
++        _pair(a, (6, 9), torch.Generator().manual_seed(4))
++    _close(daemon, eps)
++
++
++def test_a_pair_that_stops_early_and_a_stalled_link(env, daemon, words, master):
++    """A pair whose second window stops after its first layer: the next header refuses, naming the window. A link
++    whose replies stall mid-pair: the collect fails after the link timeout."""
++
++    import torch
++
++    from tensorfold.server.errors import CapacityError
++
++    links, eps = _links(daemon, words, timeout=1.5)
++    wait_attached(daemon)
++    a = mcdma_attention(links, master)
++    gen = torch.Generator().manual_seed(6)
++    _pair(a, (8, 4), gen, stop_after=(1, 1))
++    with pytest.raises(CapacityError, match=r"pair's window 0 \(seq 1\) stopped after 2 of 4"):
++        a.begin(5)
++    _close(daemon, eps)
++
++
++def test_a_stalled_link_times_out(env, daemon, words, master):
++    import torch
++
++    from tensorfold.server.errors import CapacityError
++
++    links, eps = _links(daemon, words, timeout=1.0)
++    wait_attached(daemon)
++    a = mcdma_attention(links, master)
++    gen = torch.Generator().manual_seed(7)
++    b0, b1 = _bufs(), _bufs()
++    a.begin_pair((8, 4))
++    for k, (b, r) in enumerate(((b0, 8), (b1, 4))):     # layer 0 of both windows
++        _fill(b, r, gen)
++        a.use(k)
++        a.exchange(b, r)
++        a.collect(b, r, D)
++    daemon.stalled.add("a1")
++    _fill(b0, 8, gen)
++    a.use(0)
++    a.exchange(b0, 8)
++    t = time.monotonic()
++    with pytest.raises(CapacityError, match="no reply|unanswered|failed"):
++        a.collect(b0, 8, D)
++    assert time.monotonic() - t < 10
++    daemon.stalled.discard("a1")
++    _close(daemon, eps)
++
++
++def test_the_wire_check_covers_and_names_pairs(env, daemon, words, master, monkeypatch, capsys):
++    """TF_AFD_CHECK=1 over a pair and a plain forward (the check's window of 3 forwards): both experts hash every
++    paired window; 0 mismatches, and the window line names the pair's seqs."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import afd, experts_node
++
++    monkeypatch.setattr(afd, "CHECK_FORWARDS", 3)
++    monkeypatch.setattr(experts_node, "CHECK_FORWARDS", 3)
++    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)      # the check's sync, on a CPU-only box
++    holder = {}
++    store = SimpleNamespace(set=lambda k, v: holder["s"].set(k, v))
++    links, eps = _links(daemon, words, check=True, store=store)
++    wait_attached(daemon)
++    a = mcdma_attention(links, master)
++    holder["s"] = a.store
++    a.check = True
++    gen = torch.Generator().manual_seed(8)
++    _pair(a, (8, 5), gen)
++    _plain(a, 6, gen)
++    a.begin(2)                                           # closes the plain forward: the check's third
++    a.layer = a.nlayers
++    out = capsys.readouterr().out
++    assert a.checked == 3 and a.mismatches == 0, out
++    assert "afd-check: window complete, 3 forwards (2 of them in prompt chunk pairs, seqs 1-2), 0 mismatches" in out
++    _close(daemon, eps)
++
++
++_CLOCK = [0.0]       # _HostEvent's clock (ms)
++
++
++class _HostEvent:
++    """A CUDA event on a host clock that ticks 1 ms at each record (TF_AFD_TIME's lines on CPU)."""
++
++    def __init__(self, enable_timing: bool = False) -> None:
++        self.t = None
++
++    def record(self, *_) -> None:
++        _CLOCK[0] += 1.0
++        self.t = _CLOCK[0]
++
++    def elapsed_time(self, end) -> float:
++        if self.t is None or end.t is None:
++            raise RuntimeError("an event not recorded")
++        return end.t - self.t
++
++
++def test_the_pair_timer_line(env, daemon, words, master, monkeypatch, capsys):
++    """TF_AFD_TIME=1 with pairs: each paired exchange's send / collect / reply events, sampled when the pair closes;
++    every 8 pairs one ``afd pair overlap`` line with those 8 pairs' count and, per window size R, the window (send to
++    the reply copied in), the wait (the collect to it) and the in-window work (their difference) p50 / p90. On the host
++    clock here every exchange's window is 2 ms, its wait 1 ms and its work 1 ms; a pair that never closes is not
++    sampled."""
++
++    import torch
++
++    monkeypatch.setattr(torch.cuda, "Event", _HostEvent)
++    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
++    links, eps = _links(daemon, words)
++    wait_attached(daemon)
++    a = mcdma_attention(links, master)
++    a.timing, a.ev = True, None                          # the pairs' own events only (begin_pair makes them)
++    gen = torch.Generator().manual_seed(12)
++    n, rows = len(LAYERS), (PREFILL, 7)
++
++    def want(total: int) -> str:
++        return (f"[tensorfold] afd pair overlap: {16 * n} paired MoE exchanges over the last 8 pairs ({total} so far; "
++                f"in-window work: the shared expert + the other chunk's attention); " + "; ".join(
++                    f"R{r} n{8 * n} window p50 2.00 ms p90 2.00, wait for the reply p50 1.00 ms p90 1.00, in-window "
++                    f"work p50 1.00 ms p90 1.00" for r in sorted(rows)))
++
++    for k in range(17):
++        _pair(a, rows, gen)
++        if k in (7, 15):
++            assert "afd pair overlap" not in capsys.readouterr().out     # the 8th / 16th pair closes at the next header
++        if k == 8:
++            out = capsys.readouterr().out
++            assert out.count("afd pair overlap") == 1 and want(8) in out, out
++            assert a._pairs_timed == 8 and a._overlap == {} and a.dead is None   # the 9th pair is still open
++    out = capsys.readouterr().out
++    assert out.count("afd pair overlap") == 1 and want(16) in out, out   # each line has its own 8 pairs' samples only
++    assert a._pairs_timed == 16 and a._overlap == {} and a.dead is None
++    _plain(a, 5, gen)
++    assert a._pairs_timed == 17 and sorted(a._overlap) == sorted(rows) and all(ep.error is None for ep in eps)
++    _close(daemon, eps)
++
++
++@pytest.mark.parametrize("modes", [("cpu", ("cpu", "cpu")), ("gpu", ("gpu", "gpu"))], ids=["cpu", "gpu"])
++def test_the_scheduler_over_the_mcdma_wire(env, daemon, words, master, monkeypatch, modes):
++    """The real pair scheduler (``prefill_pairs._forward_pair``) over the real wire and the fake MCDMA pair (whose
++    expert links check every header), each chunk's layer loop a stand-in for ``_steps`` (its attention marked, its
++    route filling the request, then exchange and collect at the scheduler's stops): every reply is its own window's;
++    the experts saw A's layer, B's layer, ...; the other chunk's attention of the same layer (B's) or the next (A's)
++    runs inside each exchange window but the last; never more than one request on the wire, two windows open."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import prefill_pairs as pp
++
++    links, eps = _links(daemon, words, attn=modes[0], experts=modes[1])
++    wait_attached(daemon)
++    a = mcdma_attention(links, master)
++    gen = torch.Generator().manual_seed(9)
++    log, bufs, rows = [], [_bufs(), _bufs()], (PREFILL, 13)
++    flight = {"now": 0, "max": 0}
++    exchange, collect = a.exchange, a.collect
++
++    def counted_exchange(b, r):
++        flight["now"] += 1
++        flight["max"] = max(flight["max"], flight["now"])
++        return exchange(b, r)
++
++    def counted_collect(b, r, d):
++        out = collect(b, r, d)
++        flight["now"] -= 1
++        return out
++
++    monkeypatch.setattr(a, "exchange", counted_exchange)
++    monkeypatch.setattr(a, "collect", counted_collect)
++
++    def steps(e, ch):
++        k, r, b = ch.slot, ch.R, bufs[ch.slot]
++        for pos, layer in enumerate(LAYERS):
++            log.append(("attn", k, pos))
++            _fill(b, r, gen)
++            yield pp.SEND
++            e.w.afd.use(k)
++            e.w.afd.exchange(b, r)
++            log.append(("send", k, pos))
++            yield pp.WAIT
++            e.w.afd.use(k)
++            got = e.w.afd.collect(b, r, D)
++            for half in (0, 1):
++                assert torch.equal(got[half], partial(b.normed[:r], b.pick[:r], b.wts[:r], layer, half)), (k, pos)
++            log.append(("recv", k, pos))
++            yield pp.DONE
++
++    monkeypatch.setattr(pp, "_steps", steps)
++    e = SimpleNamespace(w=SimpleNamespace(afd=a))
++    chunks = [pp.Chunk([None], k, None, R=rows[k]) for k in (0, 1)]
++    a.begin_pair(rows)
++    pp._forward_pair(e, *chunks)
++    assert flight["max"] == 1 and a.dead is None
++    n = len(LAYERS)
++    sends = [ev for ev in log if ev[0] == "send"]
++    assert sends == [("send", k, pos) for pos in range(n) for k in (0, 1)]
++    for i, (_, k, pos) in enumerate(sends):
++        lo, hi = log.index(("send", k, pos)), log.index(("recv", k, pos))
++        inside = [ev for ev in log[lo:hi] if ev[0] == "attn"]
++        want = ("attn", 1, pos) if k == 0 else ("attn", 0, pos + 1)
++        assert inside == ([want] if i < 2 * n - 1 else []), (k, pos, log[lo:hi + 1])
++    for ep in eps:
++        assert ep.node.seen == [(layer, r) for layer in LAYERS for r in rows] and ep.error is None
++    _plain(a, 9, gen)                                    # a plain forward after the pair: closes it, no pair words
++    assert all(ep.error is None for ep in eps)
++    _close(daemon, eps)
++
++
++@pytest.mark.parametrize("modes", [("cpu", ("cpu", "cpu")), ("gpu", ("gpu", "gpu")), ("gpu", ("cpu", "gpu"))],
++                         ids=["cpu", "gpu", "mixed"])
++def test_pairs_and_slices_share_the_wire(env, daemon, words, master, modes):
++    """TF_GLM_FILL_BUDGET_MS's layer slices (MODE_SLICE) and pairs on one wire, in an order the scheduler makes: a
++    chunk in two slices with a decode round's window between them, a pair, a chunk in slices again, a pair, a whole
++    chunk. Every reply is the experts' function of its own request and each expert ran exactly each forward's layers
++    in order; the pair after a slice carries no slice count (word 6), the slices after a pair no pair words (7-9)."""
++
++    import torch
++
++    from tests.glm_afd_fakes import forward as window
++    from tests.test_glm_afd_slice_wire import slice_forward
++
++    n = len(LAYERS)
++    links, eps = _links(daemon, words, attn=modes[0], experts=modes[1])
++    wait_attached(daemon)
++    a = mcdma_attention(links, master)
++    gen = torch.Generator().manual_seed(17)
++    b = _bufs()
++    slice_forward(a, b, 40, gen, 0, 2)
++    window(a, b, 3, gen)                                 # a decode round between two slices of the chunk
++    slice_forward(a, b, 40, gen, 2, n - 2)
++    _pair(a, (PREFILL, 9), gen)
++    assert all(row[6] == 0 for dev, _ in a.tr._tabs for row in dev.tolist())    # no slice count in either window
++    slice_forward(a, b, 21, gen, 0, 1)
++    assert not any(v for row in a.tr.hdr_tab.tolist() for v in row[7:10])       # no pair words on the slice
++    window(a, b, 2, gen)
++    slice_forward(a, b, 21, gen, 1, n - 1)
++    _pair(a, (6, PREFILL), gen)
++    _plain(a, 11, gen)
++    want = ([(i, 40) for i in LAYERS[:2]] + [(i, 3) for i in LAYERS] + [(i, 40) for i in LAYERS[2:]]
++            + [(i, r) for i in LAYERS for r in (PREFILL, 9)]
++            + [(LAYERS[0], 21)] + [(i, 2) for i in LAYERS] + [(i, 21) for i in LAYERS[1:]]
++            + [(i, r) for i in LAYERS for r in (6, PREFILL)] + [(i, 11) for i in LAYERS])
++    for ep in eps:
++        assert ep.node.seen == want and ep.error is None, ep.node.seen
++    assert a.dead is None and a.seq == 11                # 5 slices and windows, 2 pairs (2 forwards each), a chunk
++    _close(daemon, eps)
++
++
++# -- the engine: the fake model at world 1 (test_glm_multi_afd.afd_fake's fake_pairs) ---------------------------------
++def _world1(env, monkeypatch, *, pairs, group=False, shared=False, prompts=(), streams=2, cancel=None):
++    for name, on in ((ENV, pairs), ("TF_GLM_MULTI_PREFILL", group), ("TF_GLM_SHARED_PREFIX", shared)):
++        if on:
++            monkeypatch.setenv(name, "1")
++        else:
++            monkeypatch.delenv(name, raising=False)
++    n1 = ta.World1(env, streams=streams)
++    assert n1.d.pairs == pairs
++    fills = []
++    real = n1.d._fill_pair
++
++    def checked(first, second):
++        assert not any(x.decoding and not x.s.done for x in n1.d.lanes.values())
++        fills.append(([(x.sid, stop) for x, stop in first], [(x.sid, stop) for x, stop in second]))
++        return real(first, second)
++
++    n1.d._fill_pair = checked
++    reqs = [(tm._prompt(n, seed), 12, tm._sampling(kind, seed)) for n, seed, kind in prompts]
++    out = [n1.submit(pr, cnt, sp) for pr, cnt, sp in reqs]
++    if cancel is not None:
++        for _ in range(cancel):
++            n1.step()
++        out[0].done = True
++        n1.d.finish([out[0]])
++        return n1, out, reqs, fills
++    n1.run()
++    return n1, out, reqs, fills
++
++
++def _wire_pairs(wire) -> int:
++    """The pairs the fake wire was given: WireLog's ``paired``, or the checked slice wire's ("pair", ...) events (World1
++    has that wire in a run with TF_GLM_FILL_BUDGET_MS set and the sliced fill's seams installed)."""
++
++    return len(getattr(wire, "paired", ())) + len([e for e in getattr(wire, "events", ()) if e[0] == "pair"])
++
++
++LENGTHS = [((40, 1, "greedy"),), ((100, 2, "greedy"),), ((150, 3, "topk"),), ((300, 4, "greedy"),),
++           ((65, 5, "greedy"),), ((166, 6, "topk"),)]
++
++
++@pytest.mark.parametrize("prompts", LENGTHS, ids=["1-chunk", "2-chunks", "3-chunks", "5-chunks", "64+1", "128+38"])
++def test_a_cold_prompt_alone(afd_fake, monkeypatch, prompts):
++    """A cold prompt alone, setting on vs off (64-row chunks): the same reply (its solo reply), cached count and kept
++    states with their pool rows; pairs run where the prompt has two chunks before its last."""
++
++    n0, s0, reqs, _ = _world1(afd_fake, monkeypatch, pairs=False, prompts=prompts)
++    n1, s1, _, fills = _world1(afd_fake, monkeypatch, pairs=True, prompts=prompts)
++    for s, (pr, cnt, sp) in zip(s1, reqs):
++        assert s.got == tm.solo(afd_fake.torch, pr, cnt, sp)
++    assert [s.got for s in s0] == [s.got for s in s1] and [s.cached for s in s0] == [s.cached for s in s1]
++    assert hp.kept_view(n0.d) == hp.kept_view(n1.d)
++    chunks = len([c for c in n0.wire.calls if c[0] == "chunk"])
++    assert n1.d.paired["pairs"] == len(fills) == _wire_pairs(n1.wire) and (len(fills) > 0) == (chunks >= 2)
++    assert n1.wire.pairs() == n0.wire.pairs()            # the same forwards (begin, then chunk) in the same order
++
++
++@pytest.mark.parametrize("group", [False, True], ids=["one-at-a-time", "multi-prefill"])
++@pytest.mark.parametrize("shared", [False, True], ids=["no-shared", "shared-prefix"])
++def test_several_prompts_filling_together(afd_fake, monkeypatch, group, shared):
++    """Three prompts admitted together (TF_GLM_MULTI_PREFILL off and on, TF_GLM_SHARED_PREFIX off and on): the same
++    replies, cached counts and kept states with the setting on as off; pairs ran (grouped chunks paired too)."""
++
++    prompts = ((150, 11, "greedy"), (90, 12, "topk"), (200, 13, "greedy"))
++    n0, s0, _, _ = _world1(afd_fake, monkeypatch, pairs=False, group=group, shared=shared, prompts=prompts,
++                           streams=4)
++    n1, s1, _, fills = _world1(afd_fake, monkeypatch, pairs=True, group=group, shared=shared, prompts=prompts,
++                               streams=4)
++    assert [s.got for s in s0] == [s.got for s in s1] and [s.cached for s in s0] == [s.cached for s in s1]
++    assert hp.kept_view(n0.d) == hp.kept_view(n1.d) and fills
++    assert n1.d.grouped == n0.d.grouped                  # the same multi-prompt chunks, paired or not
++
++
++def test_fp8_rings_pair(afd_fake, rings, monkeypatch):
++    """TF_GLM_KV=fp8's per-slot rings: the same replies and kept states (their ring tails) with pairs on as off."""
++
++    from tests import test_glm_kv8_multi as tk
++
++    tk._ringed(afd_fake.torch)
++    prompts = ((180, 21, "greedy"), (70, 22, "greedy"))
++    n0, s0, _, _ = _world1(afd_fake, monkeypatch, pairs=False, prompts=prompts)
++    n1, s1, _, fills = _world1(afd_fake, monkeypatch, pairs=True, prompts=prompts)
++    assert [s.got for s in s0] == [s.got for s in s1] and hp.kept_view(n0.d) == hp.kept_view(n1.d) and fills
++
++
++def test_a_stream_cancelled_after_a_pair_frees_its_extent(afd_fake, monkeypatch):
++    """A 5-chunk prompt ended after its first two chunks: as one pair (setting on) or two chunks (off), the stream
++    leaves and its extent goes back to the pool (kept states aside) the same way."""
++
++    prompts = ((300, 31, "greedy"),)
++    n0, _, _, _ = _world1(afd_fake, monkeypatch, pairs=False, prompts=prompts, cancel=2)
++    n1, _, _, fills = _world1(afd_fake, monkeypatch, pairs=True, prompts=prompts, cancel=1)
++    assert len(fills) == 1 and not n1.d.lanes and not n0.d.lanes
++    assert n1.d.pool.free_rows() == n0.d.pool.free_rows() and hp.kept_view(n0.d) == hp.kept_view(n1.d)
++
++
++def test_no_pair_while_a_stream_decodes(afd_fake, monkeypatch):
++    """A short prompt decodes while a long one arrives: the long one's chunks fill one at a time between decode
++    rounds (no pair while anything decodes, which ``_world1`` asserts at every pair), and the replies are the same."""
++
++    prompts = ((20, 41, "greedy"), (300, 42, "greedy"))
++    n0, s0, _, _ = _world1(afd_fake, monkeypatch, pairs=False, prompts=prompts)
++    n1, s1, _, fills = _world1(afd_fake, monkeypatch, pairs=True, prompts=prompts)
++    assert [s.got for s in s0] == [s.got for s in s1] and hp.kept_view(n0.d) == hp.kept_view(n1.d)
++    assert n1.d.paired["pairs"] == len(fills)            # every pair checked by _world1: none while a stream decoded
++
++
++# -- with TF_GLM_FILL_BUDGET_MS: tests/test_glm_sliced_fill.py's layered fake model and checked wire --------------------
++def _sliced(env, monkeypatch, *, pairs):
++    """tests/test_glm_sliced_fill.py's world 1 (budget 2.5 ms of 1-ms layers) with the setting on or off; every pair
++    checked: no stream decoding, no sliced chunk suspended."""
++
++    from tests import test_glm_sliced_fill as tsf
++
++    if pairs:
++        monkeypatch.setenv(ENV, "1")
++    else:
++        monkeypatch.delenv(ENV, raising=False)
++    tsf.layered(monkeypatch, "2.5")
++    n1 = tsf.SlicedWorld1(env, streams=2)
++    d = n1.d
++    assert d.pairs == pairs and d.fill_budget == 2.5
++    fills, real = [], d._fill_pair
++
++    def checked(first, second):
++        assert d.partial is None and not any(x.decoding and not x.s.done for x in d.lanes.values())
++        fills.append(([(x.sid, stop) for x, stop in first], [(x.sid, stop) for x, stop in second]))
++        return real(first, second)
++
++    d._fill_pair = checked
++    return n1, d, fills
++
++
++def _kept(d):
++    from tests import test_glm_sliced_fill as tsf
++
++    return tsf.tmp.kept_view(d)
++
++
++def test_sliced_fills_run_as_before_with_pairs_on(afd_fake, monkeypatch):
++    """A 5-chunk prompt fills alone (pairs, setting on), then decodes while a 4-chunk prompt arrives: that one's chunks
++    go in layer slices with decode rounds between them, as with the setting off (no pair while a stream decodes or a
++    sliced chunk is suspended); the replies are the solo ones and the kept states equal the setting off."""
++
++    from tensorfold.families.glm5_next.cuda.afd import MODE_SLICE
++    from tests import test_glm_sliced_fill as tsf
++
++    reqs = [(tm._prompt(300, 51), 40, tm._sampling("greedy", 51)), (tm._prompt(200, 52), 12, tm._sampling("topk", 52))]
++    runs = {}
++    for pairs in (False, True):
++        n1, d, fills = _sliced(afd_fake, monkeypatch, pairs=pairs)
++        a = n1.submit(*reqs[0])
++        while not (a.sid in d.lanes and d.lanes[a.sid].decoding):
++            n1.step()
++        b = n1.submit(*reqs[1])
++        n1.run()
++        for s, (pr, cnt, sp) in zip((a, b), reqs):
++            assert s.got == tm.solo(afd_fake.torch, pr, cnt, sp)
++        runs[pairs] = (n1, d, fills, [a.got, b.got], _kept(d))
++    (n0, d0, f0, g0, k0), (n1, d1, f1, g1, k1) = runs[False], runs[True]
++    assert g0 == g1 and k0 == k1 and not f0 and f1 and d1.paired["pairs"] == len(f1)
++    assert [e for e in n1.wire.events if e[0] == "pair"] and not [e for e in n0.wire.events if e[0] == "pair"]
++    assert d1.sliced["chunks"] > 0 and d1.sliced == d0.sliced and tsf._between(n1.begins())
++    assert [x for x in n1.begins() if x[2] == MODE_SLICE] == [x for x in n0.begins() if x[2] == MODE_SLICE]
++    assert d1.partial is None and n1.wire.tr.next is None
++
++
++def test_a_client_leaving_mid_pair(afd_fake, monkeypatch):
++    """A 5-chunk prompt's client leaves (the server's poll, ``emit.cancelled``) while its first two chunks run: as a
++    pair (setting on; it leaves once the pair's first chunk went over the wire) or alone (off; during the second
++    chunk). The pair completes both chunks, then the stream leaves at the next iteration and its extent goes back to
++    the pool, exactly as with the setting off."""
++
++    from tensorfold.families.glm5_next.cuda.afd import MODE_CHUNK
++
++    runs = {}
++    for pairs in (False, True):
++        n1, d, fills = _sliced(afd_fake, monkeypatch, pairs=pairs)
++        free = d.pool.free_rows()
++        left, seen = [False], []
++        real = n1.wire.forward
++
++        def forward(kind, rows, real=real, left=left, seen=seen, pairs=pairs):
++            real(kind, rows)
++            if kind == "chunk":
++                seen.append(rows)
++                left[0] = left[0] or len(seen) == (1 if pairs else 2)
++
++        n1.wire.forward = forward
++        begins = len(n1.begins())
++        s = n1.submit(tm._prompt(300, 61), 12, tm._sampling("greedy", 61))
++        s.emit.cancelled = lambda left=left: left[0]
++        done = []
++        for _ in range(4):
++            done = n1.step()
++            if done:
++                break
++        assert done == [s] and s.done and s.sid not in d.lanes and d.partial is None
++        assert d.pool.free_rows() == free and n1.wire.tr.next is None and seen == [64, 64]
++        assert [x[2] for x in n1.begins()[begins:]] == [MODE_CHUNK, MODE_CHUNK]
++        runs[pairs] = (len(fills), _kept(d))
++    assert runs[False] == (0, runs[True][1]) and runs[True][0] == 1
+diff --git a/tests/test_glm_sliced_fill.py b/tests/test_glm_sliced_fill.py
+index afe91f1..7dfc751 100644
+--- a/tests/test_glm_sliced_fill.py
++++ b/tests/test_glm_sliced_fill.py
+@@ -220,6 +220,16 @@ def slice_wire(layers: int = MOE, prefill: int = 64):
+                 self.exchange(None, rows)
+             self.events.append(("forward", kind, int(rows)))
+ 
++        def begin_pair(self, rows) -> None:
++            """TF_GLM_PREFILL_PAIRS: the fakes run a pair's two chunks as forwards of their own (``fake_pairs``), each
++            checked here as a whole chunk's forward; the pair itself is logged."""
++
++            assert self.span is None or self.layer == self.end, ("a pair while a slice is open", self.span)
++            self.events.append(("pair", int(rows[0]), int(rows[1])))
++
++        def use(self, slot: int) -> None:
++            pass
++
+     return SliceWire()
+ 
+ 

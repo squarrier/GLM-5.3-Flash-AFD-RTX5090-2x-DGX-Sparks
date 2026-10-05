@@ -1,0 +1,1725 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 16:08:18 -0400
+Subject: [PATCH] cuda/exl3 + glm5_next/cuda: MiaAI-Lab's EXL3 prompt kernel
+ for GLM's prompt chunks, TF_GLM_EXL3_PROMPT (MiaAI-Lab recipe patches 0004,
+ 0009, 0020)
+
+MiaAI-Lab's recipe (github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold @ 1576746) runs GLM-5.3-Flash's
+routed experts of a prompt chunk through dedicated prompt kernels: per pass of up to 64 (or 128) members of one expert,
+Y^T = W^T X^T with each output one fp32 chain of mma over ascending k tiles (no split K, no partials in memory), each
+decoded trellis tile feeding the whole pass, and the gate/up and down epilogues fused. A row's bits depend on its own
+values only, so any chunking gives the same prompt state; they are the recipe's prompt bits, not the grouped kernel's
+(which sums split and warp partials). This ports the EXL3 part of recipe patch 0004-glm-prompt-kernels at the end state
+of the recipe's chain (with 0009-glm-prefill-kernels' shared-row inputs and 0020-glm-prompt-experts-order's item
+order), Apache License 2.0, Copyright 2026 MiaAI-Lab:
+
+- cuda/exl3/experts_prompt.cu (new): the recipe's helpers (mcg2, decode_tile_p, mma16816, fwht128, bf16r, cp.async,
+  ldmatrix), pass configuration, prompt_mainloop, prompt_spill, prompt_smem, prompt_order_kernel and prompt_launch
+  byte for byte, and its gate/up and down kernels with data movement changed only: a kernel reads its expert's
+  trellis base from the layer's per-expert pointer table and runs the recipe's main loop on it; a member is the
+  universal grouping's code row * 32 + slot, read as the recipe plan's pair row * slots + slot. prompt_plan_kernel
+  (new) lays group()'s grouping out as the recipe plan's items (expert, first member, count) of up to a pass's
+  members: the items the recipe's plan_kernel makes for the routed experts, in the same order.
+- cuda/exl3/experts.cpp: the prompt binding. cuda/exl3/experts.py: routed(.., prompt, prompt_pass) runs a window
+  through it (the recipe's rotations: rot_rows for a layer with a shared_suh under rowrot, else rot_in; then the plan,
+  the recipe's item order under order, the kernels; Y combined by combine's fma chain when weights are given), for
+  4-bit mcg layers at GLM's tile settings, widths in the kernels' blocks, 16-byte aligned trellises and GLM's bf16
+  SwiGLU (prompt_kernel_ready); anything else launches as before. prompt_items gives the launch's items bound (the
+  recipe's max_items); the plan buffers are made on a scratch's first prompt window. The extension is renamed
+  tensorfold_exl3_experts_v4 (a new source).
+- families/glm5_next/cuda/exl3_generic.py: prompt_switches reads the recipe's names: TF_GLM_EXL3_PROMPT (1 on; unset or
+  0 off; anything else refuses), TF_GLM_EXL3_PASS (64, the recipe's default, or 128: the same bits),
+  TF_GLM_EXL3_ORDER and TF_GLM_EXL3_ROWROT (on unless 0). routed(.., prompt=) adds them for a prompt chunk's window.
+- families/glm5_next/cuda/experts_node.py: the expert node marks its MODE_CHUNK, MODE_SLICE and MODE_PAIR forwards as
+  prompt chunks and compute passes the mark (decode windows never take the kernel); serve() reads the switch before
+  the load and prints a startup line when it is on.
+
+TF_GLM_EXL3_PROMPT is off unless set (the recipe's code turns it on). Unset, every call is the one before: GLM's call
+sites pass the same arguments, no existing CUDA source changed, and the only change on that path is the extension's
+name. Set, a prompt row's routed-expert outputs change class (the recipe's prompt bits). The new CUDA source needs to
+be in the experts extension wherever the extensions are prebuilt (the module's _ext lists it).
+
+Tests: tests/test_exl3_prompt_kernel.py (CPU: a model of prompt_plan_kernel gives exactly the recipe plan_kernel's
+routed items, members and order at 1-2,048 rows, uniform and skewed routing, both passes, within prompt_items; the
+recipe's order kernel (modelled) gives the same launch order on both plans; the switch's names, defaults and refusals;
+unset, every GLM call is the call before; set, prompt chunks of 1-2,048 rows call the rotation and the kernel with the
+expected buffers, decode windows and other callers do not, and layers outside the kernel's scope launch as before; the
+expert node marks prompt chunks from the forward's mode). tests/cuda/test_exl3_prompt_kernel.py (GPU: against the
+recipe's own kernel built from its tree (TF_MIA_TREE, pinned by sha256): xd and Y byte-equal at 1-2,048 rows, both
+passes, item order on and off, rotation per row and per pair, shared and per-expert suh; the same bytes twice, and a
+window's rows equal to the same rows in two smaller windows; times and the distance from the grouped kernel's bits
+reported for information).
+
+Credit: THIRD_PARTY_NOTICES.md ("GLM EXL3 prompt kernel (TF_GLM_EXL3_PROMPT)") and the kernel file's header name
+MiaAI-Lab, the patches and the recipe commit.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patches 0004, 0009, 0020,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 1576746a04983b6eded0551dbf22512ee9e95654 (v1.5); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |  21 +
+ src/tensorfold/cuda/exl3/experts.cpp          |  36 ++
+ src/tensorfold/cuda/exl3/experts.py           |  86 ++-
+ src/tensorfold/cuda/exl3/experts_prompt.cu    | 561 ++++++++++++++++++
+ .../families/glm5_next/cuda/exl3_generic.py   |  40 +-
+ .../families/glm5_next/cuda/experts_node.py   |  13 +-
+ tests/cuda/test_exl3_prompt_kernel.py         | 299 ++++++++++
+ tests/test_exl3_prompt_kernel.py              | 422 +++++++++++++
+ 8 files changed, 1468 insertions(+), 10 deletions(-)
+ create mode 100644 src/tensorfold/cuda/exl3/experts_prompt.cu
+ create mode 100644 tests/cuda/test_exl3_prompt_kernel.py
+ create mode 100644 tests/test_exl3_prompt_kernel.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index e4e4505..5e9aac5 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -340,3 +340,24 @@ keeps its state before its last token as before (`multi.keep_point`), and only w
+ a replay; MTP streams replay too (the kept last hidden row waits for the first token); multi-prompt chunks
+ (`TF_GLM_MULTI_PREFILL`) leave replays out. `TF_GLM_KDA_CHUNKED` and `TF_GLM_PROMPT_GRID` are off unless set (the
+ recipe's `config.sh` sets `KDA_CHUNKED=1`).
++
++## GLM EXL3 prompt kernel (TF_GLM_EXL3_PROMPT)
++
++`cuda/exl3/experts_prompt.cu` (`mcg2`, `decode_tile_p`, `mma16816`, `fwht128`, `bf16r`, the cp.async and ldmatrix
++helpers, `PromptCfg`, `prompt_tile`, `prompt_mainloop`, `prompt_spill`, `prompt_smem`, `prompt_order_kernel`,
++`prompt_gateup_kernel`, `prompt_down_kernel`, `prompt_launch`), the `prompt` binding in `cuda/exl3/experts.cpp`, and
++`routed(.., prompt, prompt_pass)` / `prompt_kernel_ready` / `prompt_items` in `cuda/exl3/experts.py` are ported from
++MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/1576746)
++patch 0004-glm-prompt-kernels (its EXL3 prompt kernels, at the end state of the recipe's chain: with
++0009-glm-prefill-kernels' shared-row inputs and 0020-glm-prompt-experts-order's item order), Apache License 2.0,
++Copyright 2026 MiaAI-Lab (see [the license text](LICENSES/Apache-2.0.txt)). The helpers, the main loop, the spill, the
++item order and the two kernels' arithmetic are the recipe's code. Changes in the port, data movement only: the kernels
++read each expert's trellis through the universal layer's pointer table (the recipe stacks a layer's trellises) and
++run the recipe's main loop on it; a member is the universal grouping's code `row * 32 + slot`, read as the recipe
++plan's pair `row * slots + slot`; `prompt_plan_kernel` (new) lays the universal grouping out as the recipe plan's items
++(expert, first member, count) of up to a pass's members. `families/glm5_next/cuda/exl3_generic.py`'s
++`prompt_switches` reads the recipe's names (`TF_GLM_EXL3_PROMPT`, `TF_GLM_EXL3_PASS`, `TF_GLM_EXL3_ORDER`,
++`TF_GLM_EXL3_ROWROT`), and the AFD expert node (`experts_node.py`) takes the kernel for prompt chunks only, as the
++recipe's prompt-chunk buffers do. A prompt row's expert outputs are then the recipe's prompt bits, not the grouped
++kernel's. `TF_GLM_EXL3_PROMPT` is off unless set (the recipe's code turns it on).
+diff --git a/src/tensorfold/cuda/exl3/experts.cpp b/src/tensorfold/cuda/exl3/experts.cpp
+index 5198fb7..87f8968 100644
+--- a/src/tensorfold/cuda/exl3/experts.cpp
++++ b/src/tensorfold/cuda/exl3/experts.cpp
+@@ -22,6 +22,11 @@ void exl3x_down_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::Te
+ void exl3x_combine_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
+ void exl3x_down_combine_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, const at::Tensor&,
+                              at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
++void exl3x_prompt_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                       const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&,
++                       const c10::optional<at::Tensor>&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                       const at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, double, int64_t,
++                       int64_t, bool);
+ 
+ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
+     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
+@@ -190,6 +195,36 @@ void dec(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, cons
+     exl3x_dec_cuda(X0, X1, TP0, TP1, uids, ucount, members, Z, svh, y, mats, K, N, P, SK, slots, fuse, xrow, ld);
+ }
+ 
++// A prompt window's routed experts through MiaAI-Lab's prompt kernel (TF_GLM_EXL3_PROMPT; recipe patch 0004,
++// experts_prompt.cu): group()'s grouping as her plan of `pass`-member items, her item order when `order` is given,
++// then xd [P, N] fp16 and y [P, D] fp32 of every routed pair (one fp32 mma chain an output, the epilogues fused).
++void prompt(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tensor& TPg, const at::Tensor& TPu,
++            const at::Tensor& TPd, const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members,
++            at::Tensor items, at::Tensor counts, c10::optional<at::Tensor> order, const at::Tensor& svh_g,
++            const at::Tensor& svh_u, const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor xd, at::Tensor y,
++            int64_t D, int64_t N, int64_t E, int64_t max_items, double limit, int64_t pass, int64_t slots,
++            bool shx) {
++    for (auto* t : {&Xg, &Xu, &svh_g, &svh_u, &suh_d, &svh_d}) check(*t, at::kHalf, "prompt: fp16 input");
++    for (auto* t : {&TPg, &TPu, &TPd}) check(*t, at::kLong, "prompt: trellis pointers");
++    for (auto* t : {&uids, &ucount, &members}) check(*t, at::kInt, "prompt: int32 input");
++    check(items, at::kInt, "prompt: items");
++    check(counts, at::kInt, "prompt: counts");
++    check(xd, at::kHalf, "prompt: xd");
++    check(y, at::kFloat, "prompt: y");
++    TORCH_CHECK(TPg.numel() >= E && TPu.numel() >= E && TPd.numel() >= E, "prompt: a trellis pointer an expert");
++    TORCH_CHECK(members.dim() == 2 && members.size(0) >= uids.numel(), "prompt: members [>= uids, maxm]");
++    TORCH_CHECK(max_items > 0 && items.numel() >= 3 * max_items && counts.numel() >= 2, "prompt: plan buffers");
++    TORCH_CHECK(!shx || Xg.data_ptr() == Xu.data_ptr(), "prompt: shared rows take one Xh for gate and up");
++    TORCH_CHECK(slots > 0 && slots <= 32, "prompt: 1 to 32 slots a row");
++    TORCH_CHECK(svh_g.size(-1) == N && svh_u.size(-1) == N && suh_d.size(-1) == N && svh_d.size(-1) == D,
++                "prompt: scales [E, N] (gate, up, down's suh) and [E, D] (down's svh)");
++    TORCH_CHECK(xd.size(-1) == N && y.size(-1) == D, "prompt: xd [P, N], y [P, D]");
++    if (order.has_value()) check(*order, at::kInt, "prompt: order");
++    c10::cuda::CUDAGuard guard(Xg.device());
++    exl3x_prompt_cuda(Xg, Xu, TPg, TPu, TPd, uids, ucount, members, items, counts, order, svh_g, svh_u, suh_d, svh_d,
++                      xd, y, D, N, E, max_items, limit, pass, slots, shx);
++}
++
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("grouped", &grouped);
+     m.def("dequant", &dequant);
+@@ -202,4 +237,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("combine", &combine);
+     m.def("down_combine", &down_combine);
+     m.def("dec", &dec);
++    m.def("prompt", &prompt);
+ }
+diff --git a/src/tensorfold/cuda/exl3/experts.py b/src/tensorfold/cuda/exl3/experts.py
+index f7aaf40..b1e9d2a 100644
+--- a/src/tensorfold/cuda/exl3/experts.py
++++ b/src/tensorfold/cuda/exl3/experts.py
+@@ -21,6 +21,9 @@ GLM_DOWN = (8, 4, 1, 1)
+ # The prompt switches of ``routed`` (adapted from MiaAI-Lab's GLM-5.3-Flash recipe patches 0001, 0020 and 0009, written
+ # for her dedicated 4-bit kernel) apply to 4-bit mcg layers at those tile settings; anything else launches as before.
+ PROMPT_K2 = (8, 8)
++# ``routed``'s ``prompt`` (her recipe patch 0004's prompt kernel, experts_prompt.cu): members a pass takes (her
++# TF_GLM_EXL3_PASS: 64, or 128, the same bits)
++PROMPT_PASSES = (64, 128)
+ 
+ 
+ @lru_cache(maxsize=1)
+@@ -28,8 +31,9 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
+-    return load(name="tensorfold_exl3_experts_v3", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
++    srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu",
++                                    "experts_prompt.cu")]
++    return load(name="tensorfold_exl3_experts_v4", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+                 verbose=False)
+ 
+ 
+@@ -190,6 +194,8 @@ class Scratch:
+         self.rows, self.slots, self.count_experts = rows, slots, ex.count
+         # the ``order`` prompt switch's launch order (prompt_order_kernel), sized for the widest window
+         self.order = torch.full((order_slots(rows, slots, ex.count),), -1, dtype=torch.int32, device=device)
++        # ``routed``'s ``prompt`` kernel's plan and order buffers (``_prompt_buffers``), made on its first window
++        self.prompt_bufs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+ 
+     def window(self, R: int):
+         """(ids, members) sized for R rows: the grids only span what R rows can use."""
+@@ -225,11 +231,42 @@ def nc_aligned(ex: Exl3RoutedExperts) -> bool:
+     return ok
+ 
+ 
++def prompt_kernel_ready(ex: Exl3RoutedExperts, slots: int) -> bool:
++    """Whether ``routed``'s ``prompt`` (MiaAI-Lab recipe patch 0004's prompt kernel) applies: her kernel's scope, 4-bit
++    mcg experts (one 32-bit word a lane a tile), widths in its blocks (D: 256 columns, the width: 128), trellises on
++    16-byte boundaries (its cp.async stages), at most 32 slots (group()'s member codes)."""
++
++    return (ex.cb == CB_MCG and tuple(ex.k2_gu) == PROMPT_K2 and tuple(ex.k2_d) == PROMPT_K2
++            and ex.dims % 256 == 0 and ex.width % 128 == 0 and 1 <= slots <= 32 and nc_aligned(ex))
++
++
++def prompt_items(R: int, slots: int, count: int, pass_: int) -> int:
++    """The prompt kernel's launch slots (grid y) for R rows: her plan's ``max_items`` for R * slots pairs over the
++    routed experts and the shared one (an item per used expert, plus one per ``pass_`` pairs past its first)."""
++
++    return min(R * slots, count + 1) + (R * slots) // pass_
++
++
++def _prompt_buffers(s: Scratch, count: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """The prompt kernel's plan (items [3 x launch slots], counts [2]) and order buffers, sized for ``s``'s widest
++    window at the smaller pass; made on the first prompt window (a few KB), so a scratch that never takes one is
++    unchanged."""
++
++    bufs = s.prompt_bufs
++    if bufs is None:
++        cap = prompt_items(s.rows, s.slots, count, min(PROMPT_PASSES))
++        dev = s.xg.device
++        bufs = (torch.zeros((3 * cap,), dtype=torch.int32, device=dev), torch.zeros((2,), dtype=torch.int32, device=dev),
++                torch.full((cap,), -1, dtype=torch.int32, device=dev))
++        s.prompt_bufs = bufs
++    return bufs
++
++
+ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
+            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
+            group: bool = True, *, nfirst: bool = False, prefetch: bool = False, order: bool = False,
+            rowrot: bool = False, dec: bool = False, fuse: int = 1, dec_xrow: bool = False,
+-           loads: int = 0) -> torch.Tensor:
++           loads: int = 0, prompt: bool = False, prompt_pass: int = 64) -> torch.Tensor:
+     """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync.
+ 
+     The prompt switches (all off by default; GLM sets them for prompt windows) change only the launch, never a bit
+@@ -241,7 +278,14 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
+     patches 0016 and 0047) keep every bit too: ``dec`` runs gate/up and down through the decode kernel, ``fuse`` 1 with
+     the down projection's epilogue in it, ``dec_xrow`` one rotated input a row (a ``shared_suh`` layer), ``loads``
+     1..3 its 16-byte trellis loads 1 / 2 / 4 k steps ahead (0 without 16-byte aligned trellises). Off unless
+-    ``dec_ready``."""
++    ``dec_ready``.
++
++    ``prompt`` (off by default; GLM's expert node sets it for prompt chunks under TF_GLM_EXL3_PROMPT=1) runs the window
++    through her prompt kernel (recipe patch 0004 at the end of her chain, experts_prompt.cu): passes of
++    ``prompt_pass`` members (64 or 128), one fp32 mma chain over ascending k an output, the gate/up and down epilogues
++    fused, with ``order`` her item order and ``rowrot`` one rotated input a row. Her lane's prompt bits, not the grouped
++    kernel's split-K sums (outputs class), for GLM's bf16 SwiGLU (``act_mode`` ACT_BF16) only. Off unless
++    ``prompt_kernel_ready``."""
+ 
+     ext = _ext()
+     D, I, E = ex.dims, ex.width, ex.count
+@@ -252,6 +296,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
+     ids, members = s.window(R)
+     if group:
+         ext.group(pick, ids, s.count, members, R, slots, E)
++    if prompt and act_mode == ACT_BF16 and prompt_kernel_ready(ex, slots):
++        return _prompt_routed(ext, x, pick, wts, ex, s, out, R, limit, ids, members, prompt_pass, order, rowrot)
+     if (nfirst or prefetch or order or rowrot) and not prompt_ready(ex, s):
+         nfirst = prefetch = order = rowrot = False
+     rowrot = rowrot and ex.shared_suh is not None
+@@ -327,6 +373,38 @@ def _dec_routed(ext, x, pick, wts, ex: Exl3RoutedExperts, s: Scratch, out, R: in
+     return out
+ 
+ 
++def _prompt_routed(ext, x, pick, wts, ex: Exl3RoutedExperts, s: Scratch, out, R: int, limit: float, ids, members,
++                   pass_: int, order: bool, rowrot: bool) -> torch.Tensor:
++    """``routed`` for a prompt window through MiaAI-Lab's prompt kernel (recipe patch 0004, her exl3_mm.routed's
++    prompt branch on this grouping): her rotations (``rot_rows`` for a ``shared_suh`` layer under ``rowrot``, else
++    ``rot_in``), then ``ext.prompt``: the plan, her item order under ``order``, her gate/up and down kernels writing xd
++    and Y. No Z partials; the combine is ``combine``'s fma chain, as the fused decode path's."""
++
++    if pass_ not in PROMPT_PASSES:
++        raise ValueError(f"routed: prompt_pass is 64 or 128, not {pass_}")
++    D, NI, E = ex.dims, ex.width, ex.count
++    slots = s.slots
++    P = R * slots
++    items, counts, obuf = _prompt_buffers(s, E)
++    cap = prompt_items(R, slots, E, pass_)
++    shx = rowrot and ex.shared_suh is not None
++    if shx:                                             # one rotated input a row, read by all its pairs' gate and up
++        ext.rot_rows(x, x.stride(0), ex.shared_suh, s.xg, R, D)
++        xg = xu = s.xg
++    else:
++        ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
++        xg, xu = s.xg, s.xu
++    ext.prompt(xg, xu, ex.gate_ptr, ex.up_ptr, ex.down_ptr, ids, s.count, members, items, counts,
++               obuf if order else None, ex.svh_g, ex.svh_u, ex.suh_d, ex.svh_d, s.xd, s.y, D, NI, E, cap, float(limit),
++               pass_, slots, shx)
++    if wts is None:
++        return s.y[:P]
++    if out is None:
++        out = torch.empty((R, D), dtype=torch.float32, device=x.device)
++    ext.combine(s.y, wts, out, R, D, slots)
++    return out
++
++
+ def dequant(trellis: torch.Tensor, codebook: int | str) -> torch.Tensor:
+     """W_q [K, N] fp16 of one matrix through the kernels' own lane decode (ExLlamaV3's ``reconstruct``); for tests."""
+ 
+diff --git a/src/tensorfold/cuda/exl3/experts_prompt.cu b/src/tensorfold/cuda/exl3/experts_prompt.cu
+new file mode 100644
+index 0000000..f8ad539
+--- /dev/null
++++ b/src/tensorfold/cuda/exl3/experts_prompt.cu
+@@ -0,0 +1,561 @@
++// Ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe @ 1576746, patch 0004-glm-prompt-kernels
++// (Apache-2.0, Copyright 2026 MiaAI-Lab; THIRD_PARTY_NOTICES.md "GLM EXL3 prompt kernel").
++//
++// The prompt chunks' routed-expert kernels of her dedicated glm5_next/cuda/exl3.cu, at the end state of her chain
++// (0004's kernels with 0009's shared-row inputs and 0020's item order: the recipe's patches 0001-0068 applied to
++// TensorFold v0.6.0), on this directory's grouping: the routed experts' outputs Y^T = W^T X^T of a prompt window,
++// one fp32 chain of mma over ascending k tiles an output (no split K, no partials in memory), with her gate/up and down
++// epilogues fused. A row's bits depend on its own values only (any chunking gives the same prompt state), and they
++// are her lane's prompt bits, not the grouped kernel's (which sums split and warp partials): outputs class, so the
++// GLM call site takes it only for prompt chunks under TF_GLM_EXL3_PROMPT=1 (off unless set; her default is on).
++//
++// What is hers, unchanged: the helpers (mcg2, decode_tile_p, mma16816, fwht128, bf16r, cp.async, ldmatrix), the
++// pass configuration, prompt_mainloop, prompt_spill, prompt_smem, prompt_order_kernel, the gate/up and down kernels'
++// arithmetic and launch (prompt_launch). What the port changes, all data movement (marked "port:"):
++//   - a layer's trellises are this directory's per-expert pointers (Exl3RoutedExperts.gate_ptr ..), so a kernel reads
++//     its expert's base from the table and runs her main loop on it as expert 0 of a one-expert stack;
++//   - members are group()'s codes row * 32 + slot, read as her plan's pair p = row * slots + slot;
++//   - prompt_plan_kernel (new) lays group()'s grouping out as her plan's items (expert, first member, count) of up to
++//     a pass's members, in expert order, then pass order: the items her plan_kernel makes for the routed experts.
++
++#include <cuda_fp16.h>
++#include <cuda_bf16.h>
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++
++namespace {
++
++constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
++
++// Two values of the "mcg" codebook from two 16-bit states, as a half2 (first state in .x).
++__device__ __forceinline__ uint32_t mcg2(uint32_t s0, uint32_t s1) {
++    uint32_t x0 = s0 * 0xCBAC1FEDu;
++    uint32_t x1 = s1 * 0xCBAC1FEDu;
++    x0 = (x0 & 0x8FFF8FFFu) ^ 0x3B603B60u;
++    x1 = (x1 & 0x8FFF8FFFu) ^ 0x3B603B60u;
++    uint32_t lo = __byte_perm(x0, x1, 0x5410);
++    uint32_t hi = __byte_perm(x0, x1, 0x7632);
++    half2 r = __hadd2(*reinterpret_cast<half2*>(&lo), *reinterpret_cast<half2*>(&hi));
++    return *reinterpret_cast<uint32_t*>(&r);
++}
++
++// decode_tile's values with fewer integer instructions (the prompt kernels): the byte-aligned 16-bit states taken
++// with one PRMT each and w >> 4 shared by two states. The same states, so the same bits.
++__device__ __forceinline__ void decode_tile_p(uint32_t w, int lane, uint32_t (&b0)[2], uint32_t (&b1)[2]) {
++    const uint32_t p = __shfl_sync(0xffffffffu, w, (lane + 31) & 31);
++    const uint32_t s = __funnelshift_r(w, p, 20);
++    const uint32_t t = w >> 4;
++    b0[0] = mcg2(__byte_perm(s, 0u, 0x4421), (s >> 4) & 0xffffu);          // (s >> 8) & 0xffff, (s >> 4) & 0xffff
++    b0[1] = mcg2(s & 0xffffu, w >> 16);
++    b1[0] = mcg2(__byte_perm(t, 0u, 0x4421), __byte_perm(w, 0u, 0x4421));   // (w >> 12) & 0xffff, (w >> 8) & 0xffff
++    b1[1] = mcg2(__byte_perm(t, 0u, 0x4410), w & 0xffffu);                  // (w >> 4) & 0xffff, w & 0xffff
++}
++
++__device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
++                 "{%0,%1,%2,%3};\n"
++                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
++}
++
++// Fast Walsh-Hadamard transform of 128 values held 4 per lane (lane L: values 4L..4L+3), natural order, fixed
++// butterfly order: strides 1, 2 in registers, 4..64 across lanes.
++__device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
++    float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
++    v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
++#pragma unroll
++    for (int m = 1; m < 32; m <<= 1) {
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            float o = __shfl_xor_sync(0xffffffffu, v[j], m);
++            v[j] = (lane & m) ? o - v[j] : v[j] + o;
++        }
++    }
++}
++
++__device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
++
++// ---- prompt chunks: Y^T = W^T X^T --------------------------------------------------------------------------------
++// A decoded trellis tile is, reordered, an m16n8k16 A fragment of W^T (lane (g, t): a0 = b0[0], a1 = b1[0],
++// a2 = b0[1], a3 = b1[1]), so each warp decodes its own tiles straight into registers and every decoded fragment
++// feeds the whole pass's member rows (up to 64 tokens, the prefill plan's item) as B fragments from shared memory.
++// Each output is one fp32 chain of mma over ascending k tiles (no split K, no partials in memory), so a row's bits
++// depend on its own values only (any chunking gives the same prompt state), though they are not the decode
++// kernel's (which sums split and warp partials). The epilogues are gateup/down_epilogue_kernel's formulas.
++constexpr int PBK = 32;              // k values a shared-memory stage (2 k tiles)
++constexpr int PKT = PBK / 16;
++constexpr int PSTAGES = 3;
++constexpr int PXS = PBK + 8;         // stage row stride in halves (+16 B: ldmatrix rows on distinct banks)
++
++__device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool ok) {
++    const unsigned s = (unsigned)__cvta_generic_to_shared(smem);
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(ok ? 16 : 0));
++}
++__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
++template <int N>
++__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
++__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {
++    const unsigned s = (unsigned)__cvta_generic_to_shared(p);
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
++                 : "r"(s));
++}
++
++// A block covers 16 m tiles (gate/up: 8 of each matrix = one 128-column Hadamard block; down: 256 columns) for a
++// pass of PM members with NW warps: each warp holds MT = 16 / NW m tiles for all PM members (PM / 8 n blocks), so a
++// decoded tile feeds PM / 8 mma. PM 64 / 8 warps (two blocks an SM) or PM 128 / 16 warps (one): the same per-element
++// chains, so the same bits. Every stage brings the members' next PBK k values and the 16 tiles' trellis words into
++// shared memory (cp.async, PSTAGES deep). SHX (gate/up of a layer whose experts share one suh for both): gate and up
++// read the same member rows (X0 = X1 = the per-row Xh, the members' rows from xrows), so a stage holds them once.
++constexpr int PWORDS = 16 * PKT * 32;          // a stage's trellis words (16 m tiles x PKT k tiles x 32)
++
++template <int MATS, int PM, int NW, bool SHX = false>
++struct PromptCfg {
++    static constexpr int MT = 16 / NW, NB = PM / 8, T = NW * 32;
++    static constexpr int XM = SHX ? 1 : MATS;               // member-row copies a stage holds
++    static constexpr size_t STAGE_HALVES = (size_t)XM * PM * PXS + 2 * PWORDS;
++};
++
++// Which (matrix, m tile) warp-tile q (0..15) of block cb is.
++template <int MATS>
++__device__ __forceinline__ void prompt_tile(int q, int cb, int& mat, int& nt) {
++    mat = MATS == 2 ? q >> 3 : 0;
++    nt = MATS == 2 ? cb * 8 + (q & 7) : cb * 16 + q;
++}
++
++template <int MATS, int PM, int NW, bool SHX = false>
++__device__ __forceinline__ void prompt_mainloop(const half* __restrict__ X0, const half* __restrict__ X1,
++                                                const uint32_t* __restrict__ T0, const uint32_t* __restrict__ T1,
++                                                const int* rows_sh, int cnt, int e, int K, int NTILES, int cb,
++                                                half* stage, float (&acc)[16 / NW][PM / 8][4]) {
++    using C = PromptCfg<MATS, PM, NW, SHX>;
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    int mat, nt_unused;
++    prompt_tile<MATS>(warp * C::MT, cb, mat, nt_unused);
++    const int KT = K >> 4, chunks = K / PBK;
++    const int nblocks = (cnt + 15) >> 4;                                            // 16-member blocks in use
++
++#pragma unroll
++    for (int i = 0; i < C::MT; ++i)
++#pragma unroll
++        for (int j = 0; j < C::NB; ++j)
++#pragma unroll
++            for (int c = 0; c < 4; ++c) acc[i][j][c] = 0.f;
++
++    auto load = [&](int chunk) {
++        half* dst = stage + (size_t)(chunk % PSTAGES) * C::STAGE_HALVES;
++        const int k0 = chunk * PBK;
++        for (int idx = threadIdx.x; idx < C::XM * PM * (PBK / 8); idx += C::T) {
++            const int m = idx / (PM * (PBK / 8)), rem = idx % (PM * (PBK / 8)), i = rem / (PBK / 8),
++                      j = rem % (PBK / 8);
++            const int r = rows_sh[i];
++            const half* src = (m ? X1 : X0) + (size_t)(r < 0 ? 0 : r) * K + k0 + j * 8;
++            cp_async16(dst + ((size_t)m * PM + i) * PXS + j * 8, src, r >= 0);
++        }
++        uint32_t* wdst = reinterpret_cast<uint32_t*>(dst + (size_t)C::XM * PM * PXS);
++        for (int idx = threadIdx.x; idx < 16 * PKT * 8; idx += C::T) {       // 16 B pieces of 128-B tile words
++            const int q = idx / (PKT * 8), kk = (idx / 8) % PKT, part = idx % 8;
++            int wm, nt;
++            prompt_tile<MATS>(q, cb, wm, nt);
++            const uint32_t* src = (wm ? T1 : T0) + (((size_t)e * KT + chunk * PKT + kk) * NTILES + nt) * 32 + part * 4;
++            cp_async16(wdst + ((size_t)q * PKT + kk) * 32 + part * 4, src, true);
++        }
++    };
++#pragma unroll
++    for (int c = 0; c < PSTAGES - 1; ++c) {
++        if (c < chunks) load(c);
++        cp_async_commit();
++    }
++    for (int c = 0; c < chunks; ++c) {
++        cp_async_wait<PSTAGES - 2>();
++        __syncthreads();
++        if (c + PSTAGES - 1 < chunks) load(c + PSTAGES - 1);
++        cp_async_commit();
++        const half* base = stage + (size_t)(c % PSTAGES) * C::STAGE_HALVES;
++        const half* xs = base + (size_t)(SHX ? 0 : mat) * PM * PXS;
++        const uint32_t* ws = reinterpret_cast<const uint32_t*>(base + (size_t)C::XM * PM * PXS);
++#pragma unroll
++        for (int kk = 0; kk < PKT; ++kk) {
++            uint32_t a[C::MT][4];
++#pragma unroll
++            for (int i = 0; i < C::MT; ++i) {
++                uint32_t b0[2], b1[2];
++                decode_tile_p(ws[((size_t)(warp * C::MT + i) * PKT + kk) * 32 + lane], lane, b0, b1);
++                a[i][0] = b0[0]; a[i][1] = b1[0]; a[i][2] = b0[1]; a[i][3] = b1[1];
++            }
++#pragma unroll
++            for (int jb = 0; jb < PM / 16; ++jb) {
++                if (jb < nblocks) {
++                    uint32_t r[4];
++                    const int row = jb * 16 + (lane & 7) + ((lane >> 4) & 1) * 8;
++                    ldsm_x4(r, xs + (size_t)row * PXS + kk * 16 + ((lane >> 3) & 1) * 8);
++                    const uint32_t bl[2] = {r[0], r[1]}, bh[2] = {r[2], r[3]};
++                    const bool upper = jb * 16 + 8 < cnt;         // members 8..15 of the block (else zero rows)
++#pragma unroll
++                    for (int i = 0; i < C::MT; ++i) {
++                        mma16816(acc[i][2 * jb], a[i], bl);
++                        if (upper) mma16816(acc[i][2 * jb + 1], a[i], bh);
++                    }
++                }
++            }
++        }
++    }
++    cp_async_wait<0>();
++    __syncthreads();                                   // the stages become the epilogue's rows
++}
++
++// acc (this warp's m tiles, members PM / 2 * hf .. + PM / 2 - 1) -> E[member - PM / 2 * hf][col] fp32, row stride
++// ES; col0: the first m tile's first column within the block's E columns.
++template <int MT, int PM>
++__device__ __forceinline__ void prompt_spill(float* E, int ES, int col0, const float (&acc)[MT][PM / 8][4], int hf) {
++    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
++#pragma unroll
++    for (int i = 0; i < MT; ++i)
++#pragma unroll
++        for (int q = 0; q < PM / 16; ++q) {
++            const int nb = hf * (PM / 16) + q;
++            const int tok = q * 8 + 2 * t, col = col0 + i * 16 + g;
++            E[(size_t)tok * ES + col] = acc[i][nb][0];
++            E[(size_t)(tok + 1) * ES + col] = acc[i][nb][1];
++            E[(size_t)tok * ES + col + 8] = acc[i][nb][2];
++            E[(size_t)(tok + 1) * ES + col + 8] = acc[i][nb][3];
++        }
++}
++
++constexpr int GU_ES = 128 + 4, DN_ES = 256 + 4;
++template <int PM, int XM = 2>
++constexpr size_t prompt_smem() {
++    // max of: gate/up stages (XM copies of the member rows), down stages, gate/up epilogue half (2 x PM/2 x GU_ES),
++    // down half (PM/2 x DN_ES)
++    const size_t gu = (size_t)PSTAGES * (XM * PM * PXS + 2 * PWORDS) * 2;
++    const size_t ep = (size_t)2 * (PM / 2) * GU_ES * 4;
++    const size_t dn = (size_t)(PM / 2) * DN_ES * 4;
++    return gu > ep ? (gu > dn ? gu : dn) : (ep > dn ? ep : dn);
++}
++
++// port (new, not in the recipe): group()'s grouping as MiaAI-Lab's prompt plan. group() leaves the distinct routed
++// experts in id order (uids[u], u < ucount) and each one's members in row order (members[u * maxm + m] = row * 32 +
++// slot, -1 after the last); her plan_kernel (tensorfold/cuda/experts.cu, place_items) lays a plan out as items
++// (expert, first member, count) of up to `pass` members, in expert order, then pass order. These are the same items
++// for the routed experts, with `first` indexing this grouping's members (u * maxm + j * pass); her plan also holds the
++// shared expert's (id E, last), which her kernels skip. counts = [items, experts]. One block; `cap` (the launch's grid
++// y, her max_items) bounds the items.
++__global__ void __launch_bounds__(1024) prompt_plan_kernel(const int* __restrict__ uids,
++                                                           const int* __restrict__ ucount,
++                                                           const int* __restrict__ members, int maxm, int pass,
++                                                           int cap, int E, int* __restrict__ items,
++                                                           int* __restrict__ counts) {
++    __shared__ int wsum[32];
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    const int U = ucount[0];
++    const int per = (U + 1023) / 1024;
++    const int lo = min(U, tid * per), hi = min(U, lo + per);
++    auto members_of = [&](int u) {                     // members come first, -1 after: find the first -1
++        if (uids[u] >= E) return 0;
++        const int* m = members + (size_t)u * maxm;
++        int a = 0, b = maxm;
++        while (a < b) {
++            const int c = (a + b) >> 1;
++            if (m[c] >= 0) a = c + 1; else b = c;
++        }
++        return a;
++    };
++    int t = 0;                                         // this thread's items
++    for (int u = lo; u < hi; ++u) t += (members_of(u) + pass - 1) / pass;
++    int v = t;                                         // inclusive scan over the block
++#pragma unroll
++    for (int o = 1; o < 32; o <<= 1) {
++        const int w = __shfl_up_sync(0xffffffffu, v, o);
++        if (lane >= o) v += w;
++    }
++    if (lane == 31) wsum[warp] = v;
++    __syncthreads();
++    if (warp == 0) {
++        int w = wsum[lane];
++#pragma unroll
++        for (int o = 1; o < 32; o <<= 1) {
++            const int x = __shfl_up_sync(0xffffffffu, w, o);
++            if (lane >= o) w += x;
++        }
++        wsum[lane] = w;
++    }
++    __syncthreads();
++    const int total = wsum[31];
++    if (total > cap) __trap();                         // cap bounds every grouping's items: never
++    int at = (warp ? wsum[warp - 1] : 0) + v - t;      // items before this thread's first expert
++    for (int u = lo; u < hi; ++u) {
++        const int n = members_of(u);
++        for (int j = 0; j * pass < n; ++j, ++at) {
++            items[3 * at] = uids[u];
++            items[3 * at + 1] = u * maxm + j * pass;
++            items[3 * at + 2] = min(pass, n - j * pass);
++        }
++    }
++    if (tid == 0) {
++        counts[0] = total;
++        counts[1] = U;
++    }
++}
++
++// The launch order of a prompt plan's items (ORDER): the items of experts that take one item (their weights come
++// from DRAM, few mma) and of experts that take several (their passes run together and share the weights through L2:
++// mostly mma) merged evenly, each list in plan order, so DRAM and the tensor cores stay busy together instead of in
++// turns. Only which block runs which item changes: every output keeps its bits. The shared expert's items (id E, the
++// plan's last) are left out: order[slot] = item for slot < the routed items, -1 after. One block.
++__global__ void __launch_bounds__(1024) prompt_order_kernel(const int* __restrict__ items,
++                                                            const int* __restrict__ counts, int* __restrict__ order,
++                                                            int cap, int E) {
++    __shared__ int wsum[32];
++    __shared__ int routed;
++    const int all = min(counts[0], cap);
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    if (tid == 0) routed = 0;
++    __syncthreads();
++    for (int i = tid; i < all; i += 1024)               // items are in expert order: the routed ones come first
++        if (items[3 * i] < E && (i + 1 == all || items[3 * (i + 1)] >= E)) routed = i + 1;
++    __syncthreads();
++    const int n = routed;
++    const int per = (n + 1023) / 1024;
++    const int lo = min(n, tid * per), hi = min(n, lo + per);
++    auto heavy = [&](int i) {
++        const int e = items[3 * i];
++        return (i > 0 && items[3 * (i - 1)] == e) || (i + 1 < n && items[3 * (i + 1)] == e);
++    };
++    int h = 0;
++    for (int i = lo; i < hi; ++i) h += heavy(i);
++    int v = h;
++#pragma unroll
++    for (int o = 1; o < 32; o <<= 1) {
++        const int u = __shfl_up_sync(0xffffffffu, v, o);
++        if (lane >= o) v += u;
++    }
++    if (lane == 31) wsum[warp] = v;
++    __syncthreads();
++    if (warp == 0) {
++        int w = wsum[lane];
++#pragma unroll
++        for (int o = 1; o < 32; o <<= 1) {
++            const int u = __shfl_up_sync(0xffffffffu, w, o);
++            if (lane >= o) w += u;
++        }
++        wsum[lane] = w;
++    }
++    __syncthreads();
++    const int nh = wsum[31], nl = n - nh;
++    int rh = (warp ? wsum[warp - 1] : 0) + v - h;       // heavy items before lo
++    for (int i = lo; i < hi; ++i) {
++        if (heavy(i)) {                                // heavy rank r sits at (r + 1/2) / nh; lights before it: strictly
++            const int r = rh++;
++            const long long X = (2LL * r + 1) * nl;
++            const int cl = X > nh ? (int)min((long long)nl, (X - nh + 2LL * nh - 1) / (2LL * nh)) : 0;
++            order[r + cl] = i;
++        } else {                                       // light rank l at (l + 1/2) / nl; heavies at or before it
++            const int l = i - rh;
++            const long long Y = (2LL * l + 1) * nh;
++            const int ch = Y >= nl ? (int)min((long long)nh, (Y - nl) / (2LL * nl) + 1) : 0;
++            order[l + ch] = i;
++        }
++    }
++    for (int i = n + tid; i < all; i += 1024) order[i] = -1;
++}
++
++// SHX: Xg = Xu = Xh [rows, K], one row a token (pair p reads row p / slots); otherwise Xg, Xu [pairs, K].
++// port: Tg / Tu are the layer's per-expert trellis pointers; members hold group()'s codes (row * 32 + slot).
++template <int PM, int NW, bool SHX>
++__global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_gateup_kernel(
++    const half* __restrict__ Xg, const half* __restrict__ Xu, const int64_t* __restrict__ Tg,
++    const int64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
++    const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u,
++    const half* __restrict__ suh_d, half* __restrict__ xd, int K, int N, int E, float limit, int slots,
++    const int* __restrict__ order) {
++    constexpr int MT = 16 / NW, PH = PM / 2;
++    extern __shared__ __align__(16) unsigned char smem_raw[];
++    __shared__ int rows_sh[PM];
++    __shared__ int xrows_sh[SHX ? PM : 1];              // SHX: the members' token rows
++    const int cb = blockIdx.x;
++    if ((int)blockIdx.y >= counts[0]) return;
++    const int item = order ? order[blockIdx.y] : blockIdx.y;
++    if (item < 0) return;                                // ORDER leaves the shared expert's items out
++    const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
++    if (e >= E) return;                                  // the shared expert
++    if (threadIdx.x < PM) {
++        // port: a member is group()'s code row * 32 + slot; her plan's member is the pair p = row * slots + slot
++        const int code = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
++        const int p = code < 0 ? -1 : (code >> 5) * slots + (code & 31);
++        rows_sh[threadIdx.x] = p;
++        if (SHX) xrows_sh[threadIdx.x] = p < 0 ? -1 : p / slots;
++    }
++    __syncthreads();
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    float acc[MT][PM / 8][4];
++    // port: the expert's own trellises, read by her main loop as expert 0 of a one-expert stack
++    const uint32_t* tg = reinterpret_cast<const uint32_t*>(Tg[e]);
++    const uint32_t* tu = reinterpret_cast<const uint32_t*>(Tu[e]);
++    prompt_mainloop<2, PM, NW, SHX>(Xg, Xu, tg, tu, SHX ? xrows_sh : rows_sh, cnt, 0, K, N >> 4, cb,
++                                    reinterpret_cast<half*>(smem_raw), acc);
++    float* Eg = reinterpret_cast<float*>(smem_raw);
++    int mat, nt;
++    prompt_tile<2>(warp * MT, cb, mat, nt);
++    const int col0 = (nt - cb * 8) * 16;
++    const int n = cb * 128 + 4 * lane;
++    for (int hf = 0; hf < 2 && hf * PH < cnt; ++hf) {
++    if (hf) __syncthreads();                             // the first half's rows are read
++    prompt_spill<MT, PM>(Eg + (size_t)mat * PH * GU_ES, GU_ES, col0, acc, hf);
++    __syncthreads();
++    for (int i = warp; i < PH && hf * PH + i < cnt; i += NW) {
++        const int p = rows_sh[hf * PH + i];
++        float gv[4], uv[4];
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            gv[j] = Eg[(size_t)i * GU_ES + 4 * lane + j];
++            uv[j] = Eg[(size_t)(PH + i) * GU_ES + 4 * lane + j];
++        }
++        fwht128(gv, lane);
++        fwht128(uv, lane);
++        float v[4];
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            float gg = fminf(bf16r(gv[j] * HAD_SCALE * __half2float(svh_g[(size_t)e * N + n + j])), limit);
++            float uu = fminf(fmaxf(bf16r(uv[j] * HAD_SCALE * __half2float(svh_u[(size_t)e * N + n + j])), -limit),
++                             limit);
++            float act = bf16r(bf16r(gg / (1.f + expf(-gg))) * uu);
++            v[j] = act * __half2float(suh_d[(size_t)e * N + n + j]);
++        }
++        fwht128(v, lane);
++        const half2 o01 = __halves2half2(__float2half_rn(v[0] * HAD_SCALE), __float2half_rn(v[1] * HAD_SCALE));
++        const half2 o23 = __halves2half2(__float2half_rn(v[2] * HAD_SCALE), __float2half_rn(v[3] * HAD_SCALE));
++        uint2 packed;
++        packed.x = *reinterpret_cast<const uint32_t*>(&o01);
++        packed.y = *reinterpret_cast<const uint32_t*>(&o23);
++        *reinterpret_cast<uint2*>(xd + (size_t)p * N + n) = packed;
++    }
++    }  // halves
++}
++
++// port: Td is the layer's per-expert trellis pointers; members hold group()'s codes (row * 32 + slot).
++template <int PM, int NW>
++__global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_down_kernel(
++    const half* __restrict__ Xd, const int64_t* __restrict__ Td, const int* __restrict__ items,
++    const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
++    float* __restrict__ y, int K, int D, int E, int slots, const int* __restrict__ order) {
++    constexpr int MT = 16 / NW, PH = PM / 2;
++    extern __shared__ __align__(16) unsigned char smem_raw[];
++    __shared__ int rows_sh[PM];
++    const int cb = blockIdx.x;
++    if ((int)blockIdx.y >= counts[0]) return;
++    const int item = order ? order[blockIdx.y] : blockIdx.y;
++    if (item < 0) return;
++    const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
++    if (e >= E) return;
++    if (threadIdx.x < PM) {
++        // port: group()'s code row * 32 + slot as her plan's pair p = row * slots + slot
++        const int code = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
++        rows_sh[threadIdx.x] = code < 0 ? -1 : (code >> 5) * slots + (code & 31);
++    }
++    __syncthreads();
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    float acc[MT][PM / 8][4];
++    // port: the expert's own trellis, read by her main loop as expert 0 of a one-expert stack
++    const uint32_t* td = reinterpret_cast<const uint32_t*>(Td[e]);
++    prompt_mainloop<1, PM, NW>(Xd, Xd, td, td, rows_sh, cnt, 0, K, D >> 4, cb, reinterpret_cast<half*>(smem_raw),
++                               acc);
++    float* Ed = reinterpret_cast<float*>(smem_raw);
++    for (int hf = 0; hf < 2 && hf * PH < cnt; ++hf) {
++    if (hf) __syncthreads();
++    prompt_spill<MT, PM>(Ed, DN_ES, warp * MT * 16, acc, hf);
++    __syncthreads();
++    for (int i = warp; i < PH && hf * PH + i < cnt; i += NW) {
++        const int p = rows_sh[hf * PH + i];
++#pragma unroll
++        for (int blk = 0; blk < 2; ++blk) {
++            const int n = cb * 256 + blk * 128 + 4 * lane;
++            float v[4];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) v[j] = Ed[(size_t)i * DN_ES + blk * 128 + 4 * lane + j];
++            fwht128(v, lane);
++            const uint2 sv = *reinterpret_cast<const uint2*>(svh_d + (size_t)e * D + n);
++            const half2 s01 = *reinterpret_cast<const half2*>(&sv.x), s23 = *reinterpret_cast<const half2*>(&sv.y);
++            *reinterpret_cast<float4*>(y + (size_t)p * D + n) =
++                make_float4(v[0] * HAD_SCALE * __low2float(s01), v[1] * HAD_SCALE * __high2float(s01),
++                            v[2] * HAD_SCALE * __low2float(s23), v[3] * HAD_SCALE * __high2float(s23));
++        }
++    }
++    }  // halves
++}
++
++// Prompt chunks (a plan of PM-pair items, PM 64 or 128): Xd [P, N] = the gate/up epilogue of Xg/Xu's pairs;
++// Y [P, D] = the down epilogue. port: the trellises as per-expert pointer tables, the members as group()'s codes.
++template <int PM, int NW>
++static void prompt_launch(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tensor& Tg, const at::Tensor& Tu,
++                          const at::Tensor& Td, const at::Tensor& items, const at::Tensor& counts,
++                          const at::Tensor& members, const at::Tensor& svh_g, const at::Tensor& svh_u,
++                          const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor& xd, at::Tensor& y, int64_t D,
++                          int64_t N, int64_t E, int64_t max_items, double limit, int64_t slots, bool shx,
++                          const int* order) {
++    constexpr size_t SMEM = prompt_smem<PM>(), SMEM_SHX = prompt_smem<PM, 1>();
++    static bool once = [] {
++        cudaFuncSetAttribute(prompt_gateup_kernel<PM, NW, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                             (int)SMEM);
++        cudaFuncSetAttribute(prompt_gateup_kernel<PM, NW, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                             (int)SMEM_SHX);
++        cudaFuncSetAttribute(prompt_down_kernel<PM, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM);
++        return true;
++    }();
++    (void)once;
++    auto stream = at::cuda::getCurrentCUDAStream();
++    auto h = [](const at::Tensor& t) { return reinterpret_cast<const half*>(t.data_ptr()); };
++    auto w = [](const at::Tensor& t) { return reinterpret_cast<const int64_t*>(t.data_ptr()); };
++    const dim3 gu_grid((unsigned)(N / 128), (unsigned)max_items);
++    if (shx)
++        prompt_gateup_kernel<PM, NW, true><<<gu_grid, NW * 32, SMEM_SHX, stream>>>(
++            h(Xg), h(Xu), w(Tg), w(Tu), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),
++            h(svh_g), h(svh_u), h(suh_d), reinterpret_cast<half*>(xd.data_ptr()), (int)D, (int)N, (int)E,
++            (float)limit, (int)slots, order);
++    else
++        prompt_gateup_kernel<PM, NW, false><<<gu_grid, NW * 32, SMEM, stream>>>(
++            h(Xg), h(Xu), w(Tg), w(Tu), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),
++            h(svh_g), h(svh_u), h(suh_d), reinterpret_cast<half*>(xd.data_ptr()), (int)D, (int)N, (int)E,
++            (float)limit, (int)slots, order);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    prompt_down_kernel<PM, NW><<<dim3((unsigned)(D / 256), (unsigned)max_items), NW * 32, SMEM, stream>>>(
++        reinterpret_cast<const half*>(xd.data_ptr()), w(Td), items.data_ptr<int>(), counts.data_ptr<int>(),
++        members.data_ptr<int>(), h(svh_d), y.data_ptr<float>(), (int)N, (int)D, (int)E, (int)slots, order);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++}  // namespace
++
++// A prompt window's routed experts (TF_GLM_EXL3_PROMPT): group()'s grouping as her plan (prompt_plan_kernel),
++// her item order when `order_buf` is given, then her gate/up and down kernels: xd [P, N] and y [P, D] of every routed
++// pair. max_items: the plan's items bound (her max_items), the kernels' grid y; items [3 * max_items] and counts [2]
++// are scratch.
++void exl3x_prompt_cuda(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tensor& Tg, const at::Tensor& Tu,
++                       const at::Tensor& Td, const at::Tensor& uids, const at::Tensor& ucount,
++                       const at::Tensor& members, at::Tensor& items, at::Tensor& counts,
++                       const c10::optional<at::Tensor>& order_buf, const at::Tensor& svh_g, const at::Tensor& svh_u,
++                       const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor& xd, at::Tensor& y, int64_t D,
++                       int64_t N, int64_t E, int64_t max_items, double limit, int64_t pass, int64_t slots, bool shx) {
++    TORCH_CHECK(D % 256 == 0 && N % 128 == 0 && D % PBK == 0 && N % PBK == 0, "prompt experts: shapes");
++    TORCH_CHECK(pass == 64 || pass == 128, "prompt experts: passes of 64 or 128 members");
++    auto stream = at::cuda::getCurrentCUDAStream();
++    prompt_plan_kernel<<<1, 1024, 0, stream>>>(uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(),
++                                               (int)members.size(1), (int)pass, (int)max_items, (int)E,
++                                               items.data_ptr<int>(), counts.data_ptr<int>());
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    const int* order = nullptr;
++    if (order_buf.has_value()) {
++        TORCH_CHECK(order_buf->numel() >= max_items, "prompt experts: order buffer too small");
++        int* o = order_buf->data_ptr<int>();
++        prompt_order_kernel<<<1, 1024, 0, stream>>>(items.data_ptr<int>(), counts.data_ptr<int>(), o, (int)max_items,
++                                                    (int)E);
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
++        order = o;
++    }
++    if (pass == 128)
++        prompt_launch<128, 16>(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N,
++                               E, max_items, limit, slots, shx, order);
++    else
++        prompt_launch<64, 8>(Xg, Xu, Tg, Tu, Td, items, counts, members, svh_g, svh_u, suh_d, svh_d, xd, y, D, N, E,
++                             max_items, limit, slots, shx, order);
++}
+diff --git a/src/tensorfold/families/glm5_next/cuda/exl3_generic.py b/src/tensorfold/families/glm5_next/cuda/exl3_generic.py
+index 7e41d46..73ba67d 100644
+--- a/src/tensorfold/families/glm5_next/cuda/exl3_generic.py
++++ b/src/tensorfold/families/glm5_next/cuda/exl3_generic.py
+@@ -1,7 +1,9 @@
+ """GLM's universal EXL3 route uses buffer-owned scratch and the existing bf16 expert epilogue. Prompt windows take
+ MiaAI-Lab's prompt launch switches (adapted from her GLM-5.3-Flash recipe patches 0001, 0020 and 0009 onto the
+ universal kernel): the same bits in a faster launch order. Decode windows take her decode kernel when
+-TF_GLM_EXL3_DEC / TF_GLM_EXL3_LOADS ask for it (patches 0016 and 0047, adapted the same way): the same bits."""
++TF_GLM_EXL3_DEC / TF_GLM_EXL3_LOADS ask for it (patches 0016 and 0047, adapted the same way): the same bits. The expert
++node's prompt chunks take her prompt kernel when TF_GLM_EXL3_PROMPT=1 (patch 0004, ported onto this grouping): her
++lane's prompt bits, not the grouped kernel's (outputs class)."""
+ 
+ import os
+ 
+@@ -55,6 +57,30 @@ def switches(rows: int) -> dict:
+     return {k: os.environ.get(v, "1") != "0" for k, v in SWITCHES.items()}
+ 
+ 
++# MiaAI-Lab recipe patch 0004's EXL3 prompt kernel (her name; her default on, off here unless set)
++PROMPT_ENV = "TF_GLM_EXL3_PROMPT"
++
++
++def prompt_switches() -> dict:
++    """A prompt chunk's routed experts through MiaAI-Lab's prompt kernel (recipe patch 0004, at the end of her chain:
++    ``generic.routed``'s ``prompt``) when TF_GLM_EXL3_PROMPT=1: one fp32 mma chain over ascending k an output, the
++    gate/up and down epilogues fused, so a prompt row's expert outputs have her lane's bits, not the grouped kernel's
++    split-K sums (outputs class). TF_GLM_EXL3_PASS: the members a pass takes, 64 (her default) or 128 (the same bits);
++    her TF_GLM_EXL3_ORDER and TF_GLM_EXL3_ROWROT (on unless 0) give its item order and one rotated input a row. Unset
++    or 0: {} (prompt chunks launch as before); any other value refuses."""
++
++    v = os.environ.get(PROMPT_ENV, "").strip()
++    if v in ("", "0"):
++        return {}
++    if v != "1":
++        raise ValueError(f"{PROMPT_ENV} is 1 (on) or 0 (off), not {v!r}")
++    p = os.environ.get("TF_GLM_EXL3_PASS", "").strip() or "64"
++    if p not in ("64", "128"):
++        raise ValueError(f"TF_GLM_EXL3_PASS is 64 or 128, not {p!r}")
++    return {"prompt": True, "prompt_pass": int(p), "order": os.environ.get("TF_GLM_EXL3_ORDER", "1") != "0",
++            "rowrot": os.environ.get("TF_GLM_EXL3_ROWROT", "1") != "0"}
++
++
+ def share_suh(ex):
+     """``ex`` with ``shared_suh`` recorded (the ``rowrot`` switch's condition), for GLM's loaders."""
+ 
+@@ -62,7 +88,13 @@ def share_suh(ex):
+     return ex
+ 
+ 
+-def routed(x, pick, ex, scratch, rows, limit):
+-    """Write the live routed pairs into scratch.y; the caller supplies each row's shared-expert slot."""
++def routed(x, pick, ex, scratch, rows, limit, prompt=False):
++    """Write the live routed pairs into scratch.y; the caller supplies each row's shared-expert slot. ``prompt``: a
++    prompt chunk's window (the expert node's MODE_CHUNK, MODE_SLICE and MODE_PAIR forwards), which takes the prompt
++    kernel under TF_GLM_EXL3_PROMPT=1 (``prompt_switches``); unset, its call is a decode window's or any window's of
++    the same rows, as before."""
+ 
+-    return generic.routed(x, pick, None, ex, scratch, None, rows, limit, act_mode=generic.ACT_BF16, **switches(rows))
++    kw = switches(rows)
++    if prompt:
++        kw.update(prompt_switches())
++    return generic.routed(x, pick, None, ex, scratch, None, rows, limit, act_mode=generic.ACT_BF16, **kw)
+diff --git a/src/tensorfold/families/glm5_next/cuda/experts_node.py b/src/tensorfold/families/glm5_next/cuda/experts_node.py
+index 693c8e6..56741c2 100644
+--- a/src/tensorfold/families/glm5_next/cuda/experts_node.py
++++ b/src/tensorfold/families/glm5_next/cuda/experts_node.py
+@@ -93,6 +93,8 @@ class ExpertBuffers:
+ class ExpertNode:
+     """One half's routed experts plus buffers; ``compute`` is the per-layer AFD exchange's device side."""
+ 
++    prompt = False         # the window in hand is a prompt chunk's (``forwards`` sets it from the forward's mode)
++
+     def __init__(self, model_dir, half: int, layers, *, device: str = "cuda", rows: int = 8,
+                  prefill_rows: int = 2048) -> None:
+         self.cfg = Config.read(model_dir)
+@@ -103,13 +105,14 @@ class ExpertNode:
+ 
+     def compute(self, layer_i: int, R: int, x: tuple | None = None) -> torch.Tensor:
+         """``routed_half[:R] = sum_k wts[:, k] * y_k`` in slot order, the shared slot zeroed, fp32.
+-        ``x``: (normed, pick, wts) to read instead of the wire slots (where the link landed them)."""
++        ``x``: (normed, pick, wts) to read instead of the wire slots (where the link landed them). A prompt chunk's
++        window (``self.prompt``) takes the prompt kernel under TF_GLM_EXL3_PROMPT=1 (``exl3_generic.routed``)."""
+ 
+         b = self.buf
+         if R > b.prefill_rows:
+             raise ValueError(f"{R} rows: buffers hold {b.prefill_rows}")
+         normed, pick, wts = x if x is not None else (b.normed[:R], b.pick[:R], b.wts[:R])
+-        exl3_generic.routed(normed, pick, self.by_layer[layer_i], b.scratch(R), R, self.cfg.limit)
++        exl3_generic.routed(normed, pick, self.by_layer[layer_i], b.scratch(R), R, self.cfg.limit, prompt=self.prompt)
+         b.ey(R)[:, b.top_k].zero_()                          # the shared slot: attention adds its own sy
+         glue.combine(b.ey(R), wts, b.routed[:R])
+         return b.routed[:R]
+@@ -166,6 +169,7 @@ def forwards(node: ExpertNode, link, store, rank: int, *, check_on: bool = False
+     checked = 0
+     while True:
+         seq, rows, mode = link.next_forward()
++        node.prompt = mode != MODE_EAGER         # MODE_CHUNK, MODE_SLICE and MODE_PAIR forwards are prompt chunks
+         if mode == MODE_PAIR and getattr(link, "pairs", False):
+             both = [([], []) if check_on and checked + k < CHECK_FORWARDS else None for k in (0, 1)]
+             second = _pair(node, link, both)
+@@ -230,9 +234,14 @@ def serve(model_dir, half: int, master: str, port: int, *, device: str = "cuda")
+         # before the load: a missing daemon fails in seconds, not after it
+         link = afd_mcdma.open_expert_link(theirs, rank, cfg, store, device)
+         store.set(f"afd_ready/{rank}", b"1")
++        pk = exl3_generic.prompt_switches()     # a bad TF_GLM_EXL3_PROMPT / TF_GLM_EXL3_PASS refuses before the load
+         node = ExpertNode(model_dir, half, mine["layers"], device=device, rows=int(theirs["max_rows"]),
+                           prefill_rows=int(theirs["prefill_rows"]))
+         print(f"[tensorfold] afd expert {rank}: {len(node.layers)} MoE layers resident", flush=True)
++        if pk:
++            print(f"[tensorfold] afd expert {rank}: TF_GLM_EXL3_PROMPT=1: prompt chunks' routed experts through "
++                  f"MiaAI-Lab's prompt kernel (recipe patch 0004; pass {pk['prompt_pass']}, order "
++                  f"{'on' if pk['order'] else 'off'}, rowrot {'on' if pk['rowrot'] else 'off'})", flush=True)
+         store.set(f"afd_loaded/{rank}", b"1")
+         forwards(node, link, store, rank, check_on=os.environ.get(CHECK_ENV, "").strip() == "1")
+     except Exception as exc:  # noqa: BLE001   the attention's watchdog reads this; the process exits for the lane
+diff --git a/tests/cuda/test_exl3_prompt_kernel.py b/tests/cuda/test_exl3_prompt_kernel.py
+new file mode 100644
+index 0000000..1c17b92
+--- /dev/null
++++ b/tests/cuda/test_exl3_prompt_kernel.py
+@@ -0,0 +1,299 @@
++"""MiaAI-Lab's EXL3 prompt kernel on the universal route (her GLM-5.3-Flash recipe patch 0004 at the end of her
++chain, ``tensorfold/cuda/exl3/experts_prompt.cu``) against her own kernel on the GPU: byte-equal per shape.
++
++Her kernel is built here from her tree: TF_MIA_TREE names the ``src`` directory of the recipe's TensorFold tree
++(the recipe @ 1576746's patches 0001-0068 applied to TensorFold v0.6.0), whose
++``tensorfold/families/glm5_next/cuda/exl3.cpp`` / ``exl3.cu`` build with her extension's flags (-O3 and this GPU's
++arch, as her ``exl3_mm._ext`` through ``tensorfold.cuda.build.load``). Without TF_MIA_TREE the comparison skips; the
++self-checks run anyway.
++
++On a GLM-shaped synthetic layer (288 experts, 4096 -> 1024 a half, 4-bit mcg trellises), with one gate/up suh shared
++by every expert (GLM-5.3-Flash's EXL3 layers) and with one an expert, at prompt windows of 1 to 2,048 rows with
++uniform and skewed routing:
++- ours (``experts.routed(.., prompt=True)``: group(), her rotations, ``prompt``) and hers (her rotations, her plan,
++  her ``prompt``) write the same xd (fp16) and Y (fp32) bytes, rows they do not write included, at passes of 64 and
++  128 members, her item order on and off, the input rotated once a row and once a pair;
++- ours gives the same bytes twice, and a row's outputs do not depend on the rows windowed with it (her kernel's "any
++  chunking gives the same prompt state");
++- for information (printed with -s, and to TF_EXL3_PROMPT_IDENT_OUT as JSON): the kernels' times, and how far the prompt bits
++  are from the grouped kernel's (the outputs class)."""
++
++from __future__ import annotations
++
++import hashlib
++import itertools
++import json
++import os
++import random
++from functools import lru_cache
++from pathlib import Path
++
++import pytest
++import torch
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
++
++E, D, NI, TOPK, SLOTS, LIMIT = 288, 4096, 1024, 8, 9, 10.0
++ROWS = (1, 16, 63, 64, 65, 594, 1024, 2048)
++MIA_TREE = os.environ.get("TF_MIA_TREE", "").strip()
++# her end state's files (patches 0001-0068 on v0.6.0): the reference must be exactly these
++MIA_SHA256 = {"exl3.cu": "160c054a8069e191979a993c8b9f323f8485ca2b20bd4f1035c6fced2557ed37",
++              "exl3.cpp": "ebbe4494a3e0475420f57d881854858f727b76729ec6a6240eaffb9682a6dac9"}
++REPORT: dict = {"cases": [], "speed": [], "grouped": []}
++
++
++def _report(key: str, row: dict) -> None:
++    REPORT[key].append(row)
++    out = os.environ.get("TF_EXL3_PROMPT_IDENT_OUT", "").strip()
++    if out:
++        Path(out).write_text(json.dumps(REPORT, indent=1))
++
++
++@lru_cache(maxsize=1)
++def _mia():
++    """Her dedicated exl3 extension (exl3.cpp + exl3.cu at the end of her chain), built from TF_MIA_TREE with her flags."""
++
++    from tensorfold.cuda.build import load
++
++    d = Path(MIA_TREE) / "tensorfold/families/glm5_next/cuda"
++    for name, want in MIA_SHA256.items():
++        got = hashlib.sha256((d / name).read_bytes()).hexdigest()
++        assert got == want, f"TF_MIA_TREE's {name} is not her chain's end state ({got[:16]})"
++    return load(name="ref_tensorfold_glm_exl3_v20", sources=[str(d / "exl3.cpp"), str(d / "exl3.cu")],
++                extra_cuda_cflags=["-O3"], verbose=False)
++
++
++def _need_mia():
++    if not MIA_TREE:
++        pytest.skip("TF_MIA_TREE (the recipe tree's src: patches 0001-0068 on v0.6.0) is not set")
++    return _mia()
++
++
++@lru_cache(maxsize=2)
++def _layer(share: bool):
++    """(ours, hers): our Exl3RoutedExperts over stacked synthetic trellises, and her stacked int32 words of the same."""
++
++    from tensorfold.cuda.exl3 import experts
++    from tensorfold.families.glm5_next.cuda import exl3_generic
++
++    g = torch.Generator().manual_seed(11)
++
++    def trel(k, n):                                   # 4-bit trellis tiles: 64 int16 a 16x16 tile
++        v = torch.randint(-32768, 32768, (E, k // 16, n // 16, 64), dtype=torch.int32, generator=g)
++        return v.to(torch.int16).cuda().contiguous()
++
++    def sc(n, mag):
++        sign = torch.randint(0, 2, (E, n), generator=g).float() * 2 - 1
++        return (sign * (torch.rand((E, n), generator=g) + 0.5) * mag).half().cuda().contiguous()
++
++    gt, ut, dt = trel(D, NI), trel(D, NI), trel(NI, D)
++    suh_g = sc(D, 0.02)
++    if share:
++        suh_g = suh_g[:1].expand(E, D).contiguous()
++    suh_u = suh_g.clone() if share else sc(D, 0.02)
++    svh_g, svh_u, suh_d, svh_d = sc(NI, 0.5), sc(NI, 0.5), sc(NI, 0.05), sc(D, 0.2)
++    ex = exl3_generic.share_suh(experts.prepare_stacked(gt, ut, dt, suh_g, suh_u, svh_g, svh_u, suh_d, svh_d, "mcg"))
++    hers = {"gt": gt.view(torch.int32), "ut": ut.view(torch.int32), "dt": dt.view(torch.int32), "suh_g": suh_g,
++            "suh_u": suh_u, "svh_g": svh_g, "svh_u": svh_u, "suh_d": suh_d, "svh_d": svh_d}
++    return ex, hers
++
++
++def _inputs(R: int, skew: bool, seed: int):
++    rng, g = random.Random(seed), torch.Generator().manual_seed(seed)
++    hot = rng.sample(range(E), 12)
++    rows = []
++    for _ in range(R):
++        if skew:
++            row = rng.sample(hot, 6) + rng.sample([e for e in range(E) if e not in hot], TOPK - 6)
++        else:
++            row = rng.sample(range(E), TOPK)
++        rows.append(row + [E])                        # the shared slot (id E): not an EXL3 expert
++    pick = torch.tensor(rows, dtype=torch.int32).cuda().contiguous()
++    x = torch.randn((R, D), generator=g).to(torch.bfloat16).cuda()
++    return x, pick
++
++
++def _her_plan(pick: torch.Tensor, tile: int):
++    """Her plan_kernel's plan (the recipe's tensorfold/cuda/experts.cu, place_items): pairs p = row * slots + slot grouped by
++    expert in pair order over her plan's experts (the routed ones and the shared one, id E); items (expert, first,
++    count) of up to ``tile`` pairs in expert order; counts [items, distinct experts]; her max_items."""
++
++    flat = pick.reshape(-1).long()
++    P = flat.numel()
++    members = torch.argsort(flat * P + torch.arange(P, device=flat.device)).to(torch.int32).contiguous()
++    cnt = torch.bincount(flat, minlength=E + 1).tolist()
++    items, off = [], 0
++    for e, c in enumerate(cnt):
++        items += [(e, off + tile * j, min(tile, c - tile * j)) for j in range((c + tile - 1) // tile)]
++        off += c
++    cap = min(P, E + 1) + P // tile
++    it = torch.zeros((cap, 3), dtype=torch.int32)
++    it[:len(items)] = torch.tensor(items, dtype=torch.int32)
++    counts = torch.tensor([len(items), sum(c > 0 for c in cnt)], dtype=torch.int32)
++    return members, it.cuda().contiguous(), counts.cuda(), cap
++
++
++def _rot_rows_of(xg, xu, pick, R: int, shx: bool):
++    """The rotated inputs both sides write: one row a token (``shx``), else every routed pair's gate and up rows."""
++
++    if shx:
++        return xg[:R].clone()
++    live = (pick.reshape(-1) < E).nonzero().squeeze(1)
++    return torch.cat([xg[live], xu[live]])
++
++
++def _hers_prepared(mia, h: dict, ex, x, pick, R: int, pm: int, order: bool, shx: bool):
++    """Her prompt branch (her exl3_mm.routed at the end of her chain) as a closure: her plan built once (on the host,
++    as her plan_kernel lays it out), then each call her rotation and her ``prompt``. Returns (run, xd, y, xg, xu)."""
++
++    P = R * SLOTS
++    xg = torch.zeros((P, D), dtype=torch.float16, device="cuda")
++    xu = xg if shx else torch.zeros_like(xg)
++    xd = torch.full((P, NI), float("nan"), dtype=torch.float16, device="cuda")
++    y = torch.full((P, D), float("nan"), dtype=torch.float32, device="cuda")
++    members, items, counts, cap = _her_plan(pick, pm)
++    obuf = torch.full((cap,), -1, dtype=torch.int32, device="cuda") if order else None
++
++    def run():
++        if shx:
++            mia.rot_rows(x, x.stride(0), ex.shared_suh, xg, R, D)
++        else:
++            mia.rot_in(x, x.stride(0), pick, h["suh_g"], h["suh_u"], xg, xu, R, D, SLOTS)
++        mia.prompt(xg, xu, h["gt"], h["ut"], h["dt"], items, counts, members, h["svh_g"], h["svh_u"], h["suh_d"],
++                   h["svh_d"], xd, y, D, NI, E, cap, LIMIT, pm, SLOTS, shx, obuf)
++
++    return run, xd, y, xg, xu
++
++
++def _hers(mia, h: dict, ex, x, pick, R: int, pm: int, order: bool, shx: bool):
++    """Her prompt branch once: xd, Y and the rotated inputs."""
++
++    run, xd, y, xg, xu = _hers_prepared(mia, h, ex, x, pick, R, pm, order, shx)
++    run()
++    return xd, y, _rot_rows_of(xg, xu, pick, R, shx)
++
++
++def _ours(s, ex, x, pick, R: int, pm: int, order: bool, rowrot: bool):
++    from tensorfold.cuda.exl3 import experts
++
++    P = R * SLOTS
++    s.xd[:P].fill_(float("nan"))
++    s.y[:P].fill_(float("nan"))
++    experts.routed(x, pick, None, ex, s, None, R, limit=LIMIT, act_mode=experts.ACT_BF16, prompt=True,
++                   prompt_pass=pm, order=order, rowrot=rowrot)
++    shx = rowrot and ex.shared_suh is not None
++    return s.xd[:P].clone(), s.y[:P].clone(), _rot_rows_of(s.xg, s.xg if shx else s.xu, pick, R, shx)
++
++
++def _first_diff(a: torch.Tensor, b: torch.Tensor) -> str:
++    ai, bi = a.view(torch.int16 if a.dtype == torch.float16 else torch.int32), \
++        b.view(torch.int16 if b.dtype == torch.float16 else torch.int32)
++    bad = (ai != bi).nonzero()
++    if not bad.numel():
++        return "same"
++    r, c = bad[0].tolist()
++    return f"{bad.shape[0]} elements differ; first [{r} (row {r // SLOTS} slot {r % SLOTS}), {c}]: {a[r, c]} vs {b[r, c]}"
++
++
++def _scratch(ex):
++    from tensorfold.cuda.exl3 import experts
++
++    s = experts.Scratch(ex, max(ROWS), SLOTS, experts.GLM_GATEUP, experts.GLM_DOWN)
++    assert experts.prompt_kernel_ready(ex, SLOTS)
++    return s
++
++
++@pytest.mark.parametrize("share", (True, False), ids=("shared-suh", "own-suh"))
++def test_prompt_kernel_is_hers_byte_for_byte(share):
++    mia = _need_mia()
++    ex, h = _layer(share)
++    assert (ex.shared_suh is not None) is share
++    s = _scratch(ex)
++    bad = []
++    for R, skew in itertools.product(ROWS, (False, True)):
++        x, pick = _inputs(R, skew, seed=R * 2 + skew)
++        for pm, order, rowrot in itertools.product((64, 128), (False, True), (True, False) if share else (False,)):
++            xd, y, xr = _ours(s, ex, x, pick, R, pm, order, rowrot)
++            hxd, hy, hxr = _hers(mia, h, ex, x, pick, R, pm, order, rowrot and share)
++            dx, dy = _first_diff(xd, hxd), _first_diff(y, hy)
++            drot = "same" if torch.equal(xr.view(torch.int16), hxr.view(torch.int16)) else "DIFFERENT"
++            ok = dx == "same" and dy == "same"
++            written = int(torch.isfinite(y).all(1).sum())             # rows written: the routed pairs
++            _report("cases", {"share": share, "R": R, "skew": skew, "pass": pm, "order": order, "rowrot": rowrot,
++                              "same": ok, "xd": dx, "y": dy, "rotated_inputs": drot, "rows_written": written,
++                              "y_sha": hashlib.sha256(y.cpu().numpy().tobytes()).hexdigest()[:16]})
++            assert written == R * TOPK
++            if not ok:
++                bad.append((R, skew, pm, order, rowrot, dx, dy, f"rotated inputs {drot}"))
++    print(f"EXL3_PROMPT_IDENT {'OK' if not bad else 'DIFF'} share={share}: {len(bad)} of "
++          f"{len(ROWS) * 2 * 4 * (2 if share else 1)} cases differ {bad[:3]}")
++    assert not bad, bad[:3]
++
++
++@pytest.mark.parametrize("share", (True, False), ids=("shared-suh", "own-suh"))
++def test_prompt_kernel_rows_are_their_own(share):
++    """Twice the same bytes, and a 2,048-row window's rows equal the same rows run as windows of 594 and 1,454."""
++
++    ex, _ = _layer(share)
++    s = _scratch(ex)
++    R, cut = 2048, 594
++    x, pick = _inputs(R, True, seed=7)
++    for pm, order in itertools.product((64, 128), (False, True)):
++        xd, y, _ = _ours(s, ex, x, pick, R, pm, order, True)
++        xd2, y2, _ = _ours(s, ex, x, pick, R, pm, order, True)
++        assert _first_diff(y, y2) == "same" and _first_diff(xd, xd2) == "same"
++        a_xd, a_y, _ = _ours(s, ex, x[:cut].contiguous(), pick[:cut].contiguous(), cut, pm, order, True)
++        b_xd, b_y, _ = _ours(s, ex, x[cut:].contiguous(), pick[cut:].contiguous(), R - cut, pm, order, True)
++        assert _first_diff(torch.cat([a_y, b_y]), y) == "same", (pm, order)
++        assert _first_diff(torch.cat([a_xd, b_xd]), xd) == "same", (pm, order)
++
++
++def _time(fn, reps: int = 5) -> float:
++    fn()
++    ts = []
++    for _ in range(reps):
++        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++        a.record()
++        fn()
++        b.record()
++        b.synchronize()
++        ts.append(a.elapsed_time(b))
++    return sorted(ts)[len(ts) // 2]
++
++
++def test_report_speed_and_distance_from_the_grouped_kernel():
++    """Information only: each path's time (ms, median of 5) and the prompt bits' distance from the grouped kernel's."""
++
++    from tensorfold.cuda.exl3 import experts
++    from tensorfold.families.glm5_next.cuda import exl3_generic
++
++    ex, h = _layer(True)
++    s = _scratch(ex)
++    mia = _mia() if MIA_TREE else None
++    for R in (64, 128, 594, 1024, 2048):
++        x, pick = _inputs(R, False, seed=R)
++        sw = exl3_generic.switches(R)                  # the prompt launch switches, as the GLM call site sets them
++        P = R * SLOTS
++
++        def grouped(x=x, pick=pick, R=R, sw=sw):
++            return experts.routed(x, pick, None, ex, s, None, R, limit=LIMIT, act_mode=experts.ACT_BF16, **sw)
++
++        def ours(x=x, pick=pick, R=R):
++            return experts.routed(x, pick, None, ex, s, None, R, limit=LIMIT, act_mode=experts.ACT_BF16, prompt=True,
++                                  order=True, rowrot=True)
++
++        row = {"R": R, "grouped_ms": _time(grouped), "ours_ms": _time(ours)}
++        if mia is not None:                            # her rotation and kernels, her plan prepared beforehand
++            row["mia_ms"] = _time(_hers_prepared(mia, h, ex, x, pick, R, 64, True, True)[0])
++        _report("speed", row)
++        gy = grouped().clone()
++        py = ours().clone()
++        routed = torch.isfinite(gy).all(1) & (pick.reshape(-1) < E)
++        d = (py[routed] - gy[routed]).abs()
++        rel = d.max() / gy[routed].abs().max().clamp_min(1e-30)
++        _report("grouped", {"R": R, "differ_frac": float((py[routed] != gy[routed]).float().mean()),
++                            "max_abs": float(d.max()), "max_rel_to_max": float(rel)})
++        hers = "" if mia is None else f", hers {row['mia_ms']:.3f} ms"
++        print(f"R={R}: grouped {row['grouped_ms']:.3f} ms, prompt kernel {row['ours_ms']:.3f} ms{hers}; "
++              f"vs grouped bits: {REPORT['grouped'][-1]}")
++        assert P > 0
+diff --git a/tests/test_exl3_prompt_kernel.py b/tests/test_exl3_prompt_kernel.py
+new file mode 100644
+index 0000000..597ee58
+--- /dev/null
++++ b/tests/test_exl3_prompt_kernel.py
+@@ -0,0 +1,422 @@
++"""MiaAI-Lab's EXL3 prompt kernel on the universal route (her GLM-5.3-Flash recipe patch 0004 at the end of her
++chain, ``tensorfold/cuda/exl3/experts_prompt.cu``), on CPU:
++
++- a model of ``prompt_plan_kernel`` (group()'s grouping laid out as her plan) gives exactly the routed items her
++  ``plan_kernel`` gives (expert, members' pairs p, count), in her order, within ``prompt_items`` launch slots; her
++  ``prompt_order_kernel`` (modelled) then gives the same launch order on both plans;
++- the switch: ``exl3_generic.prompt_switches`` reads her names (TF_GLM_EXL3_PROMPT, default off here, and
++  TF_GLM_EXL3_PASS, ORDER, ROWROT), and refuses other values; unset, every GLM call is the call before, argument for
++  argument;
++- the plumbing: ``generic.routed(.., prompt=True)`` makes the prompt kernel's calls (her rotations, then ``prompt``)
++  only for her kernel's scope, else the launches before; the expert node marks prompt chunks (MODE_CHUNK, MODE_SLICE,
++  MODE_PAIR) from the forward's mode, and ``compute`` passes the mark.
++The GPU side (bits against her kernel, built from her tree) is tests/cuda/test_exl3_prompt_kernel.py."""
++
++from __future__ import annotations
++
++import random
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from tensorfold.cuda.exl3 import experts as generic
++from tensorfold.families.glm5_next.cuda import exl3_generic
++
++E, TOPK, SLOTS = 288, 8, 9                    # GLM-5.3-Flash: 288 routed experts, top 8, the shared expert last
++ENVS = ("TF_GLM_EXL3_PROMPT", "TF_GLM_EXL3_PASS", "TF_GLM_EXL3_ORDER", "TF_GLM_EXL3_ROWROT", "TF_GLM_EXL3_NFIRST",
++        "TF_GLM_EXL3_PF", "TF_GLM_EXL3_DEC", "TF_GLM_EXL3_LOADS", "TF_GLM_EXL3_FUSE", "TF_GLM_EXL3_XROW")
++
++
++@pytest.fixture(autouse=True)
++def _clean_env(monkeypatch):
++    for v in ENVS:
++        monkeypatch.delenv(v, raising=False)
++
++
++# ----------------------------------------------------------------------------------------------- the plans (models)
++
++def picks(R: int, rng: random.Random, skew: bool) -> list[list[int]]:
++    """R rows of TOPK distinct routed experts and the shared slot (id E); ``skew``: a few experts take most rows."""
++
++    hot = rng.sample(range(E), 12)
++    rows = []
++    for _ in range(R):
++        if skew:
++            row = rng.sample(hot, 6) + rng.sample([e for e in range(E) if e not in hot], TOPK - 6)
++        else:
++            row = rng.sample(range(E), TOPK)
++        rows.append(row + [E])
++    return rows
++
++
++def group(pick: list[list[int]], maxm: int) -> tuple[list[int], list[int]]:
++    """group_kernel: distinct routed experts (< E) in id order; members row * 32 + slot in row order, -1 after."""
++
++    n = len(pick) * SLOTS
++    flat = [pick[i // SLOTS][i % SLOTS] for i in range(n)]
++    uids = sorted({e for e in flat if 0 <= e < E})
++    members: list[int] = []
++    for e in uids:
++        m = [(i // SLOTS) * 32 + i % SLOTS for i in range(n) if flat[i] == e][:maxm]
++        members += m + [-1] * (maxm - len(m))
++    return uids, members
++
++
++def our_plan(uids: list[int], members: list[int], maxm: int, pm: int, cap: int) -> tuple[list[tuple], list[int]]:
++    """prompt_plan_kernel: each expert's members counted up to its first -1, its items in pass order after the items
++    of the experts before it (the block's exclusive scan); items (expert, first, count), counts [items, experts]."""
++
++    per_u = []
++    for u in range(len(uids)):
++        row = members[u * maxm:(u + 1) * maxm]
++        n = next((i for i, c in enumerate(row) if c < 0), maxm) if uids[u] < E else 0
++        per_u.append(n)
++    items = []
++    for u, n in enumerate(per_u):
++        j = 0
++        while j * pm < n:
++            items.append((uids[u], u * maxm + j * pm, min(pm, n - j * pm)))
++            j += 1
++    assert len(items) <= cap, "the kernel traps here: cap must bound every grouping"
++    return items, [len(items), len(uids)]
++
++
++def her_plan(pick: list[list[int]], experts: int, tile: int) -> tuple[list[tuple], list[int], list[int]]:
++    """MiaAI-Lab's plan_kernel (the recipe's tensorfold/cuda/experts.cu, place_items): pairs p = row * slots + slot
++    grouped by expert in pair order; items (expert, first, count) of <= tile pairs in expert order; counts [items,
++    distinct experts]. ``experts`` is her plan's (the routed ones plus the shared expert, id E)."""
++
++    flat = [e for row in pick for e in row]
++    cnt = [0] * experts
++    for e in flat:
++        cnt[e] += 1
++    off, at = [0] * experts, 0
++    for e in range(experts):
++        off[e], at = at, at + cnt[e]
++    members, rank = [0] * len(flat), [0] * experts
++    for p, e in enumerate(flat):
++        members[off[e] + rank[e]] = p
++        rank[e] += 1
++    items = [(e, off[e] + tile * j, min(tile, cnt[e] - tile * j)) for e in range(experts)
++             for j in range((cnt[e] + tile - 1) // tile)]
++    return items, [len(items), sum(c > 0 for c in cnt)], members
++
++
++def order_model(items: list[tuple], count: int, cap: int) -> list[int]:
++    """Her prompt_order_kernel's result (the merge arithmetic, per item): heavy items (an expert with several) and
++    light ones merged evenly, each list in plan order; items of the shared expert (id >= E, last) left out; -1 after."""
++
++    allx = min(count, cap)
++    routed = 0
++    for i in range(allx):
++        if items[i][0] < E and (i + 1 == allx or items[i + 1][0] >= E):
++            routed = i + 1
++    n = routed
++
++    def heavy(i):
++        e = items[i][0]
++        return (i > 0 and items[i - 1][0] == e) or (i + 1 < n and items[i + 1][0] == e)
++
++    nh = sum(heavy(i) for i in range(n))
++    nl = n - nh
++    order = [-2] * allx
++    rh = 0
++    for i in range(n):
++        if heavy(i):
++            r = rh
++            rh += 1
++            x = (2 * r + 1) * nl
++            cl = min(nl, (x - nh + 2 * nh - 1) // (2 * nh)) if x > nh else 0
++            order[r + cl] = i
++        else:
++            lr = i - rh
++            y = (2 * lr + 1) * nh
++            ch = min(nh, (y - nl) // (2 * nl) + 1) if y >= nl else 0
++            order[lr + ch] = i
++    for i in range(n, allx):
++        order[i] = -1
++    return order
++
++
++def _pairs_of(item, members, maxm, ours: bool) -> list[int]:
++    _, first, cnt = item
++    got = members[first:first + cnt]
++    return [(c >> 5) * SLOTS + (c & 31) for c in got] if ours else got
++
++
++@pytest.mark.parametrize("pm", (64, 128))
++@pytest.mark.parametrize("R,skew", [(1, False), (7, True), (63, False), (64, True), (65, False), (594, True),
++                                    (1024, False), (2048, False), (2048, True)])
++def test_our_plan_is_her_plans_routed_items(R, skew, pm):
++    pick = picks(R, random.Random(R * 7 + skew), skew)
++    uids, members = group(pick, R)
++    cap = generic.prompt_items(R, SLOTS, E, pm)
++    ours, counts = our_plan(uids, members, R, pm, cap)
++    hers, hcounts, hmembers = her_plan(pick, E + 1, pm)
++    routed = [it for it in hers if it[0] < E]
++    assert hers[len(routed):] == [it for it in hers if it[0] >= E]          # her shared expert's items come last
++    assert [(e, c) for e, _, c in ours] == [(e, c) for e, _, c in routed]
++    for a, b in zip(ours, routed):
++        assert _pairs_of(a, members, R, True) == _pairs_of(b, hmembers, R, False)
++    assert counts == [len(routed), hcounts[1] - 1] and hcounts[0] <= cap   # her bound is the launch's grid y
++    # every routed pair exactly once
++    seen = sorted(p for it in ours for p in _pairs_of(it, members, R, True))
++    assert seen == sorted(r * SLOTS + s for r in range(R) for s in range(TOPK))
++    # her order kernel puts the same items in the same launch slots on either plan
++    assert order_model(ours, len(ours), cap) == order_model(hers, len(hers), cap)[:len(ours)] + []
++    full = order_model(hers, len(hers), cap)
++    assert full[len(ours):] == [-1] * (len(full) - len(ours))
++
++
++def test_prompt_items_bounds_every_grouping():
++    rng = random.Random(5)
++    for R in (1, 2, 3, 8, 31, 64, 100, 594, 2048, 4096):
++        for pm in (64, 128):
++            worst = 0
++            for e_used in {min(E, R * TOPK), 1, TOPK}:     # spread over every expert, or the fewest possible
++                n = R * TOPK
++                per = [n // e_used + (1 if i < n % e_used else 0) for i in range(e_used)]
++                worst = max(worst, sum((c + pm - 1) // pm for c in per))
++            assert worst <= generic.prompt_items(R, SLOTS, E, pm), (R, pm)
++        pick = picks(R, rng, True)
++        uids, members = group(pick, R)
++        our_plan(uids, members, R, 64, generic.prompt_items(R, SLOTS, E, 64))
++
++
++# --------------------------------------------------------------------------------------------------------- switch
++
++def test_prompt_switch_reads_her_names_off_unless_set(monkeypatch):
++    assert exl3_generic.prompt_switches() == {}
++    for v in ("", "0", " 0 "):
++        monkeypatch.setenv("TF_GLM_EXL3_PROMPT", v)
++        assert exl3_generic.prompt_switches() == {}, v
++    monkeypatch.setenv("TF_GLM_EXL3_PROMPT", "1")
++    assert exl3_generic.prompt_switches() == {"prompt": True, "prompt_pass": 64, "order": True, "rowrot": True}
++    monkeypatch.setenv("TF_GLM_EXL3_PASS", "128")
++    monkeypatch.setenv("TF_GLM_EXL3_ORDER", "0")
++    monkeypatch.setenv("TF_GLM_EXL3_ROWROT", "0")
++    assert exl3_generic.prompt_switches() == {"prompt": True, "prompt_pass": 128, "order": False, "rowrot": False}
++    for bad in ("32", "abc", "256"):
++        monkeypatch.setenv("TF_GLM_EXL3_PASS", bad)
++        with pytest.raises(ValueError, match="TF_GLM_EXL3_PASS"):
++            exl3_generic.prompt_switches()
++    monkeypatch.delenv("TF_GLM_EXL3_PASS")
++    for bad in ("yes", "2", "true"):
++        monkeypatch.setenv("TF_GLM_EXL3_PROMPT", bad)
++        with pytest.raises(ValueError, match="TF_GLM_EXL3_PROMPT"):
++            exl3_generic.prompt_switches()
++
++
++def test_switch_unset_every_glm_call_is_the_call_before(monkeypatch):
++    seen = []
++    monkeypatch.setattr(exl3_generic.generic, "routed", lambda *a, **k: seen.append((a, k)))
++    for R in (1, 8, 63, 64, 594, 2048):
++        for env in ({}, {"TF_GLM_EXL3_DEC": "1"}, {"TF_GLM_EXL3_NFIRST": "0"}):
++            for k, v in env.items():
++                monkeypatch.setenv(k, v)
++            seen.clear()
++            exl3_generic.routed("x", "pick", "ex", "s", R, 7.0)
++            exl3_generic.routed("x", "pick", "ex", "s", R, 7.0, prompt=True)
++            assert seen[0] == seen[1] and seen[1][1] == {"act_mode": generic.ACT_BF16, **exl3_generic.switches(R)}
++            for k in env:
++                monkeypatch.delenv(k)
++
++
++# ------------------------------------------------------------------------------------------------------ plumbing
++
++class FakeExt:
++    """The extension's calls, recorded (no kernel runs)."""
++
++    def __init__(self):
++        self.calls = []
++
++    def __getattr__(self, name):
++        def call(*args):
++            self.calls.append((name, args))
++        return call
++
++    def named(self, name):
++        return [a for n, a in self.calls if n == name]
++
++
++def _layer(D=256, NI=128, k2=8, cb=generic.CB_MCG, share=True, keep=()):
++    g = torch.Generator().manual_seed(1)
++
++    def sc(n):
++        return (torch.rand((E, n), generator=g) + 0.5).half()
++
++    suh = sc(D)[:1].expand(E, D).contiguous() if share else sc(D)
++    i64, i32 = torch.zeros(E, dtype=torch.int64), torch.full((E,), k2, dtype=torch.int32)
++    ex = generic.Exl3RoutedExperts(i64, i64.clone(), i64.clone(), i32, i32, i32, suh, suh.clone(), sc(NI), sc(NI),
++                                   sc(NI), sc(D), E, D, NI, cb, (k2, k2), (k2, k2), torch.zeros(E, dtype=torch.int64),
++                                   list(keep))
++    return exl3_generic.share_suh(ex)
++
++
++def _run(monkeypatch, fn, R, ex=None, rows=2048):
++    fake = FakeExt()
++    monkeypatch.setattr(generic, "_ext", lambda: fake)
++    ex = ex or _layer()
++    s = generic.Scratch(ex, rows, SLOTS, device="cpu")
++    x = torch.zeros((R, ex.dims), dtype=torch.bfloat16)
++    pick = torch.zeros((R, SLOTS), dtype=torch.int32)
++    out = fn(x, pick, ex, s, R)
++    return fake, ex, s, out
++
++
++def _glm(prompt):
++    return lambda x, p, ex, s, R: exl3_generic.routed(x, p, ex, s, R, 7.0, prompt=prompt)
++
++
++@pytest.mark.parametrize("R", (1, 8, 63, 64, 594, 2048))
++def test_switch_on_prompt_chunks_take_her_kernel(monkeypatch, R):
++    monkeypatch.setenv("TF_GLM_EXL3_PROMPT", "1")
++    fake, ex, s, out = _run(monkeypatch, _glm(True), R)
++    assert [n for n, _ in fake.calls] == ["group", "rot_rows", "prompt"]   # every prompt chunk, as her Buffers(prefill)
++    (a,) = fake.named("prompt")
++    items, counts, obuf = s.prompt_bufs
++    cap = generic.prompt_items(R, SLOTS, E, 64)
++    ids, members = s.window(R)
++    assert a[0] is s.xg and a[1] is s.xg                                 # one rotated row a token for gate and up
++    assert a[2] is ex.gate_ptr and a[3] is ex.up_ptr and a[4] is ex.down_ptr
++    assert torch.equal(a[5], ids) and a[6] is s.count and torch.equal(a[7], members)
++    assert a[8] is items and a[9] is counts and a[10] is obuf
++    assert a[11:15] == (ex.svh_g, ex.svh_u, ex.suh_d, ex.svh_d) and a[15] is s.xd and a[16] is s.y
++    assert a[17:] == (ex.dims, ex.width, E, cap, 7.0, 64, SLOTS, True)
++    assert items.numel() == 3 * generic.prompt_items(2048, SLOTS, E, 64) and obuf.numel() * 3 == items.numel()
++    assert out.data_ptr() == s.y.data_ptr() and out.shape == (R * SLOTS, ex.dims)
++    rr = fake.named("rot_rows")[0]
++    assert rr[2] is ex.shared_suh and rr[3] is s.xg and rr[4:] == (R, ex.dims)
++
++
++def test_switch_on_pass_order_rowrot(monkeypatch):
++    monkeypatch.setenv("TF_GLM_EXL3_PROMPT", "1")
++    monkeypatch.setenv("TF_GLM_EXL3_PASS", "128")
++    monkeypatch.setenv("TF_GLM_EXL3_ORDER", "0")
++    monkeypatch.setenv("TF_GLM_EXL3_ROWROT", "0")
++    fake, ex, s, _ = _run(monkeypatch, _glm(True), 594)
++    assert [n for n, _ in fake.calls] == ["group", "rot_in", "prompt"]
++    (a,) = fake.named("prompt")
++    assert a[0] is s.xg and a[1] is s.xu and a[10] is None
++    assert a[17:] == (ex.dims, ex.width, E, generic.prompt_items(594, SLOTS, E, 128), 7.0, 128, SLOTS, False)
++    monkeypatch.setenv("TF_GLM_EXL3_ROWROT", "1")                         # a layer without one suh: per pair
++    fake, ex, s, _ = _run(monkeypatch, _glm(True), 594, ex=_layer(share=False))
++    assert ex.shared_suh is None and [n for n, _ in fake.calls] == ["group", "rot_in", "prompt"]
++    assert fake.named("prompt")[0][-1] is False
++
++
++def test_switch_on_decode_windows_and_other_callers_are_unchanged(monkeypatch):
++    monkeypatch.setenv("TF_GLM_EXL3_PROMPT", "1")
++    for fn, R in ((_glm(False), 8), (_glm(False), 64), (_glm(False), 2048),
++                  (lambda x, p, ex, s, R: generic.routed(x, p, None, ex, s, None, R), 594)):
++        fake = _run(monkeypatch, fn, R)[0]
++        names = [n for n, _ in fake.calls]
++        assert "prompt" not in names and names.count("grouped") == 2, (R, names)
++        monkeypatch.delenv("TF_GLM_EXL3_PROMPT")
++        base, _, _, _ = _run(monkeypatch, fn, R)
++        monkeypatch.setenv("TF_GLM_EXL3_PROMPT", "1")
++        assert [n for n, _ in base.calls] == names
++
++
++def test_prompt_kernel_needs_her_scope(monkeypatch):
++    odd = torch.zeros(64, dtype=torch.int16)[1:]                          # a trellis 2 bytes off a 16-byte boundary
++    cases = [(_layer(k2=6), "k2"), (_layer(cb=generic.CB_MUL1), "codebook"), (_layer(D=128), "D % 256"),
++             (_layer(NI=64), "width % 128"), (_layer(keep=[odd]), "alignment")]
++    for ex, why in cases:
++        fake, _, _, _ = _run(monkeypatch, lambda x, p, ex, s, R: generic.routed(x, p, None, ex, s, None, R,
++                                                                               act_mode=generic.ACT_BF16, prompt=True),
++                             64, ex=ex)
++        assert "prompt" not in [n for n, _ in fake.calls], why
++    fake, _, _, _ = _run(monkeypatch, lambda x, p, ex, s, R: generic.routed(x, p, None, ex, s, None, R,
++                                                                           act_mode=generic.ACT_F32, prompt=True), 64)
++    assert "prompt" not in [n for n, _ in fake.calls]                     # her kernel is GLM's bf16 SwiGLU only
++    assert generic.prompt_kernel_ready(_layer(), SLOTS) and not generic.prompt_kernel_ready(_layer(), 33)
++    with pytest.raises(ValueError, match="prompt_pass"):
++        _run(monkeypatch, lambda x, p, ex, s, R: generic.routed(x, p, None, ex, s, None, R, act_mode=generic.ACT_BF16,
++                                                               prompt=True, prompt_pass=32), 64)
++
++
++def test_prompt_kernel_with_weights_combines(monkeypatch):
++    def fn(x, p, ex, s, R):
++        return generic.routed(x, p, torch.ones((R, SLOTS)), ex, s, None, R, act_mode=generic.ACT_BF16, prompt=True)
++
++    fake, ex, s, out = _run(monkeypatch, fn, 64)
++    assert [n for n, _ in fake.calls] == ["group", "rot_in", "prompt", "combine"]   # rowrot unset: per pair
++    c = fake.named("combine")[0]
++    assert c[0] is s.y and c[2] is out and c[3:] == (64, ex.dims, SLOTS) and out.shape == (64, ex.dims)
++
++
++# ------------------------------------------------------------------------------------------------- the expert node
++
++def _node(monkeypatch):
++    from tensorfold.families.glm5_next.cuda import experts_node
++
++    ex = _layer()
++    node = experts_node.ExpertNode.__new__(experts_node.ExpertNode)
++    node.cfg = SimpleNamespace(hidden=ex.dims, top_k=TOPK, moe_width=2 * ex.width, experts=E, limit=7.0)
++    node.half, node.layers, node.experts, node.by_layer = 0, [3, 4], [ex, ex], {3: ex, 4: ex}
++    node.buf = experts_node.ExpertBuffers(node.cfg, rows=8, prefill_rows=128, device="cpu")
++    return experts_node, node
++
++
++def test_compute_passes_the_prompt_mark(monkeypatch):
++    experts_node, node = _node(monkeypatch)
++    seen = []
++    monkeypatch.setattr(experts_node.exl3_generic, "routed", lambda *a, **k: seen.append(k))
++    monkeypatch.setattr(experts_node.glue, "combine", lambda ey, wts, out: None)
++    assert node.prompt is False                                           # the class default: a decode window
++    node.compute(3, 64)
++    node.prompt = True
++    node.compute(3, 8)
++    assert seen == [{"prompt": False}, {"prompt": True}]
++
++
++class _Done(Exception):
++    pass
++
++
++class FakeLink:
++    """forwards()'s link: a fixed list of forwards (seq, rows, mode[, span]), then _Done."""
++
++    def __init__(self, fwd, D):
++        self.fwd, self.D, self.pairs, self.span, self.rows = list(fwd), D, True, None, 0
++        self.partner_rows = []
++
++    def next_forward(self):
++        if not self.fwd:
++            raise _Done
++        seq, rows, mode, *span = self.fwd.pop(0)
++        self.span, self.rows = (span[0] if span else None), rows
++        return seq, rows, mode
++
++    def next_partner(self):
++        return (99,)
++
++    def use(self, slot):
++        pass
++
++    def land(self, pos, slots):
++        return slots
++
++    def reply(self, pos, routed):
++        pass
++
++
++def test_forwards_marks_prompt_chunks_from_the_mode(monkeypatch):
++    experts_node, node = _node(monkeypatch)
++    from tensorfold.families.glm5_next.cuda.afd import MODE_CHUNK, MODE_EAGER, MODE_PAIR, MODE_SLICE
++
++    marks = []
++
++    def compute(layer_i, R, x=None):
++        marks.append((R, node.prompt))
++        return node.buf.routed[:R]
++
++    node.compute = compute
++    link = FakeLink([(1, 8, MODE_EAGER), (2, 100, MODE_CHUNK), (3, 5, MODE_EAGER), (4, 64, MODE_SLICE, (1, 1)),
++                     (5, 32, MODE_PAIR), (6, 3, MODE_EAGER)], node.cfg.hidden)
++    with pytest.raises(_Done):
++        experts_node.forwards(node, link, store=None, rank=1)
++    assert marks == [(8, False), (8, False), (100, True), (100, True), (5, False), (5, False), (64, True),
++                     (32, True), (32, True), (32, True), (32, True), (3, False), (3, False)]

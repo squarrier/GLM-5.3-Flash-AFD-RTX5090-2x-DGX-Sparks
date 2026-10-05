@@ -1,0 +1,2057 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 13:55:47 +0300
+Subject: [PATCH] feat(glm cuda): segmented KDA and DSA kernels for
+ multi-stream verify windows (each segment its solo bits)
+
+One verify window can hold several streams' rows back to back. Each segment runs from its own state with the
+arithmetic of the single-stream decode kernels, so its rows get the bits of its window run alone:
+
+- kda.cu / kda.py: chain_wide_segments (each segment from its state slot and parity into the other parity, its conv
+  taps from its conv slot) and replay_layers_segments (each segment's kept rows); segment_table builds the int32
+  table (first row, rows, slot, parity, conv slot, keep); 0-row segments are skipped, so one table and one CUDA
+  graph per window size serve fewer streams
+- forward.conv_shift_segments: each segment's conv window shifted by its own kept rows
+- latent.py: seg_latent_write and seg_attention (dense rows over keys 0 .. pos of their stream's extent, sparse rows
+  over their selected tokens, one chunk pass and one merge, the solo kernels' tiles and _tile math)
+- sparse.py: seg_index_update (index keys, gates and the pools a row completes, at its stream's base) and
+  seg_select_tokens (each sparse row's visible pools scored and selected by a split radix select: the same pools
+  as top_pools); SPARSE_FROM and TOKENS name the dense limit and a sparse row's token list
+- segments.py: SegRows (per-row position, extent base and kind, per-segment tables) and the selection's scratch
+- forward.dsa_segments: dsa_block's latent path for such a window
+- kda.reserve keeps the wide chain's scratch at its largest before graph capture (an outgrown pair stays alive)
+
+The single-stream paths are unchanged.
+
+Tests (GPU): tests/cuda/test_glm_kda_segments.py (chain, replay and conv shift against solo runs, torch.equal, at
+real per-rank shapes, and against the one-kernel chain a decode window runs); tests/cuda/test_glm_attn_segments.py
+(segmented DSA windows against each segment alone through the decode path, eager and graph, dense, across the dense
+limit and sparse to 200k tokens; one graph per window size for any mix; dsa_segments against dsa_block; selection
+kernels against the stable-sort reference; absorb, expand and matmul rows independent of the window).
+
+From the GLM-5.3-Flash EXL3 2x DGX Sparks recipe (MiaAI-Lab), patches 0026 and 0029.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+---
+Credit: MiaAI-Lab's pull request ashhart/TensorFold#243, her commit 2c16d3edab62147c61cd3bc66fa4709fa4a4b689,
+  https://github.com/ashhart/TensorFold/pull/243 (Apache-2.0, as TensorFold). Her authorship is kept.
+
+ .../families/glm5_next/cuda/forward.py        |  82 +++
+ .../families/glm5_next/cuda/kda.cpp           |  77 +++
+ src/tensorfold/families/glm5_next/cuda/kda.cu | 215 +++++++
+ src/tensorfold/families/glm5_next/cuda/kda.py |  77 ++-
+ .../families/glm5_next/cuda/latent.py         | 111 ++++
+ .../families/glm5_next/cuda/segments.py       |  99 ++++
+ .../families/glm5_next/cuda/sparse.py         | 357 ++++++++++++
+ tests/cuda/test_glm_attn_segments.py          | 534 ++++++++++++++++++
+ tests/cuda/test_glm_kda_segments.py           | 330 +++++++++++
+ 9 files changed, 1881 insertions(+), 1 deletion(-)
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/segments.py
+ create mode 100644 tests/cuda/test_glm_attn_segments.py
+ create mode 100644 tests/cuda/test_glm_kda_segments.py
+
+diff --git a/src/tensorfold/families/glm5_next/cuda/forward.py b/src/tensorfold/families/glm5_next/cuda/forward.py
+index c73a130..0408c90 100644
+--- a/src/tensorfold/families/glm5_next/cuda/forward.py
++++ b/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -385,6 +385,48 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
+     return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
+ 
+ 
++def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int, rows, sel=None, index=None, *,
++                 select: bool = True) -> torch.Tensor | None:
++    """dsa_block on the latent cache for a multi-stream window (``rows``: segments.SegRows, already set): several
++    streams' rows back to back, each stream's latents (lc), index keys, gates and pooled keys (index: arenas) in
++    its own extent. Each segment's rows get the bits of that segment alone through dsa_block (the projections,
++    absorb and expand keep rows apart; the attention kernels are latent.seg_* / sparse.seg_*). Graphs: one per R
++    covers every position mix. ``select`` False skips the token selection (eager windows with no sparse row:
++    ``rows.any_sparse()``); ``sel``: segments.SelectScratch, needed with an index."""
++
++    c = w.cfg
++    a = layer.dsa
++    if a.absorb is None:
++        raise ValueError("segmented windows need the latent cache (TF_GLM_LATENT=1)")
++    mm(b, b.normed[:R], a.proj, b.xs[:R], b.dp[:R])
++    glue.rmsnorm(b.dp[:R, :c.q_lora], a.q_norm, c.eps, b.qr[:R], b.xs_qr[:R])
++    glue.rmsnorm(b.dp[:R, c.q_lora:], a.kv_norm, c.eps, b.lat[:R], b.xs_lat[:R])
++    HL = a.heads
++    mm(b, b.qr[:R], a.q_b, b.xs_qr[:R], b.q[:R].view(R, HL * c.qk_dim))
++    s = b.lat_s
++    with prof.timed("dsa: latent write"):
++        latent.seg_latent_write(b.lat[:R], lc, rows)
++    tokens = counts = None
++    if index is not None:
++        ik, ig, pk = index
++        ix = a.index
++        with prof.timed("dsa: indexer update"):
++            mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ikr[:R])
++            glue.router(b.normed[:R], ix.gate, b.igr[:R])
++            sparse.seg_index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, rows)
++        if select:
++            with prof.timed("dsa: select tokens"):
++                mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
++                tokens, counts = sparse.seg_select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], pk, rows, sel)
++    with prof.timed("dsa: absorb"):
++        qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R])
++    with prof.timed("dsa: attention"):
++        ol = latent.seg_attention(qa, lc, rows, tokens, counts, s, scale=c.qk_dim ** -0.5, out=s.ol[:R])
++    with prof.timed("dsa: expand"):
++        o = latent.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
++    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
++
++
+ def mlp_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+     m = layer.mlp
+     mm(b, b.normed[:R], m.gu, b.xs[:R], b.gu[:R])
+@@ -541,6 +583,46 @@ def _shift_conv(conv: torch.Tensor, proj: torch.Tensor, keep: int) -> None:
+                                            TAPS=taps, BLOCK=1024, num_warps=4)
+ 
+ 
++@triton.jit
++def _conv_shift_seg(CONV, PROJ, SEG, conv_slot, conv_layer, proj_layer, proj_row, C: tl.constexpr,
++                    TAPS: tl.constexpr, COLS: tl.constexpr, BLOCK: tl.constexpr):
++    """Program (layer, channel block, segment): ``_conv_shift`` of the segment's conv slot over its own rows."""
++
++    l = tl.program_id(0).to(tl.int64)
++    c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    e = SEG + tl.program_id(2) * COLS
++    row0 = tl.load(e + 0).to(tl.int64)
++    rows = tl.load(e + 1)
++    cslot = tl.load(e + 4).to(tl.int64)
++    keep = tl.load(e + 5)
++    if rows > 0:
++        conv = CONV + cslot * conv_slot
++        proj = PROJ + row0 * proj_row
++        v0 = _row(conv, proj, l, keep, c, conv_layer, proj_layer, proj_row, C, TAPS)
++        v1 = _row(conv, proj, l, keep + 1, c, conv_layer, proj_layer, proj_row, C, TAPS)
++        v2 = _row(conv, proj, l, keep + 2, c, conv_layer, proj_layer, proj_row, C, TAPS)
++        tl.store(conv + l * conv_layer + c, v0, mask=c < C)
++        tl.store(conv + l * conv_layer + C + c, v1, mask=c < C)
++        tl.store(conv + l * conv_layer + 2 * C + c, v2, mask=c < C)
++
++
++def conv_shift_segments(conv: torch.Tensor, proj: torch.Tensor, seg: torch.Tensor) -> None:
++    """``_shift_conv`` per segment of a multi-stream window: conv [conv slots, L, 3, C] (in place; each [3, C]
++    contiguous), proj [L, R, W >= C] the window's projection rows; segment i (``kda.segment_table``) has its conv
++    slot take rows keep .. keep + 2 of [conv[slot]; its own proj rows]. Segments of 0 rows are skipped."""
++
++    _, n, taps, C = conv.shape
++    if taps != 3:
++        raise ValueError("the conv shift kernel is written for 4-tap convolutions")
++    if conv.stride(3) != 1 or conv.stride(2) != C:
++        raise ValueError("each conv slot's [3, C] window must be contiguous")
++    if seg.dtype != torch.int32 or seg.dim() != 2 or seg.shape[1] != kda_mod.SEG_COLS or not seg.is_contiguous():
++        raise ValueError("segments: a contiguous int32 [nseg, SEG_COLS] table")
++    _conv_shift_seg[(n, triton.cdiv(C, 1024), seg.shape[0])](
++        conv, proj, seg, conv.stride(0), conv.stride(1), proj.stride(0), proj.stride(1), C=C, TAPS=taps,
++        COLS=kda_mod.SEG_COLS, BLOCK=1024, num_warps=4)
++
++
+ @torch.no_grad()
+ def commit(w: Weights, st: State, b: Buffers, R: int, keep: int) -> None:
+     """Keep the last forward's first ``keep`` rows; a prompt chunk keeps all, its KDA layers already committed."""
+diff --git a/src/tensorfold/families/glm5_next/cuda/kda.cpp b/src/tensorfold/families/glm5_next/cuda/kda.cpp
+index 4a1315b..c40f527 100644
+--- a/src/tensorfold/families/glm5_next/cuda/kda.cpp
++++ b/src/tensorfold/families/glm5_next/cuda/kda.cpp
+@@ -14,6 +14,15 @@ void kda_replay_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, co
+ void kda_replay_layers_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                             const at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, at::Tensor&);
+ 
++void kda_chain_wide_segments_cuda(const at::Tensor&, int64_t, const at::Tensor&, int64_t, int64_t, const at::Tensor&,
++                                  int64_t, const at::Tensor&, int64_t, const at::Tensor&, int64_t, const at::Tensor&,
++                                  at::Tensor&, int64_t, int64_t, const at::Tensor&, const at::Tensor&,
++                                  const at::Tensor&, double, double, int64_t, at::Tensor&, at::Tensor&, at::Tensor&,
++                                  at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&);
++void kda_replay_layers_segments_cuda(const at::Tensor&, int64_t, at::Tensor&, int64_t, int64_t, int64_t,
++                                     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                                     int64_t, int64_t, int64_t, int64_t);
++
+ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
+     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t, name, ": expected a CUDA tensor of the right dtype");
+ }
+@@ -97,9 +106,77 @@ void replay_layers(const at::Tensor& state_in, int64_t state_stride, const at::T
+                            rows, state_out);
+ }
+ 
++static void check_segments(const at::Tensor& seg) {
++    TORCH_CHECK(seg.is_cuda() && seg.scalar_type() == at::kInt && seg.dim() == 2 && seg.size(1) == 6 &&
++                seg.is_contiguous(), "segments: a contiguous CUDA int32 [nseg, 6] table "
++                "(first row, rows, state slot, parity, conv slot, keep)");
++}
++
++// rec [slots, 2, H, 128, 128] (this layer's states; each [H, 128, 128] contiguous), conv [slots, 3, 3 H 128]
++// (this layer's conv windows; each [3, C] contiguous). Segment i runs rows row0 .. row0 + rows - 1 of P/A/G from
++// rec[slot, parity] and conv[conv slot] into rec[slot, 1 - parity]; conv is read only.
++void chain_wide_segments(const at::Tensor& seg, const at::Tensor& P, int64_t p_stride, int64_t b_off,
++                         const at::Tensor& A, int64_t a_stride, const at::Tensor& G, int64_t g_stride,
++                         const at::Tensor& conv, const at::Tensor& cw, at::Tensor rec, const at::Tensor& a_log,
++                         const at::Tensor& dt_bias, const at::Tensor& norm_w, double eps, double lower, int64_t rows,
++                         at::Tensor out, at::Tensor k_save, at::Tensor v_save, at::Tensor g_save, at::Tensor b_save,
++                         at::Tensor q_tmp, at::Tensor y_tmp) {
++    check_segments(seg);
++    check(P, at::kBFloat16, "P");
++    check(A, at::kBFloat16, "A");
++    check(G, at::kBFloat16, "G");
++    check(conv, at::kBFloat16, "conv state");
++    check(cw, at::kBFloat16, "conv weight");
++    check(rec, at::kFloat, "state");
++    check(out, at::kBFloat16, "out");
++    check(k_save, at::kFloat, "k");
++    check(v_save, at::kBFloat16, "v");
++    check(g_save, at::kFloat, "g");
++    check(b_save, at::kFloat, "beta");
++    check(q_tmp, at::kFloat, "q scratch");
++    check(y_tmp, at::kBFloat16, "read-out scratch");
++    const int64_t H = a_log.numel();
++    TORCH_CHECK(cw.is_contiguous() && out.is_contiguous(), "conv weight and out must be contiguous");
++    TORCH_CHECK(conv.dim() == 3 && conv.size(1) == 3 && conv.size(2) == 3 * H * 128 && conv.stride(2) == 1 &&
++                conv.stride(1) == 3 * H * 128, "conv state [slots, 3, 3*H*128], each slot contiguous");
++    TORCH_CHECK(rec.dim() == 5 && rec.size(1) == 2 && rec.size(2) == H && rec.size(3) == 128 && rec.size(4) == 128 &&
++                rec.stride(4) == 1 && rec.stride(3) == 128 && rec.stride(2) == 128 * 128,
++                "state [slots, 2, H, 128, 128], each [H, 128, 128] contiguous");
++    TORCH_CHECK(dt_bias.numel() == H * 128 && norm_w.numel() == 128, "dt_bias [H*128], norm [128]");
++    TORCH_CHECK(cw.size(0) == 3 * H * 128 && cw.size(1) == 4, "conv weight [3*H*128, 4]");
++    TORCH_CHECK(rows >= 1 && P.size(0) >= rows && out.size(0) >= rows, "rows");
++    TORCH_CHECK(k_save.numel() >= rows * H * 128 && q_tmp.numel() >= rows * H * 128 &&
++                y_tmp.numel() >= rows * H * 128 && b_save.numel() >= rows * H, "scratch rows");
++    c10::cuda::CUDAGuard guard(P.device());
++    kda_chain_wide_segments_cuda(seg, seg.size(0), P, p_stride, b_off, A, a_stride, G, g_stride, conv,
++                                 conv.stride(0), cw, rec, rec.stride(0), rec.stride(1), a_log, dt_bias, norm_w, eps,
++                                 lower, rows, out, k_save, v_save, g_save, b_save, q_tmp, y_tmp);
++}
++
++// rec [slots, 2, layers, H, 128, 128] (each [H, 128, 128] contiguous); segment i with keep < rows replays its
++// first ``keep`` saved rows of every layer from rec[slot, parity] into rec[slot, 1 - parity].
++void replay_layers_segments(const at::Tensor& seg, at::Tensor rec, const at::Tensor& k_save, const at::Tensor& v_save,
++                            const at::Tensor& g_save, const at::Tensor& b_save, int64_t kv_stride, int64_t b_stride,
++                            int64_t layers, int64_t heads) {
++    check_segments(seg);
++    check(rec, at::kFloat, "state");
++    check(k_save, at::kFloat, "k");
++    check(v_save, at::kBFloat16, "v");
++    check(g_save, at::kFloat, "g");
++    check(b_save, at::kFloat, "beta");
++    TORCH_CHECK(rec.dim() == 6 && rec.size(1) == 2 && rec.size(2) >= layers && rec.size(3) == heads &&
++                rec.size(4) == 128 && rec.size(5) == 128 && rec.stride(5) == 1 && rec.stride(4) == 128 &&
++                rec.stride(3) == 128 * 128, "state [slots, 2, layers, H, 128, 128], each [H, 128, 128] contiguous");
++    c10::cuda::CUDAGuard guard(rec.device());
++    kda_replay_layers_segments_cuda(seg, seg.size(0), rec, rec.stride(0), rec.stride(1), rec.stride(2), k_save,
++                                    v_save, g_save, b_save, kv_stride, b_stride, layers, heads);
++}
++
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("chain", &chain);
+     m.def("chain_wide", &chain_wide);
+     m.def("replay", &replay);
+     m.def("replay_layers", &replay_layers);
++    m.def("chain_wide_segments", &chain_wide_segments);
++    m.def("replay_layers_segments", &replay_layers_segments);
+ }
+diff --git a/src/tensorfold/families/glm5_next/cuda/kda.cu b/src/tensorfold/families/glm5_next/cuda/kda.cu
+index 4d458e0..91ac58a 100644
+--- a/src/tensorfold/families/glm5_next/cuda/kda.cu
++++ b/src/tensorfold/families/glm5_next/cuda/kda.cu
+@@ -352,6 +352,181 @@ __global__ void __launch_bounds__(128) out_kernel(
+     out[(size_t)r * H * DV + h * DV + t] = __float2bfloat16_rn(yw * sigmoidf_(gate));
+ }
+ 
++// Several streams' windows in one launch. A segment table (int32 [nseg, SEG_COLS]: first row, rows, state slot,
++// parity, conv slot, keep) cuts the window's rows into streams; each segment reads its conv taps from its own
++// conv slot and runs the recurrence from rec[slot, parity] into rec[slot, 1 - parity]. Per row the arithmetic is
++// the solo kernels' line for line (same ``update``), so a segment's bits equal a solo run of its rows. A segment
++// of 0 rows is skipped: a table sized for the most streams serves fewer (grids stay fixed for CUDA graphs).
++constexpr int SEG_COLS = 6, SEG_ROW0 = 0, SEG_ROWS = 1, SEG_SLOT = 2, SEG_PARITY = 3, SEG_CONV = 4, SEG_KEEP = 5;
++
++// prep_kernel for block (row, head) of the whole window; the row's conv taps come from its segment.
++__global__ void __launch_bounds__(512) prep_seg_kernel(
++        int H, const int* __restrict__ seg, int nseg, const __nv_bfloat16* __restrict__ P, int p_stride, int b_off,
++        const __nv_bfloat16* __restrict__ A, int a_stride, const __nv_bfloat16* __restrict__ conv,
++        size_t conv_slot_stride, const __nv_bfloat16* __restrict__ cw, const float* __restrict__ a_log,
++        const float* __restrict__ dt_bias, float lower, float* __restrict__ q_out, float* __restrict__ k_save,
++        __nv_bfloat16* __restrict__ v_save, float* __restrict__ g_save, float* __restrict__ b_save) {
++    const int C = 3 * H * DK;
++    const int r = blockIdx.x, h = blockIdx.y;
++    int row0 = -1, cslot = 0;
++    for (int i = 0; i < nseg; ++i) {
++        const int* e = seg + i * SEG_COLS;
++        if (r >= e[SEG_ROW0] && r < e[SEG_ROW0] + e[SEG_ROWS]) { row0 = e[SEG_ROW0]; cslot = e[SEG_CONV]; }
++    }
++    if (row0 < 0) return;                             // a row no segment covers
++    const int rr = r - row0;                          // the row within its stream's window
++    const __nv_bfloat16* cs = conv + (size_t)cslot * conv_slot_stride;
++    const __nv_bfloat16* Ps = P + (size_t)row0 * p_stride;
++    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
++    __shared__ float qs[DK], ks[DK];
++    const size_t base = ((size_t)r * H + h) * DK;
++    if (t < 3 * DK) {
++        const int c = (t / DK) * H * DK + h * DK + (t % DK);
++        float acc = 0.0f;
++#pragma unroll
++        for (int tap = 0; tap < TAPS; ++tap) {
++            const int at = rr + tap;
++            const float x = at < TAPS - 1 ? __bfloat162float(cs[(size_t)at * C + c])
++                                          : __bfloat162float(Ps[(size_t)(at - (TAPS - 1)) * p_stride + c]);
++            acc = acc + __bfloat162float(cw[(size_t)c * TAPS + tap]) * x;
++        }
++        const float act = bf(acc / (1.0f + expf(-acc)));
++        if (t < DK) qs[t] = act;
++        else if (t < 2 * DK) ks[t - DK] = act;
++        else v_save[base + t - 2 * DK] = __float2bfloat16_rn(act);
++    } else {
++        const int i = t - 3 * DK;
++        const float decay_rate = expf(a_log[h]);
++        const float a = __bfloat162float(A[(size_t)r * a_stride + h * DK + i]) + dt_bias[h * DK + i];
++        g_save[base + i] = expf(lower * sigmoidf_(decay_rate * a));
++        if (i == 0) b_save[r * H + h] = bf(sigmoidf_(__bfloat162float(P[(size_t)r * p_stride + b_off + h])));
++    }
++    __syncthreads();
++    if (warp < 2) {
++        const float* x = warp == 0 ? qs : ks;
++        float v4[4], ss = 0.0f;
++#pragma unroll
++        for (int i = 0; i < 4; ++i) { v4[i] = x[lane * 4 + i]; ss = ss + v4[i] * v4[i]; }
++        ss = warp_sum(ss);
++        float inv = 1.0f / sqrtf(ss + 1e-6f);
++        float* dst = warp == 0 ? q_out : k_save;
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            float y = v4[i] * inv;
++            if (warp == 0) y = y * (1.0f / sqrtf((float)DK));
++            dst[base + lane * 4 + i] = y;
++        }
++    }
++}
++
++// step_kernel for block (segment x head, part): the segment's rows from rec[slot, parity] into rec[slot, 1 - parity].
++template <int WARPS, int TR>
++__global__ void __launch_bounds__(WARPS * 32) step_seg_kernel(
++        int H, const int* __restrict__ seg, float* __restrict__ rec, size_t slot_stride, size_t parity_stride,
++        const float* __restrict__ q_in, const float* __restrict__ k_save, const __nv_bfloat16* __restrict__ v_save,
++        const float* __restrict__ g_save, const float* __restrict__ b_save, __nv_bfloat16* __restrict__ y_out) {
++    constexpr int NT = WARPS * 32, VR = WARPS * 4;
++    const int* e = seg + (blockIdx.x / H) * SEG_COLS;
++    const int row0 = e[SEG_ROW0], rows = e[SEG_ROWS], slot = e[SEG_SLOT], parity = e[SEG_PARITY];
++    if (rows <= 0) return;
++    const float* state_in = rec + (size_t)slot * slot_stride + (size_t)parity * parity_stride;
++    float* state_out = rec + (size_t)slot * slot_stride + (size_t)(1 - parity) * parity_stride;
++    const int h = blockIdx.x % H, v0 = blockIdx.y * VR;
++    const int lw = threadIdx.x >> 5, lane = threadIdx.x & 31, warp = blockIdx.y * WARPS + lw;
++    __shared__ __align__(16) float kt[TR][DK];
++    __shared__ __align__(16) float qt[TR][DK];
++    __shared__ __align__(16) float gt[TR][DK];
++    __shared__ __align__(16) float vt[TR][VR];
++    __shared__ float bt[TR];
++    float s[4][4];
++    const size_t sbase = (size_t)h * DV * DK;
++#pragma unroll
++    for (int j = 0; j < 4; ++j)
++#pragma unroll
++        for (int i = 0; i < 4; ++i) s[j][i] = state_in[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i];
++    for (int r0 = 0; r0 < rows; r0 += TR) {
++        const int n = rows - r0 < TR ? rows - r0 : TR;
++        __syncthreads();
++        for (int x = threadIdx.x; x < n * DK; x += NT) {
++            const int rr = x / DK, c = x % DK;
++            const size_t base = ((size_t)(row0 + r0 + rr) * H + h) * DK + c;
++            kt[rr][c] = k_save[base];
++            qt[rr][c] = q_in[base];
++            gt[rr][c] = g_save[base];
++        }
++        for (int x = threadIdx.x; x < n * VR; x += NT) {
++            const int rr = x / VR, c = x % VR;
++            vt[rr][c] = __bfloat162float(v_save[((size_t)(row0 + r0 + rr) * H + h) * DV + v0 + c]);
++        }
++        if (threadIdx.x < n) bt[threadIdx.x] = b_save[(row0 + r0 + threadIdx.x) * H + h];
++        __syncthreads();
++        for (int rr = 0; rr < n; ++rr) {
++            const float4 k4 = reinterpret_cast<const float4*>(kt[rr])[lane];
++            const float4 q4 = reinterpret_cast<const float4*>(qt[rr])[lane];
++            const float4 g4 = reinterpret_cast<const float4*>(gt[rr])[lane];
++            const float4 v4 = reinterpret_cast<const float4*>(vt[rr])[lw];
++            float kk[4] = {k4.x, k4.y, k4.z, k4.w}, qq[4] = {q4.x, q4.y, q4.z, q4.w};
++            float gg[4] = {g4.x, g4.y, g4.z, g4.w}, vv[4] = {v4.x, v4.y, v4.z, v4.w};
++            update(s, kk, gg, vv, 0, bt[rr]);
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                float o = 0.0f;
++#pragma unroll
++                for (int i = 0; i < 4; ++i) o = o + s[j][i] * qq[i];
++                o = warp_sum(o);
++                if (lane == 0)
++                    y_out[((size_t)(row0 + r0 + rr) * H + h) * DV + warp * 4 + j] = __float2bfloat16_rn(o);
++            }
++        }
++    }
++#pragma unroll
++    for (int j = 0; j < 4; ++j)
++#pragma unroll
++        for (int i = 0; i < 4; ++i) state_out[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i] = s[j][i];
++}
++
++// replay_layers_kernel for block (segment, layer, head): the segment's first ``keep`` rows from rec[slot, parity]
++// into rec[slot, 1 - parity]; keep == rows (the chain already left that state) or rows == 0 skips the segment.
++__global__ void __launch_bounds__(1024) replay_layers_seg_kernel(
++        int H, int layers, const int* __restrict__ seg, float* __restrict__ rec, size_t slot_stride,
++        size_t parity_stride, size_t layer_stride, const float* __restrict__ k_save,
++        const __nv_bfloat16* __restrict__ v_save, const float* __restrict__ g_save, const float* __restrict__ b_save,
++        size_t kv_stride, size_t b_stride) {
++    const int* e = seg + (blockIdx.x / (layers * H)) * SEG_COLS;
++    const int row0 = e[SEG_ROW0], rows = e[SEG_ROWS], slot = e[SEG_SLOT], parity = e[SEG_PARITY];
++    const int keep = e[SEG_KEEP];
++    if (rows <= 0 || keep < 0 || keep >= rows) return;
++    const int layer = (blockIdx.x / H) % layers, h = blockIdx.x % H;
++    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
++    __shared__ float vs[DV];
++    float s[4][4];
++    const float* sin = rec + (size_t)slot * slot_stride + (size_t)parity * parity_stride + layer * layer_stride;
++    float* sout = rec + (size_t)slot * slot_stride + (size_t)(1 - parity) * parity_stride + layer * layer_stride;
++    const float* ks = k_save + layer * kv_stride + (size_t)row0 * H * DK;
++    const __nv_bfloat16* vsv = v_save + layer * kv_stride + (size_t)row0 * H * DV;
++    const float* gsv = g_save + layer * kv_stride + (size_t)row0 * H * DK;
++    const float* bsv = b_save + layer * b_stride + (size_t)row0 * H;
++    const size_t sbase = (size_t)h * DV * DK;
++#pragma unroll
++    for (int j = 0; j < 4; ++j)
++#pragma unroll
++        for (int i = 0; i < 4; ++i) s[j][i] = sin[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i];
++    for (int r = 0; r < keep; ++r) {
++        const size_t base = ((size_t)r * H + h) * DK;
++        if (t < DV) vs[t] = __bfloat162float(vsv[base + t]);
++        __syncthreads();
++        float kk[4], gg[4];
++#pragma unroll
++        for (int i = 0; i < 4; ++i) { kk[i] = ks[base + lane * 4 + i]; gg[i] = gsv[base + lane * 4 + i]; }
++        update(s, kk, gg, vs, warp, bsv[r * H + h]);
++        __syncthreads();
++    }
++#pragma unroll
++    for (int j = 0; j < 4; ++j)
++#pragma unroll
++        for (int i = 0; i < 4; ++i) sout[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i] = s[j][i];
++}
++
+ }  // namespace
+ 
+ template <typename T>
+@@ -417,3 +592,43 @@ void kda_chain_wide_cuda(const at::Tensor& P, int64_t p_stride, int64_t b_off, c
+                                         ptr<__nv_bfloat16>(norm_w), (float)eps, ptr<__nv_bfloat16>(out));
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
++
++void kda_chain_wide_segments_cuda(const at::Tensor& seg, int64_t nseg, const at::Tensor& P, int64_t p_stride,
++                                  int64_t b_off, const at::Tensor& A, int64_t a_stride, const at::Tensor& G,
++                                  int64_t g_stride, const at::Tensor& conv, int64_t conv_slot_stride,
++                                  const at::Tensor& cw, at::Tensor& rec, int64_t slot_stride, int64_t parity_stride,
++                                  const at::Tensor& a_log, const at::Tensor& dt_bias, const at::Tensor& norm_w,
++                                  double eps, double lower, int64_t rows, at::Tensor& out, at::Tensor& k_save,
++                                  at::Tensor& v_save, at::Tensor& g_save, at::Tensor& b_save, at::Tensor& q_tmp,
++                                  at::Tensor& y_tmp) {
++    auto stream = at::cuda::getCurrentCUDAStream();
++    const int H = (int)a_log.numel();
++    const dim3 grid((unsigned)rows, (unsigned)H);
++    prep_seg_kernel<<<grid, 512, 0, stream>>>(
++        H, ptr<int>(seg), (int)nseg, ptr<__nv_bfloat16>(P), (int)p_stride, (int)b_off, ptr<__nv_bfloat16>(A),
++        (int)a_stride, ptr<__nv_bfloat16>(conv), (size_t)conv_slot_stride, ptr<__nv_bfloat16>(cw), ptr<float>(a_log),
++        ptr<float>(dt_bias), (float)lower, ptr<float>(q_tmp), ptr<float>(k_save), ptr<__nv_bfloat16>(v_save),
++        ptr<float>(g_save), ptr<float>(b_save));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    constexpr int WARPS = 4, TR = 16;
++    step_seg_kernel<WARPS, TR><<<dim3((unsigned)(nseg * H), DV / 4 / WARPS), WARPS * 32, 0, stream>>>(
++        H, ptr<int>(seg), ptr<float>(rec), (size_t)slot_stride, (size_t)parity_stride, ptr<float>(q_tmp),
++        ptr<float>(k_save), ptr<__nv_bfloat16>(v_save), ptr<float>(g_save), ptr<float>(b_save),
++        ptr<__nv_bfloat16>(y_tmp));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    out_kernel<<<grid, DV, 0, stream>>>(H, ptr<__nv_bfloat16>(y_tmp), ptr<__nv_bfloat16>(G), (int)g_stride,
++                                        ptr<__nv_bfloat16>(norm_w), (float)eps, ptr<__nv_bfloat16>(out));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++void kda_replay_layers_segments_cuda(const at::Tensor& seg, int64_t nseg, at::Tensor& rec, int64_t slot_stride,
++                                     int64_t parity_stride, int64_t layer_stride, const at::Tensor& k_save,
++                                     const at::Tensor& v_save, const at::Tensor& g_save, const at::Tensor& b_save,
++                                     int64_t kv_stride, int64_t b_stride, int64_t layers, int64_t heads) {
++    auto stream = at::cuda::getCurrentCUDAStream();
++    replay_layers_seg_kernel<<<(unsigned)(nseg * layers * heads), 1024, 0, stream>>>(
++        (int)heads, (int)layers, ptr<int>(seg), ptr<float>(rec), (size_t)slot_stride, (size_t)parity_stride,
++        (size_t)layer_stride, ptr<float>(k_save), ptr<__nv_bfloat16>(v_save), ptr<float>(g_save), ptr<float>(b_save),
++        (size_t)kv_stride, (size_t)b_stride);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
+diff --git a/src/tensorfold/families/glm5_next/cuda/kda.py b/src/tensorfold/families/glm5_next/cuda/kda.py
+index b4a8a60..1fc7f04 100644
+--- a/src/tensorfold/families/glm5_next/cuda/kda.py
++++ b/src/tensorfold/families/glm5_next/cuda/kda.py
+@@ -57,19 +57,33 @@ def replay_layers(state_in: torch.Tensor, scratch: KDAScratchSet, rows: int, sta
+ 
+ WIDE_ROWS = 64          # windows of this many rows or more (prefill chunks) run the chain in three kernels
+ _tmp: dict = {}
++_outgrown: list = []
+ 
+ 
+ def _wide_scratch(rows: int, heads: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+-    """The normalized q and the read-out of a long window, shared by every layer (they run one after another)."""
++    """The normalized q and the read-out of a long window, shared by every layer (they run one after another).
++    A CUDA graph keeps the addresses it was captured with (``chain_segments`` in a multi-stream window's graphs):
++    an outgrown pair stays alive, and ``reserve`` sizes them before any capture."""
++    device = torch.device(device)
++    if device.type == "cuda" and device.index is None:
++        device = torch.device("cuda", torch.cuda.current_device())
+     key = (heads, device)
+     q, y = _tmp.get(key, (None, None))
+     if q is None or q.shape[0] < rows:
++        if q is not None:                # a captured graph may still use the smaller pair: keep it alive
++            _outgrown.append((q, y))
+         q = torch.empty((rows, heads, DK), dtype=torch.float32, device=device)
+         y = torch.empty((rows, heads, DV), dtype=torch.bfloat16, device=device)
+         _tmp[key] = (q, y)
+     return q, y
+ 
+ 
++def reserve(rows: int, heads: int, device) -> None:
++    """The wide path's scratch for windows of up to ``rows`` rows, allocated now (before graph capture)."""
++
++    _wide_scratch(rows, heads, device)
++
++
+ def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_state: torch.Tensor,
+           conv_w: torch.Tensor, state_in: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
+           norm_w: torch.Tensor, eps: float, lower: float, rows: int, scratch: KDAScratch,
+@@ -90,3 +104,64 @@ def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_st
+ 
+ def replay(state_in: torch.Tensor, scratch: KDAScratch, rows: int, state_out: torch.Tensor) -> None:
+     _ext().replay(state_in, scratch.k, scratch.v, scratch.g, scratch.b, int(rows), state_out)
++
++
++# -- several streams in one window ----------------------------------------------------------------------------
++# A verify window holding several streams' rows back to back ([s1 rows][s2 rows]...) runs as segments: an int32
++# CUDA table [nseg, SEG_COLS] of (first row, rows, state slot, parity, conv slot, keep). Segment i runs from
++# rec[slot, parity] with conv[conv slot]'s taps into rec[slot, 1 - parity]; its outputs and states are the bits of a
++# solo ``chain(..., wide=True)`` / ``replay_layers`` of its rows. A segment of 0 rows is skipped, so a table sized for
++# the most streams (and the grids a CUDA graph captured) serves fewer: rewrite the table in place between replays.
++SEG_COLS = 6
++SEG_ROW0, SEG_ROWS, SEG_SLOT, SEG_PARITY, SEG_CONV, SEG_KEEP = range(SEG_COLS)
++
++
++def segment_table(segments, device, out: torch.Tensor | None = None) -> torch.Tensor:
++    """The table of ``segments`` [(rows, state slot, parity[, conv slot[, keep]])] laid back to back from row 0;
++    conv slot defaults to the state slot, keep to rows. With ``out`` ([n >= len, SEG_COLS] int32) it is written in
++    place (rows past the list become empty segments) and returned."""
++
++    rows_ = []
++    row0 = 0
++    for s in segments:
++        rows, slot, parity = int(s[0]), int(s[1]), int(s[2])
++        conv = int(s[3]) if len(s) > 3 and s[3] is not None else slot
++        keep = int(s[4]) if len(s) > 4 and s[4] is not None else rows
++        if rows < 0 or parity not in (0, 1) or not 0 <= keep <= rows:
++            raise ValueError(f"bad segment {s!r}")
++        rows_.append([row0, rows, slot, parity, conv, keep])
++        row0 += rows
++    n = len(rows_) if out is None else out.shape[0]
++    if len(rows_) > n:
++        raise ValueError(f"{len(rows_)} segments do not fit a table of {n}")
++    rows_ += [[row0, 0, 0, 0, 0, 0]] * (n - len(rows_))
++    host = torch.tensor(rows_, dtype=torch.int32).reshape(n, SEG_COLS)
++    if out is None:
++        return host.to(device)
++    out.copy_(host, non_blocking=False)
++    return out
++
++
++def chain_segments(seg: torch.Tensor, p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor,
++                   conv: torch.Tensor, conv_w: torch.Tensor, rec: torch.Tensor, a_log: torch.Tensor,
++                   dt_bias: torch.Tensor, norm_w: torch.Tensor, eps: float, lower: float, rows: int,
++                   scratch: KDAScratch) -> torch.Tensor:
++    """One layer's window of ``rows`` rows cut into the segments ``seg`` (``segment_table``): p/a/g as in ``chain``;
++    conv [conv slots, 3, 3 H 128] this layer's conv windows (read only; ``conv_shift_segments`` after the commit);
++    rec [state slots, 2, H, 128, 128] this layer's states (e.g. ``rec[:, :, layer]``). The three-kernel path
++    (``chain_wide``) for any window."""
++
++    q_tmp, y_tmp = _wide_scratch(rows, a_log.numel(), p.device)
++    _ext().chain_wide_segments(seg, p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv, conv_w, rec,
++                               a_log, dt_bias, norm_w, float(eps), float(lower), int(rows), scratch.out, scratch.k,
++                               scratch.v, scratch.g, scratch.b, q_tmp, y_tmp)
++    return scratch.out[:rows]
++
++
++def replay_layers_segments(seg: torch.Tensor, rec: torch.Tensor, scratch: KDAScratchSet) -> None:
++    """Every segment with keep < rows: every layer's state after its first ``keep`` rows, rec[slot, parity] ->
++    rec[slot, 1 - parity] (rec [state slots, 2, layers, H, 128, 128]); keep == rows leaves the chain's state."""
++
++    L, H = scratch.layers, scratch.heads
++    _ext().replay_layers_segments(seg, rec, scratch.k, scratch.v, scratch.g, scratch.b, scratch.rows * H * DK,
++                                  scratch.rows * H, L, H)
+diff --git a/src/tensorfold/families/glm5_next/cuda/latent.py b/src/tensorfold/families/glm5_next/cuda/latent.py
+index cec1ff1..b84208c 100644
+--- a/src/tensorfold/families/glm5_next/cuda/latent.py
++++ b/src/tensorfold/families/glm5_next/cuda/latent.py
+@@ -350,3 +350,114 @@ def sparse_attention(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor
+ 
+ def chunks_for(length: int) -> int:
+     return triton.cdiv(length, CHUNK)
++
++
++# ------------------------------------------------------------------------------------- multi-stream windows ---
++# A window of several streams' rows back to back ([s1: rows][s2: rows]...), each stream's latents in its own extent
++# of a shared arena [P, LW]: per-row device tables (``segments.SegRows``: position, extent base, dense or sparse)
++# drive the kernels below. Every row keeps the arithmetic, tiles and head blocks of today's single-stream kernels,
++# so a segment's rows get the bits of that segment run alone on its extent (tests/cuda/test_glm_attn_segments.py).
++# Cache reads and writes go through _lat_get / _lat_put (the one place a quantized cache plugs in).
++
++@triton.jit
++def _lat_get(LC, rows, ok, k, RS: tl.constexpr):
++    """Cache rows ``rows`` (int64 [n]) as a bf16 tile [n, LW]; rows with ok false are not read (zeros)."""
++    return tl.load(LC + rows[:, None] * RS + k[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
++
++
++@triton.jit
++def _lat_put(LC, row, k, x, RS: tl.constexpr):
++    """Cache row ``row`` (int64) <- x [LW] (bf16)."""
++    tl.store(LC + row * RS + k, x)
++
++
++@triton.jit
++def _seg_lat_write(LAT, lat_stride, LC, POS, BASE, LW: tl.constexpr):
++    """Row r -> arena row base[r] + pos[r]."""
++    r = tl.program_id(0)
++    row = tl.load(BASE + r).to(tl.int64) + tl.load(POS + r).to(tl.int64)
++    k = tl.arange(0, LW)
++    _lat_put(LC, row, k, tl.load(LAT + r * lat_stride + k), LW)
++
++
++def seg_latent_write(lat: torch.Tensor, cache: torch.Tensor, rows) -> None:
++    """lat [R, latent] bf16 rows into the arena at each row's base + pos (``rows``: segments.SegRows)."""
++    _seg_lat_write[(lat.shape[0],)](lat, lat.stride(0), cache, rows.pos, rows.base, LW=cache.shape[1], num_warps=4)
++
++
++@triton.jit
++def _seg_chunks(QA, LC, POS, BASE, SPR, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.constexpr,
++                LW: tl.constexpr, CH: tl.constexpr, SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr):
++    """Program (row, head block, chunk): _dense_chunks for a dense row (keys base + 0 .. base + pos[r], its own
++    limit), _sparse_chunks for a sparse one (keys base + its selected tokens, list order): the same tiles, masks and
++    _tile math either way, so a row's partials are those of its single-stream kernel."""
++    r = tl.program_id(0)
++    hb = tl.program_id(1)
++    c = tl.program_id(2)
++    B = tl.load(BASE + r).to(tl.int64)
++    sp = tl.load(SPR + r) != 0
++    n = tl.where(sp, tl.load(CNT + r, mask=sp, other=0), tl.load(POS + r) + 1)   # selected tokens, or keys 0 .. pos
++    hh = hb * HBT + tl.arange(0, HBT)
++    hok = hh < H
++    k = tl.arange(0, LW)
++    m = tl.full((HBT,), float("-inf"), tl.float32)
++    l = tl.zeros((HBT,), tl.float32)
++    o = tl.zeros((HBT, LW), tl.float32)
++    if c * CH < n:
++        q = tl.load(QA + (r * H + hh[:, None]) * LW + k[None, :], mask=hok[:, None], other=0).to(tl.bfloat16)
++        for t in range(CH // KTT):
++            idx = c * CH + t * KTT + tl.arange(0, KTT)
++            ok = idx < n
++            tok = tl.load(TOK + r * W + idx, mask=ok & sp, other=0).to(tl.int64)
++            tok = tl.where(sp, tok, idx.to(tl.int64))
++            kv = _lat_get(LC, B + tok, ok, k, LW)
++            m, l, o = _tile(q, kv, m, l, o, ok, SCALE)
++    base = (c * R + r) * H + hh
++    tl.store(PO + base[:, None] * LW + k[None, :], o, mask=hok[:, None])
++    tl.store(PM + base, m, mask=hok)
++    tl.store(PL + base, l, mask=hok)
++
++
++def seg_chunks() -> int:
++    """Chunks a segmented window's rows take: a sparse row's 2,051 selected tokens, a dense row's keys up to
++    SPARSE_FROM - 1 (both 5 of 512); chunks past a row's keys are empty (merged as nothing, the same bits)."""
++    from .sparse import SPARSE_FROM, TOKENS
++
++    return triton.cdiv(max(SPARSE_FROM, TOKENS), CHUNK)
++
++
++SEG_WIDE_ROWS = 8        # segmented windows from this many rows take 32-head tiles (keys read once; fewer programs)
++
++
++def seg_head_block(R: int) -> int:
++    """Heads per program of a segmented window: 16 for a few rows (more programs in flight), a rank's 32 from
++    SEG_WIDE_ROWS (each key tile read once for them). 16- and 32-row tiles give a row the same bits (head_block),
++    so either matches the single-stream kernels' 16 (tests/cuda/test_glm_attn_segments.py checks both)."""
++    return HB_WIDE if R >= SEG_WIDE_ROWS else HB
++
++
++def seg_attention(qa: torch.Tensor, cache: torch.Tensor, rows, tokens: torch.Tensor | None,
++                  counts: torch.Tensor | None, s: LatentScratch, *, scale: float, out: torch.Tensor,
++                  hb: int | None = None) -> torch.Tensor:
++    """Attention of a segmented window's rows qa [R, H, 512] -> out [R, H, 512]: dense rows over their stream's
++    keys 0 .. pos, sparse rows over their selected tokens (``segments.seg_select``: tokens relative to the stream,
++    counts), each in its own extent of the arena. One chunk pass and one merge for both kinds; a row gets the bits
++    of ``attention`` (dense) or ``sparse_attention`` (sparse) run on its segment alone."""
++    R, H, LW = qa.shape
++    nch = seg_chunks()
++    if nch > s.nch or R > s.rows or LW != s.lw:
++        raise ValueError(f"segmented attention: {R} rows, {nch} chunks, width {LW} past the scratch's "
++                         f"{s.rows}, {s.nch}, {s.lw}")
++    if tokens is None:                   # a window without sparse rows (no index): nothing reads the lists
++        tokens, counts, W = s.dummy, s.dummy, 1
++    else:
++        W = tokens.shape[1]
++    n = nch * R * H
++    hb = seg_head_block(R) if hb is None else hb
++    if hb not in (HB, HB_WIDE):
++        raise ValueError(f"segmented attention: {hb} heads a tile, not {HB} or {HB_WIDE}")
++    _seg_chunks[(R, triton.cdiv(H, hb), nch)](qa, cache, rows.pos, rows.base, rows.sparse, tokens, counts,
++                                              s.po[:n * LW], s.pm[:n], s.pl[:n], R, W=W, H=H, LW=LW, CH=CHUNK,
++                                              SCALE=scale, HBT=hb, KTT=KT, num_warps=8, num_stages=1)
++    _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
++    return out
+diff --git a/src/tensorfold/families/glm5_next/cuda/segments.py b/src/tensorfold/families/glm5_next/cuda/segments.py
+new file mode 100644
+index 0000000..1a847f3
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/segments.py
+@@ -0,0 +1,99 @@
++"""Multi-stream decode windows: several streams' rows back to back ([s1: rows][s2: rows]...), each stream's per-token
++DSA state in its own extent of shared arenas (latents [P, 512], index keys and gates [P, 128], pooled keys
++[P / 4 + 2, 128]; extents aligned to EXTENT tokens). ``SegRows`` holds the per-row and per-segment device tables the
++segmented kernels read (latent.seg_*, sparse.seg_*); ``SelectScratch`` the token selection's buffers. Static
++buffers, so one CUDA graph per window size covers every mix of positions and context lengths."""
++
++from __future__ import annotations
++
++from collections.abc import Sequence
++
++import torch
++
++from .sparse import POOL, SPARSE_FROM, TOKENS, split_scratch
++
++MAX_SEGS = 4          # streams a window holds
++EXTENT = 2048         # a stream's extent starts at a multiple of this many tokens (its pooled keys at base / 4)
++
++
++class SegRows:
++    """Device tables of a window of up to ``rows`` rows in up to ``max_segs`` segments, one int32 tensor:
++
++    per row: ``pos`` (the row's position in its stream), ``base`` (its stream's first arena row), ``seg`` (segment
++    index), ``sparse`` (1: past the dense limit, attends to its selected tokens; 0: dense over keys 0 .. pos);
++    per segment: ``seg_start`` (first row), ``seg_rows`` (0: unused), ``seg_pbase`` (pooled-key base, base / 4),
++    ``seg_pools`` (pools its last row sees when it has sparse rows, else 0: what the selection scores)."""
++
++    def __init__(self, rows: int, device, max_segs: int = MAX_SEGS) -> None:
++        self.rows, self.max_segs = rows, max_segs
++        n = 4 * rows + 4 * max_segs
++        pin = torch.cuda.is_available() and torch.device(device).type == "cuda"
++        self.host = torch.zeros((n,), dtype=torch.int32, pin_memory=pin)
++        self.dev = torch.zeros((n,), dtype=torch.int32, device=device)
++        self.pos, self.base, self.seg, self.sparse = (self.dev[i * rows:(i + 1) * rows] for i in range(4))
++        o = 4 * rows
++        self.seg_start, self.seg_rows, self.seg_pbase, self.seg_pools = (
++            self.dev[o + i * max_segs:o + (i + 1) * max_segs] for i in range(4))
++        self.staged = torch.cuda.Event() if pin else None
++        self.R = 0
++        self.segments: list[tuple[int, int, int]] = []
++
++    def fill(self, segments: Sequence[tuple[int, int, int]], *, sparse_from: int | None = SPARSE_FROM):
++        """The host tables for ``segments`` [(base, pos, rows)] in window order (numpy int32, the device layout).
++        ``sparse_from``: the first position that attends sparsely (None: no index, every row dense)."""
++
++        if not 1 <= len(segments) <= self.max_segs:
++            raise ValueError(f"a window of {len(segments)} segments, at most {self.max_segs}")
++        R = sum(n for _, _, n in segments)
++        if R > self.rows:
++            raise ValueError(f"a window of {R} rows, the tables hold {self.rows}")
++        rows, S = self.rows, self.max_segs
++        t = torch.zeros((4 * rows + 4 * S,), dtype=torch.int32).numpy()
++        r = 0
++        for s, (base, pos, n) in enumerate(segments):
++            if n < 1 or pos < 0 or base < 0 or base % EXTENT:
++                raise ValueError(f"segment {s}: base {base} (a multiple of {EXTENT}), position {pos}, {n} rows")
++            for i in range(n):
++                q = pos + i
++                t[r + i] = q
++                t[rows + r + i] = base
++                t[2 * rows + r + i] = s
++                t[3 * rows + r + i] = int(sparse_from is not None and q >= sparse_from)
++            last = pos + n - 1
++            t[4 * rows + s] = r
++            t[4 * rows + S + s] = n
++            t[4 * rows + 2 * S + s] = base // POOL
++            t[4 * rows + 3 * S + s] = (last + 1) // POOL if sparse_from is not None and last >= sparse_from else 0
++            r += n
++        return t, R
++
++    def set(self, segments: Sequence[tuple[int, int, int]], *, sparse_from: int | None = SPARSE_FROM) -> int:
++        """Stage ``segments`` [(base, pos, rows)] into the device tables (a pinned copy, ordered on the current
++        stream like forward.stage's token ids); returns the window's rows."""
++
++        t, R = self.fill(segments, sparse_from=sparse_from)
++        if self.staged is not None:
++            self.staged.synchronize()          # the previous copy has left the pinned buffer
++        self.host.numpy()[:] = t
++        self.dev.copy_(self.host, non_blocking=True)
++        if self.staged is not None:
++            self.staged.record()
++        self.R, self.segments = R, list(segments)
++        return R
++
++    def any_sparse(self) -> bool:
++        """Host view of the last ``set``: does any row attend sparsely."""
++        return bool(self.host[3 * self.rows:3 * self.rows + self.R].any())
++
++
++class SelectScratch:
++    """The segmented selection's buffers: fp32 scores [rows, pools] (a stream's pools at most: its largest context
++    / 4), tokens [rows, 2051] int32, counts [rows] int32, the split selection's scratch."""
++
++    def __init__(self, rows: int, max_context: int, device) -> None:
++        self.rows = rows
++        pools = max(1, -(-max_context // POOL))
++        self.scores = torch.empty((rows, pools), dtype=torch.float32, device=device)
++        self.tokens = torch.full((rows, TOKENS), -1, dtype=torch.int32, device=device)
++        self.counts = torch.zeros((rows,), dtype=torch.int32, device=device)
++        self.split = split_scratch(rows, pools, device)
+diff --git a/src/tensorfold/families/glm5_next/cuda/sparse.py b/src/tensorfold/families/glm5_next/cuda/sparse.py
+index a7930dd..b537314 100644
+--- a/src/tensorfold/families/glm5_next/cuda/sparse.py
++++ b/src/tensorfold/families/glm5_next/cuda/sparse.py
+@@ -11,6 +11,9 @@ from tensorfold.cuda.geometry import MLA_SELECT_ROWS as SELECT_ROWS   # a prompt
+ POOL = 4
+ TOPK_POOLS = 512
+ BR = 16
++# the first position whose row select_tokens counts (npool > TOPK_POOLS): rows before it keep dense attention
++SPARSE_FROM = (TOPK_POOLS + 1) * POOL - 1
++TOKENS = TOPK_POOLS * POOL + POOL - 1      # a sparse row's attended tokens: its 512 pools', then its incomplete pool's
+ 
+ 
+ @triton.jit
+@@ -305,3 +308,357 @@ def sparse_attention(q: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor, tokens
+         _sparse_chunks[(n, H, nch)](q[rows], kc, vc, tokens[rows], counts[rows], po, pm, pl, W=W, H=H, D=D, CH=CH,
+                                     SCALE=scale, num_warps=4, num_stages=1)
+         _sparse_merge[(n, H)](po, pm, pl, out[rows], counts[rows], H=H, D=D, NCH=nch, CH=CH, num_warps=4)
++
++
++# ------------------------------------------------------------------------------------- multi-stream windows ---
++# Segmented windows (latent.py's section of the same name): each stream's index keys and gates in its own extent of
++# shared arenas [P, 128] (token t of the stream at base + t) and its pooled keys at base / 4 + p of [P / 4 + 2, 128];
++# per-row device tables (``segments.SegRows``) give each row its position, base and kind. A row keeps its
++# single-stream arithmetic. Reads and writes of the index caches go through the helpers below.
++
++@triton.jit
++def _ix_put(IX, row, d, x, D: tl.constexpr):
++    """Index key or gate row ``row`` (int64) <- x [D] as bf16."""
++    tl.store(IX + row * D + d, x.to(tl.bfloat16))
++
++
++@triton.jit
++def _ix_get(IX, row, d, D: tl.constexpr):
++    """Index key or gate row ``row`` (int64) as fp32 [D]."""
++    return tl.load(IX + row * D + d).to(tl.float32)
++
++
++@triton.jit
++def _pk_put(PK, row, d, x, D: tl.constexpr):
++    """Pooled key row ``row`` (int64) <- x [D] (fp32) as bf16."""
++    tl.store(PK + row * D + d, x.to(tl.bfloat16))
++
++
++@triton.jit
++def _pk_get(PK, rows, ok, d, D: tl.constexpr):
++    """Pooled key rows ``rows`` (int64 [n]) as a bf16 tile [n, D]; rows with ok false are zeros."""
++    return tl.load(PK + rows[:, None] * D + d[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
++
++
++@triton.jit
++def _seg_index_write(KR, k_stride, GR, LNW, LNB, IK, IG, POS, BASE, eps, D: tl.constexpr):
++    """_index_write for row r at its stream's row base[r] + pos[r]."""
++
++    r = tl.program_id(0)
++    row = tl.load(BASE + r).to(tl.int64) + tl.load(POS + r).to(tl.int64)
++    d = tl.arange(0, D)
++    x = tl.load(KR + r * k_stride + d).to(tl.float32)
++    mean = tl.sum(x, axis=0) / D
++    xc = x - mean
++    var = tl.sum(xc * xc, axis=0) / D
++    y = xc / tl.sqrt(var + eps) * tl.load(LNW + d).to(tl.float32) + tl.load(LNB + d).to(tl.float32)
++    _ix_put(IK, row, d, y, D)
++    _ix_put(IG, row, d, tl.load(GR + r * D + d), D)
++
++
++@triton.jit
++def _seg_pool_keys(IK, IG, APE, PK, POS, BASE, D: tl.constexpr):
++    """Program r: the pool row r completes (pos[r] % 4 == 3), pool p = pos[r] // 4 of its stream, from tokens
++    base + 4p .. base + 4p + 3 into pooled row base / 4 + p: _pool_keys' arithmetic (the pools a single-stream
++    window completes are exactly those its rows end)."""
++
++    r = tl.program_id(0)
++    q = tl.load(POS + r).to(tl.int64)
++    if q % 4 != 3:
++        return
++    B = tl.load(BASE + r).to(tl.int64)
++    t = B + (q // 4) * 4
++    d = tl.arange(0, D)
++    l0 = _ix_get(IG, t + 0, d, D) + tl.load(APE + 0 * D + d).to(tl.float32)
++    l1 = _ix_get(IG, t + 1, d, D) + tl.load(APE + 1 * D + d).to(tl.float32)
++    l2 = _ix_get(IG, t + 2, d, D) + tl.load(APE + 2 * D + d).to(tl.float32)
++    l3 = _ix_get(IG, t + 3, d, D) + tl.load(APE + 3 * D + d).to(tl.float32)
++    m = tl.maximum(tl.maximum(l0, l1), tl.maximum(l2, l3))
++    e0 = tl.exp(l0 - m)
++    e1 = tl.exp(l1 - m)
++    e2 = tl.exp(l2 - m)
++    e3 = tl.exp(l3 - m)
++    s = ((e0 + e1) + e2) + e3
++    k0 = _ix_get(IK, t + 0, d, D)
++    k1 = _ix_get(IK, t + 1, d, D)
++    k2 = _ix_get(IK, t + 2, d, D)
++    k3 = _ix_get(IK, t + 3, d, D)
++    t0 = ((e0 / s).to(tl.bfloat16).to(tl.float32) * k0).to(tl.bfloat16).to(tl.float32)
++    t1 = ((e1 / s).to(tl.bfloat16).to(tl.float32) * k1).to(tl.bfloat16).to(tl.float32)
++    t2 = ((e2 / s).to(tl.bfloat16).to(tl.float32) * k2).to(tl.bfloat16).to(tl.float32)
++    t3 = ((e3 / s).to(tl.bfloat16).to(tl.float32) * k3).to(tl.bfloat16).to(tl.float32)
++    _pk_put(PK, B // 4 + q // 4, d, ((t0 + t1) + t2) + t3, D)
++
++
++def seg_index_update(k_raw: torch.Tensor, gate: torch.Tensor, ln_w: torch.Tensor, ln_b: torch.Tensor,
++                     ape: torch.Tensor, ik: torch.Tensor, ig: torch.Tensor, pk: torch.Tensor, rows) -> None:
++    """index_update for a segmented window: each row's index key and gate at its stream's base + pos, then every
++    pool a row completes (``rows``: segments.SegRows)."""
++
++    R = k_raw.shape[0]
++    _seg_index_write[(R,)](k_raw, k_raw.stride(0), gate, ln_w, ln_b, ik, ig, rows.pos, rows.base, 1e-6, D=128,
++                           num_warps=1)
++    _seg_pool_keys[(R,)](ik, ig, ape, pk, rows.pos, rows.base, D=128, num_warps=1)
++
++
++@triton.jit
++def _seg_scores(QI, W, w_stride, PK, OUT, o_stride, POS, SPR, SEG_START, SEG_ROWS, SEG_PBASE, SEG_POOLS, scale,
++                wscale, H: tl.constexpr, HP: tl.constexpr, D: tl.constexpr, BP: tl.constexpr, G: tl.constexpr):
++    """Program (segment, g): pool blocks g, g + G, .. below the segment's pool count (on the device: the pools its
++    last row sees), each block's keys (at the stream's pooled base) loaded once for all the segment's sparse rows;
++    a row's scores are _scores' (its keys masked to its own pools before the dot, as with RB > 1), written for its
++    visible pools only (the ones the selection reads)."""
++
++    s = tl.program_id(0)
++    g = tl.program_id(1)
++    npm = tl.load(SEG_POOLS + s)
++    nr = tl.load(SEG_ROWS + s)
++    r0 = tl.load(SEG_START + s)
++    pbase = tl.load(SEG_PBASE + s).to(tl.int64)
++    d = tl.arange(0, D)
++    hh = tl.arange(0, HP)
++    hok = hh < H
++    for pb in range(g, (npm + BP - 1) // BP, G):
++        p = pb * BP + tl.arange(0, BP)
++        k = _pk_get(PK, pbase + p, p < npm, d, D)                                       # [BP, D]
++        for i in range(nr):
++            r = r0 + i
++            if tl.load(SPR + r) != 0:
++                npool = (tl.load(POS + r) + 1) // 4
++                q = tl.load(QI + (r * H + hh[:, None]) * D + d[None, :], mask=hok[:, None], other=0.0).to(tl.bfloat16)
++                kr = tl.where((p < npool)[:, None], k, 0.0)
++                dots = tl.dot(q, tl.trans(kr))                                            # [HP, BP] fp32
++                w = tl.load(W + r * w_stride + hh, mask=hok, other=0.0).to(tl.float32) * wscale
++                sc = tl.sum(w[:, None] * tl.maximum(dots * scale, 0.0), axis=0)
++                tl.store(OUT + r * o_stride + p, sc, mask=p < npool)
++
++
++@triton.jit
++def _seg_select(S, s_stride, POS, SPR, TOK, CNT, W: tl.constexpr, K: tl.constexpr, PL: tl.constexpr,
++                BLOCK: tl.constexpr):
++    """Program r (a sparse row): _select_rows over the row's visible pools, its K pools' tokens written as they are
++    taken (ascending), then _tokens' tail and count; a dense row gets count 0. Every single-stream path scores more
++    columns, but those lie past the row's visible pools, score -inf and have the highest indices: they rank below
++    every visible pool (ties go to the lower pool), so a row with more than K visible pools selects the same ones
++    (sparse._select_prompt)."""
++
++    r = tl.program_id(0).to(tl.int64)
++    if tl.load(SPR + r) == 0:
++        tl.store(CNT + r, 0)
++        return
++    qpos = tl.load(POS + r).to(tl.int64)
++    NP = (qpos + 1) // PL
++    row = S + r * s_stride
++    bins = tl.arange(0, 256)
++    prefix = tl.zeros((), dtype=tl.uint32)
++    fixed = tl.zeros((), dtype=tl.uint32)
++    need = K
++    for p in tl.static_range(4):
++        hist = tl.zeros((256,), dtype=tl.int32)
++        for c in range(0, NP, BLOCK):
++            i = c + tl.arange(0, BLOCK)
++            ok = i < NP
++            u = _order_key(tl.load(row + i, mask=ok, other=0.0))
++            match = ok & ((u & fixed) == prefix)
++            hist += tl.histogram(((u >> (24 - 8 * p)) & 0xFF).to(tl.int32), 256, mask=match)
++        at_or_above = tl.sum(hist, 0) - tl.cumsum(hist, 0) + hist
++        digit = tl.max(tl.where(at_or_above >= need, bins, 0), 0)
++        need -= tl.sum(tl.where(bins > digit, hist, 0), 0)
++        prefix = prefix | (digit.to(tl.uint32) << (24 - 8 * p))
++        fixed = fixed | (tl.full((), 0xFF, tl.uint32) << (24 - 8 * p))
++    written = 0
++    equal_seen = 0
++    j = tl.arange(0, PL)
++    for c in range(0, NP, BLOCK):
++        i = c + tl.arange(0, BLOCK)
++        ok = i < NP
++        u = _order_key(tl.load(row + i, mask=ok, other=0.0))
++        eq = (ok & (u == prefix)).to(tl.int32)
++        take = (ok & (u > prefix)) | ((eq == 1) & (tl.cumsum(eq, 0) - eq + equal_seen < need))
++        t = take.to(tl.int32)
++        slot = (written + tl.cumsum(t, 0) - t).to(tl.int64)
++        tl.store(TOK + r * W + slot[:, None] * PL + j[None, :], (i.to(tl.int64)[:, None] * PL + j[None, :]).to(tl.int32),
++                 mask=take[:, None])
++        written += tl.sum(t, 0)
++        equal_seen += tl.sum(eq, 0)
++    jt = tl.arange(0, 4)
++    jok = jt < PL - 1
++    tail = NP * PL + jt
++    tok = jok & (tail <= qpos)
++    tl.store(TOK + r * W + K * PL + jt, tl.where(tok, tail, -1).to(tl.int32), mask=jok)
++    n = K * PL + tl.sum(tok.to(tl.int64), 0)
++    tl.store(CNT + r, tl.where(NP > K, n, 0).to(tl.int32))
++
++
++SEG_SCORE_GRID = 256       # _seg_scores programs a segment (grid stride over its pool blocks): speed only
++SEG_SPLIT = True           # seg_select_tokens: the split selection (select_split), else one program a row (_seg_select)
++SEG_SELECT = (4096, 8)     # _seg_select's scores a step and warps: speed only (the selection is exact integer logic)
++
++
++def seg_select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, rows, scratch) -> tuple[torch.Tensor,
++                                                                                                          torch.Tensor]:
++    """select_tokens for a segmented window: each sparse row's attended tokens [R, 2051] (relative to its stream,
++    ascending, -1 padded) and counts (0 for dense rows). Scores every segment's pools up to its device-side pool
++    count, so one CUDA graph per window size serves every context length (``scratch``: segments.SelectScratch)."""
++
++    if qi.stride(0) != qi.shape[1] or wts.stride(1) != 1:
++        raise ValueError("seg_select_tokens: index queries must be contiguous rows, weights unit-stride columns")
++    R = qi.shape[0]
++    if R > scratch.rows:
++        raise ValueError(f"seg_select_tokens: {R} rows, the scratch holds {scratch.rows}")
++    H = wts.shape[1]
++    D = qi.shape[1] // H
++    wscale = 1.0 / 5.656854249492381 if H == 32 else H ** -0.5            # select_tokens' constants
++    scores = scratch.scores
++    grid = min(SEG_SCORE_GRID, triton.cdiv(scores.shape[1], 64))
++    _seg_scores[(rows.max_segs, grid)](qi, wts, wts.stride(0), pk, scores, scores.stride(0), rows.pos, rows.sparse,
++                                       rows.seg_start, rows.seg_rows, rows.seg_pbase, rows.seg_pools, D ** -0.5,
++                                       wscale, H=H, HP=max(16, triton.next_power_of_2(H)), D=D, BP=64, G=grid,
++                                       num_warps=4)
++    tokens, counts = scratch.tokens[:R], scratch.counts[:R]
++    if SEG_SPLIT:
++        select_split(scores[:R], TOPK_POOLS, scratch=scratch.split, rows=rows, tokens=tokens, counts=counts)
++        return tokens, counts
++    _seg_select[(R,)](scores, scores.stride(0), rows.pos, rows.sparse, tokens, counts, W=TOKENS, K=TOPK_POOLS,
++                      PL=POOL, BLOCK=SEG_SELECT[0], num_warps=SEG_SELECT[1])
++    return tokens, counts
++
++
++# ----------------------------------------------------------------------------------- split top-k selection ---
++# _select_rows' radix select with each row's scores split into CHS-score chunks, one program a (row, chunk), in five
++# launches. Passes 0..3: every program takes the digits so far from the row's total histograms (TOT, integer
++# atomic sums: exact in any order), keeps its chunk's count of scores above them (GT, first differing at an earlier
++# byte) and its chunk's histogram of the next byte (HIST), adding it into the row's total. Step 4 writes the chunk's
++# pools at the offset the earlier chunks' counts give (GT and their last histograms, which step 4 only reads):
++# scores above the K-th best, then ties in pool order. The same K-th best, ties and ascending output as
++# _select_rows: integers only, no floating-point sum order to keep.
++
++@triton.jit
++def _split_digits(TOT, r, STEPS: tl.constexpr, K: tl.constexpr):
++    """(prefix, fixed, need, last digit) after the first STEPS passes, from the row's total histograms."""
++    bins = tl.arange(0, 256)
++    prefix = tl.zeros((), dtype=tl.uint32)
++    fixed = tl.zeros((), dtype=tl.uint32)
++    need = tl.full((), K, tl.int32)
++    digit = tl.full((), 0, tl.int32)
++    for p in tl.static_range(STEPS):
++        hist = tl.load(TOT + (r * 4 + p) * 256 + bins)
++        at_or_above = tl.sum(hist, 0) - tl.cumsum(hist, 0) + hist
++        digit = tl.max(tl.where(at_or_above >= need, bins, 0), 0)
++        need -= tl.sum(tl.where(bins > digit, hist, 0), 0)
++        prefix = prefix | (digit.to(tl.uint32) << (24 - 8 * p))
++        fixed = fixed | (tl.full((), 0xFF, tl.uint32) << (24 - 8 * p))
++    return prefix, fixed, need, digit
++
++
++@triton.jit
++def _select_split(S, s_stride, NPC, POS, SPR, TOT, HIST, GT, OUT, TOK, CNT, W: tl.constexpr, K: tl.constexpr,
++                  PL: tl.constexpr, CHS: tl.constexpr, CP: tl.constexpr, STEP: tl.constexpr, SEG: tl.constexpr):
++    """Program (row, chunk), STEP 0..3: pass STEP over the chunk; STEP 4: its selected pools, as pool ids OUT[r, :K]
++    (SEG False: NPC scores a row) or (SEG: the row's visible pools, dense rows skipped) as _seg_select's tokens,
++    tail and count. TOT [R, 4, 256] zeroed before step 0; HIST [R, CP, 256], GT [R, CP] int32."""
++
++    r = tl.program_id(0).to(tl.int64)
++    c = tl.program_id(1)
++    if SEG:
++        if tl.load(SPR + r) == 0:
++            if STEP == 4:
++                if c == 0:
++                    tl.store(CNT + r, 0)
++            return
++        qpos = tl.load(POS + r).to(tl.int64)
++        NP = (qpos + 1) // PL
++    else:
++        qpos = 0
++        NP = NPC
++    nch = (NP + CHS - 1) // CHS
++    if c >= nch:
++        return
++    bins = tl.arange(0, 256)
++    i = c * CHS + tl.arange(0, CHS)
++    ok = i < NP
++    u = _order_key(tl.load(S + r * s_stride + i, mask=ok, other=0.0))
++    prefix, fixed, need, d = _split_digits(TOT, r, STEP, K)
++    own = HIST + (r * CP + c) * 256
++    if STEP > 0 and STEP < 4:             # the chunk's scores above the prefix first at the byte just fixed
++        above = tl.sum(tl.where(bins > d, tl.load(own + bins), 0), 0)
++        if STEP > 1:
++            above += tl.load(GT + r * CP + c)
++        tl.store(GT + r * CP + c, above)
++    if STEP < 4:
++        match = ok & ((u & fixed) == prefix)
++        hist = tl.histogram(((u >> (24 - 8 * STEP)) & 0xFF).to(tl.int32), 256, mask=match)
++        tl.store(own + bins, hist)
++        tl.atomic_add(TOT + (r * 4 + STEP) * 256 + bins, hist)
++    else:
++        ci = tl.arange(0, CP)
++        before = ci < c
++        # earlier chunks: scores above the prefix at bytes 0..2 (GT), at byte 3 and equal to it (their last histograms)
++        last = tl.load(HIST + (r * CP + ci[:, None]) * 256 + bins[None, :], mask=before[:, None], other=0)
++        gt = tl.load(GT + r * CP + ci, mask=before, other=0) + tl.sum(tl.where(bins[None, :] > d, last, 0), 1)
++        equal_seen = tl.sum(tl.sum(tl.where(bins[None, :] == d, last, 0), 1), 0)
++        written = tl.sum(gt, 0) + tl.minimum(equal_seen, need)
++        e = (ok & (u == prefix)).to(tl.int32)
++        take = (ok & (u > prefix)) | ((e == 1) & (tl.cumsum(e, 0) - e + equal_seen < need))
++        t = take.to(tl.int32)
++        slot = (written + tl.cumsum(t, 0) - t).to(tl.int64)
++        if SEG:
++            j = tl.arange(0, PL)
++            tl.store(TOK + r * W + slot[:, None] * PL + j[None, :],
++                     (i.to(tl.int64)[:, None] * PL + j[None, :]).to(tl.int32), mask=take[:, None])
++            if c == 0:
++                jt = tl.arange(0, 4)
++                jok = jt < PL - 1
++                tail = NP * PL + jt
++                tok = jok & (tail <= qpos)
++                tl.store(TOK + r * W + K * PL + jt, tl.where(tok, tail, -1).to(tl.int32), mask=jok)
++                n = K * PL + tl.sum(tok.to(tl.int64), 0)
++                tl.store(CNT + r, tl.where(NP > K, n, 0).to(tl.int32))
++        else:
++            tl.store(OUT + r * K + slot, i.to(tl.int64), mask=take)
++
++
++SPLIT_FROM = 8192          # decode windows split rows of at least this many scores (fewer: one program a row)
++SPLIT_ROWS = 64            # ... windows of fewer rows (prompt chunks' hundreds of rows fill the GPU as they are)
++SPLIT_WARPS = 4
++
++
++def split_chunk(np_: int) -> int:
++    """Scores a chunk program takes (speed only): 2,048 up to 16,384 a row, else 4,096."""
++    return 2048 if np_ <= 16384 else 4096
++
++
++def split_chunks(np_: int) -> int:
++    """Chunk programs a row of np_ scores takes (a power of two, the chunk tables' row stride)."""
++    return triton.next_power_of_2(triton.cdiv(np_, split_chunk(np_)))
++
++
++def split_scratch(rows: int, np_: int, device) -> torch.Tensor:
++    """select_split's int32 scratch for rows of np_ scores: totals [rows, 4, 256], then chunk histograms and counts."""
++    return torch.empty((rows * (1024 + split_chunks(np_) * 257),), dtype=torch.int32, device=device)
++
++
++def select_split(scores: torch.Tensor, k: int, *, scratch: torch.Tensor | None = None, rows=None,
++                 tokens: torch.Tensor | None = None, counts: torch.Tensor | None = None) -> torch.Tensor | None:
++    """The split selection: top_pools' pools [R, k] (``rows`` None), or with ``rows`` (segments.SegRows) and
++    tokens / counts, seg_select_tokens' per-row output over each sparse row's visible pools. ``scratch``: at least
++    split_scratch(R, NP)'s (allocated when None)."""
++
++    R, NP = scores.shape
++    chs, warps = split_chunk(NP), SPLIT_WARPS
++    cp = split_chunks(NP)
++    if scratch is None or scratch.numel() < R * (1024 + cp * 257):
++        scratch = split_scratch(R, NP, scores.device)
++    tot = scratch[:R * 1024]
++    hist = scratch[R * 1024:R * (1024 + cp * 256)]
++    gt = scratch[R * (1024 + cp * 256):R * (1024 + cp * 257)]
++    tot.zero_()
++    seg = rows is not None
++    out = None if seg else torch.empty((R, k), dtype=torch.int64, device=scores.device)
++    dummy = scratch
++    for step in range(5):
++        _select_split[(R, cp)](scores, scores.stride(0), NP, rows.pos if seg else dummy, rows.sparse if seg else dummy,
++                               tot, hist, gt, out if out is not None else dummy, tokens if seg else dummy,
++                               counts if seg else dummy, W=TOKENS, K=k, PL=POOL, CHS=chs, CP=cp, STEP=step, SEG=seg,
++                               num_warps=warps)
++    return out
+diff --git a/tests/cuda/test_glm_attn_segments.py b/tests/cuda/test_glm_attn_segments.py
+new file mode 100644
+index 0000000..826d937
+--- /dev/null
++++ b/tests/cuda/test_glm_attn_segments.py
+@@ -0,0 +1,534 @@
++"""Segmented DSA decode windows (latent.seg_*, sparse.seg_*, segments.SegRows): several streams' rows back to back,
++each stream's latents, index keys and pooled keys in its own extent of shared arenas. Every segment's outputs and
++cache writes must equal, bit for bit, that segment run alone through the single-stream path on its extent (the
++eager path and the CUDA-graph path, dense, straddling the dense limit and sparse up to 200k tokens), and one
++captured graph per window size must serve any mix of positions."""
++
++from __future__ import annotations
++
++import os
++import random
++
++import pytest
++import torch
++
++if not torch.cuda.is_available():
++    pytest.skip("CUDA only", allow_module_level=True)
++
++import triton  # noqa: E402
++
++from tensorfold.families.glm5_next.cuda import forward, latent, qmm, segments, sparse  # noqa: E402
++
++DEV = "cuda"
++H, L = 32, 512                 # a rank's heads, the latent width
++IH, ID = 32, 128               # indexer heads and width
++SCALE = 256 ** -0.5
++LIMIT = sparse.SPARSE_FROM
++EXTENTS = (204800, 131072, 65536, 8192)          # four streams' extents (multiples of 2,048)
++BASES = tuple(sum(EXTENTS[:i]) for i in range(len(EXTENTS)))
++TOTAL = sum(EXTENTS)
++MAXR = 32
++
++
++def _rand(gen, *shape, scale=1.0, dtype=torch.bfloat16):
++    return (torch.randn(shape, generator=gen) * scale).to(dtype).to(DEV)
++
++
++class Arena:
++    def __init__(self, gen, index: bool = True):
++        self.lc = _rand(gen, TOTAL, L)
++        self.index = index
++        if index:
++            self.ik = _rand(gen, TOTAL, ID)
++            self.ig = _rand(gen, TOTAL, ID, scale=2.0)
++            self.pk = _rand(gen, TOTAL // 4 + 2, ID)
++
++    def clone(self) -> "Arena":
++        other = Arena.__new__(Arena)
++        other.index = self.index
++        other.lc = self.lc.clone()
++        if self.index:
++            other.ik, other.ig, other.pk = self.ik.clone(), self.ig.clone(), self.pk.clone()
++        return other
++
++    def tensors(self):
++        return (self.lc, self.ik, self.ig, self.pk) if self.index else (self.lc,)
++
++    def stream(self, si: int):
++        b, e = BASES[si], EXTENTS[si]
++        lc = self.lc[b:b + e]
++        if not self.index:
++            return lc, None
++        return lc, (self.ik[b:b + e], self.ig[b:b + e], self.pk[b // 4:b // 4 + e // 4 + 2])
++
++
++class Inputs:
++    """A window's per-row inputs: latents, index key rows (k_raw | head weights), gates, absorbed and index queries."""
++
++    def __init__(self, gen, R: int):
++        self.lat = _rand(gen, R, L)
++        self.ikr = _rand(gen, R, ID + IH)
++        self.igr = _rand(gen, R, ID, dtype=torch.float32)
++        self.qa = _rand(gen, R, H, L, scale=0.3)
++        self.qi = _rand(gen, R, IH * ID)
++
++    def rows(self, lo: int, hi: int) -> "Inputs":
++        other = Inputs.__new__(Inputs)
++        for k, v in vars(self).items():
++            setattr(other, k, v[lo:hi])
++        return other
++
++    def copy_(self, src: "Inputs") -> None:
++        for k, v in vars(self).items():
++            v.copy_(getattr(src, k))
++
++
++def _params(gen):
++    return _rand(gen, ID), _rand(gen, ID), _rand(gen, 4, ID)         # LayerNorm weight, bias; ape [4, 128]
++
++
++_POS: dict[int, torch.Tensor] = {}
++
++
++def _solo(ar: Arena, si: int, pos: int, x: Inputs, params, s, mode: str) -> torch.Tensor:
++    """One segment through today's single-stream DSA path (forward._dsa_latent minus the projections) on its
++    extent: ``eager`` (host position) or ``graph`` (the captured graphs' arguments: every chunk dense, or every row
++    sparse with the pool bucket)."""
++
++    n = x.lat.shape[0]
++    lc, index = ar.stream(si)
++    pos_dev = _POS.get(pos)
++    if pos_dev is None:                  # made once, outside any capture
++        pos_dev = _POS[pos] = torch.tensor([pos], dtype=torch.int32, device=DEV)
++    latent.latent_write(x.lat, lc, pos_dev)
++    if index is not None:
++        ik, ig, pk = index
++        sparse.index_update(x.ikr[:, :ID], x.igr, *params, ik, ig, pk, pos_dev)
++    if mode == "eager":
++        host_pos, nch, sparse_np = pos, triton.cdiv(pos + n, latent.CHUNK), None
++    else:
++        host_pos, nch = None, None
++        if pos >= LIMIT:
++            sparse_np = sparse.pool_bucket(pos, n, index[2].shape[0] - 2)
++        else:
++            assert pos + n <= LIMIT, "no graph for a window across the dense limit"
++            sparse_np = None
++    all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= LIMIT)
++    sparse_rows = index is not None and (all_sparse or (host_pos is not None and host_pos + n - 1 >= LIMIT))
++    ol = torch.full((n, H, L), float("nan"), dtype=torch.bfloat16, device=DEV)
++    if not all_sparse:                   # every row dense first (forward._dsa_latent); sparse rows are redone below
++        forward.dense_attention(x.qa, lc, pos_dev, s, scale=SCALE, nch=min(nch or s.nch, s.nch), out=ol)
++    if sparse_rows:
++        pk = index[2]
++        tokens, counts = sparse.select_tokens(x.qi, x.ikr[:, ID:], pk, host_pos, n, pk.shape[0] - 2, pos_dev,
++                                              bucket=sparse_np)
++        latent.sparse_attention(x.qa, lc, tokens, counts, ol, SCALE)
++    return ol
++
++
++class Seg:
++    """The segmented path's static buffers (one set, as an engine keeps them)."""
++
++    def __init__(self, index: bool = True):
++        self.rows = segments.SegRows(MAXR, DEV)
++        self.sel = segments.SelectScratch(MAXR, max(EXTENTS), DEV)
++        self.s = latent.LatentScratch(MAXR, H, latent.chunks_for(2560 + MAXR), DEV)
++        self.index = index
++
++    def run(self, ar: Arena, x: Inputs, params, out: torch.Tensor, select: bool = True, hb=None) -> torch.Tensor:
++        R = x.lat.shape[0]
++        latent.seg_latent_write(x.lat, ar.lc, self.rows)
++        tokens = counts = None
++        if self.index:
++            sparse.seg_index_update(x.ikr[:, :ID], x.igr, *params, ar.ik, ar.ig, ar.pk, self.rows)
++            if select:
++                tokens, counts = sparse.seg_select_tokens(x.qi, x.ikr[:, ID:], ar.pk, self.rows, self.sel)
++        latent.seg_attention(x.qa, ar.lc, self.rows, tokens, counts, self.s, scale=SCALE, out=out[:R], hb=hb)
++        return out[:R]
++
++
++def _same(a: torch.Tensor, b: torch.Tensor) -> bool:
++    return torch.equal(a.contiguous().view(torch.int16), b.contiguous().view(torch.int16))
++
++
++def _check_window(segs, seed: int = 0, index: bool = True, zero_pools: bool = False, hb=None):
++    """segs: [(stream, pos, rows)]. Runs the segmented window once and every segment alone (eager, and the graph
++    path where one exists), comparing outputs and every cache byte."""
++
++    gen = torch.Generator().manual_seed(seed)
++    ar = Arena(gen, index)
++    if zero_pools:                       # every pooled key 0: all scores tie, the selection keeps the lowest pools
++        ar.pk.zero_()
++    params = _params(gen) if index else None
++    R = sum(n for _, _, n in segs)
++    x = Inputs(gen, R)
++    ref = ar.clone()
++    seg = Seg(index)
++    seg.rows.set([(BASES[si], pos, n) for si, pos, n in segs], sparse_from=LIMIT if index else None)
++    out = torch.full((MAXR, H, L), float("nan"), dtype=torch.bfloat16, device=DEV)
++    got = seg.run(ar, x, params, out, hb=hb)
++    if index:                            # sparse rows (and only they) selected 2,048 + tail tokens
++        want_sparse = torch.tensor([p + i >= LIMIT for _, p, n in segs for i in range(n)], device=DEV)
++        counts = seg.sel.counts[:R]
++        assert torch.equal(counts > 0, want_sparse)
++        assert bool((counts[want_sparse] >= sparse.TOPK_POOLS * sparse.POOL).all())
++    solo_s = latent.LatentScratch(16, H, latent.chunks_for(2560 + 16), DEV)
++    r0 = 0
++    for si, pos, n in segs:
++        xs = x.rows(r0, r0 + n)
++        want = _solo(ref, si, pos, xs, params, solo_s, "eager")
++        assert not torch.isnan(want.float()).any()
++        assert _same(got[r0:r0 + n], want), f"segment {si} at {pos} ({n} rows): eager"
++        straddles = pos < LIMIT < pos + n
++        if index and not straddles:
++            again = _solo(ref, si, pos, xs, params, solo_s, "graph")     # rewrites the same cache bytes
++            assert _same(got[r0:r0 + n], again), f"segment {si} at {pos} ({n} rows): graph path"
++        r0 += n
++    torch.cuda.synchronize()
++    for a, b in zip(ar.tensors(), ref.tensors()):
++        assert _same(a, b), "cache writes differ"
++    return seg, ar, x, got
++
++
++# -- the whole DSA block on the synthetic checkpoint (projections included; first, while memory is free) ---------
++
++@pytest.fixture(scope="module")
++def engine_long(tmp_path_factory):
++    from test_glm_engine import _checkpoint, _TwoCopies
++
++    from tensorfold.families.glm5_next.cuda.engine import GlmEngine
++
++    import gc
++
++    gc.collect()
++    torch.cuda.empty_cache()             # the arenas above: the engine's startup budget reads MemAvailable
++    path = tmp_path_factory.mktemp("glm_long_seg")
++    _checkpoint(path)
++    return GlmEngine(path, rank=0, master="", port=0, comm=_TwoCopies(), context=2600)
++
++
++@pytest.mark.parametrize("segs", [[(0, 5, 3), (1, 2040, 16), (2, 2600 - 13, 13)],
++                                  [(2, 2051, 1), (0, 2047, 4)],
++                                  [(1, 700, 16), (0, 2500, 16)]], ids=["mixed", "edges", "32 rows"])
++def test_dsa_segments_equal_dsa_block(engine_long, segs):
++    """forward.dsa_segments on a window of several streams (each in its own 4,096-token extent of the arenas)
++    gives each segment's rows the partials, cache rows and pooled keys of forward.dsa_block run on that segment
++    alone (2 index heads and a 128-wide latent here: the kernels take the widths from the tensors)."""
++
++    from tensorfold.families.glm5_next.cuda import qmm as q
++
++    e = engine_long.e
++    w = e.w
++    layer = next(l for l in w.layers if l.kind == "dsa")
++    c = w.cfg
++    ext, streams = 4096, 3
++    gen = torch.Generator().manual_seed(len(segs))
++    lw, idim = c.kv_lora, c.index_dim
++    lc = _rand(gen, streams * ext, lw)
++    ik, ig = _rand(gen, streams * ext, idim), _rand(gen, streams * ext, idim)
++    pk = _rand(gen, streams * ext // 4 + 2, idim, scale=0.1)
++    R = sum(n for _, _, n in segs)
++    x = _rand(gen, R, c.hidden)
++    b = forward.Buffers(w, MAXR, 2600)
++    rows = segments.SegRows(MAXR, DEV)
++    sel = segments.SelectScratch(MAXR, ext, DEV)
++    arenas = (lc, ik, ig, pk)
++    ref = tuple(t.clone() for t in arenas)
++    rows.set([(si * ext, p, n) for si, p, n in segs])
++    b.normed[:R].copy_(x)
++    q.group_sums(b.normed[:R], b.xs[:R])
++    got = forward.dsa_segments(layer, w, lc, b, R, rows, sel, (ik, ig, pk)).clone()
++    r0 = 0
++    for si, p, n in segs:
++        base = si * ext
++        b.normed[:n].copy_(x[r0:r0 + n])
++        q.group_sums(b.normed[:n], b.xs[:n])
++        pos_dev = torch.tensor([p], dtype=torch.int32, device=DEV)
++        index = (ref[1][base:base + ext], ref[2][base:base + ext], ref[3][base // 4:base // 4 + ext // 4 + 2])
++        want = forward.dsa_block(layer, w, ref[0][base:base + ext], None, pos_dev, b, n, triton.cdiv(p + n, 512),
++                                 index, host_pos=p)
++        assert torch.equal(got[:, r0:r0 + n].contiguous().view(torch.int32), want.contiguous().view(torch.int32)), \
++            (si, p, n)
++        r0 += n
++    for a, bb in zip(arenas, ref):
++        assert _same(a, bb)
++
++
++# -- bit identity ---------------------------------------------------------------------------------------------------
++
++WINDOWS = {
++    "one row, short": [(0, 5, 1)],
++    "one segment, 16 rows": [(1, 700, 16)],
++    "four short": [(3, 0, 3), (1, 511, 8), (0, 1024, 16), (2, 1500, 5)],
++    "straddling": [(0, 2040, 16), (1, 2047, 4), (2, 2048, 4), (3, 2035, 8)],
++    "limit edges": [(2, 2050, 1), (1, 2051, 1), (0, 2047, 5), (3, 2044, 7)],
++    "mixed": [(3, 3, 3), (1, 700, 8), (0, 2040, 16), (2, 5000, 5)],
++    "long": [(0, 200000, 4), (1, 131000, 16), (2, 2051, 2), (3, 8000, 10)],
++    "long, 16 + 16": [(1, 99999, 16), (0, 150001, 16)],
++    "single long": [(0, 204790, 10)],
++}
++
++
++@pytest.mark.parametrize("name", list(WINDOWS))
++def test_segments_match_solo(name):
++    _check_window(WINDOWS[name], seed=len(name))
++
++
++@pytest.mark.parametrize("hb", [latent.HB, latent.HB_WIDE])
++@pytest.mark.parametrize("name", ["four short", "mixed", "long"])
++def test_either_head_block(name, hb):
++    """seg_head_block's two tile heights (16 below SEG_WIDE_ROWS, 32 from it) both give the solo kernels' bits."""
++    _check_window(WINDOWS[name], seed=3 + hb, hb=hb)
++
++
++def test_segments_without_index():
++    """A short-context engine (no indexer): every row dense, no selection."""
++    _check_window([(3, 0, 3), (1, 511, 8), (0, 2040, 11), (2, 1500, 5)], seed=7, index=False)
++
++
++def test_score_ties_keep_the_lower_pools():
++    _check_window([(0, 60000, 4), (1, 2051, 3), (2, 3000, 16), (3, 2040, 9)], seed=11, zero_pools=True)
++
++
++def _random_windows(n: int, seed: int):
++    rng = random.Random(seed)
++    out = []
++    for _ in range(n):
++        k = rng.randint(1, 4)
++        streams = rng.sample(range(4), k)
++        rows = [rng.randint(1, 16) for _ in streams]
++        while sum(rows) > MAXR:
++            rows[rows.index(max(rows))] -= 1
++        segs = []
++        for si, r in zip(streams, rows):
++            kind = rng.choice(("short", "edge", "long"))
++            top = EXTENTS[si] - r
++            pos = (rng.randint(0, LIMIT - 1) if kind == "short" else
++                   rng.randint(LIMIT - 20, LIMIT + 4) if kind == "edge" else rng.randint(LIMIT, top))
++            segs.append((si, min(pos, top), r))
++        out.append(segs)
++    return out
++
++
++@pytest.mark.parametrize("i, segs", list(enumerate(_random_windows(12, 1234))))
++def test_random_windows(i, segs):
++    _check_window(segs, seed=100 + i)
++
++
++def test_one_graph_per_window_size():
++    """A graph captured for R rows with one mix of segments replays any other mix of R rows (positions, splits,
++    dense / sparse) with the eager segmented path's bits (which equal the solo paths', above)."""
++
++    R = 20
++    mixes = [[(0, 3000, 8), (1, 2040, 12)],
++             [(3, 5, 1), (2, 2049, 3), (0, 180000, 16)],
++             [(1, 100000, 10), (0, 100, 10)],
++             [(2, 60000, 5), (3, 8000, 5), (0, 2051, 5), (1, 2046, 5)],
++             [(0, 204780, 20)]]
++    gen = torch.Generator().manual_seed(5)
++    ar = Arena(gen)
++    params = _params(gen)
++    seg = Seg()
++    static = Inputs(gen, R)
++    out = torch.full((MAXR, H, L), float("nan"), dtype=torch.bfloat16, device=DEV)
++    seg.rows.set([(BASES[si], p, n) for si, p, n in mixes[0]])
++    for _ in range(2):
++        seg.run(ar, static, params, out)
++    torch.cuda.synchronize()
++    g = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(g):
++        seg.run(ar, static, params, out)
++    for k, mix in enumerate(mixes):
++        x = Inputs(gen, R)
++        before = ar.clone()
++        seg.rows.set([(BASES[si], p, n) for si, p, n in mix])
++        static.copy_(x)
++        g.replay()
++        torch.cuda.synchronize()
++        replayed = out[:R].clone()
++        eager_out = torch.full_like(out, float("nan"))
++        want = seg.run(before, x, params, eager_out)
++        torch.cuda.synchronize()
++        assert not torch.isnan(want.float()).any()
++        assert _same(replayed, want), f"mix {k}"
++        for a, b in zip(ar.tensors(), before.tensors()):
++            assert _same(a, b), f"mix {k}: cache writes"
++        del before
++
++
++# -- the selection's kernels: split across chunk programs, or one program a row at other block sizes -------------
++
++def _scores_for(kind: str, R: int, NP: int, seed: int) -> torch.Tensor:
++    gen = torch.Generator().manual_seed(seed)
++    s = torch.randn((R, NP), generator=gen)
++    if kind == "ties":                   # a few values, +0 and -0 among them: the lower pools must win the ties
++        s = torch.randint(-3, 5, (R, NP), generator=gen).float() * 0.25
++        s[s == 0] = torch.where(torch.rand(int((s == 0).sum()), generator=gen) < 0.5, 0.0, -0.0)
++    elif kind == "tail":                 # visible pools first, -inf past them (what the scores kernels write)
++        for r in range(R):
++            vis = int(torch.randint(513, NP + 1, (1,), generator=gen))
++            s[r, vis:] = float("-inf")
++    elif kind == "relu":                 # sums of relus: many exact zeros, the rest positive
++        s = torch.relu(s) * (torch.rand((R, NP), generator=gen) < 0.3)
++    return s.to(DEV)
++
++
++@pytest.mark.parametrize("kind", ["random", "ties", "tail", "relu"])
++@pytest.mark.parametrize("NP", [1024, 5000, 8192, 50000, 51200, 65536])
++def test_select_kernels_agree(kind, NP):
++    """select_split (the segmented windows' selection), top_pools and _select_rows keep the reference's pools
++    (``_top_pools``: a stable sort's), for decode windows and prompt-sized blocks of rows."""
++
++    for R in (5, 70):
++        scores = _scores_for(kind, R, NP, NP + R)
++        want = sparse._top_pools(scores, sparse.TOPK_POOLS)
++        old = torch.empty_like(want)
++        sparse._select_rows[(R,)](scores, old, NP, scores, K=sparse.TOPK_POOLS, BLOCK=1024, VISIBLE=False,
++                                  num_warps=4)
++        assert torch.equal(old, want)
++        assert torch.equal(sparse.top_pools(scores, sparse.TOPK_POOLS), want)
++        assert torch.equal(sparse.select_split(scores, sparse.TOPK_POOLS), want)
++
++
++@pytest.mark.parametrize("name", ["mixed", "long", "long, 16 + 16"])
++def test_segmented_select_either_kernel(name):
++    """seg_select_tokens' split selection and its one-program-a-row kernel give the same tokens and counts."""
++
++    gen = torch.Generator().manual_seed(21)
++    ar = Arena(gen)
++    segs = WINDOWS[name]
++    R = sum(n for _, _, n in segs)
++    x = Inputs(gen, R)
++    seg = Seg()
++    seg.rows.set([(BASES[si], p, n) for si, p, n in segs])
++    outs = []
++    for split in (True, False):
++        sparse.SEG_SPLIT = split
++        try:
++            seg.sel.tokens.fill_(-7)
++            t, c = sparse.seg_select_tokens(x.qi, x.ikr[:, ID:], ar.pk, seg.rows, seg.sel)
++        finally:
++            sparse.SEG_SPLIT = True
++        sp = c > 0
++        outs.append((t[sp].clone(), c.clone()))
++    assert torch.equal(outs[0][1], outs[1][1]) and torch.equal(outs[0][0], outs[1][0])
++
++
++# -- the other per-row pieces of a DSA window: absorb / expand, and the projections past 16 rows ----------------
++
++SPLITS = ((0, 4), (4, 20), (20, 21), (21, 32))
++
++
++@pytest.mark.parametrize("kind", ["bf16", "q4"])
++def test_absorb_expand_rows_alone(kind):
++    """absorb_q / expand_v of a 32-row window equal each segment's rows run alone (row_block differs past 16)."""
++
++    gen = torch.Generator().manual_seed(3)
++    D = 256
++    k_rows, v_rows = _rand(gen, H * D, L, scale=L ** -0.5), _rand(gen, H * D, L, scale=L ** -0.5)
++    if kind == "bf16":
++        a = latent.AbsorbW.from_rows(k_rows, v_rows, H)
++    else:
++        a = latent.AbsorbQ4(qmm.to_mlx(qmm.quantize4(k_rows)), qmm.to_mlx(qmm.quantize4(v_rows)), H)
++    q = _rand(gen, MAXR, H, D)
++    ol = _rand(gen, MAXR, H, L, scale=0.3)
++    qa = latent.absorb_q(q, a, torch.empty((MAXR, H, L), dtype=torch.bfloat16, device=DEV))
++    ov = latent.expand_v(ol, a, torch.empty((MAXR, H, D), dtype=torch.bfloat16, device=DEV))
++    for lo, hi in SPLITS:
++        pa = latent.absorb_q(q[lo:hi], a, torch.empty((hi - lo, H, L), dtype=torch.bfloat16, device=DEV))
++        pv = latent.expand_v(ol[lo:hi], a, torch.empty((hi - lo, H, D), dtype=torch.bfloat16, device=DEV))
++        assert _same(pa, qa[lo:hi]), (kind, lo, hi, "absorb")
++        assert _same(pv, ov[lo:hi]), (kind, lo, hi, "expand")
++
++
++@pytest.mark.parametrize("kind", ["q4", "b16"])
++@pytest.mark.parametrize("n, k", [(4096, 4096), (2560, 6144), (4096, 1024)])
++def test_matmul_rows_alone(kind, n, k):
++    """qmm.matmul of a 32-row window (no decode tile variant past 16 rows) equals its segments' rows alone."""
++
++    gen = torch.Generator().manual_seed(n + k)
++    w = _rand(gen, n, k, scale=k ** -0.5)
++    q = qmm.quantize4(w) if kind == "q4" else qmm.make_b16(w)
++    x = _rand(gen, MAXR, k)
++    for f32 in (False, True):
++        whole = qmm.matmul(x, q, f32=f32)
++        for lo, hi in SPLITS:
++            part = qmm.matmul(x[lo:hi], q, f32=f32)
++            if f32:
++                assert torch.equal(part.view(torch.int32), whole[lo:hi].view(torch.int32)), (kind, lo, hi)
++            else:
++                assert _same(part, whole[lo:hi]), (kind, lo, hi)
++
++
++# -- timing (TF_SEG_BENCH=1 pytest -s) ------------------------------------------------------------------------------
++
++def _time(fn, iters: int = 50) -> float:
++    for _ in range(3):
++        fn()
++    torch.cuda.synchronize()
++    a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++    a.record()
++    for _ in range(iters):
++        fn()
++    b.record()
++    torch.cuda.synchronize()
++    return a.elapsed_time(b) / iters * 1000.0
++
++
++def _graphed(fn):
++    for _ in range(2):
++        fn()
++    torch.cuda.synchronize()
++    g = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(g):
++        fn()
++    return g.replay
++
++
++@pytest.mark.skipif(os.environ.get("TF_SEG_BENCH") != "1", reason="timing: TF_SEG_BENCH=1")
++def test_timing_vs_solo():
++    """One DSA layer's cache writes, selection and attention (no projections): the segmented window vs its
++    segments' solo launches back to back, both as CUDA graphs (as decode runs them) and eager."""
++
++    gen = torch.Generator().manual_seed(9)
++    ar = Arena(gen)
++    params = _params(gen)
++    seg = Seg()
++    solo_s = latent.LatentScratch(16, H, latent.chunks_for(2560 + 16), DEV)
++    cases = {
++        "4 x 1 row, dense": [(0, 1000, 1), (1, 1500, 1), (2, 500, 1), (3, 1900, 1)],
++        "4 x 4 rows, dense": [(0, 1000, 4), (1, 1500, 4), (2, 500, 4), (3, 1900, 4)],
++        "4 x 1 row, 8k-60k": [(0, 60000, 1), (1, 30000, 1), (2, 16000, 1), (3, 8000, 1)],
++        "4 x 4 rows, 8k-60k": [(0, 60000, 4), (1, 30000, 4), (2, 16000, 4), (3, 8000, 4)],
++        "4 x 8 rows, 8k-60k": [(0, 60000, 8), (1, 30000, 8), (2, 16000, 8), (3, 8000, 8)],
++        "4 x 4 rows, 8k-200k": [(0, 200000, 4), (1, 130000, 4), (2, 65000, 4), (3, 8000, 4)],
++        "2 x 16 rows, 100k-200k": [(0, 200000, 16), (1, 100000, 16)],
++        "1 x 4 rows, 200k": [(0, 200000, 4)],
++    }
++    out = torch.empty((MAXR, H, L), dtype=torch.bfloat16, device=DEV)
++    lines = []
++    for name, segs in cases.items():
++        R = sum(n for _, _, n in segs)
++        x = Inputs(gen, R)
++        seg.rows.set([(BASES[si], p, n) for si, p, n in segs])
++        parts, r0 = [], 0
++        for si, p, n in segs:
++            parts.append((si, p, x.rows(r0, r0 + n)))
++            r0 += n
++
++        def run_seg():
++            seg.run(ar, x, params, out)
++
++        def run_solo(mode):
++            def go():
++                for si, p, xs in parts:
++                    _solo(ar, si, p, xs, params, solo_s, mode)
++            return go
++
++        t_seg = _time(_graphed(run_seg))
++        t_solo = _time(_graphed(run_solo("graph")))
++        e_seg = _time(run_seg)
++        e_solo = _time(run_solo("eager"))
++        lines.append(f"{name:26s} R={R:2d}  graph: seg {t_seg:7.1f} us  solo {t_solo:7.1f} us ({t_solo / t_seg:4.2f}x)"
++                     f"   eager: seg {e_seg:7.1f} us  solo {e_solo:7.1f} us")
++    print("\n" + "\n".join(lines))
+diff --git a/tests/cuda/test_glm_kda_segments.py b/tests/cuda/test_glm_kda_segments.py
+new file mode 100644
+index 0000000..fe9aeb3
+--- /dev/null
++++ b/tests/cuda/test_glm_kda_segments.py
+@@ -0,0 +1,330 @@
++"""GLM-5.3-Flash's segmented KDA kernels (kda.chain_segments, kda.replay_layers_segments, forward.conv_shift_segments):
++one verify window holding several streams' rows back to back, each stream with its own state slot, parity, conv slot
++and keep. Every segment's outputs, saved rows and states must equal (torch.equal) a solo run of its rows through the
++single-stream path (``chain`` as a decode window runs it, below WIDE_ROWS on the one-kernel chain, and its three-kernel
++twin, ``replay_layers``, ``_shift_conv``), and nothing outside its slots may change. Real per-rank shapes: 64 KDA heads
++over 2 ranks (32 a rank), 34 KDA layers, 4-tap conv. Builds no engine; needs < 2 GiB of GPU memory."""
++
++from __future__ import annotations
++
++import numpy as np
++import pytest
++import torch
++
++if not torch.cuda.is_available():
++    pytest.skip("CUDA only", allow_module_level=True)
++
++H = 32                     # KDA heads a rank (linear_attn_config num_heads 64 / world 2)
++LAYERS = 34                # KDA layers
++C = 3 * H * 128            # conv channels q | k | v
++B_OFF = C + 256            # [q | k | v | f_a | g_a | b]
++WIDTH = B_OFF + H
++LOWER, EPS = -5.0, 1e-5
++SLOTS, CONV_SLOTS = 6, 5
++
++
++def _kda():
++    from tensorfold.families.glm5_next.cuda import kda
++
++    return kda
++
++
++def _layer_weights(g: torch.Generator) -> dict:
++    return dict(conv_w=(torch.randn((C, 4), generator=g) * 0.5).to(torch.bfloat16).cuda(),
++                a_log=(torch.rand(H, generator=g) * 2 - 1).cuda(),
++                dt_bias=(torch.randn(H * 128, generator=g) * 0.5).cuda(),
++                norm_w=(torch.rand(128, generator=g) + 0.5).to(torch.bfloat16).cuda())
++
++
++def _window(rows: int, g: torch.Generator) -> dict:
++    return dict(p=(torch.randn((rows, WIDTH), generator=g) * 0.5).to(torch.bfloat16).cuda(),
++                a=(torch.randn((rows, H * 128), generator=g) * 3.0).to(torch.bfloat16).cuda(),
++                g=torch.randn((rows, H * 128), generator=g).to(torch.bfloat16).cuda())
++
++
++def _layout(rng: np.random.Generator, n: int | None = None, sizes=None) -> list[tuple]:
++    """1-4 segments of 1..16 rows on distinct state and conv slots, random parities and keeps (keep == rows and
++    keep == 1 frequent)."""
++
++    n = n or int(rng.integers(1, 5))
++    sizes = sizes or [int(rng.choice([1, 16])) if rng.random() < 0.3 else int(rng.integers(1, 17)) for _ in range(n)]
++    slots = rng.permutation(SLOTS)[:n]
++    cslots = rng.permutation(CONV_SLOTS)[:n]
++    out = []
++    for rows, slot, cslot in zip(sizes, slots, cslots):
++        u = rng.random()
++        keep = rows if u < 0.3 else 1 if u < 0.5 else int(rng.integers(1, rows + 1))
++        out.append((rows, int(slot), int(rng.integers(0, 2)), int(cslot), keep))
++    return out
++
++
++def _starts(layout) -> list[int]:
++    return list(np.cumsum([0] + [s[0] for s in layout])[:-1])
++
++
++def _eq(a: torch.Tensor, b: torch.Tensor) -> bool:
++    return a.shape == b.shape and torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8))
++
++
++# -- chain ------------------------------------------------------------------------------------------------------
++def _check_chain(layout, seed: int, table_rows: int | None = None) -> None:
++    kda = _kda()
++    g = torch.Generator().manual_seed(seed)
++    wt = _layer_weights(g)
++    R = sum(s[0] for s in layout)
++    x = _window(R, g)
++    conv = (torch.randn((CONV_SLOTS, 3, C), generator=g) * 0.5).to(torch.bfloat16).cuda()
++    rec0 = (torch.randn((SLOTS, 2, H, 128, 128), generator=g) * 0.1).cuda()
++    rec = rec0.clone()
++    conv0 = conv.clone()
++    out_tab = None if table_rows is None else torch.empty((table_rows, kda.SEG_COLS), dtype=torch.int32, device="cuda")
++    seg = kda.segment_table(layout, "cuda", out=out_tab)
++    sc = kda.KDAScratch(R, H, "cuda")
++    out = kda.chain_segments(seg, x["p"], B_OFF, x["a"], x["g"], conv, wt["conv_w"], rec, wt["a_log"],
++                             wt["dt_bias"], wt["norm_w"], EPS, LOWER, R, sc).clone()
++    assert _eq(conv, conv0), "conv states are read only"
++    touched = set()
++    for (rows, slot, parity, cslot, _), r0 in zip(layout, _starts(layout)):
++        touched.add((slot, 1 - parity))
++        solo = kda.KDAScratch(16, H, "cuda")
++        so = torch.empty((H, 128, 128), dtype=torch.float32, device="cuda")
++        ref = kda.chain(x["p"][r0:r0 + rows], B_OFF, x["a"][r0:r0 + rows], x["g"][r0:r0 + rows], conv0[cslot],
++                        wt["conv_w"], rec0[slot, parity], wt["a_log"], wt["dt_bias"], wt["norm_w"], EPS, LOWER, rows,
++                        solo, so, wide=True).clone()
++        tag = (layout, seed, slot, parity, cslot)
++        assert _eq(out[r0:r0 + rows], ref), (tag, "out")
++        assert _eq(rec[slot, 1 - parity], so), (tag, "state")
++        # the single-stream decode window's own path (one kernel below WIDE_ROWS): the same bits
++        narrow = kda.KDAScratch(16, H, "cuda")
++        sn = torch.empty((H, 128, 128), dtype=torch.float32, device="cuda")
++        ref_n = kda.chain(x["p"][r0:r0 + rows], B_OFF, x["a"][r0:r0 + rows], x["g"][r0:r0 + rows], conv0[cslot],
++                          wt["conv_w"], rec0[slot, parity], wt["a_log"], wt["dt_bias"], wt["norm_w"], EPS, LOWER,
++                          rows, narrow, sn, wide=False)
++        assert _eq(ref_n, ref) and _eq(sn, so), (tag, "the one-kernel chain")
++        for name in ("k", "v", "g", "b"):
++            assert _eq(getattr(sc, name)[r0:r0 + rows], getattr(solo, name)[:rows]), (tag, name)
++    for s in range(SLOTS):
++        for par in (0, 1):
++            if (s, par) not in touched:
++                assert _eq(rec[s, par], rec0[s, par]), ("an untouched state changed", s, par)
++
++
++def test_chain_segments_equal_solo_runs():
++    rng = np.random.default_rng(7)
++    layouts = [[(1, 0, 0, 0, 1)], [(16, 3, 1, 2, 16)], [(1, 1, 1, 4, 1)] * 1 + [(16, 0, 0, 1, 3)],
++               [(16, 5, 0, 0, 1), (16, 4, 1, 1, 16), (16, 3, 0, 2, 8), (16, 2, 1, 3, 1)],
++               [(1, 0, 1, 4, 1), (1, 1, 0, 3, 1), (1, 2, 1, 2, 1), (1, 3, 0, 1, 1)]]
++    layouts += [_layout(rng) for _ in range(40)]
++    for i, layout in enumerate(layouts):
++        _check_chain(layout, 100 + i)
++
++
++def test_chain_segments_skip_empty_table_rows():
++    """A table sized for 4 streams serving 2 (the rest 0-row segments): same bits, nothing else touched."""
++
++    rng = np.random.default_rng(11)
++    for i in range(6):
++        _check_chain(_layout(rng, n=int(rng.integers(1, 4))), 300 + i, table_rows=4)
++
++
++# -- replay -----------------------------------------------------------------------------------------------------
++def _saved_rows(L: int, R: int, g: torch.Generator):
++    """Realistic saved rows: unit k, bf16 v, decays exp(-5 sigmoid(x)), beta in (0, 1)."""
++
++    k = torch.randn((L, R, H, 128), generator=g)
++    k = k / k.norm(dim=-1, keepdim=True)
++    v = torch.randn((L, R, H, 128), generator=g).to(torch.bfloat16)
++    gd = torch.exp(LOWER * torch.sigmoid(torch.randn((L, R, H, 128), generator=g) * 2))
++    b = torch.sigmoid(torch.randn((L, R, H), generator=g)).to(torch.bfloat16).float()
++    return k.cuda(), v.cuda(), gd.cuda(), b.cuda()
++
++
++def _check_replay(layout, seed: int, L: int = LAYERS) -> None:
++    kda = _kda()
++    g = torch.Generator().manual_seed(seed)
++    R = sum(s[0] for s in layout)
++    sset = kda.KDAScratchSet(L, R, H, "cuda")
++    k, v, gd, b = _saved_rows(L, R, g)
++    sset.k.copy_(k), sset.v.copy_(v), sset.g.copy_(gd), sset.b.copy_(b)
++    gc = torch.Generator(device="cuda").manual_seed(seed)
++    rec0 = torch.randn((SLOTS, 2, L, H, 128, 128), generator=gc, device="cuda") * 0.1
++    rec = rec0.clone()
++    kda.replay_layers_segments(kda.segment_table(layout, "cuda"), rec, sset)
++    touched = set()
++    for (rows, slot, parity, _, keep), r0 in zip(layout, _starts(layout)):
++        if keep == rows:
++            continue                                       # skipped: the chain's state stays
++        touched.add((slot, 1 - parity))
++        solo = kda.KDAScratchSet(L, 16, H, "cuda")         # a solo stream's scratch: its window from row 0
++        for name in ("k", "v", "g", "b"):
++            getattr(solo, name)[:, :rows].copy_(getattr(sset, name)[:, r0:r0 + rows])
++        so = torch.empty((L, H, 128, 128), dtype=torch.float32, device="cuda")
++        kda.replay_layers(rec0[slot, parity], solo, keep, so)
++        assert _eq(rec[slot, 1 - parity], so), (layout, seed, slot, parity, keep)
++    for s in range(SLOTS):
++        for par in (0, 1):
++            if (s, par) not in touched:
++                assert _eq(rec[s, par], rec0[s, par]), ("an untouched state changed", s, par)
++
++
++def test_replay_layers_segments_equal_solo_runs():
++    rng = np.random.default_rng(13)
++    layouts = [[(16, 0, 0, 0, 16)], [(16, 1, 1, 0, 1)], [(1, 2, 0, 0, 1), (16, 3, 1, 1, 15)],
++               [(16, 5, 0, 0, 1), (16, 4, 1, 1, 16), (16, 3, 0, 2, 8), (16, 2, 1, 3, 1)],
++               [(3, 0, 1, 0, 3), (5, 1, 0, 1, 2), (2, 2, 1, 2, 1), (7, 3, 0, 3, 7)]]
++    layouts += [_layout(rng) for _ in range(16)]
++    for i, layout in enumerate(layouts):
++        _check_replay(layout, 500 + i)
++
++
++# -- conv shift ---------------------------------------------------------------------------------------------------
++def test_conv_shift_segments_equal_solo_runs():
++    from tensorfold.families.glm5_next.cuda.forward import _shift_conv, conv_shift_segments
++
++    kda = _kda()
++    rng = np.random.default_rng(17)
++    L = LAYERS
++    for i in range(20):
++        layout = _layout(rng)
++        R = sum(s[0] for s in layout)
++        g = torch.Generator().manual_seed(700 + i)
++        conv0 = torch.randn((CONV_SLOTS, L, 3, C), generator=g).to(torch.bfloat16).cuda()
++        proj = torch.randn((L, 16 * 4, WIDTH), generator=g).to(torch.bfloat16).cuda()   # st.proj-like: spare rows
++        conv = conv0.clone()
++        table = kda.segment_table(layout, "cuda", out=torch.empty((4, kda.SEG_COLS), dtype=torch.int32,
++                                                                  device="cuda"))
++        conv_shift_segments(conv, proj[:, :R], table)
++        used = set()
++        for (rows, _, _, cslot, keep), r0 in zip(layout, _starts(layout)):
++            used.add(cslot)
++            ref = conv0[cslot].clone()
++            _shift_conv(ref, proj[:, r0:r0 + rows], keep)
++            assert _eq(conv[cslot], ref), (layout, cslot, keep)
++        for s in set(range(CONV_SLOTS)) - used:
++            assert _eq(conv[s], conv0[s])
++
++
++# -- a whole round: every layer's chain, then the commit ------------------------------------------------------------
++def test_a_multi_stream_round_equals_solo_rounds():
++    """4 layers: chain_segments per layer, replay_layers_segments, conv_shift_segments, against each stream's own
++    chain(wide) per layer + commit (replay_layers when keep < rows, _shift_conv) on its own state and scratch."""
++
++    from tensorfold.families.glm5_next.cuda.forward import _shift_conv, conv_shift_segments
++
++    kda = _kda()
++    L = 4
++    rng = np.random.default_rng(19)
++    for trial in range(6):
++        layout = _layout(rng, n=4) if trial else [(16, 0, 0, 0, 1), (1, 1, 1, 1, 1), (9, 2, 1, 2, 9), (5, 3, 0, 3, 2)]
++        R = sum(s[0] for s in layout)
++        g = torch.Generator().manual_seed(900 + trial)
++        wts = [_layer_weights(g) for _ in range(L)]
++        wins = [_window(R, g) for _ in range(L)]
++        rec0 = (torch.randn((SLOTS, 2, L, H, 128, 128), generator=g) * 0.1).cuda()
++        conv0 = (torch.randn((CONV_SLOTS, L, 3, C), generator=g) * 0.5).to(torch.bfloat16).cuda()
++        proj = torch.stack([w["p"] for w in wins])                   # [L, R, W]: st.proj's role
++        rec, conv = rec0.clone(), conv0.clone()
++        seg = kda.segment_table(layout, "cuda")
++        sset = kda.KDAScratchSet(L, R, H, "cuda")
++        outs = []
++        for li in range(L):
++            x, wt = wins[li], wts[li]
++            outs.append(kda.chain_segments(seg, proj[li], B_OFF, x["a"], x["g"], conv[:, li], wt["conv_w"],
++                                           rec[:, :, li], wt["a_log"], wt["dt_bias"], wt["norm_w"], EPS, LOWER, R,
++                                           sset.views[li]).clone())
++        kda.replay_layers_segments(seg, rec, sset)
++        conv_shift_segments(conv, proj, seg)
++        for (rows, slot, parity, cslot, keep), r0 in zip(layout, _starts(layout)):
++            srec = rec0[slot].clone()                                # [2, L, H, 128, 128]: the solo stream's rec
++            sconv = conv0[cslot].clone()
++            sproj = proj[:, r0:r0 + rows]
++            solo = kda.KDAScratchSet(L, 16, H, "cuda")
++            for li in range(L):
++                x, wt = wins[li], wts[li]
++                ref = kda.chain(sproj[li], B_OFF, x["a"][r0:r0 + rows], x["g"][r0:r0 + rows], sconv[li],
++                                wt["conv_w"], srec[parity, li], wt["a_log"], wt["dt_bias"], wt["norm_w"], EPS, LOWER,
++                                rows, solo.views[li], srec[1 - parity, li], wide=True)
++                assert _eq(outs[li][r0:r0 + rows], ref), (layout, slot, li, "out")
++            if keep < rows:
++                kda.replay_layers(srec[parity], solo, keep, srec[1 - parity])
++            _shift_conv(sconv, sproj, keep)
++            assert _eq(rec[slot], srec), (layout, slot, keep, "states")
++            assert _eq(conv[cslot], sconv), (layout, cslot, keep, "conv")
++
++
++# -- timing -------------------------------------------------------------------------------------------------------
++def _time(fn, iters: int = 200) -> float:
++    for _ in range(10):
++        fn()
++    torch.cuda.synchronize()
++    a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++    a.record()
++    for _ in range(iters):
++        fn()
++    b.record()
++    torch.cuda.synchronize()
++    return a.elapsed_time(b) * 1000 / iters
++
++
++def test_timing_one_launch_vs_solo_launches():
++    """One 4-segment launch against 4 solo launches (one layer's chain; all 34 layers' replay; the conv shift)."""
++
++    from tensorfold.families.glm5_next.cuda.forward import _shift_conv, conv_shift_segments
++
++    kda = _kda()
++    g = torch.Generator().manual_seed(1)
++    wt = _layer_weights(g)
++    rec = torch.randn((4, 2, LAYERS, H, 128, 128), device="cuda") * 0.1
++    conv = (torch.randn((4, LAYERS, 3, C), generator=g) * 0.5).to(torch.bfloat16).cuda()
++    lines = []
++    for n in (1, 2, 4, 8, 16):
++        layout = [(n, s, s % 2, s, max(1, n // 2)) for s in range(4)]
++        R = 4 * n
++        x = _window(R, g)
++        seg = kda.segment_table(layout, "cuda")
++        sc = kda.KDAScratch(R, H, "cuda")
++        solos = [kda.KDAScratch(16, H, "cuda") for _ in range(4)]
++        kda.reserve(64, H, "cuda")
++        starts = _starts(layout)
++
++        def seg_chain():
++            kda.chain_segments(seg, x["p"], B_OFF, x["a"], x["g"], conv[:, 0], wt["conv_w"], rec[:, :, 0],
++                               wt["a_log"], wt["dt_bias"], wt["norm_w"], EPS, LOWER, R, sc)
++
++        def solo_chain():
++            for s, r0 in enumerate(starts):
++                kda.chain(x["p"][r0:r0 + n], B_OFF, x["a"][r0:r0 + n], x["g"][r0:r0 + n], conv[s, 0], wt["conv_w"],
++                          rec[s, s % 2, 0], wt["a_log"], wt["dt_bias"], wt["norm_w"], EPS, LOWER, n, solos[s],
++                          rec[s, 1 - s % 2, 0], wide=True)
++
++        sset = kda.KDAScratchSet(LAYERS, R, H, "cuda")
++        ssets = [kda.KDAScratchSet(LAYERS, 16, H, "cuda") for _ in range(4)]
++        for t in [sset] + ssets:
++            t.k.normal_(), t.v.normal_(), t.g.uniform_(0.5, 1.0), t.b.uniform_(0, 1)
++        keep = max(1, n // 2)
++        tab = seg if keep < n else kda.segment_table([(n, s, s % 2, s, n - 1 if n > 1 else 0) for s in range(4)],
++                                                     "cuda")
++        rkeep = keep if keep < n else max(n - 1, 0)
++
++        def seg_replay():
++            kda.replay_layers_segments(tab, rec, sset)
++
++        def solo_replay():
++            for s in range(4):
++                kda.replay_layers(rec[s, s % 2], ssets[s], rkeep, rec[s, 1 - s % 2])
++
++        proj = torch.randn((LAYERS, R, WIDTH), generator=g).to(torch.bfloat16).cuda()
++
++        def seg_shift():
++            conv_shift_segments(conv, proj, seg)
++
++        def solo_shift():
++            for s, r0 in enumerate(starts):
++                _shift_conv(conv[s], proj[:, r0:r0 + n], keep)
++
++        c1, c4 = _time(seg_chain), _time(solo_chain)
++        r1, r4 = _time(seg_replay), _time(solo_replay)
++        s1, s4 = _time(seg_shift), _time(solo_shift)
++        lines.append(f"4 x {n:2d} rows | chain (1 layer) {c1:7.1f} vs {c4:7.1f} us | replay (34 layers, keep "
++                     f"{rkeep}) {r1:7.1f} vs {r4:7.1f} us | conv shift {s1:6.1f} vs {s4:6.1f} us")
++    print("\nsegmented (one launch) vs 4 solo launches:\n" + "\n".join(lines))

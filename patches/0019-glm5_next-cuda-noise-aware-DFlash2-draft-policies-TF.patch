@@ -1,0 +1,1144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 22:16:24 -0400
+Subject: [PATCH] glm5_next/cuda: noise-aware DFlash2 draft policies,
+ TF_GLM_DFLASH_POLICY (MiaAI-Lab recipe patches 0018, 0021)
+
+MiaAI-Lab's recipe (github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold @ 1576746, with
+DRAFT_POLICY=fnc7:0.3 in its config) stops each round's DFlash2 chain by the chance that the target's own keyed
+sample takes each draft, not by the drafter's softmax alone: fnc7:0.3 drafts up to 7 while the product of those
+noise-aware confidences holds 0.3. TensorFold's default DFlash2 policy is fc5:0.3 (up to 5 while the plain product
+holds 0.3). This ports recipe patches 0018-glm-noise-policies and 0021-glm-dflash-policy-env (Apache License 2.0,
+Copyright 2026 MiaAI-Lab), with the multi-stream parts of 0027/0030/0035 that carry them, at their end state:
+
+- dflash2.py: NOISY_BETA (2.0, fitted in the recipe), noisy_confidence (softmax((score + g) / beta) at the pick, g
+  the target's keyed Gumbel draws; none when greedy), best_depth (the depth maximizing expected tokens per ms).
+  Drafter.chain and Drafter.propose take beta and round_ms; only where a chain stops changes, never its picks. The
+  joint allocation's confidences are noise-aware when the policy has a beta.
+- engine.py: encode_policy reads fncN:P[:B] (kind 16) and fcostN:noisy[:B] (kind 17, the depth that maximizes
+  E[tokens] / round ms by the startup cost table); decode_policy(code, costs) and round_costs. N goes up to 7, the
+  drafts of the verify windows _calibrate times here (1 to 8 rows; the recipe bounds it by its captured windows,
+  also 7). TF_GLM_DFLASH_POLICY sets the DFlash2 policy auto requests run on an EXL3 checkpoint with the draft model
+  (DFLASH_POLICY, read at import; unset = fc5:0.3); a value that is not a DFlash2 policy is refused at startup, and
+  on the attention/expert split's attention node before the wire opens.
+- decode.py: DepthPolicy carries beta and round_ms (chain_rule); dflash_decode proposes with them.
+- dflash2_multi.py and multi.py (PR #243's engine): DraftRequest carries the rule to MultiDrafter.propose; each
+  stream's policy decodes with the cost table; MTP twins keep the MTP rule.
+
+Drafts only propose: the verify window's keyed samples decide every token, so replies are unchanged under any
+policy; the policy changes how many rows each round verifies. Unset, TF_GLM_DFLASH_POLICY is fc5:0.3 and every
+request's drafts and replies are the ones before. On the split each extra verified row costs more than on two Sparks
+(measured a layer on its expert nodes: 1.07 ms at 8 rows, 1.95 ms at 15, 3.05 ms at 27), so the gain needs an A/B
+on the split's hardware.
+
+Tests: tests/test_glm_draft_policy.py (CPU): the recipe's units, verbatim in tests/glm_draft_policy_mia.py and pinned
+by sha256, against ours (noisy_confidence, best_depth, round_costs, _encode_noisy's codes and refusals, chain under
+every rule); the base's specs encode as before; the setting read at import and refused before the wire; PR #243's
+fake model with the real MultiDrafter.propose and Drafter.chain over fake candidates: drafted replies equal serial
+ones under fc5:0.3, fnc7:0.3, fnc7:0.6:1.0, fnc3:0.0, fcost7:noisy, fcost5:noisy:3 and f3, one stream and 2/4
+streams at two ranks (both ranks agree), PR #243's staggered requests under the setting, TF_GLM_KV=fp8's rings, world
+1 over the fake AFD wire, the joint allocation.
+
+Credit: THIRD_PARTY_NOTICES.md ("GLM noise-aware DFlash2 draft policies") and the ported units' comments name
+MiaAI-Lab and the patches.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patches 0018, 0021,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 1576746a04983b6eded0551dbf22512ee9e95654 (v1.5); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |  19 +
+ .../families/glm5_next/cuda/decode.py         |  18 +-
+ .../families/glm5_next/cuda/dflash2.py        |  69 ++-
+ .../families/glm5_next/cuda/dflash2_multi.py  |  17 +-
+ .../families/glm5_next/cuda/engine.py         |  76 ++-
+ .../families/glm5_next/cuda/multi.py          |   7 +-
+ tests/glm_draft_policy_mia.py                 | 142 +++++
+ tests/test_glm_draft_policy.py                | 523 ++++++++++++++++++
+ 8 files changed, 845 insertions(+), 26 deletions(-)
+ create mode 100644 tests/glm_draft_policy_mia.py
+ create mode 100644 tests/test_glm_draft_policy.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index f14c62b..9329db2 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -272,3 +272,22 @@ as her recipe credits them, adapted from patch 0580 of
+ [jayleaton/glm53-tensorfold-spark](https://github.com/jayleaton/glm53-tensorfold-spark) (`exl3_ld.cu`'s `ld_kernel`,
+ `LD_NC`), Apache License 2.0, Copyright 2026 Jay Leaton. Every switch here is off unless set (her recipe turns them
+ on); with none set, every launch is the one before the port.
++
++## GLM noise-aware DFlash2 draft policies
++
++The DFlash2 stop rules `fncN:P[:B]` and `fcostN:noisy[:B]` and the `TF_GLM_DFLASH_POLICY` setting in
++`families/glm5_next/cuda/dflash2.py` (`NOISY_BETA`, `noisy_confidence`, `best_depth`, `Drafter.chain`'s and
++`Drafter.propose`'s `beta` / `round_ms`), `decode.py` (`DepthPolicy`'s `beta`, `round_ms`, `chain_rule`;
++`dflash_decode`'s proposal), `engine.py` (`DFLASH_POLICY`, `encode_policy`'s `fnc` / `fcost` forms, `_encode_noisy`,
++`decode_policy`'s kinds 6 and 7, `round_costs`, `dflash_policy_check`), `dflash2_multi.py` (`DraftRequest`'s and
++`DraftContext.propose`'s `beta` / `round_ms`, `MultiDrafter.propose`) and `multi.py` (the streams' policies and
++proposals, the joint allocation's confidences) are ported from MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/1576746)
++patches 0018-glm-noise-policies and 0021-glm-dflash-policy-env, with the multi-stream parts of patches
++0027-glm-multi-dflash2, 0030-glm-multi-stream-engine and 0035-glm-multi-rounds that carry them, Apache License 2.0,
++Copyright 2026 MiaAI-Lab (see [the license text](LICENSES/Apache-2.0.txt)). `tests/glm_draft_policy_mia.py` holds the
++recipe's units verbatim, for the tests. Changes in the port: N is bounded by the verify windows `GlmEngine._calibrate`
++times here (1 to 8 rows, so N up to 7, as in the recipe, whose bound is its captured windows); the attention/expert
++split's attention node checks `TF_GLM_DFLASH_POLICY` before the wire opens; the joint allocation passes `beta` only
++when a policy has one. Unset, `TF_GLM_DFLASH_POLICY` is `fc5:0.3`, the policy before (the recipe's `config.sh` sets
++`fnc7:0.3`).
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index 82a43fd..4a78f26 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -676,14 +676,25 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
+ 
+ 
+ class DepthPolicy:
+-    """Choose a fixed draft count or adapt it to running acceptance."""
++    """Choose a fixed draft count or adapt it to running acceptance. DFlash2 stop rules within a round: the product of
++    the chain's confidences holds ``confidence``; with ``beta`` > 0 those confidences are noise-aware
++    (``dflash2.noisy_confidence``), and with ``round_ms`` too (ms of a round of k drafts, k = 0..) the chain is cut
++    where E[tokens] / ms is largest instead. MTP chains ignore ``beta`` and ``round_ms``. (``beta``, ``round_ms`` and
++    ``chain_rule``: MiaAI-Lab recipe patch 0018.)"""
+ 
+     def __init__(self, most: int = 3, fixed: bool = False, low: float = 0.8, high: float = 0.9,
+-                 confidence: float = 0.0) -> None:
++                 confidence: float = 0.0, beta: float = 0.0, round_ms: tuple[float, ...] | None = None) -> None:
+         self.most, self.fixed, self.low, self.high = most, fixed, low, high
+         self.confidence = confidence
++        self.beta, self.round_ms = beta, round_ms
+         self.rate = 0.8
+ 
++    @property
++    def chain_rule(self) -> dict:
++        """Drafter.propose's keyword arguments for the noise-aware rules (none for the others)."""
++
++        return {"beta": self.beta, "round_ms": self.round_ms} if self.beta > 0 else {}
++
+     def next(self, drafted: int, accepted: int) -> int:
+         if self.fixed:
+             return self.most
+@@ -767,7 +778,8 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
+     depth = min(policy.next(0, 0), count - len(out))
+     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos) and not stopped(e):
+         t0 = time.perf_counter()
+-        drafts = drafter.propose(out[-1], depth, sampling, policy.confidence) if depth > 0 else []
++        drafts = (drafter.propose(out[-1], depth, sampling, policy.confidence, **policy.chain_rule)
++                  if depth > 0 else [])
+         t1 = time.perf_counter()
+         tokens = e.verify_window([out[-1]] + drafts)
+         drafts = tokens[1:]
+diff --git a/src/tensorfold/families/glm5_next/cuda/dflash2.py b/src/tensorfold/families/glm5_next/cuda/dflash2.py
+index 29eb5c2..b7add8e 100644
+--- a/src/tensorfold/families/glm5_next/cuda/dflash2.py
++++ b/src/tensorfold/families/glm5_next/cuda/dflash2.py
+@@ -21,6 +21,32 @@ from .weights import Weights
+ EDGE = 0.6        # the selector's edge score weight in a chain pick
+ NOISE = 0.7       # the target's keyed noise weight when sampling
+ NO_LIMIT = 1e30
++# MiaAI-Lab recipe patch 0018 (noise-aware stop rules; NOISY_BETA, noisy_confidence, best_depth as in the recipe):
++# the noise-aware stop rules' temperature B (fnc<N>:<p>, fcost<N>:noisy): draft_sim's NoisyPredictor beta, fitted by
++# log loss (``fit_beta``, its grid) on the 9 teacher-forced dumps of 2026-09-30 (7 sampled prose, 2 greedy code):
++# 2.0 on all of them, on the sampled ones alone and on the greedy ones alone (a finer grid: 1.8, log loss -0.2%)
++NOISY_BETA = 2.0
++
++
++def noisy_confidence(score: np.ndarray, noise: np.ndarray | None, j: int, beta: float) -> float:
++    """softmax((score + g) / beta) at the pick j, g the target's keyed Gumbel draws for the candidates (None: greedy,
++    softmax(score / beta)): the chance the target's keyed sample is the pick when its scaled logits are the drafter's
++    plus iid Gumbel(beta) errors. draft_sim's ``noisy_prob`` feature, the same float64 operations in the same order."""
++
++    z = score + noise if noise is not None else score
++    z = z / beta
++    e = np.exp(z - z.max())
++    return float(e[j] / e.sum())
++
++
++def best_depth(q, round_ms) -> int:
++    """The k (0..len(q)) maximizing E[tokens | k drafts] / round_ms[k], q the drafts' conditional acceptances
++    (``draft_sim.best_depth`` with round_ms[k] = its Costs.round_ms(k, 1, True))."""
++
++    alive = np.concatenate([[1.0], np.cumprod(np.asarray(q, dtype=np.float64))])
++    expect = np.cumsum(alive)
++    ms = np.asarray(round_ms[:len(q) + 1], dtype=np.float64)
++    return int(np.argmax(expect / ms))
+ 
+ 
+ @triton.jit
+@@ -456,12 +482,15 @@ class Drafter:
+         return merge_candidates(self.packed[:, :depth].cpu(), self.proj[:depth].cpu(), self.top_k)
+ 
+     def chain(self, tokens: np.ndarray, values: np.ndarray, proj: np.ndarray, anchor: int, first: int,
+-              sampling: Sampling | None, confidence: float = 0.0, *, confs: list | None = None) -> list[int]:
+-        """Choose candidates with selector edges and target keyed noise; stop below cumulative confidence, always keeping the first draft.
+-
+-        ``confs`` (a list): the chain is walked whole and each pick's confidence (the softmax share of its score)
+-        appended to it, for a caller that cuts the chains itself (``multi``'s joint allocation). Only where the chain
+-        stops changes: the picks are the same."""
++              sampling: Sampling | None, confidence: float = 0.0, *, beta: float = 0.0,
++              round_ms: tuple[float, ...] | None = None, confs: list | None = None) -> list[int]:
++        """Choose candidates with selector edges and target keyed noise; stop below cumulative confidence, always
++        keeping the first draft. ``beta`` > 0: the confidences are noise-aware (``noisy_confidence``); with
++        ``round_ms`` (ms of a round of k drafts, k = 0..) the chain is walked whole and cut at ``best_depth`` of
++        them instead (``confidence`` unused). Only where the chain stops changes: the picks are the same. ``confs``
++        (a list): the chain is walked whole and each pick's confidence (noise-aware with ``beta``, else the
++        softmax share of its score) appended to it, for a caller that cuts the chains itself (``multi``'s joint
++        allocation). (``beta`` and ``round_ms``: MiaAI-Lab recipe patch 0018.)"""
+ 
+         depth = tokens.shape[0]
+         sampled = sampling is not None and sampling.temperature > 0
+@@ -469,7 +498,9 @@ class Drafter:
+         noise = None
+         if sampled:
+             noise = -np.log(-np.log(uniform_rows(sampling.seed, first + np.arange(depth), tokens)))
++        noisy = beta > 0
+         out: list[int] = []
++        conf: list[float] = []
+         prev, chain = anchor, 1.0
+         for d in range(depth):
+             edge = self.succ[tokens[d]].astype(np.float64) @ (self.pred[prev].astype(np.float64) * proj[d])
+@@ -477,8 +508,19 @@ class Drafter:
+             pick = score + NOISE * noise[d] if noise is not None else score
+             j = int(np.argmax(pick))
+             if confs is not None:
+-                p = np.exp(score - score.max())
+-                confs.append(float(p[j] / p.sum()))
++                if noisy:
++                    confs.append(noisy_confidence(score, noise[d] if noise is not None else None, j, beta))
++                else:
++                    p = np.exp(score - score.max())
++                    confs.append(float(p[j] / p.sum()))
++            elif noisy:
++                c = noisy_confidence(score, noise[d] if noise is not None else None, j, beta)
++                if round_ms is not None:
++                    conf.append(c)
++                else:
++                    chain *= c
++                    if d > 0 and chain < confidence:
++                        break
+             elif confidence > 0:
+                 p = np.exp(score - score.max())
+                 chain *= float(p[j] / p.sum())
+@@ -486,13 +528,20 @@ class Drafter:
+                     break
+             prev = int(tokens[d, j])
+             out.append(prev)
++        if noisy and round_ms is not None and confs is None:
++            out = out[:best_depth(conf, round_ms)]
+         return out
+ 
+-    def propose(self, pending: int, depth: int, sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
+-        """Up to ``depth`` drafts for the positions after the pending token (which sits at context_end)."""
++    def propose(self, pending: int, depth: int, sampling: Sampling | None, confidence: float = 0.0, *,
++                beta: float = 0.0, round_ms: tuple[float, ...] | None = None) -> list[int]:
++        """Up to ``depth`` drafts for the positions after the pending token (which sits at context_end); ``beta``,
++        ``round_ms``: the noise-aware stop rules (``chain``)."""
+ 
+         depth = min(depth, self.block - 1)
+         if depth < 1 or self.context_end == 0:
+             return []
+         tokens, values, proj = self.candidates(pending, depth)
++        if beta > 0:
++            return self.chain(tokens, values, proj, pending, self.context_end + 1, sampling, confidence, beta=beta,
++                              round_ms=round_ms)
+         return self.chain(tokens, values, proj, pending, self.context_end + 1, sampling, confidence)
+diff --git a/src/tensorfold/families/glm5_next/cuda/dflash2_multi.py b/src/tensorfold/families/glm5_next/cuda/dflash2_multi.py
+index f1c576f..17e0074 100644
+--- a/src/tensorfold/families/glm5_next/cuda/dflash2_multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/dflash2_multi.py
+@@ -109,19 +109,23 @@ class DraftContext:
+         """This stream's committed rows' taps alone (a prompt's chunks): ``MultiDrafter.commit`` of one stream."""
+         self.owner.commit([(self, taps)])
+ 
+-    def propose(self, pending: int, depth: int, sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
+-        return self.owner.propose([DraftRequest(self, pending, depth, sampling, confidence)])[0]
++    def propose(self, pending: int, depth: int, sampling: Sampling | None, confidence: float = 0.0, *,
++                beta: float = 0.0, round_ms: tuple[float, ...] | None = None) -> list[int]:
++        return self.owner.propose([DraftRequest(self, pending, depth, sampling, confidence, beta, round_ms)])[0]
+ 
+ 
+ @dataclass
+ class DraftRequest:
+-    """One stream's draft for a round: ``Drafter.propose``'s arguments with the stream's context."""
++    """One stream's draft for a round: ``Drafter.propose``'s arguments with the stream's context (``beta``,
++    ``round_ms``: the noise-aware stop rules, MiaAI-Lab recipe patch 0018)."""
+ 
+     ctx: DraftContext
+     pending: int
+     depth: int
+     sampling: Sampling | None = None
+     confidence: float = 0.0
++    beta: float = 0.0
++    round_ms: tuple[float, ...] | None = None
+ 
+ 
+ class MultiDrafter:
+@@ -420,5 +424,10 @@ class MultiDrafter:
+         got = self.candidates([(reqs[i].ctx, reqs[i].pending, depth) for i, depth in live])
+         for (i, _), (tokens, values, proj) in zip(live, got):
+             r = reqs[i]
+-            out[i] = self.d.chain(tokens, values, proj, r.pending, r.ctx.context_end + 1, r.sampling, r.confidence)
++            first = r.ctx.context_end + 1
++            if r.beta > 0:
++                out[i] = self.d.chain(tokens, values, proj, r.pending, first, r.sampling, r.confidence, beta=r.beta,
++                                      round_ms=r.round_ms)
++            else:
++                out[i] = self.d.chain(tokens, values, proj, r.pending, first, r.sampling, r.confidence)
+         return out
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index c29885c..01afe35 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -12,21 +12,33 @@ from pathlib import Path
+ from typing import Any, Callable
+ 
+ DEFAULT_POLICY = "auto"
+-DFLASH_POLICY = "fc5:0.3"             # DFlash2 drafts every round: up to 5 while their probability product holds 0.3
++# DFlash2 drafts every round: by default up to 5 while their probability product holds 0.3; TF_GLM_DFLASH_POLICY picks
++# another DFlash2 policy (e.g. fnc7:0.3, the noise-aware stop rule) for requests that name none (MiaAI-Lab recipe
++# patch 0021)
++DFLASH_POLICY = os.environ.get("TF_GLM_DFLASH_POLICY", "").strip() or "fc5:0.3"
+ EXL3_AUTO = DFLASH_POLICY             # what auto runs on an EXL3 checkpoint with the draft model
+ GRAPH_ROWS = (1, 2, 3, 4, 5, 6)       # verify windows captured as CUDA graphs
+ MAX_ROWS = 8                          # the widest verify window (a pending token and up to 7 drafts)
++# fncN / fcostN (MiaAI-Lab recipe patch 0018): N up to the drafts of the verify windows GlmEngine._calibrate times
++# (1 .. MAX_ROWS rows here; the recipe bounds it by its captured windows, len(GRAPH_ROWS) - 1 = 7 of 1 .. 8 rows)
++NOISY_MOST = MAX_ROWS - 1
+ DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,051 tokens)
+ # TF_GLM_DRAFT_RING=0: DFlash2's context in a flat buffer of the whole window, not a 2,176-row ring (the same drafts)
+ DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
+ 
+ 
+ def encode_policy(spec: str) -> list[int]:
+-    """Encode policy kind, maximum drafts, and two parameters in millionths as four integers, with 10 added to kind for DFlash2."""
++    """Encode policy kind, maximum drafts, and two parameters in millionths as four integers, with 10 added to kind for DFlash2.
++
++    DFlash2 only (MiaAI-Lab recipe patch 0018): ``fncN:P[:B]`` (kind 16: the fcN:P product of noise-aware
++    confidences, B their temperature, default ``dflash2.NOISY_BETA``) and ``fcostN:noisy[:B]`` (kind 17: the depth
++    k <= N maximizing E[tokens] / round ms by the startup cost table, E from the same confidences; N up to the verify
++    windows ``GlmEngine._calibrate`` times)."""
+ 
+     spec = str(spec).strip()
+     bad = ValueError(f"draft policy {spec!r}: expected auto[:E:EVERY:MARGIN], 0, N, a[:LOW:HIGH], cN:P, or one of "
+-                     f"these after f (N from 1 to {MAX_ROWS - 1})")
++                     f"these after f (N from 1 to {MAX_ROWS - 1}), fncN:P[:B] or fcostN:noisy[:B] "
++                     f"(N up to {NOISY_MOST})")
+     try:
+         if spec == "auto" or spec.startswith("auto:"):
+             parts = spec.split(":")
+@@ -36,6 +48,8 @@ def encode_policy(spec: str) -> list[int]:
+             if explore < 1 or every < 0 or not 0 <= margin < 1:
+                 raise bad
+             return [4 if len(parts) == 1 else 5, explore, every, int(round(margin * 1e6))]
++        if spec.startswith(("fnc", "fcost")):
++            return _encode_noisy(spec[1:], bad)
+         if spec.startswith("f"):
+             code = encode_policy(spec[1:])
+             return [code[0] + 10] + code[1:] if code[0] else code
+@@ -59,8 +73,32 @@ def encode_policy(spec: str) -> list[int]:
+     return [1 if most > 0 else 0, most, 0, 0]
+ 
+ 
+-def decode_policy(code: list[int]):
+-    """Decode a serial, MTP, or automatic policy, retaining exploration, sampling, and margin settings."""
++def _encode_noisy(spec: str, bad: ValueError) -> list[int]:
++    """``ncN:P[:B]`` -> [16, N, P, B] and ``costN:noisy[:B]`` -> [17, N, B, 0], P and B in millionths (DFlash2 only;
++    MiaAI-Lab recipe patch 0018)."""
++
++    from .dflash2 import NOISY_BETA
++
++    cost = spec.startswith("cost")
++    parts = spec[4 if cost else 2:].split(":")
++    if len(parts) not in (2, 3) or (cost and parts[1] != "noisy"):
++        raise bad
++    most = int(parts[0])
++    beta = float(parts[2]) if len(parts) == 3 else NOISY_BETA
++    if not 0 < most <= NOISY_MOST or not 0 < beta <= 1000 or round(beta * 1e6) < 1:
++        raise bad
++    if cost:
++        return [17, most, round(beta * 1e6), 0]
++    conf = float(parts[1])
++    if not 0 <= conf <= 1:
++        raise bad
++    return [16, most, round(conf * 1e6), round(beta * 1e6)]
++
++
++def decode_policy(code: list[int], costs: dict | None = None):
++    """Decode a serial, MTP, or automatic policy, retaining exploration, sampling, and margin settings; ``costs``: the
++    startup cost table (``GlmEngine._calibrate``) the fcost rule weighs a round's depths by (MiaAI-Lab recipe patch
++    0018)."""
+ 
+     from .decode import DepthPolicy
+ 
+@@ -72,9 +110,33 @@ def decode_policy(code: list[int]):
+         return DepthPolicy(min(most, MAX_ROWS - 1), low=a / 1e6, high=b / 1e6)
+     if kind == 3:
+         return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True, confidence=a / 1e6)
++    if kind == 6:
++        return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True, confidence=a / 1e6, beta=b / 1e6)
++    if kind == 7:
++        if costs is None:
++            raise ValueError("the fcost policy needs the engine's cost table")
++        return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True, beta=a / 1e6, round_ms=round_costs(costs))
+     return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True) if kind == 1 else None
+ 
+ 
++def round_costs(costs: dict) -> tuple[float, ...]:
++    """ms of a DFlash2 round of k drafts, k = 0 .. len(verify) - 1: the verify window of k + 1 rows, the block and a
++    kept row's context update, as draft_sim's Costs(verify, block, 0.0, taps_row).round_ms(k, 1, True) (MiaAI-Lab
++    recipe patch 0018; draft_sim is the recipe's offline simulator, not in this tree)."""
++
++    return tuple(v + costs["block"] + 0.0 + costs["taps_row"] * 1 for v in costs["verify"])
++
++
++def dflash_policy_check() -> list[int]:
++    """TF_GLM_DFLASH_POLICY (``DFLASH_POLICY``) must be a DFlash2 policy: its code, else ValueError (MiaAI-Lab recipe
++    patch 0021). The default fc5:0.3 always passes."""
++
++    code = encode_policy(DFLASH_POLICY)
++    if not code[0] >= 10:
++        raise ValueError(f"TF_GLM_DFLASH_POLICY={DFLASH_POLICY!r}: a DFlash2 policy (f...), e.g. fc5:0.3 or fnc7:0.3")
++    return code
++
++
+ def _f64_ints(x: float) -> list[int]:
+     return list(struct.unpack("<2i", struct.pack("<d", float(x))))
+ 
+@@ -278,6 +340,7 @@ class GlmEngine:
+                                               mla_ring_bytes, split_weights)
+ 
+         encode_policy(policy)                           # a bad default fails here, not in the first request
++        dflash_policy_check()                           # TF_GLM_DFLASH_POLICY: a DFlash2 policy (0021)
+         parallel = int(parallel)
+         if not 1 <= parallel <= PARALLEL_MOST:
+             raise ValueError(f"--parallel: 1 to {PARALLEL_MOST} requests at once for GLM-5.3-Flash, not {parallel}")
+@@ -800,7 +863,7 @@ class GlmEngine:
+         if max_tokens <= 1 or (stop_eos and first in self.eos):
+             return stats
+         self.e.vote = on_tokens                     # on every rank, so every rank's gathers keep the same size
+-        policy = decode_policy(code)
++        policy = decode_policy(code, self.costs)
+         if policy is None:
+             res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
+         elif auto:
+@@ -972,6 +1035,7 @@ class AfdEngine(GlmEngine):
+         if int(parallel) > 1:
+             afd_parallel_check()
+         shared_prefix()                           # TF_GLM_SHARED_PREFIX read now: a typo fails before the wire opens
++        dflash_policy_check()                     # and TF_GLM_DFLASH_POLICY (0021)
+         afd = make_afd(master, port, model_dir)   # AFD rank 0: the store lives here; the experts join
+         super().__init__(model_dir, rank=0, master=master, port=port, policy=policy, drafter=drafter,
+                          context=context, context_explicit=context_explicit, serial_only=serial_only,
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index b0a9f50..02f490a 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -862,7 +862,7 @@ class MultiDecoder:
+         st = State(self.w, x.size, e.rows, caches=e.caches, base=x.base, slots=e.slots, slot=a["slot"])
+         code = a["code"]
+         dflash, mtp = self._drafters(code)
+-        policy = decode_policy(code) if code[0] else None
++        policy = decode_policy(code, self.g.costs) if code[0] else None   # costs: the fcost rule's (0018)
+         lane = Lane(s, a["sid"], a["slot"], x, st, self.next_order, code, spec, policy, dflash, mtp,
+                     constraint=constraint)
+         self.next_sid = max(self.next_sid, a["sid"] + 1)
+@@ -1529,7 +1529,8 @@ class MultiDecoder:
+                 conf = l.policy.confidence
+                 if tune.depth == "scale":
+                     conf = scaled_confidence(conf, len(lanes), tune.alpha)
+-                asks.append((len(drafts) - 1, DraftRequest(self._ctx(l), l.s.out[-1], l.depth, l.s.sampling, conf)))
++                asks.append((len(drafts) - 1, DraftRequest(self._ctx(l), l.s.out[-1], l.depth, l.s.sampling, conf,
++                                                           **l.policy.chain_rule)))     # 0018's noise-aware rules
+         if asks and tune.depth == "joint":
+             self._joint(lanes, drafts, asks)
+         elif asks:
+@@ -1622,7 +1623,7 @@ class MultiDecoder:
+         for (k, r), (tokens, values, proj) in zip(live, got):
+             confs: list[float] = []
+             drafts[k] = md.d.chain(tokens, values, proj, r.pending, r.ctx.context_end + 1, r.sampling, 0.0,
+-                                   confs=confs)
++                                   confs=confs, **({"beta": r.beta} if r.beta > 0 else {}))   # 0018: noise-aware
+             reach.append(reach_of(confs))
+         asked = {k for k, _ in live}
+         fixed = sum(1 + (0 if k in asked else len(d)) for k, d in enumerate(drafts))
+diff --git a/tests/glm_draft_policy_mia.py b/tests/glm_draft_policy_mia.py
+new file mode 100644
+index 0000000..9720b9b
+--- /dev/null
++++ b/tests/glm_draft_policy_mia.py
+@@ -0,0 +1,142 @@
++"""MiaAI-Lab's reference units for recipe patch 0018 (the noise-aware DFlash2 stop rules), copied verbatim from her
++GLM-5.3-Flash EXL3 2x DGX Spark recipe @ 1576746 (Apache-2.0, Copyright 2026 MiaAI-Lab; THIRD_PARTY_NOTICES.md "GLM
++noise-aware DFlash2 draft policies"): its per-patch tree (TF v0.6.0 + patches 0001-0068) at d747563,
++src/tensorfold/families/glm5_next/cuda/. Each unit's lines are byte-identical to the recipe's (only this header, the
++imports and the class line around ``chain`` are ours); PINS holds each unit's sha256 and line range there, and
++tests/test_glm_draft_policy.py checks them. Generated from that tree (each unit found with ast).
++"""
++
++# ruff: noqa
++from __future__ import annotations
++
++import numpy as np
++
++from tensorfold.engine.exact_sampling import Sampling, uniform_rows
++
++PINS = {
++    "EDGE": ("dflash2.py", 21, 21, "599705b0434d24de38f182dd90e846545fc307973d9e8a86d3353d239d02ad2e"),
++    "NOISE": ("dflash2.py", 22, 22, "1a000dbe252b5cada854f0ca32799504436f958c451118ea0eac85feb20521c0"),
++    "NOISY_BETA": ("dflash2.py", 27, 27, "7ef482f536e41419a3577dfe0a2b8d028e2311b92b63145166a203d7acc98aca"),
++    "noisy_confidence": ("dflash2.py", 30, 38, "dc1b79136c214125fce268b8be1f2d3816ba40f5085eb5c584fa9ccc39903228"),
++    "best_depth": ("dflash2.py", 41, 48, "649034e1eb6f0bc7e334bc26557e58bc951e60139cfcea0b9d51c62fc273fa6c"),
++    "GRAPH_ROWS": ("engine.py", 19, 19, "266534612938ad885e11f637788596f247111ce8525aae99c48a5ea051382fb3"),
++    "_encode_noisy": ("engine.py", 256, 274, "94bd0c57e793d1e77e82d474c4c70b315cd7dff2a7461792781d4bbbd30e801f"),
++    "round_costs": ("engine.py", 300, 304, "cd6bc8f4796afa2968ddf98dba4897017a813d9e36f8ea8ca8b0b1f26b812277"),
++    "Drafter.chain": ("dflash2.py", 504, 553, "3fc7535a9bea82c265d14792c1e18af5c0700e547d95cecd5fa0762a62118ac0"),
++}
++
++
++EDGE = 0.6        # the selector's edge score weight in a chain pick
++
++
++NOISE = 0.7       # the target's keyed noise weight when sampling
++
++
++NOISY_BETA = 2.0
++
++
++def noisy_confidence(score: np.ndarray, noise: np.ndarray | None, j: int, beta: float) -> float:
++    """softmax((score + g) / beta) at the pick j, g the target's keyed Gumbel draws for the candidates (None: greedy,
++    softmax(score / beta)): the chance the target's keyed sample is the pick when its scaled logits are the drafter's
++    plus iid Gumbel(beta) errors. draft_sim's ``noisy_prob`` feature, the same float64 operations in the same order."""
++
++    z = score + noise if noise is not None else score
++    z = z / beta
++    e = np.exp(z - z.max())
++    return float(e[j] / e.sum())
++
++
++def best_depth(q, round_ms) -> int:
++    """The k (0..len(q)) maximizing E[tokens | k drafts] / round_ms[k], q the drafts' conditional acceptances
++    (``draft_sim.best_depth`` with round_ms[k] = its Costs.round_ms(k, 1, True))."""
++
++    alive = np.concatenate([[1.0], np.cumprod(np.asarray(q, dtype=np.float64))])
++    expect = np.cumsum(alive)
++    ms = np.asarray(round_ms[:len(q) + 1], dtype=np.float64)
++    return int(np.argmax(expect / ms))
++
++
++GRAPH_ROWS = (1, 2, 3, 4, 5, 6, 7, 8)  # verify windows (and MTP steps) captured as CUDA graphs; wider ones run eagerly
++
++
++def _encode_noisy(spec: str, bad: ValueError) -> list[int]:
++    """``ncN:P[:B]`` -> [16, N, P, B] and ``costN:noisy[:B]`` -> [17, N, B, 0], P and B in millionths (DFlash2 only)."""
++
++    from .dflash2 import NOISY_BETA
++
++    cost = spec.startswith("cost")
++    parts = spec[4 if cost else 2:].split(":")
++    if len(parts) not in (2, 3) or (cost and parts[1] != "noisy"):
++        raise bad
++    most = int(parts[0])
++    beta = float(parts[2]) if len(parts) == 3 else NOISY_BETA
++    if not 0 < most <= len(GRAPH_ROWS) - 1 or not 0 < beta <= 1000 or round(beta * 1e6) < 1:
++        raise bad
++    if cost:
++        return [17, most, int(round(beta * 1e6)), 0]
++    conf = float(parts[1])
++    if not 0 <= conf <= 1:
++        raise bad
++    return [16, most, int(round(conf * 1e6)), int(round(beta * 1e6))]
++
++
++def round_costs(costs: dict) -> tuple[float, ...]:
++    """ms of a DFlash2 round of k drafts, k = 0 .. len(verify) - 1: the verify window of k + 1 rows, the block and a
++    kept row's context update, as draft_sim's Costs(verify, block, 0.0, taps_row).round_ms(k, 1, True)."""
++
++    return tuple(v + costs["block"] + 0.0 + costs["taps_row"] * 1 for v in costs["verify"])
++
++
++class MiaDrafter:
++    """Only ``chain``; ``succ``, ``pred`` set by the caller."""
++
++    def chain(self, tokens: np.ndarray, values: np.ndarray, proj: np.ndarray, anchor: int, first: int,
++              sampling: Sampling | None, confidence: float = 0.0, *, beta: float = 0.0,
++              round_ms: tuple[float, ...] | None = None, confs: list | None = None) -> list[int]:
++        """Choose candidates with selector edges and target keyed noise; stop below cumulative confidence, always
++        keeping the first draft. ``beta`` > 0: the confidences are noise-aware (``noisy_confidence``); with
++        ``round_ms`` (ms of a round of k drafts, k = 0..) the chain is walked whole and cut at ``best_depth`` of
++        them instead (``confidence`` unused). Only where the chain stops changes: the picks are the same. ``confs``
++        (a list): the chain is walked whole and each pick's confidence (noise-aware with ``beta``, else the
++        softmax share of its score) appended to it, for a caller that cuts the chains itself (``multi``'s joint
++        allocation)."""
++
++        depth = tokens.shape[0]
++        sampled = sampling is not None and sampling.temperature > 0
++        temp = float(sampling.temperature) if sampled else 1.0
++        noise = None
++        if sampled:
++            noise = -np.log(-np.log(uniform_rows(sampling.seed, first + np.arange(depth), tokens)))
++        noisy = beta > 0
++        out: list[int] = []
++        conf: list[float] = []
++        prev, chain = anchor, 1.0
++        for d in range(depth):
++            edge = self.succ[tokens[d]].astype(np.float64) @ (self.pred[prev].astype(np.float64) * proj[d])
++            score = (values[d] + EDGE * edge) / temp
++            pick = score + NOISE * noise[d] if noise is not None else score
++            j = int(np.argmax(pick))
++            if confs is not None:
++                if noisy:
++                    confs.append(noisy_confidence(score, noise[d] if noise is not None else None, j, beta))
++                else:
++                    p = np.exp(score - score.max())
++                    confs.append(float(p[j] / p.sum()))
++            elif noisy:
++                c = noisy_confidence(score, noise[d] if noise is not None else None, j, beta)
++                if round_ms is not None:
++                    conf.append(c)
++                else:
++                    chain *= c
++                    if d > 0 and chain < confidence:
++                        break
++            elif confidence > 0:
++                p = np.exp(score - score.max())
++                chain *= float(p[j] / p.sum())
++                if d > 0 and chain < confidence:
++                    break
++            prev = int(tokens[d, j])
++            out.append(prev)
++        if noisy and round_ms is not None and confs is None:
++            out = out[:best_depth(conf, round_ms)]
++        return out
+diff --git a/tests/test_glm_draft_policy.py b/tests/test_glm_draft_policy.py
+new file mode 100644
+index 0000000..2fb3f37
+--- /dev/null
++++ b/tests/test_glm_draft_policy.py
+@@ -0,0 +1,523 @@
++"""MiaAI-Lab recipe patches 0018 and 0021: DFlash2's noise-aware stop rules (``fncN:P[:B]``,
++``fcostN:noisy[:B]``) and ``TF_GLM_DFLASH_POLICY``, on CPU.
++
++Covered:
++- Mia's reference units (``tests/glm_draft_policy_mia.py``: copied verbatim from the recipe's tree, each pinned by the
++  sha256 of its lines) against ours: ``noisy_confidence``, ``best_depth``, ``round_costs``, ``_encode_noisy``'s codes
++  and refusals, and ``Drafter.chain`` under every rule (fc, fnc, fcost and the joint allocation's confs) on random
++  candidates, greedy and sampled. Every rule's chain is a prefix of the whole walk: the picks never change.
++- The policy codes: every spec the base accepted encodes as before; the new ones decode to the noise-aware
++  ``DepthPolicy`` (``chain_rule``), fcost needs the cost table, and the MTP twins under --parallel keep the MTP rule.
++- ``TF_GLM_DFLASH_POLICY``: read at import (fresh interpreters), unset = fc5:0.3; a non-DFlash2 or malformed value is
++  refused at startup, on the AFD attention node before the wire opens.
++- Drafted replies equal serial replies under each policy on PR #243's fake model, with the real ``MultiDrafter.propose``
++  and ``Drafter.chain`` over fake candidates, so the policy decides where each chain stops: one stream
++  (``dflash_decode`` through ``GlmEngine.generate``), PR #243's streams at two ranks (both ranks agree), its staggered
++  requests with every policy, TF_GLM_KV=fp8's rings, world 1 over the fake AFD wire, and the joint allocation with
++  noise-aware confidences.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import importlib
++import os
++import subprocess
++import sys
++from pathlib import Path
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++
++from tests import glm_draft_policy_mia as mia
++from tests import test_glm_kv8_multi as tk
++from tests import test_glm_multi as tm
++from tests import test_glm_multi_afd as ta
++from tests.test_cuda_geometry import allocations  # noqa: F401  (fixture: fake triton, so decode imports)
++
++pytestmark = pytest.mark.torch
++fake = tm.fake
++afd_fake = ta.afd_fake
++rings = tk.rings
++
++ROOT = Path(__file__).resolve().parents[1]
++K = 4                                                       # fake candidates per position
++COSTS = {"verify": [9.0, 9.6, 10.1, 10.7, 11.2, 11.8, 12.3, 12.9], "block": 1.2, "taps_row": 0.04}
++POLICIES = ["fc5:0.3", "fnc7:0.3", "fnc7:0.6:1.0", "fnc3:0.0", "fcost7:noisy", "fcost5:noisy:3", "f3"]
++
++
++def _mods():
++    eng = importlib.import_module("tensorfold.families.glm5_next.cuda.engine")
++    dfl = importlib.import_module("tensorfold.families.glm5_next.cuda.dflash2")
++    return eng, dfl
++
++
++# -- Mia's reference units ---------------------------------------------------------------------------------------------
++def test_the_reference_units_are_mias_lines():
++    """tests/glm_draft_policy_mia.py holds each recipe unit's exact lines: the sha256 recorded from the recipe's tree
++    (recorded when the file was generated from the recipe's tree) is the sha256 of the lines in the file."""
++
++    text = (ROOT / "tests" / "glm_draft_policy_mia.py").read_text()
++    for label, (_, lo, hi, digest) in mia.PINS.items():
++        name = label.split(".")[-1]
++        lines = text.splitlines(keepends=True)
++        starts = [i for i, ln in enumerate(lines) if ln.lstrip().startswith((f"def {name}(", f"{name} ="))]
++        assert len(starts) == 1, label
++        i = starts[0]
++        got = "".join(lines[i:i + hi - lo + 1])
++        assert hashlib.sha256(got.encode()).hexdigest() == digest, label
++
++
++def _candidates(rng, depth: int, vocab: int = 64, k: int = K, spread: float = 2.0):
++    tokens = np.stack([rng.choice(vocab, size=k, replace=False) for _ in range(depth)]).astype(np.int64)
++    values = (rng.standard_normal((depth, k)) * spread).astype(np.float32)
++    proj = rng.standard_normal((depth, 3)).astype(np.float32)
++    return tokens, values, proj
++
++
++def _selector(rng, vocab: int = 64):
++    return (rng.standard_normal((vocab, 3)).astype(np.float32), rng.standard_normal((vocab, 3)).astype(np.float32))
++
++
++def test_noisy_confidence_best_depth_and_round_costs_equal_mias(allocations):  # noqa: F811
++    eng, dfl = _mods()
++    rng = np.random.default_rng(18)
++    for _ in range(300):
++        score = rng.standard_normal(rng.integers(2, 9)) * rng.uniform(0.1, 6)
++        noise = None if rng.random() < 0.4 else -np.log(-np.log(rng.uniform(1e-9, 1, score.shape)))
++        j, beta = int(rng.integers(0, score.shape[0])), float(rng.choice([0.5, 1.0, 1.8, 2.0, 3.0]))
++        assert dfl.noisy_confidence(score, noise, j, beta) == mia.noisy_confidence(score, noise, j, beta)
++        q = rng.uniform(0, 1, rng.integers(0, 8))
++        ms = sorted(rng.uniform(5, 15, 8))
++        assert dfl.best_depth(q, ms) == mia.best_depth(q, ms)
++    assert dfl.NOISY_BETA == mia.NOISY_BETA and (dfl.EDGE, dfl.NOISE) == (mia.EDGE, mia.NOISE)
++    assert eng.round_costs(COSTS) == mia.round_costs(COSTS)
++    assert len(eng.round_costs(COSTS)) == len(COSTS["verify"]) == eng.MAX_ROWS
++
++
++def test_the_noise_codes_and_refusals_equal_mias(allocations, monkeypatch):  # noqa: F811
++    """``_encode_noisy``: the same code or the same refusal as the recipe's for N 0..9 (both bound N by 7: here the
++    verify windows ``_calibrate`` times, 1 .. MAX_ROWS = 8 rows; there its captured ones, 1 .. 8), every P and B form."""
++
++    eng, dfl = _mods()
++    monkeypatch.setitem(sys.modules, "tests.dflash2", SimpleNamespace(NOISY_BETA=dfl.NOISY_BETA))  # the recipe's import
++    assert eng.NOISY_MOST == len(mia.GRAPH_ROWS) - 1 == 7
++    specs = []
++    for n in range(10):
++        specs += [f"nc{n}:0.3", f"nc{n}:0", f"nc{n}:1", f"nc{n}:1.5", f"nc{n}:0.3:1.0", f"nc{n}:0.3:0", f"nc{n}:0.3:1001",
++                  f"nc{n}:0.3:1e-7", f"cost{n}:noisy", f"cost{n}:noisy:3", f"cost{n}:quiet", f"cost{n}:noisy:0"]
++    specs += ["nc7", "nc7:0.3:1:2", "nc7:x", "ncx:0.3", "cost7", "cost7:noisy:1:2"]
++    for spec in specs:
++        got = []
++        for fn in (eng._encode_noisy, mia._encode_noisy):
++            try:
++                got.append(fn(spec, ValueError("bad")))
++            except ValueError:
++                got.append("refused")
++        assert got[0] == got[1], spec
++    assert eng.encode_policy("fnc7:0.3") == [16, 7, 300000, 2000000]
++    assert eng.encode_policy("fcost7:noisy") == [17, 7, 2000000, 0]
++    for bad in ("fnc8:0.3", "fnc7:2", "fcost7:quiet", "nc7:0.3", "fnc7"):
++        with pytest.raises(ValueError, match="fncN:P"):
++            eng.encode_policy(bad)
++
++
++def _chain_cases(rng):
++    from tensorfold.engine.exact_sampling import Sampling
++
++    for case in range(400):
++        depth = int(rng.integers(1, 8))
++        sampling = None if case % 3 == 0 else Sampling(int(rng.integers(0, 2**31)), float(rng.choice([0.6, 1.0])),
++                                                       0, 1.0)
++        kw = {}
++        rule = case % 5
++        if rule == 1:
++            kw = {"beta": float(rng.choice([1.0, 2.0]))}
++        elif rule == 2:
++            kw = {"beta": 2.0, "round_ms": tuple(sorted(rng.uniform(5, 14, 8)))}
++        elif rule == 3:
++            kw = {"confs": []}
++        elif rule == 4:
++            kw = {"beta": 2.0, "confs": []}
++        yield depth, sampling, float(rng.choice([0.0, 0.1, 0.3, 0.6])), kw
++
++
++def test_chain_equals_mias_under_every_rule(allocations):  # noqa: F811
++    """Our ``Drafter.chain`` against the recipe's (verbatim), on random candidates and selectors: the same drafts and
++    the same confidences under fc (product), fnc (noise-aware product), fcost (best_depth) and the joint allocation's
++    confs (plain and noise-aware); every rule's chain is a prefix of the whole walk."""
++
++    _, dfl = _mods()
++    rng = np.random.default_rng(21)
++    succ, pred = _selector(rng)
++    ours = SimpleNamespace(succ=succ, pred=pred)
++    ref = mia.MiaDrafter()
++    ref.succ, ref.pred = succ, pred
++    cut = 0
++    for depth, sampling, conf, kw in _chain_cases(rng):
++        tokens, values, proj = _candidates(rng, depth, spread=float(rng.choice([0.3, 1.0, 3.0])))
++        anchor, first = int(rng.integers(0, 64)), int(rng.integers(1, 5000))
++        k1 = {k: (list(v) if k == "confs" else v) for k, v in kw.items()}
++        k2 = {k: (list(v) if k == "confs" else v) for k, v in kw.items()}
++        a = dfl.Drafter.chain(ours, tokens, values, proj, anchor, first, sampling, conf, **k1)
++        b = ref.chain(tokens, values, proj, anchor, first, sampling, conf, **k2)
++        assert a == b and k1.get("confs") == k2.get("confs")
++        whole = dfl.Drafter.chain(ours, tokens, values, proj, anchor, first, sampling, 0.0)
++        assert a == whole[:len(a)] and (len(a) >= 1 or "round_ms" in kw)
++        cut += len(a) < len(whole)
++    assert cut > 50                                          # the rules did stop chains early
++
++
++# -- the policy codes --------------------------------------------------------------------------------------------------
++BASE_CODES = {"auto": [4, 2, 8, 30000], "auto:3:4:0.1": [5, 3, 4, 100000], "0": [0, 0, 0, 0], "3": [1, 3, 0, 0],
++              "7": [1, 7, 0, 0], "a": [2, 3, 800000, 900000], "a:0.6:0.85": [2, 3, 600000, 850000],
++              "c3:0.35": [3, 3, 350000, 0], "f3": [11, 3, 0, 0], "f5": [11, 5, 0, 0], "fc5:0.3": [13, 5, 300000, 0],
++              "fc7:0.3": [13, 7, 300000, 0], "fa": [12, 3, 800000, 900000], "f0": [0, 0, 0, 0]}
++
++
++def test_the_base_specs_encode_as_before_and_the_new_ones_decode(allocations):  # noqa: F811
++    eng, _ = _mods()
++    for spec, code in BASE_CODES.items():               # the codes 9080db9..c0c7351's encode_policy gives
++        assert eng.encode_policy(spec) == code, spec
++        pol = eng.decode_policy(code)
++        if not isinstance(pol, tuple) and pol is not None:
++            assert pol.chain_rule == {} and pol.beta == 0 and pol.round_ms is None
++    p = eng.decode_policy(eng.encode_policy("fnc7:0.3"))
++    assert (p.most, p.fixed, p.confidence, p.beta, p.round_ms) == (7, True, 0.3, 2.0, None)
++    assert p.chain_rule == {"beta": 2.0, "round_ms": None}
++    with pytest.raises(ValueError, match="cost table"):
++        eng.decode_policy(eng.encode_policy("fcost7:noisy"))
++    p = eng.decode_policy(eng.encode_policy("fcost7:noisy:3"), COSTS)
++    assert (p.most, p.beta, p.round_ms, p.confidence) == (7, 3.0, eng.round_costs(COSTS), 0.0)
++    from tensorfold.families.glm5_next.cuda.multi import multi_code
++
++    df = eng.encode_policy("fc5:0.3")
++    for spec in ("fnc7:0.3", "fcost7:noisy"):            # an MTP twin under --parallel: the MTP rule ignores beta
++        code = eng.encode_policy(spec)
++        twin = multi_code(code, False, True, df)
++        assert twin == [code[0] - 10] + code[1:]
++        mtp = eng.decode_policy(twin, COSTS)
++        assert mtp.most == 7 and mtp.fixed
++
++
++def _fresh(env_value: str | None, code: str) -> str:
++    env = {k: v for k, v in os.environ.items() if k != "TF_GLM_DFLASH_POLICY"}
++    if env_value is not None:
++        env["TF_GLM_DFLASH_POLICY"] = env_value
++    env["PYTHONPATH"] = os.pathsep.join([str(ROOT / "src")] + [p for p in sys.path if p])
++    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120, cwd=ROOT,
++                         check=False)
++    assert out.returncode == 0, out.stderr[-2000:]
++    return out.stdout.strip()
++
++
++def test_the_setting_is_read_at_import():
++    code = ("from tensorfold.families.glm5_next.cuda import engine as e; "
++            "print(e.DFLASH_POLICY, e.EXL3_AUTO, e.dflash_policy_check())")
++    assert _fresh(None, code) == "fc5:0.3 fc5:0.3 [13, 5, 300000, 0]"
++    assert _fresh("", code) == "fc5:0.3 fc5:0.3 [13, 5, 300000, 0]"
++    assert _fresh(" fnc7:0.3 ", code) == "fnc7:0.3 fnc7:0.3 [16, 7, 300000, 2000000]"
++    assert _fresh("fcost7:noisy", code) == "fcost7:noisy fcost7:noisy [17, 7, 2000000, 0]"
++
++
++def test_bad_settings_are_refused_at_startup_and_before_the_wire(allocations, monkeypatch, tmp_path):  # noqa: F811
++    eng, _ = _mods()
++    afd = importlib.import_module("tensorfold.families.glm5_next.cuda.afd")
++    opened = []
++    monkeypatch.setattr(afd, "make_afd", lambda *a, **k: opened.append(a) or (_ for _ in ()).throw(SystemExit))
++    for bad, why in (("3", "a DFlash2 policy"), ("auto", "a DFlash2 policy"), ("fnc9:0.3", "fncN:P"),
++                     ("fx", "draft policy")):
++        monkeypatch.setattr(eng, "DFLASH_POLICY", bad)
++        with pytest.raises(ValueError, match=why):
++            eng.dflash_policy_check()
++        with pytest.raises(ValueError, match=why):
++            eng.AfdEngine(tmp_path, master="127.0.0.1", port=1)
++        with pytest.raises(ValueError, match=why):
++            eng.GlmEngine(tmp_path, rank=0, master="127.0.0.1", port=1)
++    assert opened == []                                  # the wire never opened
++    monkeypatch.setattr(eng, "DFLASH_POLICY", "fnc7:0.3")
++    with pytest.raises(SystemExit):                      # a good one gets as far as the wire
++        eng.AfdEngine(tmp_path, master="127.0.0.1", port=1)
++    assert len(opened) == 1
++
++
++# -- the fake model: the real chain over fake candidates ---------------------------------------------------------------
++class PolicyDrafter(tm.FakeMultiDrafter):
++    """PR #243's fake DFlash2 contexts (taps checked to arrive in order) with the real ``MultiDrafter.propose`` and
++    ``Drafter.chain`` over fake candidates: at each position the fake model's greedy token (wrong every third, as the
++    PR's fake drafter) and K - 1 others, with margins that vary by position, so each rule stops chains at its own
++    depths. Every proposal is logged as (asked depth, beta, round_ms set, drafts)."""
++
++    def __init__(self, torch, streams: int, capacity: int, seed: int = 7) -> None:
++        super().__init__(torch, streams, capacity)
++        from tensorfold.families.glm5_next.cuda.dflash2 import Drafter
++        from tensorfold.families.glm5_next.cuda.dflash2_multi import MultiDrafter
++
++        self._chain, self._propose = Drafter.chain, MultiDrafter.propose
++        self.succ, self.pred = _selector(np.random.default_rng(seed), tm.V)
++        self.log: list[tuple[int, float, bool, int]] = []
++
++    @property
++    def d(self):
++        return self
++
++    def chain(self, *a, **k):
++        return self._chain(self, *a, **k)
++
++    def candidates(self, reqs):
++        torch, out = self.torch, []
++        for c, pending, depth in reqs:
++            seq = [int(v) - 1 for v in c.kc[0][0, :c.context_end, 0].tolist()] + [int(pending)]
++            toks, vals = [], []
++            for k in range(depth):
++                t = int(torch.argmax(tm.pure_logits(torch, seq)))
++                if k % 3 == 2:
++                    t = (t + 1) % tm.V
++                toks.append([t] + [(t + 1 + i) % tm.V for i in range(K - 1)])
++                lead = (9.0, 8.0, 4.0 - 1.5 * ((int(pending) + k) % 3))[k % 3]   # long chains, a softer third pick
++                vals.append([lead, 0.0, -0.4, -1.0])
++                seq.append(t)
++            proj = np.full((depth, 3), 0.05, dtype=np.float32)
++            out.append((np.asarray(toks, dtype=np.int64), np.asarray(vals, dtype=np.float32), proj))
++        return out
++
++    def propose(self, reqs) -> list[list[int]]:
++        got = self._propose(self, reqs)
++        self.proposed += 1
++        self.log += [(r.depth, r.beta, r.round_ms is not None, len(d)) for r, d in zip(reqs, got)]
++        return got
++
++
++class SoloContext(tm.FakeContext):
++    """The single-stream drafter: one of PolicyDrafter's contexts with ``DraftContext.propose``."""
++
++    def propose(self, *a, **k):
++        from tensorfold.families.glm5_next.cuda.dflash2_multi import DraftContext
++
++        return DraftContext.propose(self, *a, **k)
++
++
++def _policy_pair(torch, monkeypatch, streams: int, *, mtp: bool = False, **kw):
++    monkeypatch.setattr(tm, "FakeMultiDrafter", PolicyDrafter)
++    p = tm.Pair(torch, streams=streams, mtp=mtp, **kw)
++    for g in p.g:
++        g.costs = dict(COSTS)
++    return p
++
++
++def _policy_world1(env, monkeypatch, streams: int):
++    monkeypatch.setattr(ta, "FakeMultiDrafter", PolicyDrafter)
++    n1 = ta.World1(env, streams=streams)
++    n1.g.costs = dict(COSTS)
++    return n1
++
++
++REQS = [(37, 1, "topk", 60), (150, 2, "greedy", 50), (90, 3, "nucleus", 40), (64, 4, "minp", 45),
++        (20, 5, "greedy", 30)]
++
++
++def _stats(log) -> dict:
++    return {"rounds": len(log), "drafts": sum(n for *_, n in log), "most": max((n for *_, n in log), default=0),
++            "noisy": sum(1 for _, b, _, _ in log if b > 0), "cost": sum(1 for *_, c, _ in log if c)}
++
++
++@pytest.mark.parametrize("policy", POLICIES)
++def test_one_stream_drafted_replies_equal_serial(fake, monkeypatch, policy):
++    """``dflash_decode`` through ``GlmEngine.generate`` (one stream, two-rank shell): every request's drafted reply
++    under the policy equals its draft:false reply; the rule reached the drafter (beta, round_ms) and set the depths.
++    (A drafted single-stream prompt keeps its state before its last token; the PR's fake prompt chunk has no cut, so
++    the cut is dropped here: each request runs on a fresh engine and nothing resumes from it.)"""
++
++    torch = fake
++    decode = importlib.import_module("tensorfold.families.glm5_next.cuda.decode")
++    chunk = decode.compute
++    monkeypatch.setattr(decode, "compute", lambda w, st, b, R, *, cut=None, **kw: chunk(w, st, b, R, **kw))
++    log_all = []
++    for n, seed, kind, count in REQS:
++        g = tm.shell(torch, 0, pool=16 * tm.ALIGN, streams=1)
++        g._share = lambda values: list(values)
++        owner = PolicyDrafter(torch, 1, 16 * tm.ALIGN)
++        g.drafter = owner.contexts[0] = SoloContext(torch, owner, 0, 16 * tm.ALIGN)
++        g.costs = dict(COSTS)
++        g.request.policy = policy
++        prompt, sampling = tm._prompt(n, seed), tm._sampling(kind, seed)
++        out: list[int] = []
++        stats = g.generate(list(prompt), count, sampling, out.extend)
++        assert out == tm.solo(torch, prompt, count, sampling), (policy, seed)
++        assert stats["drafted"] > 0 and owner.proposed > 0
++        log_all += owner.log
++    s = _stats(log_all)
++    noisy, cost = policy.startswith(("fnc", "fcost")), policy.startswith("fcost")
++    assert (s["noisy"] == s["rounds"]) if noisy else s["noisy"] == 0
++    assert (s["cost"] == s["rounds"]) if cost else s["cost"] == 0
++    assert s["most"] <= int(policy.split(":")[0].lstrip("fncost") or 0) and s["drafts"] > 0
++
++
++def _staggered(p, policies, streams: int = 4):
++    """Five requests admitted as they come (two at once, then one every few rounds, while a slot is free), each with
++    its policy (``policies`` in turn)."""
++
++    d0 = p.d[0] if isinstance(p.d, list) else p.d
++    admitted, pending = [], list(enumerate(REQS))
++    starts = {0: 0, 1: 0, 2: 3, 3: 6, 4: 9}
++    for it in range(4000):
++        while pending and it >= starts[pending[0][0]] and d0.live() < streams:
++            i, (n, seed, kind, count) = pending.pop(0)
++            admitted.append((i, p.submit(tm._prompt(n, seed), count, tm._sampling(kind, seed),
++                                         policy=policies[i % len(policies)])))
++        if not d0.lanes and not pending:
++            break
++        if d0.lanes:
++            p.step()
++        elif getattr(p, "sent", None):
++            p.follow()
++    assert not pending and not d0.lanes
++    return admitted
++
++
++@pytest.mark.parametrize("streams", [2, 4])
++@pytest.mark.parametrize("policy", POLICIES)
++def test_two_ranks_streams_equal_their_serial_replies(fake, monkeypatch, streams, policy):
++    """PR #243's streams at two ranks under one policy: each reply equals the request served alone with draft:false;
++    both ranks hold the same pool, kept prompts, depths and DFlash2 contexts after every message (``Pair.check``)."""
++
++    torch = fake
++    p = _policy_pair(torch, monkeypatch, streams)
++    admitted = _staggered(p, [policy], streams)
++    for i, s in admitted:
++        n, seed, kind, count = REQS[i]
++        assert s.got == tm.solo(torch, tm._prompt(n, seed), count, tm._sampling(kind, seed)), (policy, i)
++    assert not p.d[0].lanes and p.d[1].idle
++    s0, s1 = _stats(p.d[0].drafts.log), _stats(p.d[1].drafts.log)
++    assert s0 == s1 and s0["drafts"] > 0                  # rank 1 drafted the same chains
++    noisy = policy.startswith(("fnc", "fcost"))
++    assert (s0["noisy"] == s0["rounds"]) if noisy else s0["noisy"] == 0
++
++
++def test_two_ranks_mixed_policies_and_the_drafts_they_make(fake, monkeypatch):
++    """Five streams' policies mixed in one pool (fc5, fnc7, fcost7, f3): the same replies as alone; fnc7 drafts
++    chains past fc5's limit of 5 and none past 7; the drafted rows differ by policy (the rule decides the depth)."""
++
++    torch = fake
++    per = {}
++    for policy in ("fc5:0.3", "fnc7:0.3", "fcost7:noisy"):
++        p = _policy_pair(torch, monkeypatch, 4)
++        admitted = _staggered(p, [policy])
++        for i, s in admitted:
++            n, seed, kind, count = REQS[i]
++            assert s.got == tm.solo(torch, tm._prompt(n, seed), count, tm._sampling(kind, seed))
++        per[policy] = _stats(p.d[0].drafts.log)
++    assert per["fc5:0.3"]["most"] <= 5 < per["fnc7:0.3"]["most"] <= 7
++    assert len({tuple(v.items()) for v in per.values()}) == 3
++    p = _policy_pair(torch, monkeypatch, 4)
++    admitted = _staggered(p, ["fnc7:0.3", "fc5:0.3", "fcost7:noisy", "f3"])
++    for i, s in admitted:
++        n, seed, kind, count = REQS[i]
++        assert s.got == tm.solo(torch, tm._prompt(n, seed), count, tm._sampling(kind, seed))
++
++
++@pytest.mark.parametrize("policy", ["fnc7:0.3", "fcost7:noisy"])
++def test_pr243s_staggered_requests_under_the_setting(fake, monkeypatch, policy):
++    """PR #243's own staggered scenario (auto, f3, f5, MTP and serial requests; DFlash2, both drafters) with
++    TF_GLM_DFLASH_POLICY=policy: auto requests run the policy; every reply is its solo one."""
++
++    eng, _ = _mods()
++    monkeypatch.setattr(eng, "DFLASH_POLICY", policy)
++    monkeypatch.setattr(eng, "EXL3_AUTO", policy)
++    monkeypatch.setattr(tm, "FakeMultiDrafter", PolicyDrafter)
++    seen = []
++    real = tm.Pair.__init__
++
++    def init(self, *a, **k):
++        real(self, *a, **k)
++        for g in self.g:
++            g.costs = dict(COSTS)
++        seen.append(self)
++
++    monkeypatch.setattr(tm.Pair, "__init__", init)
++    for drafters in ("dflash2", "both"):
++        tm.test_staggered_concurrent_requests_equal_their_solo_serial_replies(fake, 4, drafters)
++    assert all(_stats(p.d[0].drafts.log)["noisy"] > 0 for p in seen)
++
++
++def test_two_ranks_fp8_rings(fake, rings, monkeypatch):
++    """TF_GLM_KV=fp8's per-slot indexer rings: the streams under fnc7 and fcost7 equal their solo replies."""
++
++    tk._ringed(fake)
++    for policy in ("fnc7:0.3", "fcost7:noisy"):
++        p = _policy_pair(fake, monkeypatch, 4)
++        for i, s in _staggered(p, [policy]):
++            n, seed, kind, count = REQS[i]
++            assert s.got == tm.solo(fake, tm._prompt(n, seed), count, tm._sampling(kind, seed)), (policy, i)
++
++
++def test_world1_over_the_afd_wire(afd_fake, monkeypatch):
++    """The AFD attention node (world 1, batched eager windows over the fake wire) under fnc7 and fcost7: replies
++    equal the solo ones; every verify window is at most the batched window's rows."""
++
++    torch = afd_fake.torch
++    for policy in ("fnc7:0.3", "fcost7:noisy"):
++        n1 = _policy_world1(afd_fake, monkeypatch, 4)
++        admitted = _staggered(n1, [policy])
++        for i, s in admitted:
++            n, seed, kind, count = REQS[i]
++            assert s.got == tm.solo(torch, tm._prompt(n, seed), count, tm._sampling(kind, seed)), (policy, i)
++        assert _stats(n1.d.drafts.log)["noisy"] > 0 and n1.d.world == 1
++        n1.wire.pairs()
++
++
++def test_joint_allocation_with_noise_aware_confidences(fake, monkeypatch):
++    """TF_GLM_MULTI_DEPTH=joint (two ranks): the chains walk whole with noise-aware confidences when the policy has a
++    beta (the recipe's _joint), plain ones otherwise; replies equal the solo ones either way."""
++
++    from tensorfold.families.glm5_next.cuda.multi_tune import MultiSettings
++
++    torch = fake
++    seen: list = []
++    real = PolicyDrafter.chain
++
++    def spy(self, *a, **k):
++        if k.get("confs") is not None:
++            seen.append(k.get("beta", 0.0))
++        return real(self, *a, **k)
++
++    monkeypatch.setattr(PolicyDrafter, "chain", spy)
++    for policy, beta in (("fnc7:0.3", 2.0), ("fc5:0.3", 0.0)):
++        seen.clear()
++        tune = MultiSettings.from_env({"TF_GLM_MULTI_DEPTH": "joint"})
++        p = _policy_pair(torch, monkeypatch, 4, tune=tune, row_ms=[1.0 + 0.1 * r for r in range(32)])
++        for i, s in _staggered(p, [policy]):
++            n, seed, kind, count = REQS[i]
++            assert s.got == tm.solo(torch, tm._prompt(n, seed), count, tm._sampling(kind, seed)), (policy, i)
++        assert seen and set(seen) == {beta}
++
++
++def test_the_drafters_pass_the_rule_to_chain(fake):
++    """``MultiDrafter.propose`` (and ``DraftContext.propose`` / ``Drafter.propose`` through it) hands beta and round_ms
++    to ``chain``: its drafts are ``chain``'s with the same rule on the same candidates, and the rules give different
++    drafts somewhere."""
++
++    from tensorfold.engine.exact_sampling import Sampling
++    from tensorfold.families.glm5_next.cuda.dflash2 import Drafter
++    from tensorfold.families.glm5_next.cuda.dflash2_multi import DraftContext, DraftRequest
++
++    torch = fake
++    md = PolicyDrafter(torch, 2, 4 * tm.ALIGN)
++    ctx = md.contexts[0]
++    taps = torch.tensor([[p, t] for p, t in enumerate(tm._prompt(30, 3))], dtype=torch.int64)
++    md.commit([(ctx, taps)])
++    rms = eng_rms = tuple(COSTS["verify"][i] + 1.24 for i in range(8))
++    seen = set()
++    for pending in range(12):
++        for sampling in (None, Sampling(pending, 1.0, 0, 1.0)):
++            for kw in ({}, {"beta": 2.0}, {"beta": 2.0, "round_ms": eng_rms}, {"beta": 0.7, "round_ms": rms}):
++                (tokens, values, proj), = md.candidates([(ctx, pending, 7)])
++                want = Drafter.chain(md, tokens, values, proj, pending, ctx.context_end + 1, sampling, 0.3, **kw)
++                got = md.propose([DraftRequest(ctx, pending, 7, sampling, 0.3, **kw)])[0]
++                assert got == want == DraftContext.propose(ctx, pending, 7, sampling, 0.3, **kw)
++                seen.add((pending, sampling is None, tuple(sorted(kw)), tuple(got)))
++    by_rule: dict = {}
++    for pending, greedy, rule, got in seen:
++        by_rule.setdefault((pending, greedy), set()).add(got)
++    assert any(len(v) > 1 for v in by_rule.values())

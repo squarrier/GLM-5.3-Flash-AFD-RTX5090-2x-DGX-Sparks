@@ -1,0 +1,3956 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 15:34:34 -0400
+Subject: [PATCH] glm5_next/cuda: an attention/expert split for GLM-5.3-Flash
+ over MCDMA (--experts remote)
+
+One GPU serves everything but the routed experts (`tensorfold serve ... --experts remote`); two expert nodes
+(`tensorfold experts MODEL --rank 0|1 --master ATTENTION`) each hold one TP2 half of every MoE layer's routed experts.
+Per MoE layer the attention node sends its normed rows, picks and weights to both expert nodes and gets two fp32
+partials back while its own shared expert runs; hc_post sums the three.
+
+- The wire is MCDMA's link daemons (ashhart/MCDMA): per MoE layer one packed request into each expert's mailbox and
+  one reply back. GPU-driven by default where the device's probe passes (cuStreamWriteValue64/cuStreamWaitValue64 on
+  the serving stream, no host sync per layer), CPU-driven otherwise; TF_AFD_MCDMA_MODE=auto|gpu|cpu.
+- afd.AfdWire holds the engine hooks (begin, exchange, collect) over an afd_transport.ExpertTransport seam: the
+  TCPStore rendezvous, the settings handshake, the heartbeat watchdog, each forward's seq/rows/mode, and the opt-in
+  wire check (TF_AFD_CHECK) and exchange timer (TF_AFD_TIME).
+- Every window runs eager over the wire: graphs.py captures nothing on the attention node. The expert node refuses
+  any forward mode but eager and prompt chunk.
+- The attention node loads world-1 weights without the routed experts (EXL3 checkpoints; anything else is refused at
+  load) and plans its memory without the experts' scratch. The expert node loads only its half.
+- tools/mcdma_streamops_probe.py checks that a GPU can drive the exchange from its stream, before the first boot.
+
+Tests: tests/test_glm_afd_transport.py, test_glm_afd_mcdma.py and test_glm_afd_mcdma_cuda.py on the CPU (a fake
+MCDMA daemon pair and CUDA driver, the attention's real AfdWire); tests/cuda/test_glm_afd.py on the GPU.
+
+TensorFold is Apache-2.0 (since v0.6.0); these additions are offered under the same license. MCDMA is used at
+runtime through its daemons and libmcdma-rpc.so; none of its code is copied.
+
+Credits: Hugh Madden (@dangerm00se, github.com/hughmadden) wrote glm53f-afd, the engine that serves GLM-5.3-Flash
+with attention on one RTX 5090 and the routed experts on DGX Sparks over RDMA, and mimo26f-afd, its serving shell,
+wire and RDMA transport. T.J. Purtell (tpurtell, @wrldsuksgo2mars) wrote ds41rt, glmrt and cuteafd, engines that
+run attention on RTX GPUs and the routed experts on DGX Sparks. This commit uses no code from those engines. MCDMA
+and TensorFold are by Ash Hart (@ashhart).
+
+Assisted-by: Claude Opus 5.5 (planning) and GLM-5.3-Flash (execution), via Hermes
+
+---
+ src/tensorfold/cli.py                         |  35 +-
+ src/tensorfold/cli_args.py                    |  13 +
+ src/tensorfold/cuda/geometry.py               |   4 +-
+ src/tensorfold/families/glm5_next/__init__.py |  27 +-
+ src/tensorfold/families/glm5_next/cuda/afd.py | 394 ++++++++++++
+ .../families/glm5_next/cuda/afd_mcdma.py      | 267 ++++++++
+ .../families/glm5_next/cuda/afd_transport.py  |  96 +++
+ .../families/glm5_next/cuda/decode.py         |   6 +
+ .../families/glm5_next/cuda/engine.py         |  62 +-
+ .../families/glm5_next/cuda/experts_node.py   | 202 ++++++
+ .../families/glm5_next/cuda/forward.py        |  13 +-
+ .../families/glm5_next/cuda/graphs.py         |  13 +
+ .../families/glm5_next/cuda/mcdma.py          | 597 ++++++++++++++++++
+ .../families/glm5_next/cuda/mcdma_cuda.py     | 233 +++++++
+ .../families/glm5_next/cuda/split.py          |  15 +-
+ .../families/glm5_next/cuda/weights.py        |  22 +-
+ tests/cuda/test_glm_afd.py                    |  82 +++
+ tests/glm_afd_fakes.py                        | 389 ++++++++++++
+ tests/test_glm_afd_mcdma.py                   | 319 ++++++++++
+ tests/test_glm_afd_mcdma_cuda.py              | 152 +++++
+ tests/test_glm_afd_transport.py               | 237 +++++++
+ tools/mcdma_streamops_probe.py                | 309 +++++++++
+ 22 files changed, 3450 insertions(+), 37 deletions(-)
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/afd.py
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/afd_mcdma.py
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/afd_transport.py
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/experts_node.py
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/mcdma.py
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/mcdma_cuda.py
+ create mode 100644 tests/cuda/test_glm_afd.py
+ create mode 100644 tests/glm_afd_fakes.py
+ create mode 100644 tests/test_glm_afd_mcdma.py
+ create mode 100644 tests/test_glm_afd_mcdma_cuda.py
+ create mode 100644 tests/test_glm_afd_transport.py
+ create mode 100644 tools/mcdma_streamops_probe.py
+
+diff --git a/src/tensorfold/cli.py b/src/tensorfold/cli.py
+index d2039d2..1c615af 100644
+--- a/src/tensorfold/cli.py
++++ b/src/tensorfold/cli.py
+@@ -18,13 +18,13 @@ from tensorfold.server import stacks, thinking_notes
+ from tensorfold.server.memory_budget import MEMORY_FRACTION
+ from tensorfold.serve_options import check as _check_serve_options, vision_options as _vision_options
+ 
+-COMMANDS = ("serve", "pull", "models", "info", "update", "service", "tui", "plan")
++COMMANDS = ("serve", "experts", "pull", "models", "info", "update", "service", "tui", "plan")
+ 
+ 
+ def build_parser() -> argparse.ArgumentParser:
+     """The ``tensorfold`` parser with this module's subcommand handlers."""
+ 
+-    return cli_args.build_parser({"serve": cmd_serve, "pull": cmd_pull, "models": cmd_models,
++    return cli_args.build_parser({"serve": cmd_serve, "experts": cmd_experts, "pull": cmd_pull, "models": cmd_models,
+                                   "update": cmd_update, "info": cmd_info, "plan": cmd_plan})
+ 
+ 
+@@ -62,6 +62,24 @@ def _config_dir(model: str) -> Path:
+     return Path(hf_hub_download(model, "config.json")).parent
+ 
+ 
++def cmd_experts(args: argparse.Namespace) -> int:
++    """The AFD expert node: one TP2 half of the routed experts, driven over the wire by the attention node."""
++
++    import json
++
++    top = json.loads((_config_dir(args.model) / "config.json").read_text())
++    text = top.get("text_config") or top
++    kind = (top.get("model_type") or "") or (text.get("model_type") or "")
++    if kind not in ("glm5_next", "glm5_next_text"):
++        raise ValueError(f"tensorfold experts serves GLM-5.3-Flash (glm5_next), not {kind!r}")
++    if not args.master:
++        raise ValueError("tensorfold experts needs --master: the attention node's address")
++    from tensorfold.families.glm5_next.cuda.experts_node import serve
++
++    serve(args.model, args.rank, args.master, args.master_port)
++    return 0
++
++
+ def cmd_pull(args: argparse.Namespace) -> int:
+     from tensorfold import families, hub
+ 
+@@ -246,10 +264,20 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
+         raise ValueError("--tp 2 needs --master: rank 0's address on the link between the two machines")
+     if args.tp == 1 and args.rank != 0:
+         raise ValueError("--rank 1 needs --tp 2")
++    if getattr(args, "experts", ""):
++        if args.tp == 2:
++            raise ValueError("--experts remote serves the attention node alone: drop --tp (the experts run "
++                             "`tensorfold experts`)")
++        if args.rank:
++            raise ValueError("--experts remote is the attention node, rank 0; expert halves run `tensorfold experts`")
++        if not args.master:
++            raise ValueError("--experts remote needs --master: this node's address, for the experts to dial")
+     started = time.perf_counter()
+     drafter = "" if args.no_drafts else _drafter(family, args.drafter, "cuda")
+     options: dict[str, Any] = {"drafter": drafter, "tp": int(args.tp), "rank": int(args.rank), "master": args.master,
+                                "master_port": int(args.master_port), "no_drafts": bool(args.no_drafts)}
++    if getattr(args, "experts", ""):
++        options["experts"] = args.experts
+     if getattr(args, "kv_dtype", "bf16") != "bf16":
+         options["kv_dtype"] = args.kv_dtype
+     options.update(_vision_options(args))
+@@ -269,7 +297,8 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
+     if getattr(args, "checkpoint_slots", None) is not None and getattr(family.package, "CUDA_CHECKPOINT_SLOTS", False):
+         options["checkpoint_slots"] = int(args.checkpoint_slots)
+     served = args.name or (args.model.rstrip("/").split("/")[-1] if hub.is_repo_id(args.model) else model_dir.name)
+-    where = f", rank {args.rank} of 2" if args.tp == 2 else ""
++    where = (f", rank {args.rank} of 2" if args.tp == 2 else
++             ", AFD attention" if getattr(args, "experts", "") else "")
+     print(f"[tensorfold] loading {served}: {family.title} ({family.model_type}) on CUDA{where}", flush=True)
+     from tensorfold.cuda import precision, prompt_precision
+ 
+diff --git a/src/tensorfold/cli_args.py b/src/tensorfold/cli_args.py
+index 4ee8773..e6eae6c 100644
+--- a/src/tensorfold/cli_args.py
++++ b/src/tensorfold/cli_args.py
+@@ -132,6 +132,9 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
+                       help="with --tp 2: this machine's rank; rank 0 serves HTTP, rank 1 follows it")
+     cuda.add_argument("--master", default="", help="with --tp 2: rank 0's address on the link between the machines")
+     cuda.add_argument("--master-port", type=int, default=29551, help="with --tp 2: rank 0's rendezvous port")
++    cuda.add_argument("--experts", default="", choices=("", "remote"),
++                      help="remote: serve attention only; the routed experts run on two `tensorfold experts` nodes "
++                           "that dial --master (this node's fabric address)")
+     cuda.add_argument("--kv-dtype", choices=("bf16", "int8", "int4"), default="bf16",
+                       help="KV cache: bf16 (the default), int8, or int4. Quantized keys and values use one "
+                            "fp16 scale per 32 values (changes the output; Flash Next on CUDA only)")
+@@ -151,6 +154,16 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
+                            "MLX checkpoints have one math. Replies equal this server's own serial decoding either way")
+     serve.set_defaults(func=handlers["serve"])
+ 
++    experts = commands.add_parser("experts", help="serve one AFD expert node's half of the routed experts (GLM)",
++                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
++    experts.add_argument("model", help="the checkpoint, the same one the attention node serves")
++    experts.add_argument("--rank", type=int, choices=(0, 1), required=True,
++                         help="this node's TP2 half: 0 or 1; the AFD wire rank is rank + 1 of 3")
++    experts.add_argument("--master", default="", help="the attention node's address")
++    experts.add_argument("--master-port", type=int, default=29551,
++                         help="the attention node's rendezvous port (its --master-port)")
++    experts.set_defaults(func=handlers["experts"])
++
+     pull = commands.add_parser("pull", help="download models (or draft models) from Hugging Face")
+     pull.add_argument("repos", nargs="+", help="repo ids, e.g. TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP")
+     pull.set_defaults(func=handlers["pull"])
+diff --git a/src/tensorfold/cuda/geometry.py b/src/tensorfold/cuda/geometry.py
+index 0f9dae5..d596278 100644
+--- a/src/tensorfold/cuda/geometry.py
++++ b/src/tensorfold/cuda/geometry.py
+@@ -252,7 +252,7 @@ def exl3_expert_scratch(rows: int, slots: int, d: int, width: int) -> int:
+ 
+ 
+ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560, latent: bool = False,
+-                 mtp: bool | None = None) -> Geometry:
++                 mtp: bool | None = None, exl3_scratch: bool = True) -> Geometry:
+     """GLM's engine; ``mtp``: whether it holds the MTP head's caches and buffers (None: when the checkpoint has one)."""
+     linear, attention = layer_counts(t)
+     lin = t.get("linear_attn_config") or {}
+@@ -275,7 +275,7 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
+     fixed += (2 if mtp else 1) * (16 * rows * extent * 4 + 8 * rows * 16384 * 4)
+     # prompt-chunk buffers: at most 5 row extents a row without the head
+     fixed += PREFILL_ROWS * 5 * (extent - int(t["vocab_size"]) // world)
+-    if (t.get("_quantization") or {}).get("quant_method") == "exl3":
++    if exl3_scratch and (t.get("_quantization") or {}).get("quant_method") == "exl3":
+         # EXL3 experts' scratch (decode windows, the MTP head's, a prompt chunk) and the prompt's BF16 split-K partials
+         fixed += (2 if mtp else 1) * exl3_expert_scratch(rows, slots, d, width)
+         fixed += exl3_expert_scratch(PREFILL_ROWS, slots, d, width) + 8 * PREFILL_ROWS * 16384 * 4
+diff --git a/src/tensorfold/families/glm5_next/__init__.py b/src/tensorfold/families/glm5_next/__init__.py
+index fd7a3e0..7bbd805 100644
+--- a/src/tensorfold/families/glm5_next/__init__.py
++++ b/src/tensorfold/families/glm5_next/__init__.py
+@@ -203,10 +203,17 @@ CUDA_QUANTIZATION = (4, 64)
+ 
+ 
+ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
+-                master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None, **options: Any):
+-    """Build the two-rank engine with adaptive drafting, reusable prompt state, or serial decoding when drafts are disabled."""
+-
+-    if int(tp) != 2:
++                master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None,
++                experts: str = "", **options: Any):
++    """Build the two-rank engine, the AFD attention node, or the serial/adaptive fallbacks behind it."""
++
++    if experts:
++        if int(tp) != 1:
++            raise ValueError("--experts remote serves the attention node alone: drop --tp (the experts run "
++                             "`tensorfold experts`)")
++        if not master:
++            raise ValueError("--experts remote needs --master: this node's address, for the expert nodes")
++    elif int(tp) != 2:
+         raise ValueError("GLM-5.3-Flash needs two GPUs, one per machine: run the same `tensorfold serve` command "
+                          "with --tp 2 --rank R --master ADDRESS on both (rank 1 first)")
+     if not master:
+@@ -219,10 +226,16 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank:
+         policy = DFLASH_POLICY          # no MTP drafts: every round still verifies DFlash2's drafts
+     else:
+         policy = str(int(mtp_drafts))
++    drafter_path = Path(drafter) if drafter and not no_drafts else None
++    if experts:
++        from .cuda.engine import AfdEngine
++
++        return AfdEngine(Path(model_dir), master=master, port=int(master_port), policy=policy,
++                         drafter=drafter_path, context=options.get("context"),
++                         context_explicit=options.get("context_explicit"), serial_only=bool(no_drafts))
+     return GlmEngine(Path(model_dir), rank=int(rank), master=master, port=int(master_port), policy=policy,
+-                     drafter=Path(drafter) if drafter and not no_drafts else None,
+-                     context=options.get("context"), context_explicit=options.get("context_explicit"),
+-                     serial_only=bool(no_drafts))
++                     drafter=drafter_path, context=options.get("context"),
++                     context_explicit=options.get("context_explicit"), serial_only=bool(no_drafts))
+ 
+ 
+ def __getattr__(name: str) -> Any:
+diff --git a/src/tensorfold/families/glm5_next/cuda/afd.py b/src/tensorfold/families/glm5_next/cuda/afd.py
+new file mode 100644
+index 0000000..7f849be
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/afd.py
+@@ -0,0 +1,394 @@
++"""The attention node's half of the attention/expert split: the engine hooks over the MCDMA wire.
++
++The attention node is AFD rank 0 of 3; each expert node is its TP2 half plus one. ``AfdWire`` is what the engine
++calls: ``begin`` before every forward's eager kernels, then ``exchange`` and ``collect`` around each MoE layer's
++shared expert in ``forward.moe_block`` (through ``Weights.afd``). It keeps the store, the settings handshake, the
++watchdog, the forward's ``seq``/``rows``/``mode``, the wire check and the exchange timer; the wire itself is an
++``afd_transport.ExpertTransport``, MCDMA's link daemons (``afd_mcdma``). Idle waits are on the TCPStore, never a spin on the wire. ``TF_AFD_CHECK=1`` hashes both sides' wire tensors for
++the first ``TF_AFD_CHECK_FORWARDS`` forwards and compares them through the store; ``TF_AFD_TIME=1`` events-times
++each layer's exchange and prints a p50 every so often.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import threading
++import time
++from datetime import timedelta
++
++from .afd_transport import WireError
++
++# the header's mode word: the attention sends only these two, and the experts refuse any other value
++MODE_EAGER = 1          # an eager window
++MODE_CHUNK = 3          # a prompt chunk: eager, the expert's wide scratch
++CHECK_ENV = "TF_AFD_CHECK"
++TIME_ENV = "TF_AFD_TIME"
++CHECK_FORWARDS = int(os.environ.get("TF_AFD_CHECK_FORWARDS", "4096"))
++ALIVE_EVERY = 5         # s between an expert's store heartbeats
++ALIVE_STALE = 20        # s of silence before the attention's watchdog calls an expert dead
++WATCH_EVERY = 2         # s between watchdog polls
++
++
++def moe_layers(cfg) -> list[int]:
++    """The checkpoint's MoE layer indices, the expert nodes' layers in order."""
++
++    return [i for i, kind in enumerate(cfg.mlp_kinds) if kind == "moe"]
++
++
++def settings_for(model_dir, cfg, *, prefill_rows: int) -> dict:
++    """Everything both sides must agree on before the first forward; a mismatch refuses to start."""
++
++    from pathlib import Path
++
++    index = Path(model_dir) / "model.safetensors.index.json"
++    digest = hashlib.sha256(index.read_bytes()).hexdigest() if index.is_file() else ""
++    return {"digest": digest, "layers": moe_layers(cfg), "max_rows": 8, "mtp": 0, "prefill_rows": int(prefill_rows),
++            "quant": cfg.quant, "experts": cfg.experts, "top_k": cfg.top_k}
++
++
++def settings_mismatch(mine: dict, theirs: dict) -> str:
++    """The first differing settings key, or "" (every key must be equal; the attention's value names the print)."""
++
++    for key in sorted(set(mine) | set(theirs)):
++        if mine.get(key) != theirs.get(key):
++            return f"{key}: attention {theirs.get(key)!r} != expert {mine.get(key)!r}"
++    return ""
++
++
++def wait_store(store, keys: list[str], seconds: float, every: float = 30.0) -> None:
++    """``store.wait`` with the idle timeout retried until ``seconds`` elapse."""
++
++    end = time.monotonic() + seconds
++    while True:
++        try:
++            store.wait(keys, timedelta(seconds=every))
++            return
++        except Exception as exc:  # noqa: BLE001  the idle timeout; anything else is real
++            if "timeout" not in str(exc).lower() or time.monotonic() >= end:
++                raise
++
++
++def client(host: str, port: int, seconds: float = 5.0):
++    """A store client of our own: short ops (the comm's shared store wedges; 5 s beats the 300 s default)."""
++
++    from torch.distributed import TCPStore
++
++    return TCPStore(host, port, is_master=False, timeout=timedelta(seconds=seconds), wait_for_workers=False)
++
++
++class Store:
++    """The protocol's store: short timeouts, and one fresh-client retry when an op stalls or drops."""
++
++    def __init__(self, host: str, port: int) -> None:
++        self.host, self.port = host, port
++        self.s = client(host, port)
++
++    def _fresh(self) -> None:
++        try:
++            self.s.close()
++        except Exception:  # noqa: BLE001
++            pass
++        self.s = client(self.host, self.port)
++
++    def get(self, key: str):
++        try:
++            if not self.s.check([key]):          # an absent key: get would block the full timeout on it
++                raise KeyError(key)
++            return self.s.get(key)
++        except Exception:  # noqa: BLE001  a stall or a dropped socket: once more, on a new connection
++            self._fresh()
++            if not self.s.check([key]):
++                raise KeyError(key)  # noqa: B904
++            return self.s.get(key)
++
++    def set(self, key: str, value) -> None:
++        try:
++            self.s.set(key, value)
++        except Exception:  # noqa: BLE001
++            self._fresh()
++            self.s.set(key, value)
++
++    def wait(self, keys: list[str], timeout) -> None:  # noqa: ANN001  timedelta passthrough
++        try:
++            self.s.wait(keys, timeout)
++        except Exception:  # noqa: BLE001
++            self._fresh()
++            self.s.wait(keys, timeout)
++
++    def check(self, keys: list[str]) -> bool:
++        try:
++            return bool(self.s.check(keys))
++        except Exception:  # noqa: BLE001
++            self._fresh()
++            return bool(self.s.check(keys))
++
++
++def get_store(store, key: str, seconds: float = 10.0):
++    """A store value once it appears, else None; the handshake's and the check's patient read."""
++
++    end = time.monotonic() + seconds
++    while True:
++        try:
++            return store.get(key)
++        except Exception:  # noqa: BLE001  a missing key or a hiccup: retry until the budget is gone
++            if time.monotonic() >= end:
++                return None
++            time.sleep(0.05)
++
++
++def sha(tensor) -> str:
++    """sha256 of a tensor's bytes, the wire check's atom (call on a contiguous tensor; syncs)."""
++
++    import torch
++
++    return hashlib.sha256(tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
++
++
++def p50_p90(v: list[float]) -> tuple[float, float]:
++    """The sample set's p50 and p90; empty samples read 0."""
++
++    s = sorted(v)
++    if not s:
++        return 0.0, 0.0
++    return s[len(s) // 2], s[min(len(s) - 1, int(len(s) * 0.9))]
++
++
++class Solo:
++    """The engine's no-op stand-in for a tensor-parallel link: world 1, every collective local."""
++
++    world = 1
++
++    def barrier(self) -> None:
++        pass
++
++    def ready(self, label: str, **_: object) -> None:
++        pass
++
++    def all_gather(self, send, recv) -> None:
++        recv[:send.numel()].copy_(send.view(-1).to(recv.dtype))
++
++
++def make_afd(master: str, port: int, model_dir=None):
++    """The attention node's AFD: ``AfdWire`` over the MCDMA wire."""
++
++    return AfdWire(master, port, model_dir)
++
++
++class AfdWire:
++    """The attention node's side: the engine hooks, the watchdog and the wire check, over an ``ExpertTransport``."""
++
++    def __init__(self, master: str, port: int, model_dir=None, transport=None) -> None:
++        import torch
++
++        from tensorfold.server.errors import CapacityError
++
++        if transport is None:                    # rank 0 hosts the store; both experts join before this returns
++            from .afd_transport import transport_for
++
++            transport = transport_for(master=master, port=port, model_dir=model_dir)
++        self.tr = transport
++        self._cap = CapacityError
++        self.torch = torch
++        self.host, self.port = master, port
++        local = "127.0.0.1"                      # our own clients over the loopback: the host-ip hairpin stalls
++        self.store = Store(local, port)          # short-timeout, self-healing clients for the bells and the checks
++        self._addr = local
++        self._wstore = None                      # the watchdog's own client: one socket per thread
++        self.peers = (1, 2)
++        self.seq = 0
++        self.layer = 0                           # the exchange's index within the forward
++        self.nlayers = 0                         # the MoE exchanges a forward makes, once announced
++        self.rows = self.mode = 0
++        self.dead: str | None = None
++        self.check = os.environ.get(CHECK_ENV, "").strip() == "1"
++        self.checked = 0
++        self.mismatches = 0
++        self._seen: set[int] = set()             # the window widths the check covered, for the check's summary line
++        self._chk: list | None = None
++        self._why = ""
++        self.timing = os.environ.get(TIME_ENV, "").strip() == "1"
++        self._times: dict[int, list[float]] = {}
++        self._timed = 0
++        self.ev = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(64)] \
++            if self.timing else None
++        self._alive: dict[int, float] = {}
++        self._quiet = {r: 0.0 for r in self.peers}    # s since the peer's stamp changed: clock-free liveness
++        threading.Thread(target=self._watchdog, daemon=True, name="afd-watchdog").start()
++        self.tr.start(self.store)
++        print(f"[tensorfold] {self.tr.describe()}", flush=True)
++
++    # -- startup -------------------------------------------------------------------------------------------------
++    def announce(self, settings: dict) -> None:
++        """The settings both sides must agree on, plus the wire's own; the experts size off them."""
++
++        self.nlayers = len(settings["layers"])
++        self.store.set("afd_settings", json.dumps(dict(settings, **self.tr.publish(settings))).encode())
++
++    def wait_loaded(self, seconds: float = 3600.0) -> None:
++        """Both expert halves' weights resident; from here the first warm-up forward can run the wire for real."""
++
++        wait_store(self.store, [f"afd_loaded/{r}" for r in self.peers], seconds)
++
++    # -- watchdogs -----------------------------------------------------------------------------------------------
++    def die(self, why: str) -> None:
++        if self.dead is None:
++            self.dead = why
++            print(f"[tensorfold] afd: {why}; in-flight requests fail, restart the serving stack", flush=True)
++            try:
++                self.tr.abort()
++            except Exception:  # noqa: BLE001  already gone
++                pass
++
++    def _watchdog(self) -> None:
++        store = self._wstore = Store(self._addr, self.port)
++        while self.dead is None:
++            time.sleep(WATCH_EVERY)
++            try:
++                why = self.tr.health()           # the MCDMA links' health
++            except Exception as exc:  # noqa: BLE001  the wire itself is gone
++                why = f"watchdog lost the {self.tr.name} wire: {exc!r}"
++            if why:
++                self.die(why)
++                return
++            for peer in self.peers:
++                try:
++                    stamp = float(store.get(f"afd_alive/{peer}"))
++                except Exception:  # noqa: BLE001  no stamp yet, or a hiccup: judge on the last one
++                    continue
++                if stamp != self._alive.get(peer):     # the stamp's CHANGE is the beat: no cross-host clocks
++                    self._alive[peer] = stamp
++                    self._quiet[peer] = 0.0
++                else:
++                    self._quiet[peer] += WATCH_EVERY
++                if self._quiet[peer] > ALIVE_STALE:
++                    self.die(f"expert rank {peer} silent for {ALIVE_STALE:.0f}s (heartbeat unchanged)")
++                    return
++                try:
++                    dead = store.get(f"afd_error/{peer}")
++                except Exception:  # noqa: BLE001
++                    dead = None
++                if dead:
++                    self.die(f"expert rank {peer} failed: {bytes(dead).decode(errors='replace')}")
++                    return
++
++    def _fail(self, exc: WireError):
++        self.die(exc.why)
++        raise self._cap(f"the AFD expert link failed ({exc}); restart the serving stack") from exc
++
++    # -- the forward's host side ---------------------------------------------------------------------------------
++    def begin(self, rows: int, *, chunk: bool = False) -> None:
++        """The forward's header to both experts, before this forward's eager kernels."""
++
++        if self.dead is not None:
++            raise self._cap(f"the AFD expert nodes are gone ({self.dead}); restart the serving stack")
++        if self.layer not in (0, self.nlayers):
++            why = f"a forward stopped after {self.layer} of {self.nlayers} MoE exchanges; the experts are out of step"
++            self.die(why)
++            raise self._cap(f"the AFD expert nodes are gone ({why}); restart the serving stack")
++        if self.check:
++            self._finish_check()
++        if self.timing:
++            self._sample_times()
++        self.seq += 1
++        self.layer = 0
++        self.rows = rows
++        mode = MODE_CHUNK if chunk else MODE_EAGER
++        self.mode = mode
++        self.tr.header(self.seq, rows, mode)
++
++    def forces_eager(self) -> bool:
++        """Always: the AFD wire runs every window eager; graphs.py captures nothing for it."""
++
++        return True
++
++    def exchange(self, b, rows: int) -> None:
++        """The send half: ``normed/pick/wts`` to each expert; the layer's shared expert runs while it flies."""
++
++        if self.timing and self.ev is not None and self.layer < len(self.ev):
++            self.ev[self.layer][0].record()
++        if self.check and self.checked < CHECK_FORWARDS:
++            self._chk = self._chk or []
++            self._chk.append([b.normed[:rows].clone(), b.pick[:rows].clone(), b.wts[:rows].clone(), None, None])
++        try:
++            self.tr.send(b, rows, self.layer)
++        except WireError as exc:
++            self._fail(exc)
++        self.layer += 1
++
++    def collect(self, b, rows: int, d: int):
++        """The receive half: both routed partial, slot 2 = the shared expert; ``[3, rows, D]`` for ``hc_post``."""
++
++        if self.timing and self.ev is not None and 0 < self.layer <= len(self.ev):
++            self.ev[self.layer - 1][1].record()
++        n = rows * d
++        flat = b.afd_recv.view(-1)
++        try:
++            self.tr.recv(flat[:n].view(rows, d), flat[n:2 * n].view(rows, d), self.layer - 1)
++        except WireError as exc:
++            self._fail(exc)
++        flat[2 * n:3 * n].view(rows, d).copy_(b.sy[:rows])
++        if self.check and self._chk is not None:
++            self._chk[-1][3] = flat[:n].clone()          # rank 1's partial, to meet that expert's sent hash
++            self._chk[-1][4] = flat[n:2 * n].clone()     # rank 2's
++        return b.afd_recv[:3 * n].view(3, rows, d)
++
++    # -- the wire check ------------------------------------------------------------------------------------------
++    def _finish_check(self) -> None:
++        pend, self._chk = self._chk, None
++        if not pend:
++            return
++        self.checked += 1
++        self._seen.add(self.rows)
++        self.torch.cuda.synchronize()
++        theirs = []
++        for peer in self.peers:
++            raw = get_store(self.store, f"afd_chk/{self.seq}/{peer}", 15.0)
++            theirs.append(json.loads(bytes(raw).decode()) if raw else None)
++        bad = layers = 0
++        first = ""
++        for i, row in enumerate(pend):
++            layers += 1
++            mine = [sha(row[0]), sha(row[1]), sha(row[2])]
++            for peer, blob in enumerate(theirs):
++                if not blob:
++                    bad += 1
++                    continue
++                got = blob["in"][i] if i < len(blob["in"]) else []
++                for k, (a, b) in enumerate(zip(mine, got[:3])):
++                    if a != b:
++                        bad += 1
++                        if not first:
++                            first = f"layer {i} peer {peer} in{k}: {a[:8]} vs {b[:8] if isinstance(b, str) else b}"
++                out = blob["out"][i] if i < len(blob["out"]) else ""
++                if out and out != sha(row[3 + peer]):
++                    bad += 1
++                    if not first:
++                        first = f"layer {i} peer {peer} out: {sha(row[3 + peer])[:8]} vs {out[:8]}"
++        self.mismatches += bad
++        if bad and not self._why:
++            self._why = first          # the first difference, printed once, naming the cause
++            print(f"[tensorfold] afd-check first mismatch: {first}", flush=True)
++        if self.checked == CHECK_FORWARDS:
++            print(f"[tensorfold] afd-check: window complete, {CHECK_FORWARDS} forwards, "
++                  f"{self.mismatches} mismatches total, rows checked {sorted(self._seen)}", flush=True)
++        if bad:
++            print(f"[tensorfold] afd-check seq {self.seq}: {bad} mismatches over {layers} layers x 4 hashes",
++                  flush=True)
++
++    # -- TF_AFD_TIME: the exchange's device time per layer -------------------------------------------------------
++    def _sample_times(self) -> None:
++        if self.ev is None:
++            return
++        for a, b in self.ev[:max(self.layer, 0)]:
++            try:
++                dt = a.elapsed_time(b) * 1e3
++            except Exception:  # noqa: BLE001  not both recorded yet
++                continue
++            self._times.setdefault(self.rows, []).append(dt)
++        self._timed += 1
++        if self._timed % 256 == 0 and self._times:
++            parts = ", ".join(f"R{r} p50 {p50_p90(v)[0]:.1f}us n{len(v)} p90 {p50_p90(v)[1]:.1f}"
++                              for r, v in sorted(self._times.items()))
++            print(f"[tensorfold] afd exchange per layer: {parts}", flush=True)
+diff --git a/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py b/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py
+new file mode 100644
+index 0000000..43a399c
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py
+@@ -0,0 +1,267 @@
++"""The AFD wire over MCDMA link daemons: eager windows.
++
++The attention node is the connect end of both links (``McdmaTransport``): per MoE layer one packed request
++``[header | normed | pick | pad | wts]`` into both mailboxes, then both fp32 replies back, as stream memory
++operations where the probe passes (``mcdma_cuda``). Each expert node is the listen end of its own link
++(``McdmaExpertLink``), opened before its weights load; the first request of a forward is its doorbell. The
++three-rank TCPStore (``StoreComm``) is the rendezvous; the handshake, the heartbeats and error keys, and the wire
++check and timer are ``afd.AfdWire``'s and ``experts_node.serve``'s.
++"""
++
++from __future__ import annotations
++
++from . import mcdma, mcdma_cuda
++from .afd import MODE_CHUNK, MODE_EAGER, get_store
++from .afd_transport import WireError
++
++
++def _bytes(t):
++    """A contiguous tensor's bytes as a flat uint8 view (no copy)."""
++
++    import torch
++
++    return t.reshape(-1).view(torch.uint8)
++
++
++class StoreComm:
++    """The AFD's rendezvous: the three-rank TCPStore (rank 0 hosts it and waits for both experts), and abort
++    (release the waits)."""
++
++    def __init__(self, rank: int, world: int, master: str, port: int, links=None) -> None:
++        from datetime import timedelta
++
++        from torch.distributed import TCPStore
++
++        self.rank, self.world, self.links = rank, world, links
++        self.store = TCPStore(master, port, world, rank == 0, timeout=timedelta(seconds=600))
++
++    def async_error(self) -> str:
++        return self.links.health() if self.links is not None else ""
++
++    def abort(self) -> None:
++        if self.links is not None:
++            self.links.release()
++
++    def close(self) -> None:
++        pass
++
++
++class McdmaTransport:
++    """The attention node's end (``afd_transport.ExpertTransport``): one packed request per MoE layer to both expert
++    links, two replies back. ``links``, ``comm``, ``device`` and ``hidden`` stand in for a GPU host in the tests."""
++
++    name = "mcdma"
++
++    def __init__(self, master: str, port: int, model_dir=None, *, links=None, comm=None, device: str = "cuda",
++                 hidden: int | None = None) -> None:
++        import torch
++
++        if links is None:
++            names = mcdma.link_names()
++            torch.cuda.init()                              # torch's runtime; the context the register needs is made
++            ordinal = torch.cuda.current_device()          # current by CudaDriver.ensure_ctx (choose_mode, register)
++            mode, driver = mcdma_cuda.choose_mode(torch, ordinal)
++            flags = mcdma_cuda.flush_flag(driver, ordinal) if mode == "gpu" else 0
++            links = mcdma.AttentionLinks(names, driver=driver, mode=mode, flags=flags)   # fail fast, before the store
++        self.mc = links
++        self.torch = torch
++        self.device = device
++        self.hidden = hidden
++        if model_dir is not None:
++            from .weights import Config
++
++            self.hidden = Config.read(model_dir).hidden
++        self.layout = None
++        self.hdr_tab = self.hdr_tab_cpu = self.req_dev = self.zeros = None
++        self.down = False                                  # aborted: the forward in flight runs on without the wire
++        # rank 0 hosts the store and waits for both experts' clients
++        self.comm = comm if comm is not None else StoreComm(0, 3, master, port, links)
++
++    def publish(self, settings: dict) -> dict:
++        """The request buffers and the header table, sized for the widest window, which both mailboxes must carry
++        (else refuse to start); the transport and the link map, which the experts check against theirs."""
++
++        torch = self.torch
++        if self.hidden is None:
++            raise RuntimeError("the MCDMA wire needs the checkpoint's hidden size: build it with the model dir")
++        layers = len(settings["layers"])
++        rows = max(int(settings["prefill_rows"]), int(settings["max_rows"]))
++        self.layout = mcdma.Layout(self.hidden, int(settings["top_k"]) + 1)
++        self.mc.check_room(self.layout, rows)
++        dev = self.device
++        tab = torch.zeros((layers, mcdma.HDR_INTS), dtype=torch.int32, pin_memory=dev != "cpu")
++        tab[:, 0] = mcdma.WIRE_MAGIC
++        tab[:, 3] = torch.arange(layers, dtype=torch.int32)
++        tab[:, 5] = layers
++        self.hdr_tab_cpu = tab
++        self.hdr_tab = torch.zeros(tab.shape, dtype=torch.int32, device=dev)
++        self.req_dev = torch.empty((self.layout.req(rows),), dtype=torch.uint8, device=dev)
++        self.zeros = torch.zeros((mcdma.ALIGN,), dtype=torch.uint8, device=dev)
++        return {"transport": "mcdma", "mcdma_links": list(self.mc.names)}
++
++    def start(self, store) -> None:
++        for peer, base in zip((1, 2), self.mc.base):       # each expert counts its link's sequence from here
++            store.set(f"afd_mcdma/base/{peer}", str(base).encode())
++
++    def header(self, seq: int, rows: int, mode: int) -> None:
++        """No doorbell of its own: the first layer's request carries the forward. One blocking copy of the
++        forward's request headers."""
++
++        tab = self.hdr_tab_cpu
++        tab[:, 1] = seq & 0x7FFFFFFF
++        tab[:, 2] = rows
++        tab[:, 4] = mode
++        self.hdr_tab.copy_(tab)                  # blocking: the next forward's rewrite must not race this copy
++
++    def send(self, b, rows: int, layer: int) -> None:
++        """[header | normed | pick | pad | wts] packed on the device, then into both mailboxes."""
++
++        if self.down:
++            return
++        torch = self.torch
++        lay = self.layout
++        n = lay.req(rows)
++        parts = [self.hdr_tab[layer].view(torch.uint8), _bytes(b.normed[:rows]), _bytes(b.pick[:rows])]
++        pad = lay.pad(rows)
++        if pad:
++            parts.append(self.zeros[:pad])
++        parts.append(_bytes(b.wts[:rows]))
++        req = self.req_dev[:n]
++        torch.cat(parts, out=req)            # one kernel: the request contiguous for one copy per link
++        try:
++            self.mc.issue(req, n, lay.rep(rows))
++        except mcdma.LinkError as exc:
++            raise WireError(str(exc), f"MCDMA {exc}") from exc
++
++    def recv(self, dst1, dst2, layer: int) -> None:
++        """Rank 1's then rank 2's partial straight from the mailboxes."""
++
++        if self.down:
++            return
++        try:
++            self.mc.collect([_bytes(dst1), _bytes(dst2)], dst1.numel() * dst1.element_size())
++        except mcdma.LinkError as exc:
++            raise WireError(str(exc), f"MCDMA {exc}") from exc
++
++    def health(self) -> str | None:
++        try:
++            err = self.mc.health()
++        except Exception as exc:  # noqa: BLE001  a mailbox gone bad
++            return f"watchdog lost the MCDMA links: {exc!r}"
++        return f"MCDMA {err}" if err else None
++
++    def abort(self) -> None:
++        self.down = True
++        self.comm.abort()
++
++    def describe(self) -> str:
++        mc, box = self.mc, self.mc.boxes[0]
++        return (f"afd transport mcdma, {mc.mode}-driven{' +flush' if mc.flags else ''}: link {mc.names[0]} -> "
++                f"expert 1, {mc.names[1]} -> expert 2; mailboxes {box.req >> 20}+{box.rep >> 20} MiB; first sequences "
++                f"{mc.base}; generations {mc.gen}; no NCCL communicator")
++
++
++# -- the expert node -----------------------------------------------------------------------------------------------
++def open_expert_link(theirs: dict, rank: int, cfg, store, device: str = "cuda", log=print) -> McdmaExpertLink:
++    """The expert's end of its link, before its weights load (a missing daemon fails in seconds, not after the load):
++    the link the attention maps to this rank, room for the widest window, the daemon registration, the base."""
++
++    import torch
++
++    name = mcdma.link_name()
++    names = list(theirs.get("mcdma_links") or [])
++    if len(names) != 2 or names[rank - 1] != name:
++        raise SystemExit(f"[tensorfold] afd: expert {rank} serves MCDMA link {name!r} but the attention maps links "
++                         f"{names} to ranks 1, 2 ({mcdma.LINK_ENV} vs {mcdma.LINKS_ENV})")
++    cuda = str(device).startswith("cuda")
++    ordinal = 0
++    if cuda:
++        torch.cuda.init()
++        ordinal = torch.cuda.current_device()
++    mode, driver = mcdma_cuda.choose_mode(torch, ordinal, log=log) if cuda else ("cpu", None)
++    flags = mcdma_cuda.flush_flag(driver, ordinal) if mode == "gpu" else 0
++    link = mcdma.ExpertLink(name, driver=driver, mode=mode, flags=flags, log=log)
++    rows = int(theirs["prefill_rows"])
++    link.check_room(mcdma.Layout(cfg.hidden, cfg.top_k + 1), max(rows, int(theirs["max_rows"])))
++    raw = get_store(store, f"afd_mcdma/base/{rank}", 60.0)
++    if raw is None:
++        link.close()
++        raise RuntimeError(f"the attention published no MCDMA base sequence for expert {rank}")
++    link.base = int(bytes(raw).decode())
++    log(f"[tensorfold] afd expert {rank}: MCDMA link {name}, {mode}-driven{' +flush' if flags else ''}, mailbox "
++        f"{link.box.req >> 20}+{link.box.rep >> 20} MiB, socket {link.socket_path}, first sequence {link.base}",
++        flush=True)
++    return McdmaExpertLink(link, cfg.hidden, cfg.top_k + 1, len(theirs["layers"]), rows, device)
++
++
++class McdmaExpertLink:
++    """An expert node's end (``afd_transport.ExpertLink``) over its listen-end ``mcdma.ExpertLink``. A forward's first
++    request is awaited on the host: its header gives rows and mode. Every layer then lands the request (one copy)
++    and stages the partial back: as stream operations (GPU-driven: the later layers' requests are stream waits) or
++    with a host wait and one sync per layer (CPU-driven)."""
++
++    def __init__(self, link, hidden: int, slots: int, layers: int, prefill_rows: int, device: str = "cuda") -> None:
++        self.link, self.lay = link, mcdma.Layout(hidden, slots)
++        self.layers, self.prefill_rows, self.device = layers, prefill_rows, device
++        self.gpu = link.mode == "gpu"
++        self.seq = link.base                     # the next request's sequence
++        self.landing = None                      # the widest request's bytes past the header slot, on the device
++        self.fseq = self.rows = self.n_req = self.n_rep = 0
++        self.x = self.src = self.dst = self.rep = self._routed = self._out = None
++
++    def next_forward(self) -> tuple[int, int, int]:
++        import torch
++
++        link, lay, L = self.link, self.lay, self.layers
++        if self.landing is None:
++            self.landing = torch.empty((lay.req(self.prefill_rows) - mcdma.HDR_BYTES,), dtype=torch.uint8,
++                                       device=self.device)
++        w = link.wait(self.seq)
++        magic, fseq, rows, layer, mode, nl = link.box.header()[:6]
++        if (magic != mcdma.WIRE_MAGIC or layer != 0 or nl != L or not 1 <= rows <= self.prefill_rows
++                or mcdma.word_len(w) != lay.req(rows)):
++            raise mcdma.LinkError(f"link {link.name}: request {self.seq} is no forward's first: magic {magic:#x}, "
++                                  f"layer {layer} of {nl}, {rows} rows, {mcdma.word_len(w)} bytes (expected layer 0 "
++                                  f"of {L}, rows 1..{self.prefill_rows}, {lay.req(rows) if 0 < rows else '?'} bytes)")
++        if mode not in (MODE_EAGER, MODE_CHUNK):
++            raise mcdma.LinkError(f"link {link.name}: forward mode {mode}: the MCDMA wire carries eager windows only")
++        self.fseq, self.rows = fseq, rows
++        self.n_req, self.n_rep = lay.req(rows), lay.rep(rows)
++        self.x = lay.views(self.landing, rows)
++        self.src, self.dst = link.box.req_bytes[mcdma.HDR_BYTES:self.n_req], self.landing[:self.n_req - mcdma.HDR_BYTES]
++        self.rep = link.box.rep_bytes[:self.n_rep]
++        return fseq, rows, mode
++
++    def land(self, layer: int, views):
++        """The request into the landing buffer, one copy; the compute reads its sections there (not ``views``)."""
++
++        link = self.link
++        if layer:
++            if self.gpu:
++                link.wait_gpu(self.seq, self.n_req)
++            else:
++                w = link.wait(self.seq)
++                h = link.box.header()
++                if (h[0] != mcdma.WIRE_MAGIC or h[1] != self.fseq or h[2] != self.rows or h[3] != layer
++                        or mcdma.word_len(w) != self.n_req):
++                    raise mcdma.LinkError(f"link {link.name}: request {self.seq} header {h[:6]} is not layer {layer} "
++                                          f"of forward {self.fseq} ({self.rows} rows, {self.n_req} bytes)")
++        self.dst.copy_(self.src, non_blocking=True)    # the request, header slot skipped: normed | pick | pad | wts
++        return self.x
++
++    def reply(self, layer: int, routed) -> None:
++        if routed is not self._routed:
++            self._routed, self._out = routed, _bytes(routed)
++        if self.gpu:
++            self.rep.copy_(self._out, non_blocking=True)
++            self.link.stage_gpu(self.seq, self.n_rep)       # write-value's fence: the partial lands before the word
++        else:
++            self.rep.copy_(self._out)                       # blocking: the compute, then these bytes, before the word
++            self.link.stage(self.seq, self.n_rep)
++        self.seq = mcdma.next_seq(self.seq)
++
++    def health(self) -> str | None:
++        return self.link.alive() or None
++
++    def close(self) -> None:
++        self.link.close()
+diff --git a/src/tensorfold/families/glm5_next/cuda/afd_transport.py b/src/tensorfold/families/glm5_next/cuda/afd_transport.py
+new file mode 100644
+index 0000000..ac4e4d0
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/afd_transport.py
+@@ -0,0 +1,96 @@
++"""The AFD's transport seam: the wire between the attention node and the two expert nodes.
++
++The wire is MCDMA's link daemons (``afd_mcdma``): GPU-driven stream memory operations where the device's probe
++passes, CPU-driven otherwise (``TF_AFD_MCDMA_MODE``). Each node holds one end:
++
++- the attention node an ``ExpertTransport``, under ``afd.AfdWire``, which keeps the store, the settings handshake,
++  the watchdog, the forward's ``seq``/``rows``/``mode`` and the wire check and timer;
++- each expert node an ``ExpertLink``, under ``experts_node.serve``'s per-forward loop.
++
++``layer`` is the MoE exchange's position within the forward, 0 for the first MoE layer.
++"""
++
++from __future__ import annotations
++
++from typing import Protocol
++
++
++class WireError(RuntimeError):
++    """``send``/``recv`` found the wire unable to carry the exchange: ``AfdWire`` dies with ``why`` and fails the
++    forward with a capacity error naming this error's text."""
++
++    def __init__(self, message: str, why: str) -> None:
++        super().__init__(message)
++        self.why = why
++
++
++class ExpertTransport(Protocol):
++    """The attention node's end of the wire."""
++
++    name: str      # the wire's name in the handshake and the startup line: "mcdma"
++
++    def publish(self, settings: dict) -> dict:
++        """The handshake settings this wire adds to ``settings``, once its buffers are sized for them."""
++        ...
++
++    def start(self, store) -> None:
++        """Once the attention's store exists: what the experts read before their first forward."""
++        ...
++
++    def header(self, seq: int, rows: int, mode: int) -> None:
++        """Once per forward, before layer 0: the forward's ``seq``, ``rows`` and ``mode`` to both experts."""
++        ...
++
++    def send(self, b, rows: int, layer: int) -> None:
++        """This layer's ``b.normed``/``b.pick``/``b.wts`` rows to both expert halves."""
++        ...
++
++    def recv(self, dst1, dst2, layer: int) -> None:
++        """Both halves' fp32 partials for this layer into ``dst1`` (expert 1) and ``dst2`` (expert 2)."""
++        ...
++
++    def health(self) -> str | None:
++        """Why the wire can no longer carry the exchange, in the watchdog's words; None while it can."""
++        ...
++
++    def abort(self) -> None:
++        """No exchange may wait for an answer that will not come (the watchdog's death)."""
++        ...
++
++    def describe(self) -> str:
++        """The wire's one startup line."""
++        ...
++
++
++class ExpertLink(Protocol):
++    """An expert node's end of the wire."""
++
++    def next_forward(self) -> tuple[int, int, int]:
++        """Wait for the next forward; its ``(seq, rows, mode)``."""
++        ...
++
++    def land(self, layer: int, views):
++        """This layer's request; ``views`` are the node's ``(normed, pick, wts)`` slots. Returns the views it landed
++        in, which the compute reads."""
++        ...
++
++    def reply(self, layer: int, routed) -> None:
++        """This layer's fp32 partial back to the attention node."""
++        ...
++
++    def health(self) -> str | None:
++        """Why this end can no longer carry the wire, or None."""
++        ...
++
++    def close(self) -> None:
++        """Let go of the wire."""
++        ...
++
++
++def transport_for(**kw) -> ExpertTransport:
++    """The attention node's end of the wire, MCDMA's link daemons, built with ``kw`` (``master``, ``port`` and
++    ``model_dir`` in the server)."""
++
++    from .afd_mcdma import McdmaTransport
++
++    return McdmaTransport(**kw)
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index f8b4ec4..d2282a6 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -121,6 +121,9 @@ class Engine:
+             # every row past the dense limit: the sparse graph for this pool bucket (same kernels as eager)
+             bucket = pool_bucket(self.st.pos, R, self.st.index[0][2].shape[0] - 2)
+             g, kind = self.graphs.sparse.get((R, self.st.parity, bucket)), "sparse"
++        afd = getattr(self.w, "afd", None)
++        if afd is not None:
++            afd.begin(R)                         # the forward's header, before its eager kernels
+         if g is not None:
+             self.replays[kind] += 1
+             g.replay()
+@@ -347,6 +350,7 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+     if not prompt:
+         raise ValueError("prefill requires at least one token")
+     w, st, b = e.w, e.st, e.pbuf
++    afd = getattr(w, "afd", None)
+     use_mtp = mtp and w.mtp is not None
+     begin = 0
+     if resume is None:
+@@ -375,6 +379,8 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+         R = len(chunk)
+         point = keep_at - start if keep_at is not None else 0
+         cut = Cut(point, torch.empty_like(st.rec[0]), st.conv.clone()) if 0 < point < R else None
++        if afd is not None:
++            afd.begin(R, chunk=True)             # prompt chunks cross the wire eager, the expert's wide scratch
+         last = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos, cut=cut).clone()
+         e.last_hidden = b.fnormed[R - 1:R].clone()
+         if 0 < point <= R:
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index e6c4d2a..423d740 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -110,7 +110,7 @@ class GlmEngine:
+ 
+     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
+                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
+-                 prefill_rows: int | None = None) -> None:
++                 prefill_rows: int | None = None, afd=None) -> None:
+         """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests)."""
+ 
+         import torch
+@@ -118,7 +118,7 @@ class GlmEngine:
+         from tensorfold.cuda.comm import open_comm
+         from .decode import Engine
+         from .weights import Config, load
+-        from .split import rule
++        from .split import afd_rule, rule
+         from tensorfold.cuda.capacity import admit
+         from tensorfold.cuda.geometry import (PREFILL_ROWS, dflash2_geometry, dflash2_weights, mla_geometry,
+                                               split_weights)
+@@ -137,21 +137,35 @@ class GlmEngine:
+         from . import LATENT
+ 
+         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
+-        self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
+-        weights_estimate = split_weights(rule)
++        if afd is not None and (os.environ.get("TF_GLM_MTP") or "").strip() == "1":
++            raise ValueError("TF_GLM_MTP=1 is not supported with --experts remote (the MTP head does not cross the "
++                             "AFD wire): run the attention node with TF_GLM_MTP unset or 0")
++        self.mtp_on = False if afd is not None else mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
++        if afd is None:
++            weights_estimate = split_weights(rule)
++        else:                                        # world-1 attention: whole tensors, the routed experts elsewhere
++            weights_estimate = split_weights(afd_rule, world=1)
+         if not self.mtp_on:
+             weights_estimate = without_mtp(weights_estimate, cfg.layers)
++        world = 1 if afd is not None else 2          # the AFD attention node holds every head and the whole draft
++        def geometry_for(text):                      # the afd attention runs no routed experts: no EXL3 scratch
++            return mla_geometry(text, world, MAX_ROWS, minimum_slots=DENSE_CAPACITY, latent=LATENT,
++                                mtp=self.mtp_on, exl3_scratch=afd is None)
++
+         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
+-                                   lambda text: mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY,
+-                                                             latent=LATENT, mtp=self.mtp_on),
+-                                   weights_estimate, rank=rank, world=2, gather=self._gather_ints,
+-                                   draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, 2),
+-                                   draft_geometry=lambda text: dflash2_geometry(text, 2, MAX_ROWS, ring=DRAFT_RING))
++                                   geometry_for,
++                                   weights_estimate, rank=rank, world=world, gather=self._gather_ints,
++                                   draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, world),
++                                   draft_geometry=lambda text: dflash2_geometry(text, world, MAX_ROWS, ring=DRAFT_RING))
+         self.limit = self.capacity_plan["context_window"]
+         capacity = self.capacity_plan["cache_slots"]
+         long_context = self.limit > cfg.dense_limit
+         # both ranks must run the same calls: refuse to start when they were given different settings
+         prefill_rows = PREFILL_ROWS if prefill_rows is None else int(prefill_rows)
++        if afd is not None:
++            from .afd import settings_for
++
++            afd.announce(settings_for(model_dir, cfg, prefill_rows=prefill_rows))  # the experts size off this
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
+                 prefill_rows, int(self.mtp_on), int(DRAFT_RING)]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+@@ -159,12 +173,12 @@ class GlmEngine:
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+         spare = max(0, min(wanted, plan["budget_bytes"] - plan["total_bytes_estimate"]))
+         both = self._gather_ints(mine + [spare >> 20])
+-        if both[0][:-1] != both[1][:-1]:
++        if len(both) > 1 and both[0][:-1] != both[1][:-1]:
+             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
+                                "TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+                                "(or pass --drafter none to both) and give both the same flags")
+-        self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
++        self.cache_bytes = (min(both[0][-1], both[1][-1]) if len(both) > 1 else both[0][-1]) << 20
+         plan["kept_bytes"] = self.cache_bytes
+         for key in ("serving_peak_bytes_estimate", "total_bytes_estimate"):
+             plan[key] = plan[key] + self.cache_bytes
+@@ -175,8 +189,11 @@ class GlmEngine:
+             raise ValueError(("TF_GLM_MTP=0 leaves" if cfg.mtp_layers else "this checkpoint has") + " no MTP head and "
+                              "no DFlash2 draft model was given, so every round would decode one token: pull the draft "
+                              "model on both machines (--drafter), or pass --no-drafts to both for the serial reference")
+-        w = load(model_dir, rank=rank, mtp=self.mtp_on)
++        w = load(model_dir, rank=rank, mtp=self.mtp_on,
++                 **(dict(world=1, experts=False) if afd is not None else {}))
+         w.comm = self.comm
++        if afd is not None:
++            w.afd = afd                              # the seam: moe_block and the buffers read w.afd from here
+         self.comm.ready("loading")                   # a peer stuck loading is named, not waited on in NCCL
+         self.comm.barrier()
+         self.w = w
+@@ -189,6 +206,8 @@ class GlmEngine:
+             from .dflash2 import Drafter
+ 
+             self.drafter = Drafter(drafter, w, capacity=capacity, ring=DRAFT_RING)
++        if afd is not None:
++            afd.wait_loaded()                        # the experts' weights resident before the first wire warm-up
+         self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True, graph_rows=GRAPH_ROWS,
+                         long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else ())
+         if self.drafter is not None:
+@@ -287,10 +306,11 @@ class GlmEngine:
+ 
+     def _gather_ints(self, values: list[int]) -> list[list[int]]:
+         torch = self.torch
++        world = getattr(self.comm, "world", 2)
+         mine = torch.tensor(values, dtype=torch.int32, device="cuda")
+-        got = torch.empty((2 * len(values),), dtype=torch.int32, device="cuda")
++        got = torch.empty((world * len(values),), dtype=torch.int32, device="cuda")
+         self.comm.all_gather(mine, got)
+-        return [got[:len(values)].tolist(), got[len(values):].tolist()]
++        return [got[i * len(values):(i + 1) * len(values)].tolist() for i in range(world)]
+ 
+     # the idle doorbell: rank 1 waits for each request on the rendezvous store (no store: no doorbell), not in NCCL
+     def _store(self):
+@@ -588,3 +608,17 @@ class GlmEngine:
+                     raise RuntimeError(f"rank 1 has no snapshot of the {cached} tokens rank 0 resumes from")
+             self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
+                       constraint)
++
++
++class AfdEngine(GlmEngine):
++    """The AFD attention node: world-1 weights, no TP peer, the routed experts on two ``tensorfold experts`` nodes."""
++
++    def __init__(self, model_dir: Path, *, master: str, port: int, policy: str = DEFAULT_POLICY,
++                 drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None,
++                 serial_only: bool = False) -> None:
++        from .afd import Solo, make_afd
++
++        afd = make_afd(master, port, model_dir)   # AFD rank 0: the store lives here; the experts join
++        super().__init__(model_dir, rank=0, master=master, port=port, policy=policy, drafter=drafter,
++                         context=context, context_explicit=context_explicit, serial_only=serial_only,
++                         comm=Solo(), afd=afd)
+diff --git a/src/tensorfold/families/glm5_next/cuda/experts_node.py b/src/tensorfold/families/glm5_next/cuda/experts_node.py
+new file mode 100644
+index 0000000..7a68637
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/experts_node.py
+@@ -0,0 +1,202 @@
++"""The AFD expert node's half: one TP2 rank's routed experts, and its serve loop over the wire."""
++
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++
++import torch
++
++from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
++
++from . import exl3_generic, glue
++from .afd import ALIVE_EVERY, CHECK_ENV, CHECK_FORWARDS, MODE_CHUNK, MODE_EAGER, Store, get_store, sha
++from .afd import settings_for, settings_mismatch
++from .split import RankReader
++from .weights import PREFIX, Config
++
++
++def _expert_names(i: int, experts: int) -> list[str]:
++    """Layer ``i``'s EXL3 routed-expert tensors in ``weights.load``'s order (no shared: the attention node keeps it)."""
++
++    p = PREFIX + f"layers.{i}.mlp."
++    return [p + f"experts.{e}.{proj}.{part}" for proj in ("gate_proj", "up_proj", "down_proj")
++            for e in range(experts) for part in ("trellis", "suh", "svh")]
++
++
++def load_half(model_dir, half: int, layers, device: str = "cuda") -> list:
++    """``layers``' routed experts as TP2 half ``half``: one ``Exl3RoutedExperts`` per layer, in order, through
++    ``RankReader(model_dir, half)`` and the existing split rules, every trellis on ``device``."""
++
++    from tensorfold.cuda.exl3 import experts as generic
++
++    cfg = Config.read(model_dir)
++    if cfg.quant != "exl3":
++        raise ValueError(f"expert nodes read EXL3 checkpoints, not {cfg.quant!r}")
++    layers = list(layers)
++    for i in layers:
++        if not 0 <= i < len(cfg.mlp_kinds) or cfg.mlp_kinds[i] != "moe":
++            raise ValueError(f"layer {i} is not one of the checkpoint's MoE layers")
++    dev = torch.device(device)
++    rd = RankReader(model_dir, half)
++    out: list = []
++    try:
++        for n, i in enumerate(layers):
++            rd.prefetch(_expert_names(i, cfg.experts))                  # already queued, but the first
++            if n + 1 < len(layers):
++                rd.prefetch(_expert_names(layers[n + 1], cfg.experts))  # two layers of reads in flight
++            p = PREFIX + f"layers.{i}.mlp."
++
++            def triple(proj: str) -> list:
++                return [(rd.get(p + f"experts.{e}.{proj}.trellis").to(dev),  # noqa: B023  `p` is this layer's
++                         rd.get(p + f"experts.{e}.{proj}.suh").to(dev),
++                         rd.get(p + f"experts.{e}.{proj}.svh").to(dev)) for e in range(cfg.experts)]
++
++            out.append(generic.prepare(triple("gate_proj"), triple("up_proj"), triple("down_proj"), "mcg",
++                                       device=dev))
++            if n % 8 == 7:
++                torch.cuda.empty_cache()
++    finally:
++        rd.close()
++    return out
++
++
++class ExpertBuffers:
++    """The expert node's static scratch and wire-shaped slots: ``rows`` decode rows, ``prefill_rows`` a chunk."""
++
++    def __init__(self, cfg: Config, rows: int = 8, prefill_rows: int = 2048, device: str = "cuda") -> None:
++        if not 1 <= rows <= prefill_rows:
++            raise ValueError(f"rows {rows} must be within 1..prefill_rows {prefill_rows}")
++        D, slots = cfg.hidden, cfg.top_k + 1
++        self.rows, self.prefill_rows, self.slots, self.top_k, self.dims = rows, prefill_rows, slots, cfg.top_k, D
++        dev = torch.device(device)
++        top = prefill_rows                                   # the wire slots span the widest window
++        self.normed = torch.empty((top, D), dtype=torch.bfloat16, device=dev)
++        self.pick = torch.empty((top, slots), dtype=torch.int32, device=dev)
++        self.wts = torch.empty((top, slots), dtype=torch.float32, device=dev)
++        self.routed = torch.empty((top, D), dtype=torch.float32, device=dev)
++        shape = SimpleNamespace(dims=D, width=cfg.moe_width // 2, count=cfg.experts)
++        self.decode = Exl3Scratch(shape, rows, slots, device=dev)
++        self.pref = Exl3Scratch(shape, prefill_rows, slots, device=dev)
++
++    def scratch(self, R: int) -> Exl3Scratch:
++        return self.decode if R <= self.rows else self.pref
++
++    def ey(self, R: int) -> torch.Tensor:
++        """The live scratch's per-slot outputs as ``[R, slots, D]`` (the shared slot still to be zeroed)."""
++
++        s = self.scratch(R)
++        return s.y.view(s.rows, self.slots, self.dims)[:R]
++
++
++class ExpertNode:
++    """One half's routed experts plus buffers; ``compute`` is the per-layer AFD exchange's device side."""
++
++    def __init__(self, model_dir, half: int, layers, *, device: str = "cuda", rows: int = 8,
++                 prefill_rows: int = 2048) -> None:
++        self.cfg = Config.read(model_dir)
++        self.half, self.layers = half, list(layers)
++        self.experts = load_half(model_dir, half, self.layers, device=device)
++        self.by_layer = dict(zip(self.layers, self.experts))
++        self.buf = ExpertBuffers(self.cfg, rows=rows, prefill_rows=prefill_rows, device=device)
++
++    def compute(self, layer_i: int, R: int, x: tuple | None = None) -> torch.Tensor:
++        """``routed_half[:R] = sum_k wts[:, k] * y_k`` in slot order, the shared slot zeroed, fp32.
++        ``x``: (normed, pick, wts) to read instead of the wire slots (where the link landed them)."""
++
++        b = self.buf
++        if R > b.prefill_rows:
++            raise ValueError(f"{R} rows: buffers hold {b.prefill_rows}")
++        normed, pick, wts = x if x is not None else (b.normed[:R], b.pick[:R], b.wts[:R])
++        exl3_generic.routed(normed, pick, self.by_layer[layer_i], b.scratch(R), R, self.cfg.limit)
++        b.ey(R)[:, b.top_k].zero_()                          # the shared slot: attention adds its own sy
++        glue.combine(b.ey(R), wts, b.routed[:R])
++        return b.routed[:R]
++
++
++def _window(node: ExpertNode, link, R: int, collect: tuple[list, list] | None = None) -> None:
++    """One forward's device body: per layer land, compute, reply; hashes when ``collect``."""
++
++    b = node.buf
++    slots, routed = (b.normed[:R], b.pick[:R], b.wts[:R]), b.routed[:R]
++    for pos, i in enumerate(node.layers):
++        x = link.land(pos, slots)
++        if collect is not None:
++            collect[0].append([sha(x[0]), sha(x[1]), sha(x[2])])
++        node.compute(i, R, x)
++        if collect is not None:
++            collect[1].append(sha(routed))
++        link.reply(pos, routed)
++
++
++def forwards(node: ExpertNode, link, store, rank: int, *, check_on: bool = False) -> None:
++    """The per-forward loop over the expert's end of the wire (returns only by raising): every forward eager, the
++    wire check's hashes to the store."""
++
++    checked = 0
++    while True:
++        seq, rows, mode = link.next_forward()
++        if mode not in (MODE_EAGER, MODE_CHUNK):
++            raise RuntimeError(f"forward mode {mode}: the expert runs eager windows only")
++        collect = ([], []) if check_on and checked < CHECK_FORWARDS else None
++        _window(node, link, rows, collect)
++        if collect is not None:
++            checked += 1
++            store.set(f"afd_chk/{seq}/{rank}", json.dumps({"in": collect[0], "out": collect[1]}).encode())
++
++
++def serve(model_dir, half: int, master: str, port: int, *, device: str = "cuda") -> None:
++    """The expert node's whole run: AFD rank ``half + 1`` of 3 over its MCDMA link, the settings handshake, the
++    heartbeat, then ``forwards``."""
++
++    import os
++    import threading
++    import time
++
++    from . import afd_mcdma
++
++    cfg = Config.read(model_dir)
++    rank = half + 1
++    _rendezvous = afd_mcdma.StoreComm(rank, 3, master, port)   # joins the attention's three-rank store
++    store = Store(master, port)                  # the protocol's own short-timeout, self-healing client
++    beat_store = Store(master, port)             # the beat's own wrapper
++    stop = threading.Event()
++
++    def beat() -> None:
++        while not stop.is_set():
++            try:
++                beat_store.set(f"afd_alive/{rank}", f"{time.time():.3f}")
++            except Exception:  # noqa: BLE001  the store outliving us is fine
++                pass
++            stop.wait(ALIVE_EVERY)
++
++    threading.Thread(target=beat, daemon=True, name=f"afd-beat-{rank}").start()
++    link = None
++    try:
++        theirs = None
++        while theirs is None:                            # the attention publishes before its own load
++            raw = get_store(store, "afd_settings", 3600.0)
++            theirs = json.loads(bytes(raw).decode()) if raw else None
++        # the attention's wire must be this one; its link map is checked by open_expert_link
++        mine = dict(settings_for(model_dir, cfg, prefill_rows=int(theirs["prefill_rows"])), transport="mcdma",
++                    mcdma_links=theirs.get("mcdma_links"))
++        bad = settings_mismatch(mine, theirs)
++        if bad:
++            raise SystemExit(f"[tensorfold] afd: settings mismatch on expert {rank}: {bad}")
++        # before the load: a missing daemon fails in seconds, not after it
++        link = afd_mcdma.open_expert_link(theirs, rank, cfg, store, device)
++        store.set(f"afd_ready/{rank}", b"1")
++        node = ExpertNode(model_dir, half, mine["layers"], device=device, rows=int(theirs["max_rows"]),
++                          prefill_rows=int(theirs["prefill_rows"]))
++        print(f"[tensorfold] afd expert {rank}: {len(node.layers)} MoE layers resident", flush=True)
++        store.set(f"afd_loaded/{rank}", b"1")
++        forwards(node, link, store, rank, check_on=os.environ.get(CHECK_ENV, "").strip() == "1")
++    except Exception as exc:  # noqa: BLE001   the attention's watchdog reads this; the process exits for the lane
++        try:
++            store.set(f"afd_error/{rank}", repr(exc).encode())
++        except Exception:  # noqa: BLE001
++            pass
++        raise
++    finally:
++        if link is not None:
++            link.close()
+diff --git a/src/tensorfold/families/glm5_next/cuda/forward.py b/src/tensorfold/families/glm5_next/cuda/forward.py
+index f073b6e..c73a130 100644
+--- a/src/tensorfold/families/glm5_next/cuda/forward.py
++++ b/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -114,6 +114,9 @@ class Buffers:
+         # rank partials
+         self.part = torch.empty((rows, D), dtype=f32, device=dev)
+         self.gath = torch.empty((w.world * rows * D,), dtype=f32, device=dev)
++        # AFD: the two expert halves' partial sums, then this node's shared expert, packed flat for hc_post
++        self.afd_recv = (torch.empty((3 * rows * D,), dtype=f32, device=dev)
++                         if getattr(w, "afd", None) is not None else None)
+         self.sk = torch.empty((1 if prefill and not exl3 else 8 * rows * 16384,), dtype=f32, device=dev)
+         # final
+         self.hidden = torch.empty((rows, D), dtype=bf, device=dev)
+@@ -392,18 +395,24 @@ def mlp_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+     c = w.cfg
+     m = layer.moe
++    afd = w.afd
+     with prof.timed("moe: route"):
+         glue.router(b.normed[:R], m.router, b.mlog[:R])
+         glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
+         if m.shared is None:
+             grouped.route(b.pick[:R], b.plan)
++    if afd is not None:
++        afd.exchange(b, R)                       # the wire out first; this layer's shared expert overlaps it
+     if m.shared is not None:
+-        # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
+-        exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
++        if afd is None:
++            # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
++            exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
+         s = m.shared
+         mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
+         glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
+         mm(b, b.sact[:R], s.down, b.sxs[:R], b.sy[:R], f32=True)
++        if afd is not None:
++            return afd.collect(b, R, c.hidden)   # [3, R, D]: rank 1's and 2's partials, the shared last; hc_post sums
+         b.ey[:R, c.top_k].copy_(b.sy[:R])
+         glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
+         return gather(w, b, R)
+diff --git a/src/tensorfold/families/glm5_next/cuda/graphs.py b/src/tensorfold/families/glm5_next/cuda/graphs.py
+index 39e5b1d..de8a5fb 100644
+--- a/src/tensorfold/families/glm5_next/cuda/graphs.py
++++ b/src/tensorfold/families/glm5_next/cuda/graphs.py
+@@ -26,9 +26,19 @@ class Graphs:
+         self.sparse: dict[tuple[int, int, int], torch.cuda.CUDAGraph] = {}      # (rows, parity, pool bucket)
+         self.sparse_mtp: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}       # (rows, pool bucket)
+         w, st = e.w, e.st
++        afd = getattr(w, "afd", None)
+         prof.active = False
+         saved = list(st.cur)
+         parities = (0, 1) if st.cur else (0,)
++        if afd is not None and afd.forces_eager():
++            with torch.no_grad():                # eager-only: one real-wire pass per rows, no captures at all
++                for R in main_rows:
++                    st.cur = [parities[0]] * len(st.cur) if st.cur else st.cur
++                    afd.begin(R)
++                    compute(w, st, e.buf, R)
++            torch.cuda.synchronize()
++            st.cur = saved
++            return
+         with torch.no_grad():
+             for R in main_rows:
+                 for parity in parities:
+@@ -57,6 +67,9 @@ class Graphs:
+ 
+     def _capture_sparse(self, e, main_rows, mtp_rows, parities) -> None:
+         w, st = e.w, e.st
++        afd = getattr(w, "afd", None)
++        if afd is not None and afd.forces_eager():
++            return                                   # eager-only: the sparse path runs eager per request, no captures
+         np_max = st.index[0][2].shape[0] - 2
+         saved = list(st.cur)
+         for bucket in pool_buckets(np_max):
+diff --git a/src/tensorfold/families/glm5_next/cuda/mcdma.py b/src/tensorfold/families/glm5_next/cuda/mcdma.py
+new file mode 100644
+index 0000000..fc0675c
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/mcdma.py
+@@ -0,0 +1,597 @@
++"""The MCDMA link-daemon transport for the AFD exchange: protocol-1 mailboxes and words,
++the request layout and libmcdma-rpc through ctypes; the CUDA driver side (registered mailboxes, the stream memory
++operations, their probe and the gpu/cpu choice) is ``mcdma_cuda``.
++
++One mailbox per link (MCDMA docs/link-daemon.md, e672c14): a request half of R bytes, then a reply half of P bytes,
++each led by a 4 KiB control page. A word is ``seq << 32 | length``; sequence 0 means empty. The attention node is
++the connect end of both links (``mcdma-rpcd connect``, mailbox ``/dev/shm/mcdma-rpc.NAME``), each expert node the
++listen end of its own (``mcdma-rpcd listen``, a registered ``MODE poll`` service). A link carries one request at a
++time: the next is issued only once the previous reply's done word has landed, so both ends count the same sequence
++numbers (``next_seq`` from a base the attention publishes) and one mailbox per link is enough.
++
++GPU-driven (``TF_AFD_MCDMA_MODE=gpu``): the copies into and out of the registered mailbox are stream-ordered, the
++words are ``cuStreamWriteValue64``/``cuStreamWaitValue64`` on the torch stream; no host sync per layer.
++CPU-driven (``cpu``): blocking copies, ``mcdma_rpc_store_word``/``mcdma_rpc_wait_word`` on the host. ``auto`` (the
++default) runs a capability probe and falls back to CPU loudly.
++"""
++
++from __future__ import annotations
++
++import collections
++import ctypes
++import ctypes.util
++import mmap
++import os
++import re
++import socket
++import struct
++import threading
++import time
++
++LINKS_ENV = "TF_AFD_MCDMA_LINKS"        # attention: link names for expert ranks 1 and 2, e.g. "link1,link2"
++LINK_ENV = "TF_AFD_MCDMA_LINK"          # expert: this node's link name
++MODE_ENV = "TF_AFD_MCDMA_MODE"          # gpu | cpu | auto (default)
++LIB_ENV = "TF_AFD_MCDMA_LIB"            # libmcdma-rpc.so (ABI 1)
++SHM_ENV = "TF_AFD_MCDMA_SHM_DIR"        # where the mailboxes are (default /dev/shm; tests move them)
++TIMEOUT_ENV = "TF_AFD_MCDMA_TIMEOUT"    # s a request may stay unanswered before the attention calls the link dead
++SPIN_ENV = "TF_AFD_MCDMA_SPIN_US"       # us a host wait spins before it sleeps in 20 us steps
++FLUSH_ENV = "TF_AFD_MCDMA_FLUSH"        # auto | 0 | 1: CU_STREAM_WAIT_VALUE_FLUSH on the stream waits
++SOCKET_ENV = "MCDMA_RPCD_SOCKET"        # the listen daemon's socket (the MCDMA tools' own variable)
++
++CTRL = 4096                     # each half's control page
++SEG = 4 << 20                   # mailbox halves are whole multiples of 4 MiB
++REQ_WORD, LINK_UP, GENERATION, SIZES = 0, 64, 72, 256   # request-half offsets
++DONE, STAGED = 64, 128          # reply-half offsets: done (connect end), staged (listen end)
++SEQ_MAX = 0xFFFFFFFF
++ALIGN = 256                     # every request section starts 256-B aligned (the kernels' and DMA's comfort)
++HDR_BYTES = 256                 # the request's header slot
++HDR_FMT = "<8i"                 # magic, forward seq, rows, layer, mode, layers, 0, 0
++HDR_INTS = HDR_BYTES // 4
++WIRE_MAGIC = 0x0AFD4D31         # "AFD M1": the MCDMA request header
++SLICE_NS = 50_000_000           # a host wait's slice between liveness checks
++LINKUP_WAIT = 120.0             # s the attention waits for each link to come up at start
++
++# libcuda enums (cuda.h, CUDA 13; unchanged since 11.x)
++CU_STREAM_WAIT_VALUE_EQ = 0x1
++CU_STREAM_WAIT_VALUE_FLUSH = 1 << 30
++CU_STREAM_WRITE_VALUE_DEFAULT = 0x0      # a stream-scoped system fence before the write: earlier copies land first
++CU_MEMHOSTREGISTER_PORTABLE = 0x01
++CU_MEMHOSTREGISTER_DEVICEMAP = 0x02
++PENDING_MAX = 1 << 16           # GPU mode's enqueued (seq, bytes) per link: far more than a forward's 42
++
++
++class LinkError(RuntimeError):
++    """A link that can no longer carry the exchange: daemon down, reconnected, timed out, or a protocol breach."""
++
++
++def word(seq: int, length: int) -> int:
++    return (int(seq) & SEQ_MAX) << 32 | (int(length) & SEQ_MAX)
++
++
++def word_seq(w: int) -> int:
++    return (int(w) >> 32) & SEQ_MAX
++
++
++def word_len(w: int) -> int:
++    return int(w) & SEQ_MAX
++
++
++def next_seq(s: int) -> int:
++    """The link's next sequence number: +1, wrapping past 2**32 - 1 to 1, never 0 (0 means an empty word)."""
++
++    return 1 if s >= SEQ_MAX or s < 0 else s + 1
++
++
++def prev_seq(s: int) -> int:
++    return SEQ_MAX if s <= 1 else s - 1
++
++
++def _align(n: int) -> int:
++    return (n + ALIGN - 1) // ALIGN * ALIGN
++
++
++def _env(name: str, default: str = "") -> str:
++    return (os.environ.get(name) or default).strip()
++
++
++def link_names() -> list[str]:
++    names = [n.strip() for n in _env(LINKS_ENV).split(",") if n.strip()]
++    if len(names) != 2 or len(set(names)) != 2:
++        raise ValueError(f"--experts remote needs {LINKS_ENV}=LINK_FOR_RANK1,LINK_FOR_RANK2 (two distinct "
++                         f"mcdma-rpcd link names, e.g. link1,link2); got {_env(LINKS_ENV)!r}")
++    return names
++
++
++def link_name() -> str:
++    name = _env(LINK_ENV)
++    if not name:
++        raise ValueError(f"an expert node needs {LINK_ENV}=its mcdma-rpcd link name")
++    return name
++
++
++def timeout_s() -> float:
++    return float(_env(TIMEOUT_ENV, "30"))
++
++
++def spin_ns() -> int:
++    return int(float(_env(SPIN_ENV, "5000")) * 1000)
++
++
++class Layout:
++    """One exchange's payloads for ``rows`` rows, after each half's control page. Request: the 256-B header slot,
++    normed bf16 [rows, D], pick int32 [rows, S], wts fp32 [rows, S], each section 256-B aligned. Reply: the expert
++    half's fp32 partial [rows, D]."""
++
++    def __init__(self, hidden: int, slots: int) -> None:
++        self.d, self.s = int(hidden), int(slots)
++
++    def offsets(self, rows: int) -> tuple[int, int, int, int]:
++        normed = HDR_BYTES
++        pick = normed + 2 * self.d * rows
++        wts = pick + _align(4 * self.s * rows)
++        return normed, pick, wts, wts + 4 * self.s * rows
++
++    def req(self, rows: int) -> int:
++        return self.offsets(rows)[3]
++
++    def pad(self, rows: int) -> int:
++        return _align(4 * self.s * rows) - 4 * self.s * rows
++
++    def rep(self, rows: int) -> int:
++        return 4 * self.d * rows
++
++    def mib(self, rows: int) -> tuple[int, int]:
++        """The smallest mailbox halves (req_mib, rep_mib) that carry ``rows`` rows."""
++
++        def up(n: int) -> int:
++            return (CTRL + n + SEG - 1) // SEG * 4
++
++        return up(self.req(rows)), up(self.rep(rows))
++
++    def views(self, land, rows: int):
++        """(normed, pick, wts) over a device buffer holding a request's bytes from the header slot's end on."""
++
++        import torch
++
++        normed, pick, wts, end = (o - HDR_BYTES for o in self.offsets(rows))
++        return (land[normed:pick].view(torch.bfloat16).view(rows, self.d),
++                land[pick:pick + 4 * self.s * rows].view(torch.int32).view(rows, self.s),
++                land[wts:end].view(torch.float32).view(rows, self.s))
++
++
++class Words:
++    """libmcdma-rpc ABI 1 through ctypes: release stores and acquire loads/waits on mailbox words (the GIL is
++    released while a wait spins)."""
++
++    CANDIDATES = ("/mcdma/libmcdma-rpc.so", "/usr/local/lib/libmcdma-rpc.so")
++
++    def __init__(self, path: str | None = None) -> None:
++        cands = [path or _env(LIB_ENV)] + list(self.CANDIDATES)
++        found = ctypes.util.find_library("mcdma-rpc")
++        if found:
++            cands.append(found)
++        tried = []
++        for p in cands:
++            if not p:
++                continue
++            try:
++                lib = ctypes.CDLL(p)
++                break
++            except OSError as exc:
++                tried.append(f"{p} ({exc})")
++        else:
++            raise RuntimeError(f"libmcdma-rpc not found (tried {', '.join(tried) or 'nothing'}): set {LIB_ENV} to a "
++                               "build of MCDMA rpc/libmcdma_rpc.c for this architecture")
++        lib.mcdma_rpc_abi.restype = ctypes.c_uint32
++        lib.mcdma_rpc_abi.argtypes = []
++        if lib.mcdma_rpc_abi() != 1:
++            raise RuntimeError(f"{p}: libmcdma-rpc ABI {lib.mcdma_rpc_abi()}, this transport speaks ABI 1")
++        lib.mcdma_rpc_wait_word.restype = ctypes.c_uint64
++        lib.mcdma_rpc_wait_word.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint64,
++                                            ctypes.c_uint64]
++        lib.mcdma_rpc_store_word.restype = None
++        lib.mcdma_rpc_store_word.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
++        self.lib, self.path = lib, p
++
++    def store(self, addr: int, value: int) -> None:
++        self.lib.mcdma_rpc_store_word(addr, value)
++
++    def load(self, addr: int) -> int:
++        """An acquire load: the word, or 0 while its sequence is 0 (empty)."""
++
++        return int(self.lib.mcdma_rpc_wait_word(addr, 0, 0, 0, 0))
++
++    def wait(self, addr: int, seq: int, equal: bool, spin: int, timeout: int) -> int:
++        """The word once its sequence equals ``seq`` (or, ``equal`` False, is non-zero and differs); 0 on timeout."""
++
++        return int(self.lib.mcdma_rpc_wait_word(addr, seq, 1 if equal else 0, spin, timeout))
++
++
++class Mailbox:
++    """One link's mailbox mapped shared: the daemon's ``/dev/shm/mcdma-rpc.NAME`` (``TF_AFD_MCDMA_SHM_DIR`` moves it).
++    Containers need the host's /dev/shm (``--ipc=host``, or ``-v /dev/shm:/dev/shm``)."""
++
++    def __init__(self, name: str, words: Words, shm_dir: str | None = None, wait_s: float = 10.0) -> None:
++        if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", name):
++            raise ValueError(f"MCDMA link name {name!r}: letters, digits, '-' and '_' only")
++        self.name, self.words = name, words
++        self.path = os.path.join(shm_dir or _env(SHM_ENV, "/dev/shm"), f"mcdma-rpc.{name}")
++        try:
++            fd = os.open(self.path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
++        except FileNotFoundError:
++            raise LinkError(f"no mailbox {self.path}: start mcdma-rpcd for link {name} first, and give the "
++                            "container the host's /dev/shm (--ipc=host or -v /dev/shm:/dev/shm)") from None
++        try:
++            st = os.fstat(fd)
++            self.size, self.ino = st.st_size, st.st_ino
++            if self.size <= 2 * CTRL:
++                raise LinkError(f"mailbox {self.path} is {self.size} bytes: not an mcdma-rpcd mailbox")
++            self.mm = mmap.mmap(fd, self.size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
++        finally:
++            os.close(fd)
++        end = time.monotonic() + wait_s
++        while True:                          # a daemon writes the sizes right after it creates the mailbox
++            self.req, self.rep = struct.unpack_from("<QQ", self.mm, SIZES)
++            if self.req and self.rep:
++                break
++            if time.monotonic() >= end:
++                break
++            time.sleep(0.1)
++        if (self.req + self.rep != self.size or self.req % SEG or self.rep % SEG or self.req <= CTRL
++                or self.rep <= CTRL):
++            raise LinkError(f"mailbox {self.path}: sizes R={self.req} P={self.rep} do not describe its {self.size} "
++                            "bytes (not a protocol-1 mailbox, or its daemon is still starting)")
++        self._anchor = ctypes.c_char.from_buffer(self.mm)    # pins the mapping for the process's life
++        self.base = ctypes.addressof(self._anchor)
++        self.req_word = self.base + REQ_WORD
++        self.done = self.base + self.req + DONE
++        self.staged = self.base + self.req + STAGED
++        self._req_bytes = self._rep_bytes = None
++
++    def replaced(self) -> bool:
++        """The daemon made a new mailbox under our path (a connect daemon unlinks and recreates it at start):
++        this mapping will never see another reply."""
++
++        try:
++            return os.stat(self.path).st_ino != self.ino
++        except OSError:
++            return True
++
++    def plain(self, off: int) -> int:
++        """A status value (link-up, generation): plain u64s the connect daemon stores, not words."""
++
++        return ctypes.c_uint64.from_address(self.base + off).value
++
++    def header(self) -> tuple:
++        return struct.unpack_from(HDR_FMT, self.mm, CTRL)
++
++    @property
++    def req_bytes(self):
++        """The request payload (after the control page) as a CPU uint8 tensor over the mapping."""
++
++        if self._req_bytes is None:
++            import torch
++
++            self._req_bytes = torch.frombuffer(self.mm, dtype=torch.uint8, count=self.req - CTRL, offset=CTRL)
++        return self._req_bytes
++
++    @property
++    def rep_bytes(self):
++        if self._rep_bytes is None:
++            import torch
++
++            self._rep_bytes = torch.frombuffer(self.mm, dtype=torch.uint8, count=self.rep - CTRL,
++                                               offset=self.req + CTRL)
++        return self._rep_bytes
++
++    def check_room(self, layout: Layout, rows: int) -> None:
++        """Refuse to start when the widest window (``rows``, the prompt chunk) does not fit this mailbox."""
++
++        need_req, need_rep = layout.req(rows), layout.rep(rows)
++        if need_req > self.req - CTRL or need_rep > self.rep - CTRL:
++            q, p = layout.mib(rows)
++            raise LinkError(f"mailbox {self.path} ({self.req >> 20}+{self.rep >> 20} MiB) cannot carry a {rows}-row "
++                            f"window ({need_req} request + {need_rep} reply bytes): run mcdma-rpcd with "
++                            f"req_mib>={q} rep_mib>={p} on both ends of link {self.name}")
++
++
++def _snapshot(dq) -> list:
++    """A copy of a deque another thread appends to (a mutation mid-copy raises; copy again)."""
++
++    for _ in range(100):
++        try:
++            return list(dq)
++        except RuntimeError:
++            continue
++    return []
++
++
++class AttentionLinks:
++    """The attention node's (connect) end of both links. ``issue`` puts one packed request into every mailbox and
++    rings it; ``collect`` waits for every reply and copies it to the device. GPU mode does both as stream operations
++    (no host sync); CPU mode syncs, then stores and spins on the host. ``health`` and ``release`` serve the
++    watchdog."""
++
++    def __init__(self, names: list[str], *, words: Words | None = None, driver=None, mode: str = "cpu",
++                 stream=None, timeout: float | None = None, shm_dir: str | None = None, flags: int = 0,
++                 linkup_wait: float = LINKUP_WAIT, log=print) -> None:
++        self.names, self.mode, self.driver, self.flags = list(names), mode, driver, flags
++        if mode == "gpu" and driver is None:
++            raise ValueError("GPU-driven MCDMA needs the CUDA driver binding")
++        self.words = words or Words()
++        self.boxes = [Mailbox(n, self.words, shm_dir) for n in self.names]
++        end = time.monotonic() + linkup_wait
++        for box in self.boxes:
++            while box.plain(LINK_UP) != 1:
++                if time.monotonic() >= end:
++                    raise LinkError(f"link {box.name} is not up after {linkup_wait:.0f} s (connect daemon's link-up "
++                                    "word 0): is mcdma-rpcd listen running on that expert node?")
++                time.sleep(0.1)
++        self.gen = [box.plain(GENERATION) for box in self.boxes]
++        # the connect daemon resends only a sequence that differs from its last; its last is the request word's
++        self.base = [next_seq(word_seq(self.words.load(box.req_word))) for box in self.boxes]
++        self.seq = [prev_seq(b) for b in self.base]          # the last issued; the first issue uses the base
++        self.count = [0] * len(self.boxes)
++        self.pending = [collections.deque(maxlen=PENDING_MAX) for _ in self.boxes]   # GPU mode: (seq, reply bytes)
++        from .mcdma_cuda import _register
++
++        self.dptr = [_register(driver, box, mode == "gpu", log) for box in self.boxes]
++        self.stream = stream
++        self.timeout = timeout_s() if timeout is None else float(timeout)
++        self.spin = spin_ns()
++        self.failed: str | None = None
++        self._last = [(0, 0)] * len(self.boxes)
++        self._since = [time.monotonic()] * len(self.boxes)
++        self._lock = threading.Lock()
++        self._releasing = False
++
++    def check_room(self, layout: Layout, rows: int) -> None:
++        for box in self.boxes:
++            box.check_room(layout, rows)
++
++    def _stream(self) -> int:
++        if self.stream is not None:
++            return self.stream()
++        import torch
++
++        return torch.cuda.current_stream().cuda_stream
++
++    # -- the exchange --------------------------------------------------------------------------------------------
++    def issue(self, req, n: int, rep_len: int) -> None:
++        """``req``: the packed request (``n`` bytes, a device uint8 tensor) to every link, then its word."""
++
++        if self.mode == "gpu":
++            h = self._stream()
++            for k, box in enumerate(self.boxes):
++                box.req_bytes[:n].copy_(req, non_blocking=True)
++                s = next_seq(self.seq[k])
++                self.pending[k].append((s, rep_len))
++                self.driver.write64(h, self.dptr[k] + REQ_WORD, word(s, n))   # fenced: the copy lands first
++                self.seq[k] = s
++                self.count[k] += 1
++            if self.failed is not None:                     # released while this was enqueued: release it too
++                self.release()
++            return
++        for box in self.boxes:
++            box.req_bytes[:n].copy_(req)                    # blocking: the forward so far, then these bytes
++        for k, box in enumerate(self.boxes):
++            s = next_seq(self.seq[k])
++            self.words.store(box.req_word, word(s, n))
++            self.seq[k] = s
++            self.count[k] += 1
++
++    def collect(self, outs, rep_len: int) -> None:
++        """Each link's reply (``rep_len`` bytes) into ``outs[k]`` (device uint8 views), in link order."""
++
++        if self.mode == "gpu":
++            h = self._stream()
++            for k, box in enumerate(self.boxes):
++                self.driver.wait64(h, self.dptr[k] + box.req + DONE, word(self.seq[k], rep_len),
++                                   CU_STREAM_WAIT_VALUE_EQ | self.flags)
++                outs[k].copy_(box.rep_bytes[:rep_len], non_blocking=True)
++            return
++        for k, box in enumerate(self.boxes):
++            self._wait(k, rep_len)
++            outs[k].copy_(box.rep_bytes[:rep_len], non_blocking=True)   # ordered before the next issue's sync
++
++    def _wait(self, k: int, rep_len: int) -> None:
++        box, want = self.boxes[k], self.seq[k]
++        start = time.monotonic()
++        while True:
++            w = self.words.wait(box.done, want, True, self.spin, SLICE_NS)
++            if w:
++                if word_len(w) != rep_len:
++                    raise LinkError(f"link {box.name}: reply {want} is {word_len(w)} bytes, not {rep_len} (0 = the "
++                                    "daemon refused a request larger than its mailbox)")
++                return
++            if self.failed is not None:
++                raise LinkError(self.failed)
++            why = self.health()
++            if why:
++                raise LinkError(why)
++            if time.monotonic() - start > self.timeout:
++                raise LinkError(f"link {box.name}: no reply to request {want} in {self.timeout:.0f} s "
++                                "(expert hung, or a daemon down)")
++
++    # -- the watchdog's side -------------------------------------------------------------------------------------
++    def health(self) -> str:
++        """'' while every link is up, on its first generation and answering; else why not."""
++
++        now = time.monotonic()
++        with self._lock:
++            for k, box in enumerate(self.boxes):
++                if box.replaced():
++                    return (f"link {box.name}: mailbox {box.path} was replaced or removed (its daemon restarted or "
++                            "stopped): requests in flight are lost")
++                up = box.plain(LINK_UP)
++                if up != 1:
++                    return f"link {box.name} is down (connect daemon link-up word {up})"
++                g = box.plain(GENERATION)
++                if g != self.gen[k]:
++                    return (f"link {box.name} reconnected (generation {self.gen[k]} -> {g}): requests in flight "
++                            "were lost")
++                r = word_seq(self.words.load(box.req_word))
++                d = word_seq(self.words.load(box.done))
++                if self.count[k] and r != d:
++                    if (r, d) != self._last[k]:
++                        self._last[k], self._since[k] = (r, d), now
++                    elif now - self._since[k] > self.timeout:
++                        return (f"link {box.name}: request {r} unanswered for {now - self._since[k]:.0f} s "
++                                "(expert hung, or a daemon down)")
++                else:
++                    self._last[k], self._since[k] = (r, d), now
++                self._trim(k, d)
++        return ""
++
++    def _trim(self, k: int, done: int) -> None:
++        pend = self.pending[k]
++        if not pend or done not in {s for s, _ in _snapshot(pend)}:
++            return
++        while pend:
++            s, _ = pend.popleft()
++            if s == done:
++                break
++
++    def release(self) -> None:
++        """Abort: no request may wait for an answer that will not come. CPU mode just fails the waits; GPU mode
++        answers every enqueued stream wait itself so the serving stream drains (the in-flight forward's partials
++        are garbage, and the next begin refuses)."""
++
++        self.failed = self.failed or "the MCDMA links were aborted"
++        if self.mode != "gpu":
++            return
++        with self._lock:
++            if self._releasing:
++                return
++            self._releasing = True
++        threading.Thread(target=self._release_loop, daemon=True, name="afd-mcdma-release").start()
++
++    def _release_loop(self, budget: float = 30.0, grace: float = 2.0) -> None:
++        try:
++            end, quiet = time.monotonic() + budget, None
++            while time.monotonic() < end:
++                busy = False
++                for k, box in enumerate(self.boxes):
++                    pend = _snapshot(self.pending[k])
++                    if not pend:
++                        continue
++                    d = word_seq(self.words.load(box.done))
++                    if d == pend[-1][0]:
++                        continue
++                    busy = True
++                    r = word_seq(self.words.load(box.req_word))      # the newest request the stream issued
++                    if r != d:
++                        for s, n in pend:
++                            if s == r:
++                                self.words.store(box.done, word(s, n))
++                                break
++                if busy:
++                    quiet = None
++                elif quiet is None:
++                    quiet = time.monotonic()
++                elif time.monotonic() - quiet > grace:     # a late genuine reply could still rewind a done word
++                    return
++                time.sleep(0.0005)
++        finally:
++            with self._lock:
++                self._releasing = False
++
++
++class ExpertLink:
++    """An expert node's (listen) end of its link: the listen daemon's registered ``MODE poll`` service, the request
++    wait, the reply stage. Requests come strictly one at a time, so the service counts the sequence itself."""
++
++    def __init__(self, name: str, *, words: Words | None = None, driver=None, mode: str = "cpu",
++                 socket_path: str | None = None, shm_dir: str | None = None, stream=None, flags: int = 0,
++                 log=print) -> None:
++        self.name, self.mode, self.driver, self.flags = name, mode, driver, flags
++        if mode == "gpu" and driver is None:
++            raise ValueError("GPU-driven MCDMA needs the CUDA driver binding")
++        self.words = words or Words()
++        self.box = Mailbox(name, self.words, shm_dir)
++        # both words empty before registering: the daemon takes the staged word's sequence at attach as its last
++        # sent, and a stale request word must never pass for this run's first request
++        self.words.store(self.box.req_word, 0)
++        self.words.store(self.box.staged, 0)
++        self.socket_path = socket_path or _env(SOCKET_ENV) or f"/tmp/mcdma-rpcd.{name}.sock"
++        self.sock = self._register(self.socket_path)
++        from .mcdma_cuda import _register
++
++        self.dptr = _register(driver, self.box, mode == "gpu", log)
++        self.stream = stream
++        self.spin = spin_ns()
++        self.base = 1
++
++    def _register(self, path: str) -> socket.socket:
++        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++        s.settimeout(5.0)
++        try:
++            s.connect(path)
++            s.sendall(b"MODE poll\n")
++            line = b""
++            while not line.endswith(b"\n") and len(line) < 256:
++                got = s.recv(1)
++                if not got:
++                    break
++                line += got
++        except OSError as exc:
++            s.close()
++            raise LinkError(f"cannot register with the listen daemon of link {self.name} at {path} ({exc}): is "
++                            f"mcdma-rpcd listen running, and its socket mounted ({SOCKET_ENV})?") from None
++        if line.strip() != b"OK":
++            s.close()
++            raise LinkError(f"the listen daemon of link {self.name} refused the service: {line.strip()!r} "
++                            "('ERR busy' = another service holds the link)")
++        s.setblocking(False)
++        return s
++
++    def alive(self) -> str:
++        """'' while the registration stands; else why it ended (the daemon says BYE, or closes, when the link drops)."""
++
++        try:
++            data = self.sock.recv(256)
++        except BlockingIOError:
++            return ""
++        except OSError as exc:
++            return f"service socket error {exc}"
++        if not data:
++            return "the listen daemon closed the service socket (it stopped, or dropped the link)"
++        if b"BYE" in data:
++            return "the listen daemon ended the registration (BYE): the link dropped, requests in flight are lost"
++        return ""
++
++    def check_room(self, layout: Layout, rows: int) -> None:
++        self.box.check_room(layout, rows)
++
++    def _stream(self) -> int:
++        if self.stream is not None:
++            return self.stream()
++        import torch
++
++        return torch.cuda.current_stream().cuda_stream
++
++    def wait(self, seq: int) -> int:
++        """Host wait for request ``seq`` (as long as the attention idles), checking the registration between slices."""
++
++        while True:
++            w = self.words.wait(self.box.req_word, seq, True, self.spin, SLICE_NS)
++            if w:
++                return w
++            why = self.alive()
++            if why:
++                raise LinkError(f"link {self.name}: {why}")
++
++    def stage(self, seq: int, n: int) -> None:
++        self.words.store(self.box.staged, word(seq, n))
++
++    def wait_gpu(self, seq: int, n: int) -> None:
++        self.driver.wait64(self._stream(), self.dptr + REQ_WORD, word(seq, n), CU_STREAM_WAIT_VALUE_EQ | self.flags)
++
++    def stage_gpu(self, seq: int, n: int) -> None:
++        self.driver.write64(self._stream(), self.dptr + self.box.req + STAGED, word(seq, n))
++
++    def close(self) -> None:
++        try:
++            self.sock.close()
++        except OSError:
++            pass
+diff --git a/src/tensorfold/families/glm5_next/cuda/mcdma_cuda.py b/src/tensorfold/families/glm5_next/cuda/mcdma_cuda.py
+new file mode 100644
+index 0000000..7f8df2a
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/mcdma_cuda.py
+@@ -0,0 +1,233 @@
++"""The CUDA driver side of the MCDMA wire: libcuda through ctypes for the GPU-driven exchange (mailboxes registered
++for the device, ``cuStreamWriteValue64``/``cuStreamWaitValue64`` on the serving stream), the capability probe and
++``TF_AFD_MCDMA_MODE``'s choice between it and the CPU-driven exchange.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import mmap
++import time
++
++from .mcdma import (CU_MEMHOSTREGISTER_DEVICEMAP, CU_MEMHOSTREGISTER_PORTABLE, CU_STREAM_WAIT_VALUE_EQ,
++                    CU_STREAM_WAIT_VALUE_FLUSH, CU_STREAM_WRITE_VALUE_DEFAULT, FLUSH_ENV, MODE_ENV, Mailbox, _env, word)
++
++ATTRS = {"integrated": 18, "can_map_host_memory": 19, "unified_addressing": 41, "host_native_atomic": 86,
++         "pageable_memory_access": 88, "host_pointer_for_registered_mem": 91, "can_flush_remote_writes": 98,
++         "host_register_supported": 99, "gpu_direct_rdma_writes_ordering": 118, "stream_mem_ops_64": 122}
++NEEDED = ("stream_mem_ops_64", "can_map_host_memory", "unified_addressing")
++_LEAKED: list = []              # a failed probe's page and stream: the stream may still read the page, keep both
++
++
++class CudaDriver:
++    """The CUDA driver calls the GPU-driven exchange needs, on libcuda through ctypes. torch owns the context's
++    lifetime, but ``torch.cuda.init()`` does not make it driver-current, and ``cuMemHostRegister`` needs a current
++    context (else CUDA error 201): ``ensure_ctx`` makes the device's primary context (the one torch's runtime
++    uses) current on the calling thread, retained once and never released or destroyed. ``register`` calls it first;
++    the stream ops take explicit stream handles and need none."""
++
++    def __init__(self, path: str | None = None) -> None:
++        for p in ([path] if path else ["libcuda.so.1", "libcuda.so"]):
++            try:
++                lib = ctypes.CDLL(p)
++                break
++            except OSError:
++                continue
++        else:
++            raise RuntimeError("libcuda not found")
++        u, vp, u64 = ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint64
++
++        def fn(*names, args):
++            for n in names:
++                f = getattr(lib, n, None)
++                if f is not None:
++                    f.restype, f.argtypes = ctypes.c_int, args
++                    return f
++            raise RuntimeError(f"libcuda has none of {names}")
++
++        self._version = fn("cuDriverGetVersion", args=[ctypes.POINTER(ctypes.c_int)])
++        self._dev = fn("cuDeviceGet", args=[ctypes.POINTER(ctypes.c_int), ctypes.c_int])
++        self._attr = fn("cuDeviceGetAttribute", args=[ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int])
++        self._err = fn("cuGetErrorString", args=[ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)])
++        self._reg = fn("cuMemHostRegister_v2", "cuMemHostRegister", args=[vp, ctypes.c_size_t, u])
++        self._unreg = fn("cuMemHostUnregister", args=[vp])
++        self._dptr = fn("cuMemHostGetDevicePointer_v2", "cuMemHostGetDevicePointer",
++                        args=[ctypes.POINTER(u64), vp, u])
++        self._wait = fn("cuStreamWaitValue64_v2", "cuStreamWaitValue64", args=[vp, u64, u64, u])
++        self._write = fn("cuStreamWriteValue64_v2", "cuStreamWriteValue64", args=[vp, u64, u64, u])
++        self._init = fn("cuInit", args=[u])
++        self._getcur = fn("cuCtxGetCurrent", args=[ctypes.POINTER(vp)])
++        self._setcur = fn("cuCtxSetCurrent", args=[vp])
++        self._retain = fn("cuDevicePrimaryCtxRetain_v2", "cuDevicePrimaryCtxRetain",
++                          args=[ctypes.POINTER(vp), ctypes.c_int])
++        self.ordinal = 0                     # the device ensure_ctx defaults to (the last one it was given)
++        self.ctx_source = ""                 # how the last ensure_ctx found its context: "current" or "primary"
++        self._primary: dict[int, int] = {}   # ordinal -> the primary context retained here (held for the process)
++
++    def ensure_ctx(self, ordinal: int | None = None) -> int:
++        """A current context on this thread: the one already current (torch's, once its runtime made it so), else
++        device ``ordinal``'s primary context, retained once and set current (PROBE-CTX.md's B-sequence). Idempotent;
++        never pops, releases or destroys a context. Returns the context handle."""
++
++        if ordinal is not None:
++            self.ordinal = int(ordinal)
++        self._check(self._init(0), "cuInit")
++        cur = ctypes.c_void_p()
++        self._check(self._getcur(ctypes.byref(cur)), "cuCtxGetCurrent")
++        if cur.value:
++            self.ctx_source = "current"
++            return cur.value
++        ctx = self._primary.get(self.ordinal)
++        if ctx is None:
++            d, c = ctypes.c_int(), ctypes.c_void_p()
++            self._check(self._dev(ctypes.byref(d), self.ordinal), "cuDeviceGet")
++            self._check(self._retain(ctypes.byref(c), d.value), "cuDevicePrimaryCtxRetain")
++            if not c.value:
++                raise RuntimeError(f"cuDevicePrimaryCtxRetain({self.ordinal}) returned no context")
++            ctx = self._primary[self.ordinal] = int(c.value)
++        self._check(self._setcur(ctx), "cuCtxSetCurrent")
++        self.ctx_source = "primary"
++        return ctx
++
++    def _check(self, code: int, what: str) -> None:
++        if code:
++            s = ctypes.c_char_p()
++            self._err(code, ctypes.byref(s))
++            raise RuntimeError(f"{what}: CUDA driver error {code} ({(s.value or b'?').decode()})")
++
++    def version(self) -> int:
++        v = ctypes.c_int()
++        self._check(self._version(ctypes.byref(v)), "cuDriverGetVersion")
++        return v.value
++
++    def attr(self, name: str, ordinal: int = 0) -> int:
++        d, v = ctypes.c_int(), ctypes.c_int()
++        self._check(self._dev(ctypes.byref(d), ordinal), "cuDeviceGet")
++        self._check(self._attr(ctypes.byref(v), ATTRS[name], d.value), f"cuDeviceGetAttribute({name})")
++        return v.value
++
++    def register(self, addr: int, size: int) -> int:
++        """Page-lock ``size`` bytes at ``addr`` and map them for the device; the device pointer stream ops take.
++        Under a current context (``ensure_ctx``: cuMemHostRegister without one is error 201)."""
++
++        self.ensure_ctx()
++        self._check(self._reg(addr, size, CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP),
++                    "cuMemHostRegister")
++        d = ctypes.c_uint64()
++        self._check(self._dptr(ctypes.byref(d), addr, 0), "cuMemHostGetDevicePointer")
++        return d.value
++
++    def unregister(self, addr: int) -> None:
++        self.ensure_ctx()
++        self._check(self._unreg(addr), "cuMemHostUnregister")
++
++    def write64(self, stream: int, dptr: int, value: int) -> None:
++        self._check(self._write(stream, dptr, value, CU_STREAM_WRITE_VALUE_DEFAULT), "cuStreamWriteValue64")
++
++    def wait64(self, stream: int, dptr: int, value: int, flags: int = CU_STREAM_WAIT_VALUE_EQ) -> None:
++        self._check(self._wait(stream, dptr, value, flags), "cuStreamWaitValue64")
++
++
++def probe(driver, torch, ordinal: int = 0, timeout: float = 2.0) -> tuple[bool, str]:
++    """Can this GPU run the exchange's stream memory ops on registered host memory? The attributes, a write-value,
++    then a wait-value that must hold its stream until the host stores the value. A private page and a side stream:
++    a failure here never wedges the serving stream (a wedged probe stream and its page are left alone)."""
++
++    for name in NEEDED:
++        if not driver.attr(name, ordinal):
++            return False, f"device attribute {name} is 0"
++    size = 64 << 10
++    page = mmap.mmap(-1, size, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS, mmap.PROT_READ | mmap.PROT_WRITE)
++    anchor = ctypes.c_char.from_buffer(page)
++    host = ctypes.addressof(anchor)
++    dev = driver.register(host, size)
++
++    def at(off: int) -> ctypes.c_uint64:
++        return ctypes.c_uint64.from_address(host + off)
++
++    side = torch.cuda.Stream()
++    s = side.cuda_stream
++    driver.write64(s, dev, word(7, 77))
++    side.synchronize()
++    if at(0).value != word(7, 77):
++        return False, f"write-value landed {at(0).value:#x}, not {word(7, 77):#x}"
++    driver.wait64(s, dev + 64, word(9, 99), CU_STREAM_WAIT_VALUE_EQ)
++    driver.write64(s, dev + 128, word(11, 111))
++    time.sleep(0.02)
++    if at(128).value == word(11, 111):
++        return False, "wait-value did not hold the stream (its marker landed before the host's store)"
++    at(64).value = word(9, 99)
++    end = time.monotonic() + timeout
++    while at(128).value != word(11, 111):
++        if time.monotonic() > end:
++            _LEAKED.append((page, anchor, side))         # the stream may still read the page: never unmap it
++            return False, f"the GPU never saw the host's store within {timeout:.1f} s (probe stream left waiting)"
++        time.sleep(0.0005)
++    side.synchronize()
++    driver.unregister(host)
++    del anchor
++    page.close()
++    return True, "ok"
++
++
++def flush_flag(driver, ordinal: int) -> int:
++    """CU_STREAM_WAIT_VALUE_FLUSH where the platform has it (TF_AFD_MCDMA_FLUSH=auto), so NIC writes ahead of a
++    word are visible to the stream's next copy; 0 elsewhere."""
++
++    want = _env(FLUSH_ENV, "auto").lower()
++    if want in ("0", "off", "no"):
++        return 0
++    try:
++        has = bool(driver.attr("can_flush_remote_writes", ordinal))
++    except Exception:  # noqa: BLE001  an old driver without the attribute
++        has = False
++    if want in ("1", "on", "yes") and not has:
++        raise RuntimeError(f"{FLUSH_ENV}=1 but the device lacks CAN_FLUSH_REMOTE_WRITES")
++    return CU_STREAM_WAIT_VALUE_FLUSH if has else 0
++
++
++def choose_mode(torch, ordinal: int, driver_factory=CudaDriver, log=print) -> tuple[str, object]:
++    """TF_AFD_MCDMA_MODE: gpu (refuse to start unless the probe passes), cpu, or auto (gpu when it passes, else cpu
++    with a loud line). Returns (mode, driver or None)."""
++
++    want = _env(MODE_ENV, "auto").lower()
++    if want not in ("gpu", "cpu", "auto"):
++        raise ValueError(f"{MODE_ENV}={want!r}: use gpu, cpu or auto")
++    try:
++        driver = driver_factory()
++    except Exception as exc:  # noqa: BLE001  no libcuda: only the CPU-driven exchange is possible
++        if want == "gpu":
++            raise
++        log(f"[tensorfold] afd mcdma: no CUDA driver binding ({exc}); CPU-driven exchange", flush=True)
++        return "cpu", None
++    if want == "cpu":
++        if hasattr(driver, "ensure_ctx"):
++            driver.ordinal = int(ordinal)      # the mailboxes' (best-effort) registers make this device's ctx current
++        return "cpu", driver
++    try:
++        ensure = getattr(driver, "ensure_ctx", None)
++        if ensure is not None:
++            ensure(ordinal)       # the device's context current on this (the serving) thread; later registers reuse it
++        ok, why = probe(driver, torch, ordinal)
++    except Exception as exc:  # noqa: BLE001  any driver refusal is a failed probe
++        ok, why = False, repr(exc)
++    if ok:
++        return "gpu", driver
++    if want == "gpu":
++        raise RuntimeError(f"{MODE_ENV}=gpu but the stream-memory-op probe failed: {why}")
++    log(f"[tensorfold] afd mcdma: WARNING: GPU-driven exchange unavailable ({why}); FALLING BACK to the CPU-driven "
++        f"exchange (one host sync per layer, slower); set {MODE_ENV}=cpu to silence this", flush=True)
++    return "cpu", driver
++
++
++def _register(driver, box: Mailbox, required: bool, log) -> int | None:
++    if driver is None:
++        return None
++    try:
++        return driver.register(box.base, box.size)
++    except Exception as exc:  # noqa: BLE001
++        if required:
++            raise
++        log(f"[tensorfold] afd mcdma: mailbox {box.path} not registered with CUDA ({exc}); staged copies", flush=True)
++        return None
++
+diff --git a/src/tensorfold/families/glm5_next/cuda/split.py b/src/tensorfold/families/glm5_next/cuda/split.py
+index 8f51c55..9408c06 100644
+--- a/src/tensorfold/families/glm5_next/cuda/split.py
++++ b/src/tensorfold/families/glm5_next/cuda/split.py
+@@ -47,6 +47,7 @@ SMALL = ("config.json", "generation_config.json", "tokenizer.json", "tokenizer_c
+ 
+ # EXL3 gate/up split tile columns and svh; down splits tile rows and suh; each replicates the remaining tensors.
+ EXL3_EXPERT = re.compile(r"\.mlp\.experts\.\d+\.(gate|up|down)_proj\.(trellis|suh|svh|mcg)$")
++EXPERT_ANY = re.compile(r"\.mlp\.experts\.\d+\.")
+ EXL3_RULES = {("gate", "trellis"): "dim1", ("gate", "suh"): "rep", ("gate", "svh"): "row",
+               ("down", "trellis"): "row", ("down", "suh"): "row", ("down", "svh"): "rep"}
+ 
+@@ -64,6 +65,14 @@ def rule(name: str) -> str:
+     return hits[0]
+ 
+ 
++def afd_rule(name: str) -> str:
++    """The AFD attention rank: whole tensors, no routed experts - they live on the two expert nodes."""
++
++    if EXPERT_ANY.search(name):
++        return "drop"
++    return rule(name)
++
++
+ def read_header(path: str | Path) -> tuple[dict, int]:
+     with open(path, "rb") as f:
+         n = struct.unpack("<Q", f.read(8))[0]
+@@ -136,10 +145,10 @@ def rank_files(model_dir: str | Path, rank: int) -> list[Path]:
+ class RankReader:
+     """Read stored-dtype CPU tensors for one rank from the full checkpoint or its pre-split folder."""
+ 
+-    def __init__(self, model_dir: str | Path, rank: int) -> None:
++    def __init__(self, model_dir: str | Path, rank: int, world: int = 2) -> None:
+         from tensorfold.cuda.direct_read import ReadAhead, Reader, SafeTensors
+ 
+-        self.dir, self.rank = Path(model_dir), rank
++        self.dir, self.rank, self.world = Path(model_dir), rank, world
+         self.io = Reader()                                # O_DIRECT reads where the file system allows them
+         self.reads = ReadAhead(self.io, READERS, RUN, GAP)
+         mine, other = rank_files(self.dir, rank), rank_files(self.dir, 1 - rank)
+@@ -196,6 +205,8 @@ class RankReader:
+             raise KeyError(f"{name} is not used by the engine")
+         a, b = info["data_offsets"]
+         shape = list(info["shape"])
++        if self.world == 1:                               # one rank: every tensor whole, no split
++            return file, base + a, base + b, "rep", shape, info["dtype"]
+         if kind == "row" and shape and shape[0] % 2 == 0:   # the rank's rows are one run: read only those
+             per = (b - a) // shape[0] * (shape[0] // 2)
+             a, b, kind, shape = a + self.rank * per, a + (self.rank + 1) * per, "rep", [shape[0] // 2] + shape[1:]
+diff --git a/src/tensorfold/families/glm5_next/cuda/weights.py b/src/tensorfold/families/glm5_next/cuda/weights.py
+index 5f81a7b..0177c00 100644
+--- a/src/tensorfold/families/glm5_next/cuda/weights.py
++++ b/src/tensorfold/families/glm5_next/cuda/weights.py
+@@ -181,7 +181,8 @@ class MLPW:
+ class MoEW:
+     router: torch.Tensor      # [E, D] bf16
+     bias: torch.Tensor        # [E] fp32
+-    experts: grouped.Experts | Exl3Experts  # 4-bit: E + 1 (shared expert last); EXL3: the E routed experts
++    experts: grouped.Experts | Exl3Experts | None  # 4-bit: E + 1 (shared expert last); EXL3: the E routed experts;
++    #                              None: the AFD attention node's world-1 EXL3 load, the routed experts being remote
+     shared: MLPW | None = None            # EXL3 checkpoints: the shared expert (BF16)
+ 
+ 
+@@ -222,6 +223,7 @@ class Weights:
+     comm: Any = None
+     meta: dict = field(default_factory=dict)
+     draft_head: Q4 | None = None      # BF16 heads: a 4-bit copy the draft steps read (drafts only propose)
++    afd: Any = None                   # the AFD wire on the attention node (engine.AfdEngine); None: a plain rank
+ 
+     @property
+     def vocab_offset(self) -> int:
+@@ -255,18 +257,23 @@ class Weights:
+         return total
+ 
+ 
+-def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = True) -> Weights:
+-    """One of two ranks from a checkpoint or rank folder, MTP included unless ``mtp`` is False, with its head half."""
++def load(model_dir: str | Path, *, rank: int, world: int = 2, device: str = "cuda", mtp: bool = True,
++         experts: bool = True) -> Weights:
++    """One of ``world`` ranks from a checkpoint or rank folder, MTP included unless ``mtp`` is False, with its head
++    half; ``world = 1`` reads every tensor whole and, with ``experts = False``, leaves the MoE layers'
++    ``mlp.experts.*`` unread (the AFD attention node: the routed experts live on the expert nodes)."""
+ 
+     from .split import RankReader
+ 
+-    world = 2
+     cfg = Config.read(model_dir)
+     if cfg.quant not in ("mlx", "exl3"):
+         raise ValueError(f"GLM-5.3-Flash's CUDA engine reads MLX 4-bit or EXL3 checkpoints, not {cfg.quant}")
+     exl3 = cfg.quant == "exl3"
++    if not experts and not exl3:
++        raise ValueError("experts=False (the AFD attention node) reads EXL3 checkpoints, whose shared expert stays on "
++                         "the attention node")
+     dev = torch.device(device)
+-    rd = RankReader(model_dir, rank)
++    rd = RankReader(model_dir, rank, world=world)
+     HL = cfg.heads // world
+     LL = cfg.lin_heads // world
+ 
+@@ -340,7 +347,8 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+         p, parts = PREFIX + f"layers.{i}.mlp.", ("trellis", "suh", "svh") if exl3 else ("weight", "scales", "biases")
+         names = []
+         for proj in ("gate_proj", "up_proj", "down_proj"):
+-            names += [p + f"experts.{e}.{proj}.{x}" for e in range(cfg.experts) for x in parts]
++            if experts:
++                names += [p + f"experts.{e}.{proj}.{x}" for e in range(cfg.experts) for x in parts]
+             if not exl3:
+                 names += [p + f"shared_experts.{proj}.{x}" for x in parts]
+         return names
+@@ -375,7 +383,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool =
+         router = t(p + "gate.weight", torch.bfloat16).contiguous()
+         bias = t(p + "gate.e_score_correction_bias", torch.float32).contiguous()
+         if exl3:
+-            return MoEW(router, bias, moe_exl3(p), mlp(p + "shared_experts."))
++            return MoEW(router, bias, moe_exl3(p) if experts else None, mlp(p + "shared_experts."))
+         parts = {}
+         for proj in ("gate_proj", "up_proj", "down_proj"):
+             ws, ss, bs = [], [], []
+diff --git a/tests/cuda/test_glm_afd.py b/tests/cuda/test_glm_afd.py
+new file mode 100644
+index 0000000..e40c677
+--- /dev/null
++++ b/tests/cuda/test_glm_afd.py
+@@ -0,0 +1,82 @@
++"""The AFD expert halves sum to the local MoE, offline (no network).
++
++One GPU plays every role: the two-rank ``moe_block`` partials are the reference, the halves' ``compute`` outputs
++( shared slot zeroed) plus the world-1 shared expert are the AFD sum.
++"""
++
++from __future__ import annotations
++
++import numpy as np
++import pytest
++import torch
++
++if not torch.cuda.is_available():
++    pytest.skip("CUDA only", allow_module_level=True)
++
++from test_glm_engine import _checkpoint  # noqa: E402  (the synthetic EXL3 checkpoint builder)
++
++from tensorfold.families.glm5_next.cuda import forward as fwd  # noqa: E402
++from tensorfold.families.glm5_next.cuda import glue  # noqa: E402
++from tensorfold.families.glm5_next.cuda.experts_node import ExpertNode  # noqa: E402
++from tensorfold.families.glm5_next.cuda.forward import Buffers  # noqa: E402
++from tensorfold.families.glm5_next.cuda.weights import load  # noqa: E402
++
++ROWS = (1, 4, 8, 64)
++LAYER = 1                                    # the synthetic checkpoint's MoE layer (mtp=False drops the other)
++
++
++@pytest.fixture(scope="module")
++def afd(tmp_path_factory):
++    path = tmp_path_factory.mktemp("afd")
++    _checkpoint(path, exl3=True, mtp=False)
++    ranks = [load(path, rank=h) for h in (0, 1)]
++    attn = load(path, rank=0, world=1, experts=False)
++    nodes = [ExpertNode(path, h, [LAYER]) for h in (0, 1)]
++    bufs = [Buffers(w, max(ROWS)) for w in ranks] + [Buffers(attn, max(ROWS))]
++    return attn, ranks, nodes, bufs
++
++
++def _pieces(afd, x, R):
++    """The two-rank moe_block partials, the halves' routed outputs and the world-1 shared expert, in order."""
++
++    attn, ranks, nodes, bufs = afd
++    c = attn.cfg
++    parts = []
++    for w, b in zip(ranks, bufs[:2]):
++        b.normed[:R].copy_(x)
++        fwd.moe_block(w.layers[LAYER], w, b, R)
++        parts.append(b.part[:R].clone())
++    ba = bufs[2]
++    m = attn.layers[LAYER].moe
++    ba.normed[:R].copy_(x)
++    glue.router(ba.normed[:R], m.router, ba.mlog[:R])
++    glue.select(ba.mlog[:R], m.bias, ba.pick[:R], ba.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
++    fwd.mm(ba, ba.normed[:R], m.shared.gu, ba.xs[:R], ba.sgu[:R])
++    glue.swiglu(ba.sgu[:R], ba.sact[:R], ba.sxs[:R], c.limit)
++    fwd.mm(ba, ba.sact[:R], m.shared.down, ba.sxs[:R], ba.sy[:R], f32=True)
++    routed = []
++    for node in nodes:
++        nb = node.buf
++        nb.normed[:R].copy_(x)
++        nb.pick[:R].copy_(ba.pick[:R])
++        nb.wts[:R].copy_(ba.wts[:R])
++        routed.append(node.compute(LAYER, R).clone())
++    return parts, routed, ba.sy[:R].clone()
++
++
++@pytest.mark.parametrize("R", ROWS)
++def test_halves_sum_to_local_moe(afd, R):
++    """routed0 + routed1 + sy equals part0 + part1 within fp32 reassociation, and every piece re-runs bit-exact."""
++
++    attn, ranks, nodes, bufs = afd
++    hidden = attn.cfg.hidden
++    x = torch.tensor(np.random.default_rng(7).standard_normal((R, hidden)) * 0.5).to("cuda", torch.bfloat16)
++    parts, routed, sy = _pieces(afd, x, R)
++    ref, afd_sum = parts[0] + parts[1], (routed[0] + routed[1]) + sy
++    scale = float(ref.abs().max())
++    err = float((afd_sum - ref).abs().max())
++    assert err <= 1e-3 * scale, (err, err / scale)
++    parts2, routed2, sy2 = _pieces(afd, x, R)
++    for a, b in [(parts2[0], parts[0]), (parts2[1], parts[1]), (routed2[0], routed[0]), (routed2[1], routed[1]),
++                 (sy2, sy)]:
++        assert torch.equal(a, b)
+diff --git a/tests/glm_afd_fakes.py b/tests/glm_afd_fakes.py
+new file mode 100644
+index 0000000..a517239
+--- /dev/null
++++ b/tests/glm_afd_fakes.py
+@@ -0,0 +1,389 @@
++"""CPU stand-ins for the AFD wire tests (``tests/test_glm_afd_*.py``).
++
++A fake mcdma-rpcd pair over real protocol-1 mailbox files (on one host the connect and listen mailboxes are the same
++file, and the "listen daemon" copies each new staged word to the done word while a service is attached), an ABI-1
++libmcdma-rpc stand-in compiled here (unless ``TF_AFD_MCDMA_LIB`` names a build), a fake CUDA driver whose stream runs
++its memory operations in order on the host, fake expert halves, and the attention node's real ``AfdWire`` over
++the MCDMA wire.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import mmap
++import os
++import shutil
++import socket
++import struct
++import subprocess
++import threading
++import time
++from datetime import timedelta
++from types import SimpleNamespace
++
++import pytest
++
++torch = pytest.importorskip("torch")
++
++from tensorfold.families.glm5_next.cuda import afd as afd_mod  # noqa: E402
++from tensorfold.families.glm5_next.cuda import afd_mcdma, mcdma  # noqa: E402
++
++D, S = 64, 9                       # a small hidden size; GLM's 8 routed slots + the shared slot
++LAYERS = [3, 4, 5, 6]              # the experts' MoE layer indices (three dense layers first, as GLM)
++PREFILL = 48
++STAND_IN = r"""
++#define _POSIX_C_SOURCE 200809L
++#include <stdint.h>
++#include <time.h>
++uint32_t mcdma_rpc_abi(void) { return 1u; }
++static uint64_t ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
++                           return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
++uint64_t mcdma_rpc_wait_word(const volatile uint64_t *w, uint32_t seq, int eq, uint64_t spin, uint64_t limit) {
++    uint64_t t0 = ns();
++    for (;;) {
++        uint64_t v = __atomic_load_n(w, __ATOMIC_ACQUIRE);
++        uint32_t s = (uint32_t)(v >> 32);
++        if (eq ? s == seq : (s != 0 && s != seq)) return v;
++        uint64_t e = ns() - t0;
++        if (e >= limit) return 0;
++        if (e >= spin) { struct timespec p = {0, 20000}; nanosleep(&p, 0); }
++    }
++}
++void mcdma_rpc_store_word(volatile uint64_t *w, uint64_t v) { __atomic_store_n(w, v, __ATOMIC_RELEASE); }
++"""
++
++
++# -- fixtures (registered by name; tests import the functions under these private names) --------------------------
++@pytest.fixture(scope="module", name="libpath")
++def libpath_fixture(tmp_path_factory):
++    path = os.environ.get(mcdma.LIB_ENV, "")
++    if path:
++        return path
++    cc = shutil.which("cc") or shutil.which("gcc")
++    if cc is None:
++        pytest.skip("no libmcdma-rpc (set TF_AFD_MCDMA_LIB) and no C compiler for the stand-in")
++    d = tmp_path_factory.mktemp("lib")
++    (d / "stand_in.c").write_text(STAND_IN)
++    subprocess.run([cc, "-std=c11", "-O2", "-shared", "-fPIC", "-o", str(d / "libmcdma-rpc.so"), str(d / "stand_in.c")],
++                   check=True)
++    return str(d / "libmcdma-rpc.so")
++
++
++@pytest.fixture(name="words")
++def words_fixture(libpath):
++    return mcdma.Words(libpath)
++
++
++@pytest.fixture(name="env")
++def env_fixture(monkeypatch, libpath, tmp_path):
++    monkeypatch.setenv(mcdma.LIB_ENV, libpath)
++    monkeypatch.setenv(mcdma.SPIN_ENV, "200")
++    monkeypatch.setenv(mcdma.SHM_ENV, str(tmp_path / "shm"))
++    monkeypatch.delenv(mcdma.SOCKET_ENV, raising=False)
++    return monkeypatch
++
++
++@pytest.fixture(name="daemon")
++def daemon_fixture(tmp_path):
++    d = FakeDaemon(tmp_path, ["a2", "a1"])
++    yield d
++    d.close()
++
++
++@pytest.fixture(name="master")
++def master_fixture(monkeypatch):
++    """The attention's store (rank 0's TCPStore) on a free port; AfdWire's own watchdog sleeps (the tests drive it)."""
++
++    from torch.distributed import TCPStore
++
++    monkeypatch.setattr(afd_mod, "WATCH_EVERY", 3600)
++    port = free_port()
++    server = TCPStore("127.0.0.1", port, 1, True, timeout=timedelta(seconds=30), wait_for_workers=False)
++    yield port
++    del server
++
++
++def free_port() -> int:
++    with socket.socket() as s:
++        s.bind(("127.0.0.1", 0))
++        return s.getsockname()[1]
++
++
++# -- the MCDMA daemons and the CUDA driver --------------------------------------------------------------------------
++class FakeDaemon:
++    """Both daemons of each link on one host: the mailbox file (sizes at +256, link-up 1, generation 1), the listen
++    socket (MODE poll -> OK, one service at a time, else ERR busy; its last-sent sequence taken from the staged word at
++    attach), and the reply path (a new staged word -> the done word, while a service is attached)."""
++
++    def __init__(self, root, names, req=4 << 20, rep=4 << 20) -> None:
++        self.shm = root / "shm"
++        self.shm.mkdir(exist_ok=True)
++        self.tag = f"afdm-{os.getpid()}-{id(self):x}"     # abstract sockets: test paths outgrow sun_path
++        self.req, self.rep = req, rep
++        self.mm, self.listeners, self.svc, self.last, self.stalled = {}, {}, {}, {}, set()
++        self.stop = threading.Event()
++        for n in names:
++            path = self.shm / f"mcdma-rpc.{n}"
++            with open(path, "wb") as f:
++                f.truncate(req + rep)
++            fd = os.open(path, os.O_RDWR)
++            m = mmap.mmap(fd, req + rep)
++            os.close(fd)
++            struct.pack_into("<QQ", m, mcdma.SIZES, req, rep)
++            struct.pack_into("<Q", m, mcdma.GENERATION, 1)
++            struct.pack_into("<Q", m, mcdma.LINK_UP, 1)
++            self.mm[n], self.svc[n], self.last[n] = m, None, 0
++            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++            s.bind(self.sock(n))
++            s.listen(4)
++            s.settimeout(0.1)
++            self.listeners[n] = s
++            threading.Thread(target=self._accept, args=(n,), daemon=True).start()
++        threading.Thread(target=self._replies, daemon=True).start()
++
++    def sock(self, n) -> str:
++        return f"\0{self.tag}-{n}"
++
++    def u64(self, n, off) -> int:
++        return struct.unpack_from("<Q", self.mm[n], off)[0]
++
++    def put(self, n, off, v) -> None:
++        struct.pack_into("<Q", self.mm[n], off, v)
++
++    def _accept(self, n) -> None:
++        while not self.stop.is_set():
++            try:
++                c, _ = self.listeners[n].accept()
++            except (TimeoutError, socket.timeout, OSError):
++                continue
++            c.settimeout(2)
++            line = c.recv(64).strip()
++            if line == b"MODE poll" and self.svc[n] is None:
++                c.sendall(b"OK\n")
++                self.last[n] = self.u64(n, self.req + mcdma.STAGED) >> 32
++                self.svc[n] = c
++            else:
++                c.sendall(b"ERR busy\n")
++                c.close()
++
++    def _replies(self) -> None:
++        while not self.stop.is_set():
++            for n, m in self.mm.items():
++                if self.svc[n] is None or n in self.stalled:
++                    continue
++                w = self.u64(n, self.req + mcdma.STAGED)
++                if w >> 32 and (w >> 32) != self.last[n]:
++                    self.last[n] = w >> 32
++                    self.put(n, self.req + mcdma.DONE, w)
++            time.sleep(0.00002)
++
++    def bye(self, n) -> None:
++        c, self.svc[n] = self.svc[n], None
++        if c is not None:
++            try:
++                c.sendall(b"BYE\n")
++            finally:
++                c.close()
++
++    def reconnect(self, n) -> None:
++        """The connect daemon's reconnect: words cleared, generation bumped, link up again."""
++
++        self.put(n, mcdma.REQ_WORD, 0)
++        self.put(n, self.req + mcdma.DONE, 0)
++        self.put(n, mcdma.GENERATION, self.u64(n, mcdma.GENERATION) + 1)
++
++    def replace(self, n) -> None:
++        """A restarted connect daemon: the old mailbox unlinked, a new one (a new inode) under the same path."""
++
++        path = self.shm / f"mcdma-rpc.{n}"
++        os.unlink(path)
++        with open(path, "wb") as f:
++            f.truncate(self.req + self.rep)
++
++    def close(self) -> None:
++        for n in list(self.svc):
++            self.bye(n)
++        self.stop.set()
++        for s in self.listeners.values():
++            s.close()
++
++
++class FakeDriver:
++    """The CUDA driver as one in-order host stream: write-value stores now, wait-value spins until the whole word
++    is equal (as CU_STREAM_WAIT_VALUE_EQ), registered memory's device pointer is its host address (UVA)."""
++
++    def __init__(self, words, flush=0) -> None:
++        self.words, self.flush, self.ops = words, flush, []
++
++    def attr(self, name, ordinal=0) -> int:
++        return self.flush if name == "can_flush_remote_writes" else 1
++
++    def register(self, addr, size) -> int:
++        self.ops.append(("register", addr, size))
++        return addr
++
++    def unregister(self, addr) -> None:
++        pass
++
++    def write64(self, stream, dptr, value) -> None:
++        self.ops.append(("write", dptr, value))
++        self.words.store(dptr, value)
++
++    def wait64(self, stream, dptr, value, flags=mcdma.CU_STREAM_WAIT_VALUE_EQ) -> None:
++        self.ops.append(("wait", dptr, value, flags))
++        end = time.monotonic() + 20
++        while ctypes.c_uint64.from_address(dptr).value != value:
++            if time.monotonic() > end:
++                raise AssertionError(f"fake stream wedged waiting for {value:#x}")
++            time.sleep(0.0001)
++
++
++def partial(normed, pick, wts, layer: int, half: int):
++    """The fake expert half's output: depends on every request byte, the layer and the half."""
++
++    return normed.float() * (layer + 1 + 10 * half) + (pick.float() * wts).sum(dim=1, keepdim=True)
++
++
++class FakeNode:
++    """An expert half: ``compute`` writes ``partial`` into its routed slot; ``inputs`` keeps every request it read."""
++
++    def __init__(self, layers, half: int, prefill: int = PREFILL, record: bool = False) -> None:
++        self.cfg = SimpleNamespace(hidden=D, top_k=S - 1, limit=0.0)
++        self.layers, self.half, self.record = list(layers), half, record
++        self.buf = SimpleNamespace(slots=S, prefill_rows=prefill,
++                                   normed=torch.zeros((prefill, D), dtype=torch.bfloat16),
++                                   pick=torch.zeros((prefill, S), dtype=torch.int32),
++                                   wts=torch.zeros((prefill, S), dtype=torch.float32),
++                                   routed=torch.zeros((prefill, D), dtype=torch.float32))
++        self.seen, self.inputs = [], []
++
++    def compute(self, layer_i, R, x=None):
++        b = self.buf
++        normed, pick, wts = x if x is not None else (b.normed[:R], b.pick[:R], b.wts[:R])
++        b.routed[:R].copy_(partial(normed, pick, wts, layer_i, self.half))
++        self.seen.append((layer_i, R))
++        if self.record:
++            self.inputs.append((layer_i, R, normed.clone(), pick.clone(), wts.clone()))
++        return b.routed[:R]
++
++
++class Expert:
++    """``experts_node.forwards`` over one expert link in a thread; ``error`` holds what ended it."""
++
++    def __init__(self, link, node, store=None) -> None:
++        self.link, self.node, self.error = link, node, None
++        self.store = store or DictStore()
++        self.t = threading.Thread(target=self._run, daemon=True)
++        self.t.start()
++
++    def _run(self) -> None:
++        from tensorfold.families.glm5_next.cuda import experts_node
++
++        try:
++            experts_node.forwards(self.node, self.link, self.store, self.node.half + 1)
++        except BaseException as exc:  # noqa: BLE001
++            self.error = exc
++
++    def join(self, s=5.0) -> None:
++        self.t.join(s)
++        assert not self.t.is_alive(), "expert loop did not end"
++
++
++class DictStore:
++    def __init__(self) -> None:
++        self.d = {}
++
++    def set(self, k, v) -> None:
++        self.d[k] = v if isinstance(v, bytes) else str(v).encode()
++
++    def get(self, k):
++        if k not in self.d:
++            raise KeyError(k)
++        return self.d[k]
++
++
++def fake_cfg():
++    return SimpleNamespace(hidden=D, top_k=S - 1, mlp_kinds=["dense"] * 3 + ["moe"] * len(LAYERS), quant="exl3",
++                           experts=16, limit=0.0)
++
++
++def settings(prefill=PREFILL, layers=LAYERS):
++    return {"digest": "", "layers": list(layers), "max_rows": 8, "mtp": 0,
++            "prefill_rows": prefill, "quant": "exl3", "experts": 16, "top_k": S - 1}
++
++
++# -- the attention node ---------------------------------------------------------------------------------------------
++def mcdma_attention(links, port, layers=LAYERS, prefill=PREFILL):
++    """``AfdWire`` over ``McdmaTransport`` on the CPU (the test hosts the store; ``abort`` releases the links)."""
++
++    tr = afd_mcdma.McdmaTransport("127.0.0.1", port, links=links, comm=SimpleNamespace(abort=links.release),
++                                  device="cpu", hidden=D)
++    a = afd_mod.AfdWire("127.0.0.1", port, transport=tr)
++    a.announce(settings(prefill, layers))
++    return a
++
++
++def buffers(rows=PREFILL):
++    return SimpleNamespace(normed=torch.zeros((rows, D), dtype=torch.bfloat16),
++                           pick=torch.zeros((rows, S), dtype=torch.int32),
++                           wts=torch.zeros((rows, S), dtype=torch.float32),
++                           sy=torch.zeros((rows, D), dtype=torch.float32),
++                           afd_recv=torch.zeros((3 * rows * D,), dtype=torch.float32))
++
++
++def forward(a, b, rows, gen, layers=LAYERS, chunk=False, stop_after=None) -> list:
++    """One forward's MoE exchanges with fresh wire tensors; checks every reply against the fake experts' function and
++    returns each layer's ``[3, rows, D]`` (copies)."""
++
++    a.begin(rows, chunk=chunk)
++    out = []
++    for pos, layer in enumerate(layers):
++        if stop_after is not None and pos == stop_after:
++            return out
++        b.normed[:rows] = torch.randn((rows, D), generator=gen).to(torch.bfloat16)
++        b.pick[:rows] = torch.randint(0, 16, (rows, S), generator=gen, dtype=torch.int32)
++        b.wts[:rows] = torch.rand((rows, S), generator=gen)
++        b.sy[:rows] = torch.randn((rows, D), generator=gen)
++        a.exchange(b, rows)
++        got = a.collect(b, rows, D)
++        assert got.shape == (3, rows, D)
++        for half in (0, 1):
++            want = partial(b.normed[:rows], b.pick[:rows], b.wts[:rows], layer, half)
++            assert torch.equal(got[half], want), f"layer {layer} half {half} rows {rows}"
++        assert torch.equal(got[2], b.sy[:rows])
++        out.append(got.clone())
++    return out
++
++
++def setup_pair(daemon, words, *, attn="cpu", experts=("cpu", "cpu"), timeout=10.0, before_experts=None,
++               record=False):
++    """Both MCDMA links' attention end, and both experts' loops over their own ends."""
++
++    drv = FakeDriver(words)
++    links = mcdma.AttentionLinks(["a2", "a1"], words=words, driver=drv if attn == "gpu" else None, mode=attn,
++                                 stream=lambda: 0, timeout=timeout, shm_dir=str(daemon.shm), linkup_wait=2)
++    if before_experts:
++        before_experts(links)
++    eps = []
++    for half, (name, mode) in enumerate(zip(["a2", "a1"], experts)):
++        link = mcdma.ExpertLink(name, words=words, driver=drv if mode == "gpu" else None, mode=mode,
++                                socket_path=daemon.sock(name), shm_dir=str(daemon.shm), stream=lambda: 0)
++        link.base = links.base[half]
++        end = afd_mcdma.McdmaExpertLink(link, D, S, len(LAYERS), PREFILL, device="cpu")
++        eps.append(Expert(end, FakeNode(LAYERS, half, record=record)))
++    return links, eps, drv
++
++
++def wait_attached(daemon, names=("a2", "a1"), s=5.0) -> None:
++    end = time.monotonic() + s
++    while any(daemon.svc[n] is None for n in names):
++        assert time.monotonic() < end, "service never attached"
++        time.sleep(0.01)
++
++
++def finish(daemon, eps) -> None:
++    for n in ("a2", "a1"):
++        daemon.bye(n)
++    for e in eps:
++        e.join()
++        assert isinstance(e.error, mcdma.LinkError) and "BYE" in str(e.error), repr(e.error)
+diff --git a/tests/test_glm_afd_mcdma.py b/tests/test_glm_afd_mcdma.py
+new file mode 100644
+index 0000000..ef673b0
+--- /dev/null
++++ b/tests/test_glm_afd_mcdma.py
+@@ -0,0 +1,319 @@
++"""The MCDMA AFD wire end to end on one host, CPU only: the attention's ``AfdWire`` over
++``McdmaTransport`` and the experts' ``forwards`` loops over ``McdmaExpertLink``, through a fake mcdma-rpcd pair
++(``glm_afd_fakes``)."""
++
++from __future__ import annotations
++
++import json
++import struct
++import threading
++import time
++
++import pytest
++
++torch = pytest.importorskip("torch")
++
++from tensorfold.families.glm5_next.cuda import afd as afd_mod  # noqa: E402
++from tensorfold.families.glm5_next.cuda import afd_mcdma, mcdma  # noqa: E402
++from tensorfold.server.errors import CapacityError  # noqa: E402
++from tests.glm_afd_fakes import (D, LAYERS, PREFILL, S, FakeDaemon, FakeDriver, FakeNode, buffers,  # noqa: E402
++                                 fake_cfg, finish, forward, free_port, mcdma_attention, settings, setup_pair,
++                                 wait_attached)
++from tests.glm_afd_fakes import (daemon_fixture, env_fixture, libpath_fixture, master_fixture,  # noqa: E402, F401
++                                 words_fixture)
++
++
++# -- the protocol's arithmetic ---------------------------------------------------------------------------------------
++def test_sequence_never_zero_and_wraps():
++    assert mcdma.next_seq(1) == 2 and mcdma.next_seq(0) == 1
++    assert mcdma.next_seq(mcdma.SEQ_MAX) == 1 and mcdma.prev_seq(1) == mcdma.SEQ_MAX
++    s, seen = mcdma.SEQ_MAX - 2, []
++    for _ in range(6):
++        s = mcdma.next_seq(s)
++        seen.append(s)
++    assert seen == [mcdma.SEQ_MAX - 1, mcdma.SEQ_MAX, 1, 2, 3, 4] and 0 not in seen
++    assert all(a != b for a, b in zip(seen, seen[1:]))        # consecutive requests always differ (the daemon's test)
++    w = mcdma.word(0xFFFFFFFF, 16384)
++    assert mcdma.word_seq(w) == 0xFFFFFFFF and mcdma.word_len(w) == 16384
++
++
++def test_layout_for_glm_and_the_mailbox_sizes():
++    lay = mcdma.Layout(4096, 9)
++    assert lay.req(1) == 256 + 8192 + 256 + 36 and lay.rep(1) == 16384
++    assert all(o % 256 == 0 for r in (1, 3, 8, 2048) for o in lay.offsets(r)[:3])
++    assert lay.mib(8) == (4, 4) and lay.mib(2048) == (20, 36)     # the daemons' req_mib, rep_mib
++
++
++def test_packed_request_round_trips_through_the_landing_views():
++    lay, rows, gen = mcdma.Layout(D, S), 5, torch.Generator().manual_seed(1)
++    normed = torch.randn((rows, D), generator=gen).to(torch.bfloat16)
++    pick = torch.randint(0, 16, (rows, S), generator=gen, dtype=torch.int32)
++    wts = torch.rand((rows, S), generator=gen)
++    req = torch.empty((lay.req(rows),), dtype=torch.uint8)
++    hdr = torch.zeros((mcdma.HDR_INTS,), dtype=torch.int32)
++    torch.cat([hdr.view(torch.uint8), afd_mcdma._bytes(normed), afd_mcdma._bytes(pick),
++               torch.zeros((lay.pad(rows),), dtype=torch.uint8), afd_mcdma._bytes(wts)], out=req)
++    n2, p2, w2 = lay.views(req[mcdma.HDR_BYTES:].clone(), rows)
++    assert torch.equal(n2, normed) and torch.equal(p2, pick) and torch.equal(w2, wts)
++
++
++# -- mailboxes ----------------------------------------------------------------------------------------------------
++def test_mailbox_reads_the_daemon_layout_and_refuses_what_does_not_fit(daemon, words, tmp_path):
++    box = mcdma.Mailbox("a2", words, str(daemon.shm))
++    assert (box.req, box.rep) == (4 << 20, 4 << 20) and box.plain(mcdma.LINK_UP) == 1
++    box.check_room(mcdma.Layout(4096, 9), 8)
++    with pytest.raises(mcdma.LinkError, match="req_mib>=20 rep_mib>=36"):
++        box.check_room(mcdma.Layout(4096, 9), 2048)
++    with pytest.raises(mcdma.LinkError, match="--ipc=host"):
++        mcdma.Mailbox("nope", words, str(daemon.shm))
++
++
++def test_announce_refuses_a_window_the_mailboxes_cannot_carry(tmp_path, words):
++    d = FakeDaemon(tmp_path, ["b2", "b1"])
++    try:
++        links = mcdma.AttentionLinks(["b2", "b1"], words=words, shm_dir=str(d.shm), linkup_wait=2)
++        tr = afd_mcdma.McdmaTransport("", 0, links=links, comm=object(), device="cpu", hidden=4096)
++        with pytest.raises(mcdma.LinkError, match="req_mib>=20 rep_mib>=36"):
++            tr.publish(settings(prefill=2048))         # GLM's hidden 4096 at 2048 rows: past the fake's 4+4 MiB
++    finally:
++        d.close()
++
++
++# -- the exchange, end to end -------------------------------------------------------------------------------------
++@pytest.mark.parametrize("attn,experts", [("cpu", ("cpu", "cpu")), ("gpu", ("gpu", "gpu")), ("gpu", ("cpu", "gpu")),
++                                          ("cpu", ("gpu", "cpu"))])
++def test_exchange_end_to_end(env, daemon, words, master, attn, experts):
++    links, eps, drv = setup_pair(daemon, words, attn=attn, experts=experts)
++    wait_attached(daemon)
++    a, b, gen = mcdma_attention(links, master), buffers(), torch.Generator().manual_seed(7)
++    plan = [1, 3, 8, 1, PREFILL, 2]
++    for rows in plan:
++        forward(a, b, rows, gen, chunk=rows > 8)
++    n = len(plan) * len(LAYERS)
++    assert links.count == [n, n]
++    for k, e in enumerate(eps):                       # every request served in order, the sequence in step
++        assert e.node.seen == [(i, r) for r in plan for i in LAYERS]
++        assert mcdma.word_seq(words.load(links.boxes[k].done)) == links.seq[k]
++        assert links.seq[k] == (links.base[k] + n - 1) % (mcdma.SEQ_MAX + 1)
++    if attn == "gpu":                                 # the stream did it: per layer two writes, two EQ waits
++        writes = [op for op in drv.ops if op[0] == "write" and op[1] in (links.dptr[0], links.dptr[1])]
++        waits = [op for op in drv.ops if op[0] == "wait" and op[1] in [links.boxes[k].done for k in (0, 1)]]
++        assert len(writes) == 2 * n and len(waits) == 2 * n
++        assert all(op[3] == mcdma.CU_STREAM_WAIT_VALUE_EQ for op in waits)
++    assert links.health() == "" and a.tr.health() is None
++    finish(daemon, eps)
++
++
++def test_sequence_wrap_on_the_wire(env, daemon, words, master):
++    def stale(links):                                  # a previous run's last request was 2**32 - 2
++        for k, box in enumerate(links.boxes):
++            words.store(box.req_word, mcdma.word(mcdma.SEQ_MAX - 1, 100))
++            links.base[k] = mcdma.next_seq(mcdma.SEQ_MAX - 1)
++            links.seq[k] = mcdma.prev_seq(links.base[k])
++
++    links, eps, _ = setup_pair(daemon, words, attn="gpu", experts=("gpu", "cpu"), before_experts=stale)
++    assert links.base == [mcdma.SEQ_MAX, mcdma.SEQ_MAX]
++    wait_attached(daemon)
++    a, b, gen = mcdma_attention(links, master), buffers(), torch.Generator().manual_seed(3)
++    for rows in (1, 2):
++        forward(a, b, rows, gen)
++    assert links.seq == [2 * len(LAYERS) - 1] * 2     # 2**32-1, then 1, 2, ...: past the wrap, never 0
++    finish(daemon, eps)
++
++
++def test_a_stale_staged_word_cannot_swallow_the_first_reply(env, daemon, words, master):
++    """The listen daemon takes the staged word's sequence at attach as already sent; the expert clears it first."""
++
++    def stale(links):
++        for k, n in enumerate(("a2", "a1")):
++            daemon.put(n, daemon.req + mcdma.STAGED, mcdma.word(links.base[k], mcdma.Layout(D, S).rep(1)))
++
++    links, eps, _ = setup_pair(daemon, words, before_experts=stale)
++    wait_attached(daemon)
++    forward(mcdma_attention(links, master), buffers(), 1, torch.Generator().manual_seed(5))
++    finish(daemon, eps)
++
++
++def test_the_bases_the_settings_and_the_startup_line(env, daemon, words, master, capsys):
++    links, eps, _ = setup_pair(daemon, words)
++    a = mcdma_attention(links, master)
++    for peer, base in zip((1, 2), links.base):        # start(): each expert counts its link's sequence from here
++        assert int(bytes(a.store.get(f"afd_mcdma/base/{peer}")).decode()) == base
++    line = [ln for ln in capsys.readouterr().out.splitlines() if "afd transport" in ln]
++    assert line == [f"[tensorfold] afd transport mcdma, cpu-driven: link a2 -> expert 1, a1 -> expert 2; mailboxes "
++                    f"4+4 MiB; first sequences {links.base}; generations [1, 1]; no NCCL communicator"]
++    sent = json.loads(bytes(a.store.get("afd_settings")).decode())
++    assert sent == dict(settings(), transport="mcdma", mcdma_links=["a2", "a1"])
++    finish(daemon, eps)
++
++
++# -- failure detection --------------------------------------------------------------------------------------------
++def test_generation_change_fails_the_wait(env, daemon, words, master):
++    links, eps, _ = setup_pair(daemon, words, timeout=30)
++    wait_attached(daemon)
++    a, b, gen = mcdma_attention(links, master), buffers(), torch.Generator().manual_seed(2)
++    forward(a, b, 1, gen)
++    daemon.stalled.add("a2")
++    threading.Timer(0.3, daemon.reconnect, args=("a2",)).start()
++    with pytest.raises(CapacityError, match="restart the serving stack"):
++        forward(a, b, 1, gen)
++    assert a.dead.startswith("MCDMA ") and "reconnected (generation 1 -> 2)" in a.dead
++    with pytest.raises(CapacityError):
++        a.begin(1)
++    finish(daemon, eps)
++
++
++def test_cpu_wait_times_out_on_a_hung_expert(env, daemon, words, master):
++    links, eps, _ = setup_pair(daemon, words, timeout=0.5)
++    wait_attached(daemon)
++    a, b = mcdma_attention(links, master), buffers()
++    daemon.stalled.add("a1")                           # rank 2's replies never land: a hung expert or daemon
++    t0 = time.monotonic()
++    with pytest.raises(CapacityError):
++        forward(a, b, 1, torch.Generator().manual_seed(4))
++    assert time.monotonic() - t0 < 5
++    assert "link a1" in a.dead and ("no reply" in a.dead or "unanswered" in a.dead)
++    finish(daemon, eps)
++
++
++def test_gpu_mode_watchdog_releases_the_stream(env, daemon, words, master):
++    links, eps, drv = setup_pair(daemon, words, attn="gpu", experts=("cpu", "cpu"), timeout=0.3)
++    wait_attached(daemon)
++    a, b = mcdma_attention(links, master), buffers()
++    daemon.stalled.add("a2")
++
++    def watchdog():                                    # AfdWire._watchdog's transport check, faster
++        while a.dead is None:
++            why = a.tr.health()
++            if why:
++                a.die(why)
++            time.sleep(0.05)
++
++    threading.Thread(target=watchdog, daemon=True).start()
++    a.begin(1)
++    b.normed[:1] = 1
++    a.exchange(b, 1)
++    a.collect(b, 1, D)                                 # the stream's wait was answered by the release, not wedged
++    assert a.dead and a.dead.startswith("MCDMA ") and "unanswered" in a.dead
++    assert words.load(links.boxes[0].done) == mcdma.word(links.seq[0], 4 * D)
++    a.exchange(b, 1)                                   # the forward runs on without the wire, no new waits
++    a.collect(b, 1, D)
++    with pytest.raises(CapacityError, match="gone"):
++        a.begin(1)
++    daemon.stalled.discard("a2")
++    finish(daemon, eps)
++
++
++def test_link_down_is_reported(env, daemon, words, master):
++    links, eps, _ = setup_pair(daemon, words)
++    a = mcdma_attention(links, master)
++    daemon.put("a1", mcdma.LINK_UP, 0)
++    assert "link a1 is down" in links.health() and a.tr.health() == f"MCDMA {links.health()}"
++    daemon.put("a1", mcdma.LINK_UP, 1)
++    assert links.health() == "" and a.tr.health() is None
++    finish(daemon, eps)
++
++
++def test_a_replaced_mailbox_is_reported(env, daemon, words):
++    links, eps, _ = setup_pair(daemon, words)
++    daemon.replace("a2")
++    assert "mailbox" in links.health() and "replaced" in links.health()
++    finish(daemon, eps)
++
++
++def test_link_must_come_up(env, daemon, words):
++    daemon.put("a2", mcdma.LINK_UP, 0)
++    with pytest.raises(mcdma.LinkError, match="not up"):
++        mcdma.AttentionLinks(["a2", "a1"], words=words, shm_dir=str(daemon.shm), linkup_wait=0.3)
++
++
++def test_registration_busy_and_bye(env, daemon, words):
++    links, eps, _ = setup_pair(daemon, words)
++    wait_attached(daemon)
++    with pytest.raises(mcdma.LinkError, match="ERR busy"):
++        mcdma.ExpertLink("a2", words=words, socket_path=daemon.sock("a2"), shm_dir=str(daemon.shm))
++    with pytest.raises(mcdma.LinkError, match="cannot register"):
++        mcdma.ExpertLink("a2", words=words, socket_path=daemon.sock("none"), shm_dir=str(daemon.shm))
++    finish(daemon, eps)                                # BYE ends both loops with a LinkError naming it
++
++
++def test_expert_refuses_a_bad_first_request(env, daemon, words):
++    links, eps, _ = setup_pair(daemon, words)
++    wait_attached(daemon)
++    box = links.boxes[0]
++    struct.pack_into(mcdma.HDR_FMT, box.mm, mcdma.CTRL, 0x1234, 1, 1, 0, afd_mod.MODE_EAGER, len(LAYERS), 0, 0)
++    words.store(box.req_word, mcdma.word(links.base[0], mcdma.Layout(D, S).req(1)))
++    eps[0].join()
++    assert isinstance(eps[0].error, mcdma.LinkError) and "no forward's first" in str(eps[0].error)
++    daemon.bye("a1")
++    eps[1].join()
++
++
++def test_every_window_is_eager_and_a_forward_stopped_midway_kills_the_wire(env, daemon, words, master):
++    links, eps, _ = setup_pair(daemon, words)
++    wait_attached(daemon)
++    a, b = mcdma_attention(links, master), buffers()
++    assert a.forces_eager()
++    a.begin(1)                                         # the mode word every layer's request header carries
++    assert a.tr.hdr_tab[:, 4].tolist() == [afd_mod.MODE_EAGER] * len(LAYERS)
++    a.begin(3, chunk=True)
++    assert a.tr.hdr_tab[:, 4].tolist() == [afd_mod.MODE_CHUNK] * len(LAYERS)
++    forward(a, b, 2, torch.Generator().manual_seed(6), stop_after=2)
++    with pytest.raises(CapacityError, match="stopped after 2 of 4"):
++        a.begin(1)
++    finish(daemon, eps)
++
++
++# -- the expert node's serve(), handshake included ------------------------------------------------------------------
++@pytest.mark.parametrize("attn", ["cpu", "gpu"])
++def test_serve_over_mcdma_with_the_store_handshake(env, daemon, words, tmp_path, attn):
++    from tensorfold.families.glm5_next.cuda import experts_node
++
++    env.setattr(afd_mod, "WATCH_EVERY", 3600)
++    env.setattr(experts_node, "ALIVE_EVERY", 3600)     # serve()'s beat thread outlives the test: let it sleep
++    env.setattr(experts_node.Config, "read", staticmethod(lambda _d: fake_cfg()))
++    env.setattr(experts_node, "ExpertNode", lambda _d, half, layers, **_: FakeNode(layers, half))
++    by_thread = {"x0": "a2", "x1": "a1"}
++    env.setattr(mcdma, "link_name", lambda: by_thread[threading.current_thread().name])
++    init = mcdma.ExpertLink.__init__
++
++    def link_init(self, name, **kw):
++        kw.setdefault("socket_path", daemon.sock(name))
++        init(self, name, **kw)
++
++    env.setattr(mcdma.ExpertLink, "__init__", link_init)
++    port, errors = free_port(), {}
++
++    def run(half):
++        try:
++            experts_node.serve(tmp_path, half, "127.0.0.1", port, device="cpu")
++        except BaseException as exc:  # noqa: BLE001
++            errors[half] = exc
++
++    threads = [threading.Thread(target=run, args=(h,), name=f"x{h}", daemon=True) for h in (0, 1)]
++    for t in threads:
++        t.start()
++    links = mcdma.AttentionLinks(["a2", "a1"], words=words, driver=FakeDriver(words) if attn == "gpu" else None,
++                                 mode=attn, stream=lambda: 0, timeout=10, shm_dir=str(daemon.shm), linkup_wait=2)
++    tr = afd_mcdma.McdmaTransport("127.0.0.1", port, links=links, device="cpu", hidden=D)   # StoreComm: both join
++    a = afd_mod.AfdWire("127.0.0.1", port, transport=tr)
++    a.announce(afd_mod.settings_for(tmp_path, fake_cfg(), prefill_rows=PREFILL))
++    a.wait_loaded(30)
++    b, gen = buffers(), torch.Generator().manual_seed(11)
++    for rows in (1, 4, PREFILL, 1):
++        forward(a, b, rows, gen, chunk=rows > 8)
++    for n in ("a2", "a1"):
++        daemon.bye(n)
++    for t in threads:
++        t.join(10)
++        assert not t.is_alive()
++    assert all(isinstance(errors[h], mcdma.LinkError) for h in (0, 1)), errors
++    for r in (1, 2):                                   # the attention's watchdog would read these
++        assert b"BYE" in bytes(a.store.get(f"afd_error/{r}"))
++
++
++def test_an_expert_on_another_link_refuses(env):
++    env.setenv(mcdma.LINK_ENV, "a1")
++    theirs = dict(settings(), transport="mcdma", mcdma_links=["a2", "a1"])
++    with pytest.raises(SystemExit, match="serves MCDMA link 'a1' but the attention maps links"):
++        afd_mcdma.open_expert_link(theirs, 1, fake_cfg(), None, device="cpu")
+diff --git a/tests/test_glm_afd_mcdma_cuda.py b/tests/test_glm_afd_mcdma_cuda.py
+new file mode 100644
+index 0000000..a085930
+--- /dev/null
++++ b/tests/test_glm_afd_mcdma_cuda.py
+@@ -0,0 +1,152 @@
++"""The MCDMA wire's CUDA driver side (``mcdma_cuda``) on the CPU: the gpu/cpu mode choice, the flush flag, and the
++current-context rule ``cuMemHostRegister`` needs (error 201 without one)."""
++
++from __future__ import annotations
++
++import threading
++
++import pytest
++
++torch = pytest.importorskip("torch")
++
++from tensorfold.families.glm5_next.cuda import mcdma, mcdma_cuda  # noqa: E402
++from tests.glm_afd_fakes import FakeDriver  # noqa: E402
++from tests.glm_afd_fakes import env_fixture, libpath_fixture, words_fixture  # noqa: E402, F401  (fixtures)
++
++
++def test_mode_choice(env):
++    logs = []
++
++    def log(*a, **_):
++        logs.append(" ".join(map(str, a)))
++
++    class NoOps:
++        def attr(self, name, ordinal=0):
++            return 0 if name == "stream_mem_ops_64" else 1
++
++    env.setenv(mcdma.MODE_ENV, "auto")
++    mode, drv = mcdma_cuda.choose_mode(torch, 0, driver_factory=NoOps, log=log)
++    assert mode == "cpu" and isinstance(drv, NoOps) and "FALLING BACK" in logs[-1]
++    env.setenv(mcdma.MODE_ENV, "gpu")
++    with pytest.raises(RuntimeError, match="stream_mem_ops_64"):
++        mcdma_cuda.choose_mode(torch, 0, driver_factory=NoOps, log=log)
++    env.setenv(mcdma.MODE_ENV, "cpu")
++    assert mcdma_cuda.choose_mode(torch, 0, driver_factory=NoOps, log=log)[0] == "cpu"
++    env.setenv(mcdma.MODE_ENV, "auto")
++
++    def broken():
++        raise RuntimeError("libcuda not found")
++
++    assert mcdma_cuda.choose_mode(torch, 0, driver_factory=broken, log=log) == ("cpu", None)
++    env.setenv(mcdma.MODE_ENV, "fast")
++    with pytest.raises(ValueError):
++        mcdma_cuda.choose_mode(torch, 0, driver_factory=NoOps, log=log)
++
++
++def test_flush_flag_follows_the_device(words):
++    assert mcdma_cuda.flush_flag(FakeDriver(words, flush=1), 0) == mcdma.CU_STREAM_WAIT_VALUE_FLUSH
++    assert mcdma_cuda.flush_flag(FakeDriver(words, flush=0), 0) == 0
++
++
++class FakeLibcuda:
++    """libcuda's context calls for CudaDriver, per thread (as the driver's current context is): error 201 when
++    cuMemHostRegister runs with no context current."""
++
++    PRIMARY = {0: 0x1000, 1: 0x2000}
++
++    def __init__(self) -> None:
++        self.calls: list = []
++        self.tls = threading.local()
++
++    def install(self, drv) -> None:
++        def cur():
++            return getattr(self.tls, "cur", 0)
++
++        def out(p, v):
++            p._obj.value = v                               # a ctypes.byref(...) argument's target
++            return 0
++
++        def get_cur(p):
++            self.calls.append(("get",))
++            return out(p, cur() or None)
++
++        def set_cur(c):
++            self.calls.append(("set", c))
++            self.tls.cur = c
++            return 0
++
++        def retain(p, dev):
++            self.calls.append(("retain", dev))
++            return out(p, self.PRIMARY[dev])
++
++        def reg(addr, size, flags):
++            self.calls.append(("register", cur()))
++            return 0 if cur() else 201
++
++        drv._init = lambda flags: 0
++        drv._getcur, drv._setcur, drv._retain = get_cur, set_cur, retain
++        drv._dev = lambda p, ordinal: out(p, ordinal)
++        drv._reg, drv._unreg = reg, lambda addr: 0 if cur() else 201
++        drv._dptr = lambda p, addr, flags: out(p, addr)
++        drv._err = lambda code, p: out(p, b"invalid device context")
++        drv.ordinal, drv.ctx_source, drv._primary = 0, "", {}
++
++
++def test_register_makes_the_primary_context_current():
++    """cuMemHostRegister with no current context is error 201 (torch.cuda.init does not make one current).
++    register retains the device's primary context once and sets it current; an already-current one (torch's) is
++    used as is; nothing is ever released or destroyed; another thread gets the same primary context."""
++
++    fake, drv = FakeLibcuda(), object.__new__(mcdma_cuda.CudaDriver)
++    fake.install(drv)
++    with pytest.raises(RuntimeError, match="201"):           # the probe's situation before the fix
++        drv._check(drv._reg(0x5000, 4096, 0), "cuMemHostRegister")
++    assert drv.register(0x5000, 4096) == 0x5000 and drv.ctx_source == "primary"
++    assert ("retain", 0) in fake.calls and ("register", 0x1000) in fake.calls
++    fake.calls.clear()
++    drv.register(0x6000, 4096)                               # current now: no second retain, no set
++    drv.unregister(0x6000)
++    assert drv.ctx_source == "current" and not [c for c in fake.calls if c[0] in ("retain", "set")]
++    fake.calls.clear()
++    seen = []
++    t = threading.Thread(target=lambda: seen.append(drv.register(0x7000, 4096)))
++    t.start()
++    t.join()
++    assert seen == [0x7000] and ("set", 0x1000) in fake.calls and ("retain", 0) not in fake.calls
++    fake.tls.cur = 0x9000                                    # torch's runtime made a context current: use it
++    fake.calls.clear()
++    assert drv.ensure_ctx() == 0x9000 and fake.calls == [("get",)]
++
++
++def test_choose_mode_makes_the_serving_device_current(env):
++    fake, drv = FakeLibcuda(), object.__new__(mcdma_cuda.CudaDriver)
++    fake.install(drv)
++    drv.attr = lambda name, ordinal=0: 0 if name == "stream_mem_ops_64" else 1   # the probe stops at the attrs
++    logs = []
++    env.setenv(mcdma.MODE_ENV, "auto")
++    assert mcdma_cuda.choose_mode(torch, 1, driver_factory=lambda: drv,
++                                  log=lambda *a, **_: logs.append(a))[0] == "cpu"
++    assert drv.ordinal == 1 and ("retain", 1) in fake.calls and fake.tls.cur == 0x2000
++    drv.register(0x5000, 4096)                               # a mailbox registers under the serving device's ctx
++    assert fake.calls[-1] == ("register", 0x2000)
++    fake2, drv2 = FakeLibcuda(), object.__new__(mcdma_cuda.CudaDriver)
++    fake2.install(drv2)
++    env.setenv(mcdma.MODE_ENV, "cpu")
++    assert mcdma_cuda.choose_mode(torch, 1, driver_factory=lambda: drv2)[0] == "cpu" and drv2.ordinal == 1
++    assert not fake2.calls                                   # cpu mode: no probe, no context until a register
++    env.setenv(mcdma.MODE_ENV, "auto")
++
++
++def test_a_cpu_driven_link_registers_nothing(words):
++    logs = []
++    assert mcdma_cuda._register(None, object(), True, logs.append) is None
++
++    class Refuses:
++        def register(self, addr, size):
++            raise RuntimeError("no")
++
++    box = type("Box", (), {"base": 0x1000, "size": 4096, "path": "/dev/shm/mcdma-rpc.x"})()
++    assert mcdma_cuda._register(Refuses(), box, False, lambda *a, **_: logs.append(a[0])) is None
++    assert "not registered with CUDA" in logs[-1]
++    with pytest.raises(RuntimeError, match="no"):
++        mcdma_cuda._register(Refuses(), box, True, logs.append)
+diff --git a/tests/test_glm_afd_transport.py b/tests/test_glm_afd_transport.py
+new file mode 100644
+index 0000000..879890c
+--- /dev/null
++++ b/tests/test_glm_afd_transport.py
+@@ -0,0 +1,237 @@
++"""The AFD transport seam (``afd_transport``) and the engine hooks over it, on the CPU: the one wire (MCDMA) behind
++``make_afd``, the interface it implements, the calls ``AfdWire`` makes in order, the eager-only header modes, the
++watchdog's fault lines, and the expert's refusal of a mode or a wire it does not run."""
++
++from __future__ import annotations
++
++import inspect
++import json
++import time
++from datetime import timedelta
++
++import pytest
++
++torch = pytest.importorskip("torch")
++
++from tensorfold.families.glm5_next.cuda import afd as afd_mod  # noqa: E402
++from tensorfold.families.glm5_next.cuda import afd_mcdma, afd_transport  # noqa: E402
++from tensorfold.server.errors import CapacityError  # noqa: E402
++from tests.glm_afd_fakes import (D, LAYERS, PREFILL, DictStore, FakeNode, buffers, fake_cfg, free_port,  # noqa: E402
++                                 settings)
++from tests.glm_afd_fakes import master_fixture  # noqa: E402, F401  (the master fixture)
++
++MEMBERS = ("name", "publish", "start", "header", "send", "recv", "health", "abort", "describe")
++LINK_MEMBERS = ("next_forward", "land", "reply", "health", "close")
++
++
++class Recorder:
++    """An ``ExpertTransport`` that records the calls ``AfdWire`` makes, in order; ``fail`` raises from ``send``,
++    ``err`` is what ``health`` reports (an exception: raised)."""
++
++    name = "recorder"
++
++    def __init__(self, fail: Exception | None = None) -> None:
++        self.calls: list = []
++        self.err: object = None
++        self.fail, self.aborted = fail, False
++
++    def publish(self, settings: dict) -> dict:
++        return {"transport": self.name}
++
++    def start(self, store) -> None:
++        self.calls.append(("start",))
++
++    def header(self, seq: int, rows: int, mode: int) -> None:
++        self.calls.append(("header", seq, rows, mode))
++
++    def send(self, b, rows: int, layer: int) -> None:
++        if self.fail is not None:
++            raise self.fail
++        self.calls.append(("send", rows, layer))
++
++    def recv(self, dst1, dst2, layer: int) -> None:
++        self.calls.append(("recv", tuple(dst1.shape), tuple(dst2.shape), layer))
++
++    def health(self) -> str | None:
++        if isinstance(self.err, Exception):
++            raise self.err
++        return self.err
++
++    def abort(self) -> None:
++        self.aborted = True
++
++    def describe(self) -> str:
++        return "afd transport recorder"
++
++
++def wired(port, tr=None):
++    a = afd_mod.AfdWire("127.0.0.1", port, transport=tr if tr is not None else Recorder())
++    a.announce(settings())
++    return a
++
++
++def wait_dead(a, s=5.0) -> None:
++    end = time.monotonic() + s
++    while a.dead is None and time.monotonic() < end:
++        time.sleep(0.01)
++
++
++# -- the seam: one wire --------------------------------------------------------------------------------------------
++def test_make_afd_builds_the_engine_hooks_over_mcdma(monkeypatch):
++    built, made = [], []
++    monkeypatch.setattr(afd_mcdma, "McdmaTransport", lambda **kw: built.append(kw) or "mcdma")
++    monkeypatch.setenv("TF_AFD_TRANSPORT", "other")             # not read: MCDMA is the only wire
++    wire = dict(master="127.0.0.1", port=29551, model_dir="/model")
++    assert afd_transport.transport_for(**wire) == "mcdma" and built == [wire]
++    monkeypatch.setattr(afd_mod, "AfdWire", lambda *a: made.append(a) or "wire")
++    assert afd_mod.make_afd("127.0.0.1", 29551, "/model") == "wire" and made == [("127.0.0.1", 29551, "/model")]
++    assert not hasattr(afd_mod, "Afd")                          # one class, no alias
++    for gone in ("TRANSPORT_ENV", "NAMES", "transport_name"):
++        assert not hasattr(afd_transport, gone), gone
++
++
++def test_the_mcdma_wire_implements_the_interface():
++    cls = afd_mcdma.McdmaTransport
++    for m in MEMBERS:
++        assert hasattr(cls, m), m
++        want = getattr(afd_transport.ExpertTransport, m, None)
++        if callable(want):
++            assert list(inspect.signature(getattr(cls, m)).parameters) == \
++                list(inspect.signature(want).parameters), m
++    assert cls.name == "mcdma"
++    assert "graphs" not in afd_transport.ExpertTransport.__annotations__ and not hasattr(cls, "graphs")
++    for m in LINK_MEMBERS:
++        assert list(inspect.signature(getattr(afd_mcdma.McdmaExpertLink, m)).parameters) == \
++            list(inspect.signature(getattr(afd_transport.ExpertLink, m)).parameters), m
++    for hook in ("begin", "exchange", "collect", "forces_eager", "announce", "wait_loaded", "die"):
++        assert hasattr(afd_mod.AfdWire, hook)
++    assert str(inspect.signature(afd_mod.AfdWire.begin)) == "(self, rows: 'int', *, chunk: 'bool' = False) -> 'None'"
++    assert str(inspect.signature(afd_mod.AfdWire.exchange)) == "(self, b, rows: 'int') -> 'None'"
++    assert str(inspect.signature(afd_mod.AfdWire.collect)) == "(self, b, rows: 'int', d: 'int')"
++
++
++# -- the engine hooks over the seam --------------------------------------------------------------------------------
++def test_the_attention_makes_the_wire_calls_in_order(master):
++    tr = Recorder()
++    a = wired(master, tr)
++    b = buffers(8)
++    a.begin(3)
++    for _ in range(2):
++        a.exchange(b, 3)
++        out = a.collect(b, 3, D)
++    assert tr.calls == [("start",), ("header", 1, 3, afd_mod.MODE_EAGER), ("send", 3, 0), ("recv", (3, D), (3, D), 0),
++                        ("send", 3, 1), ("recv", (3, D), (3, D), 1)]
++    assert out.shape == (3, 3, D) and a.layer == 2
++    assert json.loads(bytes(a.store.get("afd_settings")).decode()) == dict(settings(), transport="recorder")
++
++
++def test_every_window_is_eager_and_a_chunk_says_so(master, monkeypatch):
++    tr = Recorder()
++    a = wired(master, tr)
++    for value in ("", "1", "0"):
++        monkeypatch.setenv("TF_AFD_EAGER", value)                # never read: every window stays eager
++        assert a.forces_eager()
++    a.begin(2)
++    a.begin(5, chunk=True)
++    assert [c for c in tr.calls if c[0] == "header"] == [("header", 1, 2, afd_mod.MODE_EAGER),
++                                                        ("header", 2, 5, afd_mod.MODE_CHUNK)]
++    assert (afd_mod.MODE_EAGER, afd_mod.MODE_CHUNK) == (1, 3)
++
++
++@pytest.mark.parametrize("mode", [0, 16])
++def test_the_expert_refuses_a_mode_it_does_not_run(mode):
++    """A forward whose mode is neither eager (1) nor chunk (3) stops the expert before it lands any layer."""
++
++    from tensorfold.families.glm5_next.cuda import experts_node
++
++    landed = []
++
++    class Link:
++        def next_forward(self):
++            return 1, 2, mode
++
++        def land(self, layer, views):
++            landed.append(layer)
++
++    with pytest.raises(RuntimeError, match=rf"^forward mode {mode}: the expert runs eager windows only$"):
++        experts_node.forwards(FakeNode(LAYERS, 0), Link(), DictStore(), 1)
++    assert landed == []
++
++
++def test_a_forward_stopped_midway_kills_the_wire(master):
++    tr = Recorder()
++    a = wired(master, tr)
++    b = buffers(8)
++    a.begin(1)
++    a.exchange(b, 1)
++    a.collect(b, 1, D)
++    with pytest.raises(CapacityError, match="stopped after 1 of 4 MoE exchanges"):
++        a.begin(1)
++    assert tr.aborted and "out of step" in str(a.dead)
++
++
++def test_a_wire_error_fails_the_forward_and_kills_the_wire(master):
++    tr = Recorder(fail=afd_transport.WireError("link1: no reply", "MCDMA link1: no reply"))
++    a = wired(master, tr)
++    a.begin(1)
++    with pytest.raises(CapacityError, match=r"the AFD expert link failed \(link1: no reply\)"):
++        a.exchange(buffers(8), 1)
++    assert a.dead == "MCDMA link1: no reply" and tr.aborted
++    with pytest.raises(CapacityError, match="no reply"):
++        a.begin(1)
++
++
++def test_health_names_the_fault_and_the_watchdog_dies_with_it(master, monkeypatch, capsys):
++    monkeypatch.setattr(afd_mod, "WATCH_EVERY", 0.01)
++    tr = Recorder()
++    tr.err = "MCDMA link link1: generation 1 -> 2 (its daemon restarted)"
++    a = afd_mod.AfdWire("127.0.0.1", master, transport=tr)
++    wait_dead(a)
++    assert a.dead == "MCDMA link link1: generation 1 -> 2 (its daemon restarted)" and tr.aborted
++    tr2 = Recorder()
++    tr2.err = RuntimeError("gone")
++    a2 = afd_mod.AfdWire("127.0.0.1", master, transport=tr2)
++    wait_dead(a2)
++    assert a2.dead == "watchdog lost the recorder wire: RuntimeError('gone')" and tr2.aborted
++    out = capsys.readouterr().out
++    assert ("[tensorfold] afd: watchdog lost the recorder wire: RuntimeError('gone'); in-flight requests fail, "
++            "restart the serving stack") in out
++    assert "[tensorfold] afd transport recorder" in out
++    with pytest.raises(CapacityError, match="gone"):
++        a2.begin(1)
++
++
++def test_the_watchdog_reads_the_experts_error_keys(master, monkeypatch):
++    monkeypatch.setattr(afd_mod, "WATCH_EVERY", 0.01)
++    a = afd_mod.AfdWire("127.0.0.1", master, transport=Recorder())
++    a.store.set("afd_alive/2", b"1.0")
++    a.store.set("afd_error/2", b"LinkError('boom')")
++    wait_dead(a)
++    assert a.dead == "expert rank 2 failed: LinkError('boom')"
++
++
++def test_the_watchdog_calls_a_silent_expert_dead(master, monkeypatch):
++    monkeypatch.setattr(afd_mod, "WATCH_EVERY", 0.01)
++    monkeypatch.setattr(afd_mod, "ALIVE_STALE", 0.05)
++    a = afd_mod.AfdWire("127.0.0.1", master, transport=Recorder())
++    a.store.set("afd_alive/1", b"2.0")                 # a stamp that never changes: rank 1 is silent
++    wait_dead(a)
++    assert a.dead == "expert rank 1 silent for 0s (heartbeat unchanged)"
++
++
++def test_an_expert_refuses_an_attention_on_another_wire(monkeypatch, tmp_path):
++    """The handshake names the wire: an expert node refuses an attention node that announces another one."""
++
++    from torch.distributed import TCPStore
++
++    from tensorfold.families.glm5_next.cuda import experts_node
++
++    monkeypatch.setattr(afd_mcdma, "StoreComm", lambda *a: object())
++    monkeypatch.setattr(experts_node, "ALIVE_EVERY", 3600)
++    monkeypatch.setattr(experts_node.Config, "read", staticmethod(lambda _d: fake_cfg()))
++    port = free_port()
++    master = TCPStore("127.0.0.1", port, 1, True, timeout=timedelta(seconds=30), wait_for_workers=False)
++    theirs = dict(afd_mod.settings_for(tmp_path, fake_cfg(), prefill_rows=PREFILL), transport="tcp")
++    master.set("afd_settings", json.dumps(theirs))
++    with pytest.raises(SystemExit, match="settings mismatch on expert 1: transport: attention 'tcp' != expert 'mcdma'"):
++        experts_node.serve(tmp_path, 0, "127.0.0.1", port, device="cpu")
+diff --git a/tools/mcdma_streamops_probe.py b/tools/mcdma_streamops_probe.py
+new file mode 100644
+index 0000000..b845cdd
+--- /dev/null
++++ b/tools/mcdma_streamops_probe.py
+@@ -0,0 +1,309 @@
++#!/usr/bin/env python3
++"""Can this GPU drive the AFD's MCDMA exchange from its stream? (TF_AFD_MCDMA_MODE=gpu)
++
++Run in the serving image on each node before its first --experts remote boot, with PYTHONPATH=<checkout>/src:
++
++    python3 tools/mcdma_streamops_probe.py [--shm /dev/shm] [--iters 2000] [--bytes 8740] [--out probe.json]
++
++It prints the device attributes, makes the device's primary context current (cuMemHostRegister needs one;
++torch.cuda.init() does not do it: CUDA error 201), then runs, each step bounded by --timeout:
++  T1 register  a 4 MiB MAP_SHARED file under --shm (a mailbox's kind of memory; unlinked at once) with
++               cuMemHostRegister(PORTABLE|DEVICEMAP), and its device pointer
++  T2 write     cuStreamWriteValue64 lands in it
++  T3 wait      cuStreamWaitValue64(EQ) holds a stream until the host stores the value, then lets it go
++  T4 request   the attention's send path, --iters times with fresh bytes: D2H copy into the payload, then a
++               write-value of the word; the host waits for the word and checks every byte
++  T5 reply     the receive path, --iters times: the stream waits (EQ, +FLUSH where the device has it) on a word the
++               host stores after writing the payload, copies the payload to the device and writes an ack; every
++               byte is checked; the host's store -> ack round trip is timed (p50/p90)
++  T6 zerocopy  information only: a kernel reads the registered memory through the device pointer
++then one JSON line and ``STREAMOPS: PASS`` or ``STREAMOPS: FAIL (<first failure>)``; exit 0 on PASS, 1 on FAIL.
++A stream left waiting is never unmapped under it: the probe exits at once instead.
++
++Without a GPU, a live link's mailbox (sizes, room for --rows, link-up/generation on the connect end, the words), and
++with --socket its daemon's STATUS (never MODE poll, which would take the link from its service):
++
++    python3 tools/mcdma_streamops_probe.py --mailbox NAME [--side connect|listen] [--rows 2048] [--socket PATH]
++
++ends with ``MAILBOX: OK`` or ``MAILBOX: FAIL (...)``.
++"""
++
++from __future__ import annotations
++
++import argparse
++import ctypes
++import json
++import mmap
++import os
++import socket
++import sys
++import time
++
++HIDDEN, SLOTS = 4096, 9          # GLM-5.3-Flash: hidden 4096, top-8 routed + the shared slot
++
++
++def _finish(res: dict, ok: bool, why: str, out: str, tag: str = "STREAMOPS") -> int:
++    res["pass"], res["why"] = ok, why
++    if tag == "STREAMOPS":
++        res["mode"] = "gpu" if ok else "cpu"
++    line = json.dumps(res, sort_keys=True)
++    print(line, flush=True)
++    if out:
++        with open(out, "w") as f:
++            f.write(line + "\n")
++    print(f"{tag}: PASS" if ok and tag == "STREAMOPS" else f"{tag}: OK" if ok else f"{tag}: FAIL ({why})", flush=True)
++    return 0 if ok else 1
++
++
++def _pct(v: list[float]) -> dict:
++    s = sorted(v)
++    if not s:
++        return {}
++    return {"p50_us": round(s[len(s) // 2], 2), "p90_us": round(s[min(len(s) - 1, int(len(s) * 0.9))], 2),
++            "min_us": round(s[0], 2), "n": len(s)}
++
++
++def gpu_probe(a) -> int:
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import mcdma, mcdma_cuda
++
++    res: dict = {"host": socket.gethostname(), "tests": {}, "attrs": {}}
++    if not torch.cuda.is_available():
++        return _finish(res, False, "no CUDA device", a.out)
++    torch.cuda.init()
++    dev = torch.cuda.current_device()
++    res.update(device=torch.cuda.get_device_name(dev), cc=list(torch.cuda.get_device_capability(dev)),
++               torch=torch.__version__)
++    drv = mcdma_cuda.CudaDriver()
++    res["driver"] = drv.version()
++    try:                                             # cuMemHostRegister needs a current context (CUDA error 201)
++        drv.ensure_ctx(dev)
++        res["ctx"] = drv.ctx_source                  # "current" (torch's runtime had made it so) or "primary"
++    except Exception as exc:  # noqa: BLE001
++        return _finish(res, False, f"T0 context: {exc}", a.out)
++    for name in mcdma_cuda.ATTRS:
++        try:
++            res["attrs"][name] = drv.attr(name, dev)
++        except Exception as exc:  # noqa: BLE001  an attribute this driver does not know
++            res["attrs"][name] = f"error: {exc}"
++    print(f"device {res['device']} cc {res['cc']} driver {res['driver']} torch {res['torch']} ctx {res['ctx']}",
++          flush=True)
++    for name, v in res["attrs"].items():
++        print(f"  attr {name:34s} {v}", flush=True)
++    for name in mcdma_cuda.NEEDED:
++        if res["attrs"].get(name) != 1:
++            return _finish(res, False, f"device attribute {name} = {res['attrs'].get(name)}", a.out)
++    try:
++        words = mcdma.Words()
++        res["libmcdma_rpc"] = words.path
++    except Exception as exc:  # noqa: BLE001  the probe can store words without it
++        words = None
++        res["libmcdma_rpc"] = f"absent ({exc})"
++    flags = mcdma.CU_STREAM_WAIT_VALUE_EQ | mcdma_cuda.flush_flag(drv, dev)
++    res["wait_flags"] = flags
++
++    # T1: a mailbox's kind of memory, registered
++    size = 4 << 20
++    path = os.path.join(a.shm, f"tensorfold-streamops-probe.{os.getpid()}")
++    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
++    try:
++        os.ftruncate(fd, size)
++        mm = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
++    finally:
++        os.close(fd)
++        os.unlink(path)                              # the mapping stays; nothing is left in --shm
++    anchor = ctypes.c_char.from_buffer(mm)
++    host = ctypes.addressof(anchor)
++    try:
++        dptr = drv.register(host, size)
++    except Exception as exc:  # noqa: BLE001
++        return _finish(res, False, f"T1 register: {exc}", a.out)
++    res["tests"]["T1"] = {"ok": True, "device_pointer_is_host_pointer": dptr == host}
++    print(f"PASS T1 register ({size >> 20} MiB under {a.shm}; device pointer {'==' if dptr == host else '!='} host)",
++          flush=True)
++
++    def load(off: int) -> int:
++        return ctypes.c_uint64.from_address(host + off).value
++
++    def store(off: int, v: int) -> None:
++        if words is not None:
++            words.store(host + off, v)
++        else:
++            ctypes.c_uint64.from_address(host + off).value = v
++
++    def until(off: int, v: int, timeout: float) -> float | None:
++        t0 = time.perf_counter()
++        end = t0 + timeout
++        while load(off) != v:
++            if time.perf_counter() > end:
++                return None
++        return (time.perf_counter() - t0) * 1e6
++
++    def wedged(step: str, why: str) -> int:
++        res["tests"][step] = {"ok": False, "why": why}
++        rc = _finish(res, False, f"{step}: {why}", a.out)
++        sys.stdout.flush()
++        os._exit(rc)                                 # a waiting stream may still read the page: never unmap it
++
++    st = torch.cuda.Stream()
++    h = st.cuda_stream
++    REQ, DONE, ACK, T2W, PAY, REP, ZC = 0, 64, 128, 192, 4096, 4096 + (1 << 20), 4096 + (2 << 20)
++
++    # T2: write-value
++    drv.write64(h, dptr + T2W, mcdma.word(5, 55))
++    st.synchronize()
++    if load(T2W) != mcdma.word(5, 55):
++        return _finish(res, False, f"T2 write-value landed {load(T2W):#x}", a.out)
++    res["tests"]["T2"] = {"ok": True}
++    print("PASS T2 write-value", flush=True)
++
++    # T3: wait-value holds the stream until the host's store
++    drv.wait64(h, dptr + DONE, mcdma.word(7, 70), flags)
++    drv.write64(h, dptr + ACK, mcdma.word(8, 80))
++    time.sleep(0.05)
++    if load(ACK) == mcdma.word(8, 80):
++        return _finish(res, False, "T3 wait-value did not hold the stream", a.out)
++    store(DONE, mcdma.word(7, 70))
++    dt = until(ACK, mcdma.word(8, 80), a.timeout)
++    if dt is None:
++        wedged("T3", f"the stream never saw the host's store in {a.timeout:.0f} s")
++    st.synchronize()
++    res["tests"]["T3"] = {"ok": True, "release_us": round(dt, 1)}
++    print(f"PASS T3 wait-value (held 50 ms, released {dt:.1f} us after the host's store)", flush=True)
++
++    n, iters = a.bytes, a.iters
++    base = torch.arange(n, dtype=torch.int32)
++    payload = torch.frombuffer(mm, dtype=torch.uint8, count=n, offset=PAY)
++    reply = torch.frombuffer(mm, dtype=torch.uint8, count=n, offset=REP)
++    src = torch.empty((n,), dtype=torch.uint8, device="cuda")
++    dst = torch.empty((n,), dtype=torch.uint8, device="cuda")
++    base_dev = base.cuda()
++
++    # T4: the request path (copy, then write-value; the host checks the bytes after the word)
++    lat = []
++    for i in range(iters):
++        seq = i + 1
++        with torch.cuda.stream(st):
++            src.copy_(((base_dev + i) % 251).to(torch.uint8))
++            payload.copy_(src, non_blocking=True)
++            drv.write64(h, dptr + REQ, mcdma.word(seq, n))
++        dt = until(REQ, mcdma.word(seq, n), a.timeout)
++        if dt is None:
++            return _finish(res, False, f"T4 request word {seq} never landed", a.out)
++        want = ((base + i) % 251).to(torch.uint8)
++        if not torch.equal(payload, want):
++            bad = int((payload != want).nonzero()[0])
++            return _finish(res, False, f"T4 iteration {i}: payload byte {bad} is {int(payload[bad])}, not "
++                                       f"{int(want[bad])} (the word overtook its copy)", a.out)
++        lat.append(dt)
++    st.synchronize()
++    res["tests"]["T4"] = {"ok": True, "iters": iters, "bytes": n, "enqueue_to_word": _pct(lat)}
++    print(f"PASS T4 request path x{iters} ({n} B): every byte before its word", flush=True)
++
++    # T5: the reply path (host payload then word; the stream waits, copies, acks)
++    lat = []
++    for i in range(iters):
++        seq = i + 1
++        with torch.cuda.stream(st):
++            drv.wait64(h, dptr + DONE, mcdma.word(seq, n), flags)
++            dst.copy_(reply, non_blocking=True)
++            drv.write64(h, dptr + ACK, mcdma.word(seq, n))
++        reply.copy_(((base + 3 * i) % 253).to(torch.uint8))
++        t0 = time.perf_counter()
++        store(DONE, mcdma.word(seq, n))
++        if until(ACK, mcdma.word(seq, n), a.timeout) is None:
++            wedged("T5", f"iteration {i}: no ack in {a.timeout:.0f} s")
++        lat.append((time.perf_counter() - t0) * 1e6)
++        st.synchronize()
++        if not torch.equal(dst.cpu(), ((base + 3 * i) % 253).to(torch.uint8)):
++            return _finish(res, False, f"T5 iteration {i}: the device copy missed bytes the host wrote before the "
++                                       "word", a.out)
++    res["tests"]["T5"] = {"ok": True, "iters": iters, "bytes": n, "host_store_to_ack": _pct(lat)}
++    print(f"PASS T5 reply path x{iters} ({n} B): host store -> stream wait -> copy -> ack p50 "
++          f"{_pct(lat).get('p50_us')} us p90 {_pct(lat).get('p90_us')} us", flush=True)
++
++    # T6: information only - can a kernel read the registered memory directly (GB10: the expert's zero-copy option)
++    try:
++        zc = torch.frombuffer(mm, dtype=torch.uint8, count=n, offset=ZC)
++        zc.copy_((base % 199).to(torch.uint8))
++
++        class _Cai:
++            __cuda_array_interface__ = {"shape": (n,), "typestr": "|u1", "data": (dptr + ZC, False), "version": 3,
++                                        "strides": None}
++
++        view = torch.as_tensor(_Cai(), device="cuda")
++        got = int(view.to(torch.int64).sum().item())
++        want = int((base % 199).sum().item())
++        res["tests"]["T6"] = {"ok": got == want, "info_only": True}
++        print(f"INFO T6 zero-copy kernel read: {'ok' if got == want else f'MISMATCH {got} != {want}'}", flush=True)
++    except Exception as exc:  # noqa: BLE001  information only
++        res["tests"]["T6"] = {"ok": False, "info_only": True, "why": repr(exc)}
++        print(f"INFO T6 zero-copy kernel read: not possible ({exc!r})", flush=True)
++
++    st.synchronize()
++    drv.unregister(host)
++    del anchor, payload, reply
++    return _finish(res, True, "", a.out)
++
++
++def mailbox_check(a) -> int:
++    from tensorfold.families.glm5_next.cuda import mcdma
++
++    res: dict = {"host": socket.gethostname(), "link": a.mailbox, "side": a.side}
++    try:
++        words = mcdma.Words()
++        box = mcdma.Mailbox(a.mailbox, words, a.shm, wait_s=2.0)
++    except Exception as exc:  # noqa: BLE001
++        return _finish(res, False, str(exc), a.out, "MAILBOX")
++    res.update(path=box.path, req_mib=box.req >> 20, rep_mib=box.rep >> 20, link_up=box.plain(mcdma.LINK_UP),
++               generation=box.plain(mcdma.GENERATION), request_word=hex(words.load(box.req_word)),
++               done_word=hex(words.load(box.done)), staged_word=hex(words.load(box.staged)),
++               uid=os.getuid())
++    print(json.dumps(res, sort_keys=True), flush=True)
++    try:
++        box.check_room(mcdma.Layout(HIDDEN, SLOTS), a.rows)
++    except mcdma.LinkError as exc:
++        return _finish(res, False, str(exc), a.out, "MAILBOX")
++    if a.side == "connect" and res["link_up"] != 1:
++        return _finish(res, False, f"link {a.mailbox} is not up (link-up word {res['link_up']})", a.out, "MAILBOX")
++    if a.socket:
++        try:
++            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++            s.settimeout(5.0)
++            s.connect(a.socket)
++            s.sendall(b"STATUS\n")
++            text = b""
++            while b"END" not in text:
++                got = s.recv(4096)
++                if not got:
++                    break
++                text += got
++            s.close()
++        except OSError as exc:
++            return _finish(res, False, f"socket {a.socket}: {exc}", a.out, "MAILBOX")
++        res["status"] = text.decode(errors="replace").strip().splitlines()
++        if not any(line.startswith("PEER") and " up " in f"{line} " for line in res["status"]):
++            return _finish(res, False, f"daemon STATUS shows no PEER up: {res['status']}", a.out, "MAILBOX")
++    return _finish(res, True, "", a.out, "MAILBOX")
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
++    ap.add_argument("--shm", default="/dev/shm", help="where mailboxes live (the probe's own file goes here too)")
++    ap.add_argument("--iters", type=int, default=2000)
++    ap.add_argument("--bytes", type=int, default=8740, help="payload bytes (one row's request: 8740)")
++    ap.add_argument("--timeout", type=float, default=5.0, help="s any single step may take")
++    ap.add_argument("--out", default="", help="also write the JSON line here")
++    ap.add_argument("--mailbox", default="", help="check this live link's mailbox instead (no GPU)")
++    ap.add_argument("--side", choices=["connect", "listen"], default="connect")
++    ap.add_argument("--rows", type=int, default=2048, help="the widest window the mailbox must carry")
++    ap.add_argument("--socket", default="", help="the link daemon's socket, asked STATUS")
++    a = ap.parse_args()
++    if a.bytes > (1 << 20):
++        ap.error("--bytes must be at most 1 MiB")
++    return mailbox_check(a) if a.mailbox else gpu_probe(a)
++
++
++if __name__ == "__main__":
++    sys.exit(main())

@@ -1,0 +1,1094 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 15:39:19 -0400
+Subject: [PATCH] glm5_next/cuda: --parallel and #301's stop vote on the AFD
+ attention node (world 1)
+
+The glue that runs MiaAI-Lab's GLM multi-stream decode (ashhart/TensorFold#243, its sealed rank messages included)
+and stop vote (ashhart/TensorFold#301), the commits before this one, on the split's attention node: one rank (world
+1, afd.Solo as its comm), eager batched verify windows over the MCDMA wire, prompts filling between rounds, DFlash2
+drafts (MTP stays off under --experts remote).
+
+- AfdEngine(parallel=); cuda_engine passes --parallel on the --experts remote path. Before the wire opens it refuses
+  --parallel past 4 and the two settings that need CUDA graphs across the wire: TF_GLM_MULTI_DEPTH=joint (it times
+  the batched graphs) and TF_GLM_MULTI_LONE=1 (the one-stream graphs).
+- The wire's per-forward hook (afd.begin) at the two forwards #243 adds: BatchedVerify.forward and
+  decode.prefill_chunk (chunk=True, like prefill's chunks). MultiDecoder captures no batched windows when the weights
+  carry the AFD wire, and BatchedVerify.capture refuses there. TF_GLM_MULTI_GRAPHS is ignored under the split (the
+  startup line says so).
+- World 1: MultiDecoder applies its ops as it decides them, and seals, numbers and sends no per-iteration message
+  (there is no follower rank); _time_rows gathers by the comm's world. The --parallel estimate's extra stream slots,
+  the multi-stream drafter's rings and the kept states take the engine's world (a world-1 slot is twice a TP2 rank's).
+- Kept prompts: at world 1 the engine keeps at most what the startup estimate leaves room for (kept_most(entries,
+  spare, state), at least one); the pool sizing reserves the same count.
+- #301's vote needs no glue: the attention node samples alone over afd.Solo's gather, and the expert nodes never
+  sample; they wait for the next forward's header.
+- Unchanged: the expert nodes, the wire and its settings. Batched windows of 9 to 32 rows take the experts' 2,048-row
+  prompt scratch.
+
+Single-stream serving (--parallel 1, the default) is unchanged: every edit is behind parallel > 1 or #243's own paths.
+
+Tests: tests/test_glm_multi_afd.py (CPU: world 1 through the real MultiDecoder, BatchedVerify.forward and
+prefill_chunk on tests/test_glm_multi.py's fake model; every reply equals its solo draft:false reply),
+tests/test_glm_serial_stop_afd.py (CPU: #301's loops over afd.Solo), tests/cuda/test_glm_segments_world1.py and
+tests/cuda/test_glm_expert_rows_window.py (GPU: the segmented kernels at world-1 shapes; an expert row's bits alone
+and inside batched windows).
+
+Credits: GLM-5.3-Flash multi-stream decode, sealed rank messages and the stop vote by Mia's AI Lab (@MiaAI-Lab),
+ashhart/TensorFold#243 and #301, from their GLM-5.3-Flash EXL3 2x DGX Sparks recipe (Apache-2.0). Aditya
+Thyagarajan (@aditya1503) wrote ashhart/TensorFold#200, MTP concurrency, which #243 superseded. TensorFold
+(Apache-2.0 since v0.6.0) by Ash Hart (@ashhart).
+
+Assisted-by: Claude Opus 5.5 (planning) and GLM-5.3-Flash (execution), via Hermes
+
+---
+ src/tensorfold/families/glm5_next/__init__.py |   3 +-
+ .../families/glm5_next/cuda/decode.py         |   3 +
+ .../families/glm5_next/cuda/engine.py         |  53 +-
+ .../families/glm5_next/cuda/multi.py          |  14 +-
+ .../families/glm5_next/cuda/verify.py         |   5 +
+ tests/cuda/test_glm_expert_rows_window.py     |  70 +++
+ tests/cuda/test_glm_segments_world1.py        |  71 +++
+ tests/test_glm_multi_afd.py                   | 569 ++++++++++++++++++
+ tests/test_glm_serial_stop_afd.py             |  88 +++
+ 9 files changed, 865 insertions(+), 11 deletions(-)
+ create mode 100644 tests/cuda/test_glm_expert_rows_window.py
+ create mode 100644 tests/cuda/test_glm_segments_world1.py
+ create mode 100644 tests/test_glm_multi_afd.py
+ create mode 100644 tests/test_glm_serial_stop_afd.py
+
+diff --git a/src/tensorfold/families/glm5_next/__init__.py b/src/tensorfold/families/glm5_next/__init__.py
+index 5ab534f..050d14b 100644
+--- a/src/tensorfold/families/glm5_next/__init__.py
++++ b/src/tensorfold/families/glm5_next/__init__.py
+@@ -232,7 +232,8 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank:
+ 
+         return AfdEngine(Path(model_dir), master=master, port=int(master_port), policy=policy,
+                          drafter=drafter_path, context=options.get("context"),
+-                         context_explicit=options.get("context_explicit"), serial_only=bool(no_drafts))
++                         context_explicit=options.get("context_explicit"), serial_only=bool(no_drafts),
++                         parallel=int(options.get("parallel", 1)))
+     return GlmEngine(Path(model_dir), rank=int(rank), master=master, port=int(master_port), policy=policy,
+                      drafter=drafter_path, context=options.get("context"),
+                      context_explicit=options.get("context_explicit"), serial_only=bool(no_drafts),
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index 7a88858..1986ff4 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -464,6 +464,9 @@ def prefill_chunk(e: Engine, prompt: Sequence[int], start: int, R: int, *, draft
+     if st.pos != start or not 0 < R <= e.prefill_rows or start + R > len(prompt):
+         raise ValueError(f"a prompt chunk {start} .. {start + R} of {len(prompt)} at position {st.pos}")
+     chunk = list(prompt[start:start + R])
++    afd = getattr(w, "afd", None)
++    if afd is not None:
++        afd.begin(R, chunk=True)                 # AFD: prompt chunks cross the wire eager, the expert's wide scratch
+     out = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos)
+     out = out.clone() if head else None
+     e.last_hidden = b.fnormed[R - 1:R].clone()
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index de75e60..aa95498 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -145,6 +145,15 @@ def multi_draft_bytes(t: dict, streams: int, world: int = 2, *, ring: bool, capa
+     return 2 * layers * heads * hd * (streams * cap + trash) * 2
+ 
+ 
++def kept_most(entries: int, spare: int, state: int) -> int:
++    """--parallel on the AFD attention node (world 1): the kept prompts whose states (a KDA state and a DFlash2 window
++    each, ``state`` bytes) fit what the window leaves (``spare``), at most TF_GLM_CACHE_ENTRIES and at least one
++    (``multi._keep`` keeps one whatever the setting). Two ranks keep the count as it is: TF_GLM_CACHE_GIB's 3 GiB
++    covers eight states there, while the 5090 at a 262K window leaves 0.17 GiB for 1.43 GiB of them."""
++
++    return max(1, min(int(entries), int(spare) // max(1, int(state))))
++
++
+ class GlmEngine:
+     """GLM-5.3-Flash on two ranks (this one ``rank``): weights, MTP and DFlash2 drafting, per-request policies."""
+ 
+@@ -152,6 +161,7 @@ class GlmEngine:
+     concurrent = False          # the server hands every request straight to ``generate`` (the scheduler orders them)
+     multi = None                # --parallel > 1: the ``multi.MultiDecoder`` (both ranks)
+     scheduler = None            # ... and rank 0's ``multi.GlmScheduler``
++    kept_cap = None             # --parallel at world 1 (AFD): kept prompts within what the window leaves (kept_most)
+ 
+     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
+                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
+@@ -213,7 +223,7 @@ class GlmEngine:
+             # --parallel: every stream slot past the first (KDA states, conv windows, window scratch); the batched
+             # verify window's buffers fit the decode rows the estimate sizes, its token selection's fp32 scores
+             # (MULTI_WINDOW rows x a pool of 4 tokens) grow with the pool
+-            extra = (parallel - 1) * slot_bytes(text)
++            extra = (parallel - 1) * slot_bytes(text, world)
+             per = 4 * MULTI_WINDOW // 4
+             return Geometry(lambda slots: g.bytes_at(slots) + extra + per * slots, g.reserve, g.minimum_slots)
+ 
+@@ -222,7 +232,7 @@ class GlmEngine:
+             if parallel == 1:
+                 return g
+             # --parallel: the multi-stream drafter's own pool of contexts beside the solo drafter's
+-            return Geometry(lambda slots: g.bytes_at(slots) + multi_draft_bytes(text, parallel, ring=DRAFT_RING,
++            return Geometry(lambda slots: g.bytes_at(slots) + multi_draft_bytes(text, parallel, world, ring=DRAFT_RING,
+                                                                                  capacity=slots), g.reserve)
+ 
+         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
+@@ -273,7 +283,11 @@ class GlmEngine:
+             text = read_config(model_dir)
+             g = geometry(text)
+             per_token = max(1, -(-(g.bytes_at(capacity + 65536) - g.bytes_at(capacity)) // 65536))
+-            states = self._cache_entries() * (slot_bytes(text, rows=0) // 2 + (22 << 20))
++            # kept states: a KDA state and a DFlash2 window each (22 MiB a rank at two ranks, twice at world 1)
++            state = slot_bytes(text, world, rows=0) // 2 + (22 << 20) * 2 // world
++            if world == 1:                   # AFD: multi._keep bounds them by count alone; bound it by these bytes
++                self.kept_cap = kept_most(self._cache_entries(), self.cache_bytes, state)
++            states = (self.kept_cap or self._cache_entries()) * state
+             pool_rows = (capacity + max(0, self.cache_bytes - states) // per_token) // ALIGN * ALIGN
+             if pool_rows < ALIGN:
+                 raise ValueError(f"--parallel {parallel}: a pool of {pool_rows} tokens is less than one {ALIGN}-token "
+@@ -329,7 +343,7 @@ class GlmEngine:
+         # kept conversations (decode.Snapshot, least recently used first) and the live caches' ids; states and saved rows stay within cache_bytes
+         self.cache: list = []
+         self.live: list[int] = []
+-        self.cache_entries = self._cache_entries()
++        self.cache_entries = self.kept_cap or self._cache_entries()
+         if parallel > 1:
+             from .multi import GlmScheduler, MultiDecoder
+ 
+@@ -346,6 +360,12 @@ class GlmEngine:
+                 if self.multi.row_ms is not None:
+                     print("[tensorfold] --parallel batched window ms by rows: " +
+                           " ".join(f"{i + 1}:{ms:.1f}" for i, ms in enumerate(self.multi.row_ms)), flush=True)
++                if afd is not None:
++                    print(f"[tensorfold] --parallel {parallel} under --experts remote: batched verify windows of up to "
++                          f"{MULTI_WINDOW} rows run eager over the AFD wire (no batched CUDA graphs; "
++                          f"TF_GLM_MULTI_GRAPHS ignored); prompt chunks between rounds; the expert nodes unchanged; "
++                          f"kept prompts at most {self.cache_entries} (what the window leaves, TF_GLM_CACHE_ENTRIES "
++                          f"{self._cache_entries()})", flush=True)
+ 
+     @staticmethod
+     def _cache_entries() -> int:
+@@ -756,10 +776,31 @@ class AfdEngine(GlmEngine):
+ 
+     def __init__(self, model_dir: Path, *, master: str, port: int, policy: str = DEFAULT_POLICY,
+                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None,
+-                 serial_only: bool = False) -> None:
++                 serial_only: bool = False, parallel: int = 1) -> None:
++        """``parallel``: --parallel N (multi.py, world 1): eager batched verify windows over the AFD wire."""
++
+         from .afd import Solo, make_afd
+ 
++        if not 1 <= int(parallel) <= PARALLEL_MOST:   # before the wire opens: the experts never see a bad start
++            raise ValueError(f"--parallel: 1 to {PARALLEL_MOST} requests at once for GLM-5.3-Flash, not {parallel}")
++        if int(parallel) > 1:
++            afd_parallel_check()
+         afd = make_afd(master, port, model_dir)   # AFD rank 0: the store lives here; the experts join
+         super().__init__(model_dir, rank=0, master=master, port=port, policy=policy, drafter=drafter,
+                          context=context, context_explicit=context_explicit, serial_only=serial_only,
+-                         comm=Solo(), afd=afd)
++                         comm=Solo(), afd=afd, parallel=int(parallel))
++
++
++def afd_parallel_check(env=None) -> None:
++    """--parallel on the AFD attention node runs eager batched windows: refuse the multi-stream settings
++    that need CUDA graphs across the AFD wire, before the wire opens and the weights load."""
++
++    from .multi_tune import MultiSettings
++
++    tune = MultiSettings.from_env(env)
++    if tune.depth == "joint":
++        raise ValueError("TF_GLM_MULTI_DEPTH=joint times the batched verify window's CUDA graphs, which --experts "
++                         "remote does not capture (eager windows over the AFD wire): unset it, or use policy / scale:A")
++    if tune.lone:
++        raise ValueError("TF_GLM_MULTI_LONE=1 runs a lone stream on the one-stream CUDA graphs, which --experts remote "
++                         "--parallel does not use (eager windows over the AFD wire): unset it")
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index 98fb865..26845aa 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -381,6 +381,7 @@ class MultiDecoder:
+         self.e = e = engine.e
+         self.w = e.w
+         self.rank = engine.rank
++        self.world = getattr(engine.comm, "world", 2)   # 1: the AFD attention node (afd.Solo), no rank 1 to follow
+         self.count = streams
+         if e.slots.count < streams:
+             raise ValueError(f"the engine holds {e.slots.count} stream slots, not {streams}")
+@@ -403,8 +404,10 @@ class MultiDecoder:
+             if verify_kind() == "batched":
+                 taps = engine.drafter.tap_layers if engine.drafter is not None else ()
+                 verify = BatchedVerify(e, taps=taps, rows=MAX_WINDOW)
+-                # TF_GLM_MULTI_GRAPHS=0: eager windows (the same bits); by default a graph a window size
+-                if os.environ.get("TF_GLM_MULTI_GRAPHS", "1") != "0" and torch.cuda.is_available():
++                # TF_GLM_MULTI_GRAPHS=0: eager windows (the same bits); by default a graph a window size; the AFD
++                # attention node (--experts remote) always verifies eager: its wire runs inside no capture
++                if (os.environ.get("TF_GLM_MULTI_GRAPHS", "1") != "0" and torch.cuda.is_available()
++                        and getattr(self.w, "afd", None) is None):
+                     verify.capture()
+             else:
+                 verify = SerialVerify(e, taps=self.drafts is not None)
+@@ -481,6 +484,9 @@ class MultiDecoder:
+         if self.idle:
+             self.g._ring()
+             self.idle = False
++        if getattr(self, "world", 2) == 1:              # no follower rank (AFD): the ops were applied as decided,
++            self.outbox = []                             # and nothing is sealed, numbered or sent
++            return
+         msg, self.outbox = seal(self.outbox, self.sent), []
+         self.sent = (self.sent + 1) % SEAL_MOD
+         if self.tune.async_msg:
+@@ -532,9 +538,9 @@ class MultiDecoder:
+             raise ValueError("TF_GLM_MULTI_DEPTH=joint needs the batched verify window's graphs "
+                              "(TF_GLM_MULTI_VERIFY=batched, TF_GLM_MULTI_GRAPHS=1)")
+         mine = torch.tensor(v.time_rows(reps), dtype=torch.float32, device=self.w.device)
+-        got = torch.empty((2 * mine.numel(),), dtype=torch.float32, device=self.w.device)
++        got = torch.empty((self.world * mine.numel(),), dtype=torch.float32, device=self.w.device)
+         self.g.comm.all_gather(mine, got)
+-        return [float(x) for x in got.view(2, -1).max(dim=0).values.tolist()]
++        return [float(x) for x in got.view(self.world, -1).max(dim=0).values.tolist()]
+ 
+     def _compare_paths(self, reps: int = 5) -> None:
+         """TF_GLM_MULTI_PROFILE (at startup, on both ranks: the graphs all-gather; rank 0 prints): a lone stream's
+diff --git a/src/tensorfold/families/glm5_next/cuda/verify.py b/src/tensorfold/families/glm5_next/cuda/verify.py
+index 52c07ef..1d0fa3c 100644
+--- a/src/tensorfold/families/glm5_next/cuda/verify.py
++++ b/src/tensorfold/families/glm5_next/cuda/verify.py
+@@ -129,6 +129,8 @@ class BatchedVerify:
+         from .sparse import SPARSE_FROM
+ 
+         e, w, b = self.e, self.w, self.b
++        if getattr(w, "afd", None) is not None:
++            raise RuntimeError("the AFD wire runs inside no batched-window capture: --experts remote verifies eager")
+         index = e.caches.index is not None
+         # the KDA chain's wide scratch at its largest (prompt chunks) before any capture: a graph keeps its addresses
+         kda_mod.reserve(max(self.rows_max, e.prefill_rows), w.cfg.lin_heads // w.world, w.device)
+@@ -229,6 +231,9 @@ class BatchedVerify:
+         self._tables(segments)
+         self.segments, self.R = list(segments), R
+         g = self.graphs.get(R)
++        afd = getattr(w, "afd", None)
++        if afd is not None:
++            afd.begin(R)                         # AFD: the forward's header, before its eager kernels
+         if g is not None:
+             self.replays["graph"] += 1
+             g.replay()
+diff --git a/tests/cuda/test_glm_expert_rows_window.py b/tests/cuda/test_glm_expert_rows_window.py
+new file mode 100644
+index 0000000..b80cb75
+--- /dev/null
++++ b/tests/cuda/test_glm_expert_rows_window.py
+@@ -0,0 +1,70 @@
++"""The AFD expert node's routed experts (``experts_node.ExpertNode.compute``: ``exl3_generic.routed`` into the decode
++scratch up to 8 rows and the prompt scratch past them, then ``glue.combine``) give a row the same bits alone, in a solo
++decode window and inside a multi-stream batched window of up to 32 rows. This is the expert side of --parallel's
++contract under AFD (each batched reply equals its solo one; the glue after ashhart/TensorFold#243): batched
++windows of 9-32 rows run eager on the prompt scratch, solo windows on the decode scratch. Synthetic GLM-shaped experts
++(4096 -> 1024 a half, 4-bit mcg, the GLM tile settings, the shared slot zeroed). GPU only; a pre-serve check on
++each expert node's GPU and the attention node's."""
++
++from __future__ import annotations
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
++
++E, D, NI, TOPK, LIMIT, LAYER = 32, 4096, 1024, 8, 10.0, 3
++
++
++def _node():
++    from tensorfold.cuda.exl3 import experts
++    from tensorfold.families.glm5_next.cuda.experts_node import ExpertBuffers, ExpertNode
++
++    g = torch.Generator().manual_seed(5)
++
++    def trel(k, n):                                   # 4-bit trellis tiles: 64 int16 a 16x16 tile
++        v = torch.randint(-32768, 32768, (E, k // 16, n // 16, 64), dtype=torch.int32, generator=g)
++        return v.to(torch.int16).cuda().contiguous()
++
++    def sc(n, mag):
++        sign = torch.randint(0, 2, (E, n), generator=g).float() * 2 - 1
++        return (sign * (torch.rand((E, n), generator=g) + 0.5) * mag).half().cuda().contiguous()
++
++    ex = experts.prepare_stacked(trel(D, NI), trel(D, NI), trel(NI, D), sc(D, 0.02), sc(D, 0.02), sc(NI, 0.5),
++                                 sc(NI, 0.5), sc(NI, 0.05), sc(D, 0.2), "mcg")
++    node = ExpertNode.__new__(ExpertNode)             # no checkpoint: the node's buffers and compute only
++    node.cfg = SimpleNamespace(hidden=D, top_k=TOPK, moe_width=2 * NI, experts=E, limit=LIMIT)
++    node.half, node.layers, node.experts, node.by_layer = 0, [LAYER], [ex], {LAYER: ex}
++    node.buf = ExpertBuffers(node.cfg, rows=8, prefill_rows=2048)
++    return node
++
++
++def test_rows_alone_equal_rows_inside_batched_windows():
++    node = _node()
++    g = torch.Generator().manual_seed(9)
++    N = 32
++    x = torch.randn((N, D), generator=g).to(torch.bfloat16).cuda()
++    sel = torch.stack([torch.randperm(E, generator=g)[:TOPK] for _ in range(N)]).to(torch.int32)
++    pick = torch.cat([sel, torch.full((N, 1), E, dtype=torch.int32)], 1).cuda().contiguous()   # the shared slot
++    wts = torch.cat([torch.rand((N, TOPK), generator=g) * 0.2 + 0.05, torch.ones((N, 1))], 1).float().cuda()
++
++    def run(rows: list[int]) -> torch.Tensor:
++        idx = torch.tensor(rows, dtype=torch.long, device="cuda")
++        got = node.compute(LAYER, len(rows), x=(x[idx].contiguous(), pick[idx].contiguous(), wts[idx].contiguous()))
++        torch.cuda.synchronize()
++        return got.clone()
++
++    assert node.buf.scratch(8) is node.buf.decode and node.buf.scratch(9) is node.buf.pref
++    full = run(list(range(N)))                        # a 32-row batched window: the prompt scratch
++    assert torch.isfinite(full).all() and full.abs().sum() > 0
++    for n in (1, 2, 6, 8, 9, 16, 24, 32):
++        for start in sorted({0, 3, N - n}):
++            if start + n > N:
++                continue
++            got = run(list(range(start, start + n)))
++            assert torch.equal(got.view(torch.int32), full[start:start + n].view(torch.int32)), (n, start)
++    six = run(list(range(10, 16)))                    # a stream's 6-row window alone (decode scratch, R6) ...
++    window = run(list(range(4, 28)))                  # ... and inside a 24-row batched window (prompt scratch)
++    assert torch.equal(six.view(torch.int32), window[6:12].view(torch.int32))
+diff --git a/tests/cuda/test_glm_segments_world1.py b/tests/cuda/test_glm_segments_world1.py
+new file mode 100644
+index 0000000..10fa773
+--- /dev/null
++++ b/tests/cuda/test_glm_segments_world1.py
+@@ -0,0 +1,71 @@
++"""The PR's segmented-kernel GPU checks (tests/cuda/test_glm_kda_segments.py, test_glm_attn_segments.py) at the AFD
++attention node's world-1 shapes: 64 KDA heads and 64 attention heads a rank, where those files use TP2's 32. The same
++solo-vs-segmented bit comparisons (torch.equal), run on private copies of those modules with the head counts set to
++world 1; the indexer's 32 heads are whole on every rank at either world. GPU only (< 4 GiB); a pre-serve check on
++the attention node (the glue after ashhart/TensorFold#243)."""
++
++from __future__ import annotations
++
++import importlib.util
++from pathlib import Path
++
++import pytest
++import torch
++
++if not torch.cuda.is_available():
++    pytest.skip("CUDA only", allow_module_level=True)
++
++import numpy as np
++
++HERE = Path(__file__).resolve().parent
++H1 = 64                                   # KDA heads (linear_attn_config num_heads) and attention heads at world 1
++C1 = 3 * H1 * 128
++
++
++def _copy(name: str, **consts):
++    """A private copy of a sibling test module with module constants replaced (its helpers read them at call time)."""
++
++    spec = importlib.util.spec_from_file_location(f"{name}_world1", HERE / f"{name}.py")
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    for k, v in consts.items():
++        assert hasattr(mod, k), (name, k)
++        setattr(mod, k, v)
++    return mod
++
++
++@pytest.fixture(scope="module")
++def kseg():
++    return _copy("test_glm_kda_segments", H=H1, C=C1, B_OFF=C1 + 256, WIDTH=C1 + 256 + H1)
++
++
++@pytest.fixture(scope="module")
++def aseg():
++    return _copy("test_glm_attn_segments", H=H1)
++
++
++def test_kda_chain_segments_world1(kseg):
++    rng = np.random.default_rng(71)
++    layouts = [[(1, 0, 0, 0, 1)], [(16, 3, 1, 2, 16)], [(1, 1, 1, 4, 1), (16, 0, 0, 1, 3)]]
++    layouts += [kseg._layout(rng) for _ in range(12)]
++    for i, layout in enumerate(layouts):
++        kseg._check_chain(layout, 700 + i)
++
++
++def test_kda_replay_segments_world1(kseg):
++    rng = np.random.default_rng(73)
++    for i in range(6):
++        kseg._check_replay(kseg._layout(rng), 800 + i)
++
++
++@pytest.mark.parametrize("name", ["one row, short", "four short", "straddling", "mixed", "long", "long, 16 + 16"])
++def test_attention_segments_world1(aseg, name):
++    aseg._check_window(aseg.WINDOWS[name], seed=len(name))
++
++
++@pytest.mark.parametrize("name", ["four short", "long"])
++def test_attention_either_head_block_world1(aseg, name):
++    from tensorfold.families.glm5_next.cuda import latent
++
++    for hb in (latent.HB, latent.HB_WIDE):
++        aseg._check_window(aseg.WINDOWS[name], seed=3 + hb, hb=hb)
+diff --git a/tests/test_glm_multi_afd.py b/tests/test_glm_multi_afd.py
+new file mode 100644
+index 0000000..2695837
+--- /dev/null
++++ b/tests/test_glm_multi_afd.py
+@@ -0,0 +1,569 @@
++"""--parallel on the AFD attention node (the glue after ashhart/TensorFold#243) on CPU: world 1, the AFD
++wire's per-forward hook, no per-iteration messages, and every reply still its solo ``"draft": false`` reply.
++
++The model is tests/test_glm_multi.py's fake (logits that hash what each stream committed, read back from its pool rows
++and its slot), with its single-stream reference (``GlmEngine.generate(draft=False)`` on the same fake). New here:
++
++- one rank (world 1, ``afd.Solo``) runs ``multi.MultiDecoder`` alone: it sends no per-iteration message, and the
++  replies (staggered, in a burst through the threaded scheduler, greedy and sampled, cancelled, paused and given
++  back, resumed) equal their solo references;
++- the batched verify seam is the real ``verify.BatchedVerify.forward`` (its device work faked): one ``afd.begin(R)``
++  a round, before the forward, with R the window's rows (the streams' segments back to back, at most
++  32); prompt chunks (the real ``decode.prefill_chunk``) call ``afd.begin(R, chunk=True)`` before theirs;
++- no batched-window capture under AFD (and ``BatchedVerify.capture`` refuses there); TF_GLM_MULTI_DEPTH=joint and
++  TF_GLM_MULTI_LONE=1 are refused before the wire opens; --parallel reaches ``AfdEngine``; past 4 it is refused;
++- the world-1 estimate (an extra slot, the multi-stream drafter's rings, the kept states) at the real config;
++- the wire shapes of 7..32-row windows: the MCDMA layout fits the mailboxes the expert nodes already open, its request
++  header carries the rows, the expert node picks its scratch by rows, and ``settings_for`` is the same with and
++  without --parallel (current expert nodes accept this attention node).
++"""
++
++from __future__ import annotations
++
++import importlib
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from tests.test_cuda_geometry import allocations  # noqa: F401  (fixture: fake triton, so decode imports)
++from tests.test_glm_multi import (  # noqa: F401
++    ALIGN,
++    CASES,
++    FakeMultiDrafter,
++    _prompt,
++    _sampling,
++    fake,
++    fake_commit,
++    fold,
++    shell,
++    solo,
++)
++
++pytestmark = pytest.mark.torch
++
++WINDOW = 32                               # multi.MAX_WINDOW: rows of every stream's windows together
++
++
++class WireLog:
++    """The attention side of the AFD wire as the forwards see it: ``begin`` per forward, then the forward itself."""
++
++    def __init__(self) -> None:
++        self.calls: list[tuple] = []
++
++    def begin(self, rows: int, *, chunk: bool = False) -> None:      # afd.AfdWire.begin's signature: eager only
++        self.calls.append(("begin", int(rows), bool(chunk)))
++
++    def forces_eager(self) -> bool:
++        return True
++
++    def forward(self, kind: str, rows: int) -> None:
++        self.calls.append((kind, int(rows)))
++
++    def pairs(self) -> list[tuple[str, int]]:
++        """Every forward right after its own ``begin`` of the same rows, ``chunk`` exactly for prompt chunks;
++        returns [(kind, rows)]."""
++
++        out = []
++        calls = list(self.calls)
++        assert len(calls) % 2 == 0, calls[-3:]
++        for b, f in zip(calls[::2], calls[1::2]):
++            assert b[0] == "begin" and f[0] in ("chunk", "batched"), (b, f)
++            assert b[1] == f[1], ("a forward of other rows than its header", b, f)
++            assert b[2] == (f[0] == "chunk"), ("chunk flag", b, f)
++            out.append((f[0], f[1]))
++        return out
++
++
++def _batched(e):
++    """``verify.BatchedVerify`` whose device work is the fake model's: its real ``forward`` (the AFD hook, the
++    segments' spans, the per-segment slices of logits and taps) over a compute that runs every segment's rows on its
++    own state, and a commit that keeps each segment's rows as the fake's single-stream commit does."""
++
++    from tensorfold.families.glm5_next.cuda.verify import BatchedVerify
++
++    class FakeBatched(BatchedVerify):
++        def __init__(self) -> None:          # no buffers, tables or kernels: forward's own logic only
++            self.e, self.w, self.rows_max, self.taps = e, e.w, WINDOW, True
++            self.b = SimpleNamespace(logits=None, taps=[], fnormed=None, rows=WINDOW, owner=self)
++            self.seg_rows = SimpleNamespace(set=lambda spans, sparse_from=None: None, any_sparse=lambda: False)
++            self.graphs, self.replays = {}, {"graph": 0, "eager": 0}
++            self.segments, self.R = [], 0
++            self.windows: list[tuple[int, list[int]]] = []
++
++        def _stage(self, tokens) -> None:
++            assert len(tokens) <= WINDOW
++
++        def _tables(self, segments, keeps=None) -> None:
++            pass
++
++        def commit(self, segments, keeps) -> None:
++            assert [id(s) for s in segments] == [id(s) for s in self.segments]
++            b = SimpleNamespace(prefill=False)
++            for seg, keep in zip(segments, keeps):
++                fake_commit(self.w, seg.st, b, len(seg.tokens), keep)
++            self.segments = []
++
++    verify = FakeBatched()
++    e.caches.index = None
++
++    def compute(w, st, b, R, *, mixer=None, **kw):
++        import torch
++
++        assert st is None and mixer is not None          # the batched window: no state of its own, a mixer
++        v = b.owner                                      # the BatchedVerify whose forward this is
++        w.afd.forward("batched", R)
++        out, taps = [], []
++        for seg in v.segments:                           # each segment on its own stream's state, as alone
++            s = seg.st
++            h = s.h()
++            for r, t in enumerate(seg.tokens):
++                q = s.pos + r
++                s.write(q, int(t))
++                h = fold(h, q, int(t))
++                out.append(s.logits(q, h))
++            s.slots.window[s.slot] = [int(t) for t in seg.tokens]
++            taps += [[s.pos + r, int(t)] for r, t in enumerate(seg.tokens)]
++        assert len(out) == R
++        b.taps = [torch.tensor(taps, dtype=torch.int64)]
++        b.fnormed = b.taps[0].clone()
++        b.logits = torch.stack(out)
++        v.windows.append((R, [len(x.tokens) for x in v.segments]))
++        return b.logits[:R]
++
++    return verify, compute
++
++
++@pytest.fixture
++def afd_fake(fake, monkeypatch):  # noqa: F811
++    """The PR's fake model, plus: prompt chunks logged on the wire and the batched seam's forward faked."""
++
++    torch = fake
++    decode = importlib.import_module("tensorfold.families.glm5_next.cuda.decode")
++    forward = importlib.import_module("tensorfold.families.glm5_next.cuda.forward")
++    chunk = decode.compute                               # the PR fixture's fake prompt chunk
++
++    def chunk_logged(w, st, b, R, **kw):
++        wire = getattr(w, "afd", None)                   # the solo reference's engine has no wire
++        if wire is not None:
++            wire.forward("chunk", R)
++        return chunk(w, st, b, R, **kw)
++
++    monkeypatch.setattr(decode, "compute", chunk_logged)
++    monkeypatch.setattr(forward, "check_room", lambda w, st, R: None)
++    return SimpleNamespace(torch=torch, forward=forward, monkeypatch=monkeypatch)
++
++
++class World1:
++    """The AFD attention node's decoder: one rank, ``afd.Solo`` (world 1), the AFD wire on its weights."""
++
++    def __init__(self, env, *, streams: int = 2, blocks: int = 8, batched: bool = True, **kw) -> None:
++        from tensorfold.families.glm5_next.cuda.afd import Solo
++        from tensorfold.families.glm5_next.cuda.multi import MultiDecoder
++        from tensorfold.families.glm5_next.cuda.verify import SerialVerify
++
++        torch = env.torch
++        self.torch = torch
++        g = self.g = shell(torch, 0, pool=blocks * ALIGN, streams=streams, **kw)
++        g.comm = Solo()
++        self.shared: list = []
++        g._share = lambda values: (self.shared.append(list(values)), list(values))[1]
++        self.wire = WireLog()
++        g.e.w.afd = self.wire
++        g.drafter = object()
++        drafts = FakeMultiDrafter(torch, streams, blocks * ALIGN)
++        if batched:
++            verify, compute = _batched(g.e)
++            env.monkeypatch.setattr(env.forward, "compute", compute)
++        else:
++            verify = SerialVerify(g.e, taps=True)
++        self.verify = verify
++        self.d = MultiDecoder(g, streams, drafts=drafts, verify=verify)
++        g.multi = self.d
++
++    def submit(self, prompt, count, sampling=None, *, policy: str = "f3", draft: bool = True, stop_eos: bool = True,
++               cancel_after: int | None = None):
++        from tensorfold.cuda.streams import Stream
++        from tensorfold.families.glm5_next.cuda.engine import encode_policy
++
++        s = Stream(list(prompt), count, sampling, draft=draft, stop_eos=stop_eos)
++        s.glm = {"code": self.g._effective(encode_policy(policy)), "spec": policy}
++        got: list[int] = []
++
++        def emit(new):
++            got.extend(new)
++            return cancel_after is not None and len(got) >= cancel_after
++
++        s.emit, s.got = emit, got
++        self.d.admit(s)
++        return s
++
++    def step(self) -> list:
++        done = self.d.round()
++        self.d.finish(done)
++        return done
++
++    def run(self, most: int = 5000) -> None:
++        for _ in range(most):
++            if not self.d.lanes:
++                return
++            self.step()
++        raise AssertionError("the streams did not finish")
++
++
++# -- one rank: the replies, the wire, no messages ----------------------------------------------------------------
++@pytest.mark.parametrize("streams", [2, 4])
++def test_world1_staggered_requests_equal_their_solo_replies(afd_fake, streams):
++    """The PR's six staggered requests on the AFD attention node (DFlash2 drafts, MTP off): each reply equals its
++    solo draft:false reply; one begin per forward, before it; batched windows of the segments' rows (<= 32);
++    prompt chunks flagged; no message ever shared (no rank 1)."""
++
++    torch = afd_fake.torch
++    n1 = World1(afd_fake, streams=streams)
++    admitted, pending = [], list(enumerate(CASES))
++    starts = {0: 0, 1: 2, 2: 3, 3: 7, 4: 11, 5: 12}
++    for it in range(4000):
++        while pending and it >= starts[pending[0][0]] and n1.d.live() < streams:
++            i, (prompt, count, kind, policy, draft) = pending.pop(0)
++            admitted.append((i, n1.submit(prompt, count, _sampling(kind, 100 + i), policy=policy, draft=draft)))
++        if not n1.d.lanes and not pending:
++            break
++        if n1.d.lanes:
++            n1.step()
++    assert not pending and not n1.d.lanes
++    for i, s in admitted:
++        prompt, count, kind, _, _ = CASES[i]
++        assert s.got == solo(torch, prompt, count, _sampling(kind, 100 + i)), i
++    assert n1.shared == [] and n1.d.world == 1
++    pairs = n1.wire.pairs()
++    batched = [r for k, r in pairs if k == "batched"]
++    assert [r for r, _ in n1.verify.windows] == batched
++    assert all(r == sum(rows) and r <= WINDOW for r, rows in n1.verify.windows)
++    assert any(len(rows) > 1 for _, rows in n1.verify.windows)              # streams shared a window
++    assert any(r > 8 for r in batched)                                      # past a solo window's rows
++    chunks = [r for k, r in pairs if k == "chunk"]
++    assert chunks and all(r <= n1.g.e.prefill_rows for r in chunks)
++    assert n1.d.drafts.proposed > 0 and any(s.accepted for _, s in admitted)
++
++
++def test_world1_serial_reference_verify_keeps_the_hook_out_of_the_seam(afd_fake):
++    """TF_GLM_MULTI_VERIFY=serial (the reference, each window its own forward through the solo engine) is allowed
++    under AFD: the fake's single-stream forward stands in for Engine.forward (whose begin is the branch's own), so
++    only the prompt chunks reach the wire here; the replies are the solo ones."""
++
++    torch = afd_fake.torch
++    n1 = World1(afd_fake, streams=2, batched=False)
++    a = n1.submit(_prompt(120, 1), 40, None)
++    b = n1.submit(_prompt(70, 2), 35, _sampling("topk", 3))
++    n1.run()
++    assert a.got == solo(torch, a.prompt, 40, None) and b.got == solo(torch, b.prompt, 35, _sampling("topk", 3))
++    assert {k for k, _ in n1.wire.pairs()} == {"chunk"} and n1.shared == []
++
++
++def test_world1_cancel_pause_give_back_and_resume(afd_fake):
++    """A cancelled stream ends at the round boundary (the others unchanged); two streams that fill the pool pause
++    and the youngest is given back and replays (each token sent once); the same conversation's next turn resumes
++    from its kept prompt in place. Every reply equals its solo one; nothing is shared."""
++
++    torch = afd_fake.torch
++    n1 = World1(afd_fake, streams=3)
++    a = n1.submit(_prompt(60, 9), 200, _sampling("topk", 1), stop_eos=False, cancel_after=12)
++    b = n1.submit(_prompt(70, 10), 40, None)
++    n1.run()
++    assert 12 <= len(a.got) < 12 + 16 and a.done
++    assert a.got == solo(torch, a.prompt, 200, _sampling("topk", 1), stop_eos=False)[:len(a.got)]
++    assert b.got == solo(torch, b.prompt, 40, None)
++
++    tight = World1(afd_fake, streams=2, blocks=2)
++    one = tight.submit(_prompt(2000, 14), 80, None, stop_eos=False)
++    two = tight.submit(_prompt(2010, 15), 60, _sampling("topk", 4), stop_eos=False)
++    requeued, gave_back = [], 0
++    for _ in range(5000):
++        if not tight.d.lanes and not requeued:
++            break
++        if not tight.d.lanes and requeued:
++            tight.d.admit(requeued.pop(0))
++        tight.step()
++        for s in tight.d.requeue:
++            gave_back += 1
++            again = s.continued()
++            again.glm, again.emit, again.got = s.glm, s.emit, s.got
++            requeued.append(again)
++        tight.d.requeue = []
++    assert gave_back == 1
++    assert one.got == solo(torch, one.prompt, 80, None, stop_eos=False)
++    assert two.got == solo(torch, two.prompt, 60, _sampling("topk", 4), stop_eos=False)
++
++    base = _prompt(300, 40)
++    first = n1.submit(base, 20, None)
++    n1.run()
++    turn = base + first.got + _prompt(30, 41)
++    again = n1.submit(turn, 25, _sampling("topk", 7))
++    assert again.cached == 299
++    n1.run()
++    assert again.got == solo(torch, turn, 25, _sampling("topk", 7))
++    assert n1.shared == [] and tight.shared == []
++    n1.wire.pairs()
++    tight.wire.pairs()
++
++
++def test_world1_scheduler_burst(afd_fake):
++    """GlmScheduler on the AFD attention node alone (no follower thread): five requests at once from five threads
++    (a burst past the two slots), one stopped by its client: every other reply equals its solo one."""
++
++    from tensorfold.families.glm5_next.cuda.engine import encode_policy
++    from tensorfold.families.glm5_next.cuda.multi import GlmScheduler
++
++    torch = afd_fake.torch
++    n1 = World1(afd_fake, streams=2)
++    sched = GlmScheduler(n1.d, max_streams=2)
++    kinds = ("topk", "greedy", "nucleus", "minp", "greedy")
++    reqs = [(_prompt(40 + 30 * i, 70 + i), 30 + 5 * i, _sampling(kinds[i], i)) for i in range(5)]
++    results: dict[int, list[int]] = {}
++    errors: list = []
++
++    def client(i):
++        prompt, n, sp = reqs[i]
++        got: list[int] = []
++
++        def emit(new):
++            got.extend(new)
++            return i == 3 and len(got) >= 6
++
++        try:
++            sched.submit(prompt, n, sp, True, emit, glm={"code": encode_policy("f3"), "spec": "f3"})
++        except Exception as exc:                     # noqa: BLE001
++            errors.append(exc)
++        results[i] = got
++
++    threads = [threading.Thread(target=client, args=(i,)) for i in range(5)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join(timeout=120)
++    sched.close()
++    assert not errors and len(results) == 5
++    for i in (0, 1, 2, 4):
++        prompt, n, sp = reqs[i]
++        assert results[i] == solo(torch, prompt, n, sp), i
++    assert 6 <= len(results[3]) < reqs[3][1]
++    assert results[3] == solo(torch, reqs[3][0], reqs[3][1], reqs[3][2])[:len(results[3])]
++    assert n1.shared == []
++    assert all(r <= WINDOW for k, r in n1.wire.pairs() if k == "batched")
++
++
++# -- capture, settings and construction ---------------------------------------------------------------------------
++def test_no_batched_capture_under_afd(afd_fake, monkeypatch):
++    """MultiDecoder captures the batched windows by default, never with the AFD wire on its weights; and
++    BatchedVerify.capture itself refuses there (the wire runs inside no capture)."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import multi
++    from tensorfold.families.glm5_next.cuda.verify import BatchedVerify
++
++    made = []
++
++    class Stub:
++        def __init__(self, e, *, taps=(), rows=WINDOW):
++            made.append(self)
++            self.captured, self.graphs = False, {}
++
++        def capture(self):
++            self.captured = True
++
++    monkeypatch.setattr(multi, "BatchedVerify", Stub)
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.delenv("TF_GLM_MULTI_GRAPHS", raising=False)
++    monkeypatch.delenv("TF_GLM_MULTI_VERIFY", raising=False)
++    for with_afd in (False, True):
++        g = shell(torch, 0, pool=4 * ALIGN, streams=2)
++        if with_afd:
++            from tensorfold.families.glm5_next.cuda.afd import Solo
++
++            g.comm, g.e.w.afd = Solo(), WireLog()
++        multi.MultiDecoder(g, 2, drafts=FakeMultiDrafter(torch, 2, 4 * ALIGN))
++    assert [s.captured for s in made] == [True, False]
++
++    bv = BatchedVerify.__new__(BatchedVerify)
++    bv.e, bv.w, bv.b = SimpleNamespace(), SimpleNamespace(afd=WireLog()), None
++    with pytest.raises(RuntimeError, match="no batched-window capture"):
++        bv.capture()
++
++
++def test_multi_settings_that_need_graphs_are_refused_before_the_wire(monkeypatch, tmp_path):
++    """AfdEngine(parallel > 1) refuses TF_GLM_MULTI_DEPTH=joint and TF_GLM_MULTI_LONE=1, and --parallel past 4,
++    before make_afd opens the wire (the expert nodes never see a start that cannot serve)."""
++
++    from tensorfold.families.glm5_next.cuda import afd as afd_mod
++    from tensorfold.families.glm5_next.cuda import engine
++
++    monkeypatch.setattr(afd_mod, "make_afd", lambda *a, **k: pytest.fail("the wire opened"))
++    for env, match in (({"TF_GLM_MULTI_DEPTH": "joint"}, "TF_GLM_MULTI_DEPTH=joint"),
++                       ({"TF_GLM_MULTI_LONE": "1"}, "TF_GLM_MULTI_LONE=1")):
++        for k in ("TF_GLM_MULTI_DEPTH", "TF_GLM_MULTI_LONE"):
++            monkeypatch.delenv(k, raising=False)
++        for k, v in env.items():
++            monkeypatch.setenv(k, v)
++        with pytest.raises(ValueError, match=match):
++            engine.AfdEngine(tmp_path, master="192.0.2.10", port=29551, parallel=2)
++    for k in ("TF_GLM_MULTI_DEPTH", "TF_GLM_MULTI_LONE"):
++        monkeypatch.delenv(k, raising=False)
++    with pytest.raises(ValueError, match="1 to 4"):
++        engine.AfdEngine(tmp_path, master="192.0.2.10", port=29551, parallel=5)
++    engine.afd_parallel_check({"TF_GLM_MULTI_DEPTH": "scale:0.5", "TF_GLM_MULTI_SAMPLER": "packed"})   # allowed
++
++
++def test_parallel_reaches_the_afd_engine(monkeypatch, tmp_path):
++    """`serve --experts remote --parallel 2` hands parallel=2 to cuda_engine, which builds AfdEngine(parallel=2);
++    without --parallel the AFD engine gets 1 (one request at a time, as before)."""
++
++    from tensorfold import cli
++    from tensorfold.cuda import server
++    from tensorfold.families import glm5_next
++    from tensorfold.families.glm5_next.cuda import engine
++
++    made = []
++    family = SimpleNamespace(title="GLM-5.3-Flash", model_type="glm5_next",
++                             package=SimpleNamespace(cuda_engine=lambda *a, **k: made.append(k) or SimpleNamespace()))
++    monkeypatch.setattr(server, "App", lambda *a, **k: SimpleNamespace(effective_context_window=262144))
++    monkeypatch.setattr(server, "serve", lambda *a: None)
++    for flags, want in (([], None), (["--parallel", "2"], 2)):
++        args = cli.build_parser().parse_args(["serve", str(tmp_path), "--backend", "cuda", "--no-drafts",
++                                              "--experts", "remote", "--master", "192.0.2.10", *flags])
++        assert cli._serve_cuda(args, family, tmp_path, 262144) == 0
++        assert made[-1]["experts"] == "remote" and made[-1].get("parallel") == want
++
++    built = []
++    monkeypatch.setattr(engine, "AfdEngine", lambda *a, **k: built.append(k) or SimpleNamespace(**k))
++    for options, want in (({}, 1), ({"parallel": 2}, 2), ({"parallel": 4}, 4)):
++        glm5_next.cuda_engine(tmp_path, experts="remote", master="192.0.2.10", no_drafts=True, **options)
++        assert built[-1]["parallel"] == want
++
++
++# -- the world-1 estimate -----------------------------------------------------------------------------------------
++GLM = {"hidden_size": 4096, "num_hidden_layers": 45, "num_attention_heads": 64, "vocab_size": 154880,
++       "linear_attn_config": {"num_heads": 64, "head_dim": 128, "short_conv_kernel_size": 4,
++                              "kda_layers": [i for i in range(45) if i % 4 != 3],
++                              "full_attn_layers": [i for i in range(45) if i % 4 == 3]},
++       "moe_intermediate_size": 2048, "num_experts_per_tok": 8, "kv_lora_rank": 512, "qk_nope_head_dim": 192,
++       "v_head_dim": 256, "index_topk": 2048}
++DFLASH2 = {"num_hidden_layers": 5, "num_key_value_heads": 8, "head_dim": 128, "sliding_window": 2048,
++           "dflash_config": {"block_size": 8}}
++
++
++def test_the_world1_estimate():
++    """At GLM-5.3-Flash's shapes a world-1 stream slot is 0.308 GiB (34 KDA layers x 64 heads), about twice the TP2
++    rank's; the multi-stream drafter's rings at world 1 are twice the TP2 rank's (8 KV heads, not 4); a kept state's
++    KDA state likewise."""
++
++    from tensorfold.families.glm5_next.cuda.engine import multi_draft_bytes, slot_bytes
++
++    one, two = slot_bytes(GLM, 1), slot_bytes(GLM, 2)
++    assert one == 330_577_920 and abs(one / 2 ** 30 - 0.308) < 0.001
++    assert 1.99 < one / two < 2.05
++    assert slot_bytes(GLM, 1, rows=0) // 2 == 2 * (slot_bytes(GLM, 2, rows=0) // 2)
++    for streams in (2, 4):
++        w1 = multi_draft_bytes(DFLASH2, streams, 1, ring=True, capacity=262152)
++        assert w1 == 2 * multi_draft_bytes(DFLASH2, streams, 2, ring=True, capacity=262152)
++    assert abs(multi_draft_bytes(DFLASH2, 2, 1, ring=True, capacity=262152) / 2 ** 30 - 0.084) < 0.001
++
++
++def test_world1_kept_prompts_fit_what_the_window_leaves():
++    """Under --parallel the PR bounds kept prompts by count alone (TF_GLM_CACHE_ENTRIES, 8; multi._keep keeps at least
++    one), and a world-1 kept state (a KDA state and a DFlash2 window) is 0.178 GiB: eight are 1.43 GiB, while the 5090
++    leaves 0.17 GiB at a 262K window. At world 1 the engine bounds the count by what the window leaves: one kept prompt
++    at 262K, seven at 196K (1.28 GiB), the setting itself with room (two ranks keep the PR's count)."""
++
++    from tensorfold.families.glm5_next.cuda.engine import kept_most, slot_bytes
++
++    gib = 2 ** 30
++    state = slot_bytes(GLM, 1, rows=0) // 2 + (22 << 20) * 2
++    assert abs(state / gib - 0.178) < 0.001 and abs(8 * state / gib - 1.425) < 0.001
++    assert kept_most(8, int(0.17 * gib), state) == 1
++    assert kept_most(8, int(1.28 * gib), state) == 7
++    assert kept_most(8, 3 * gib, state) == 8
++    assert kept_most(8, 0, state) == 1 and kept_most(0, 3 * gib, state) == 1
++
++
++# -- the wire for batched windows ---------------------------------------------------------------------------------
++@pytest.mark.parametrize("R", [7, 8, 9, 24, 32])
++def test_batched_window_shapes_on_the_wire(R, monkeypatch):
++    """A batched window of R rows: the MCDMA request and reply fit 20 + 36 MiB mailboxes
++    (startup already checks 2,048 rows); the expert node takes its decode scratch up to 8 rows, its prompt scratch
++    past them; the MCDMA request header carries R in eager mode; settings_for is the same whatever --parallel."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import afd as afd_mod
++    from tensorfold.families.glm5_next.cuda import afd_mcdma, mcdma
++    from tensorfold.families.glm5_next.cuda.experts_node import ExpertBuffers
++
++    lay = mcdma.Layout(4096, 9)
++    assert lay.req(R) <= 20 << 20 and lay.rep(R) <= 36 << 20
++    assert lay.req(R) <= lay.req(2048) and lay.rep(R) <= lay.rep(2048)
++
++    eb = ExpertBuffers.__new__(ExpertBuffers)
++    eb.rows, eb.decode, eb.pref = 8, "decode", "prompt"
++    assert eb.scratch(R) == ("decode" if R <= 8 else "prompt")
++
++    tr = afd_mcdma.McdmaTransport.__new__(afd_mcdma.McdmaTransport)      # the header table only, no links
++    tr.hdr_tab_cpu = torch.zeros((42, mcdma.HDR_INTS), dtype=torch.int32)
++    tr.hdr_tab = torch.zeros((42, mcdma.HDR_INTS), dtype=torch.int32)
++    a = afd_mod.AfdWire.__new__(afd_mod.AfdWire)
++    a.dead, a.check, a.timing, a.seq, a.layer, a.nlayers, a.tr = None, False, False, 0, 0, 42, tr
++    a.begin(R)
++    assert tr.hdr_tab[:, 1].tolist() == [1] * 42 and tr.hdr_tab[:, 2].tolist() == [R] * 42
++    assert tr.hdr_tab[:, 4].tolist() == [afd_mod.MODE_EAGER] * 42
++
++    cfg = SimpleNamespace(mlp_kinds=["dense"] * 3 + ["moe"] * 42, quant="exl3", experts=288, top_k=8)
++    s = afd_mod.settings_for("/nonexistent", cfg, prefill_rows=2048)
++    assert s == {"digest": "", "layers": list(range(3, 45)), "max_rows": 8,
++                 "mtp": 0, "prefill_rows": 2048, "quant": "exl3", "experts": 288, "top_k": 8}
++    assert "parallel" not in s
++
++
++def test_flush_sends_at_two_ranks_and_not_at_one(afd_fake):
++    """The per-iteration message: rank 0 of two ranks shares it, sealed (the PR's protocol, unchanged); the world-1
++    AFD node applies its ops as it decides them and shares, seals and numbers nothing."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda.afd import Solo
++    from tensorfold.families.glm5_next.cuda.multi import ADMIT, MultiDecoder, unseal
++
++    for comm, world in ((SimpleNamespace(), 2), (Solo(), 1)):
++        g = shell(torch, 0, pool=4 * ALIGN, streams=2)
++        g.comm = comm
++        shared: list = []
++        g._share = lambda values, shared=shared: (shared.append(list(values)), list(values))[1]
++        d = MultiDecoder(g, 2, drafts=FakeMultiDrafter(torch, 2, 4 * ALIGN), verify=SimpleNamespace())
++        assert d.world == world
++        d._emit(ADMIT, [1, 2, 3])
++        d._flush()
++        if world == 2:
++            assert len(shared) == 1 and unseal(shared[0], 0) == [ADMIT, 3, 1, 2, 3] and d.sent == 1
++        else:
++            assert shared == [] and d.sent == 0
++        assert d.outbox == [] and not d.idle
++
++
++def test_prompt_rows_cross_in_fill_chunks(afd_fake, monkeypatch):
++    """TF_GLM_FILL_ROWS sizes the chunks a prompt crosses the wire in while another stream decodes (the knob that
++    bounds an AFD fill's stall): 256-row chunks while busy, the engine's chunk when the prompt fills alone."""
++
++    torch = afd_fake.torch
++    monkeypatch.setenv("TF_GLM_FILL_ROWS", "64")
++    n1 = World1(afd_fake, streams=2, prefill_rows=256)
++    assert n1.d.fill_rows == 64 and n1.g.e.prefill_rows == 256
++    a = n1.submit(_prompt(300, 50), 60, None, stop_eos=False)
++    for _ in range(4):
++        n1.step()
++    alone = [r for k, r in n1.wire.pairs() if k == "chunk"]
++    b = n1.submit(_prompt(300, 51), 20, None)
++    n1.run()
++    beside = [r for k, r in n1.wire.pairs() if k == "chunk"][len(alone):]
++    assert sum(alone) == 300 and max(alone) > 64                 # alone: the engine's chunk (kept points aside)
++    assert sum(beside) == 300 and max(beside) == 64              # beside a decoding stream: 64-row chunks
++    assert a.got == solo(torch, a.prompt, 60, None, stop_eos=False) and b.got == solo(torch, b.prompt, 20, None)
++
+diff --git a/tests/test_glm_serial_stop_afd.py b/tests/test_glm_serial_stop_afd.py
+new file mode 100644
+index 0000000..2bf06a5
+--- /dev/null
++++ b/tests/test_glm_serial_stop_afd.py
+@@ -0,0 +1,88 @@
++"""The stop vote (MiaAI-Lab's ashhart/TensorFold#301) on the AFD attention node: world 1, ``afd.Solo`` as its comm.
++
++#301's own tests cover two ranks and one rank without a comm (``w.comm is None``). The AFD attention node is world 1
++with ``afd.Solo`` as ``w.comm``, so its samples take the gathered path (``comm_gather`` over ``Solo.all_gather``) with
++the vote's extra word. These run #301's real decode loops on that path: a stop ends the run after the next round,
++voting never changes a reply, and each verify sample's gather carries exactly one word more. The AFD node decodes
++serially or with DFlash2 drafts (MTP stays off under AFD).
++"""
++
++from __future__ import annotations
++
++import pytest
++
++torch = pytest.importorskip("torch")
++pytestmark = pytest.mark.torch
++geometry = pytest.importorskip("tests.test_cuda_geometry")
++stop = pytest.importorskip("tests.test_glm_serial_stop")
++
++allocations = geometry.allocations          # the fake triton the CUDA modules import under
++cpu_loops = stop.cpu_loops                  # #301's CPU decode loops (autouse here too)
++
++KINDS = ("serial", "dflash")
++
++
++class SoloGathers:
++    """``afd.Solo``, the AFD attention node's comm, counting the words each all-gather carries."""
++
++    def __init__(self) -> None:
++        from tensorfold.families.glm5_next.cuda.afd import Solo
++
++        self.solo, self.sizes = Solo(), []
++        self.world = self.solo.world
++
++    def all_gather(self, send, recv) -> None:
++        self.sizes.append(send.numel())
++        self.solo.all_gather(send, recv)
++
++
++def run_solo(kind: str, *, sampling=None, stop_at: int | None = None, vote: bool = True, count: int = 60):
++    """One world-1 run of #301's loop over ``afd.Solo``; the server's callback asks to stop at call ``stop_at``."""
++
++    comm = SoloGathers()
++    e = stop.FakeEngine(0, 1, comm)
++    calls: list[list[int]] = []
++
++    def on_tokens(new):
++        calls.append(list(new))
++        return stop_at is not None and len(calls) >= stop_at
++
++    fn = on_tokens
++    if vote:
++        fn = e.vote = stop.decode.StopVote(on_tokens)
++    res = stop.loop(kind, e, count, sampling, fn)
++    return res, calls, e, comm
++
++
++@pytest.mark.parametrize("kind", KINDS)
++@pytest.mark.parametrize("mode", sorted(stop.SAMPLINGS))
++def test_a_stop_ends_the_afd_node_after_the_next_round(kind, mode):
++    sampling = stop.SAMPLINGS[mode]
++    ref = run_solo(kind, sampling=sampling, vote=False)[0]
++    assert len(ref.tokens) == 60                                     # unstopped: to max_tokens, as before #301
++    for stop_at in (1, 3):
++        res, calls, e, _ = run_solo(kind, sampling=sampling, stop_at=stop_at)
++        assert res.rounds == stop_at + 1 and e.vote.stop and e.vote.mine
++        assert res.tokens == ref.tokens[:len(res.tokens)]
++        assert [7] + [t for call in calls[:stop_at] for t in call] == ref.tokens[:1 + sum(map(len, calls[:stop_at]))]
++
++
++@pytest.mark.parametrize("kind", KINDS)
++@pytest.mark.parametrize("mode", sorted(stop.SAMPLINGS))
++def test_the_vote_never_changes_an_afd_reply(kind, mode):
++    sampling = stop.SAMPLINGS[mode]
++    plain, _, _, unvoted = run_solo(kind, sampling=sampling, vote=False)
++    res, _, e, voted = run_solo(kind, sampling=sampling)
++    assert res.tokens == plain.tokens and res.rounds == plain.rounds and not e.vote.stop
++    assert sum(voted.sizes) == sum(unvoted.sizes) + plain.rounds     # one word more on each verify sample's gather
++
++
++@pytest.mark.parametrize("kind", KINDS)
++def test_solo_and_no_comm_give_the_same_world1_replies(kind):
++    """``afd.Solo`` (the AFD node) and #301's own one-rank case (``w.comm is None``) decode and stop alike."""
++
++    sampling = stop.SAMPLINGS["top_k"]
++    for stop_at in (None, 2):
++        res = run_solo(kind, sampling=sampling, stop_at=stop_at)[0]
++        ref = stop.run_ranks(kind, world=1, sampling=sampling, stop_at=stop_at)[0][0][0]
++        assert res.tokens == ref.tokens and res.rounds == ref.rounds

@@ -1,5 +1,4 @@
 .env
-.install-*.env
 *.log
 __pycache__/
-telemetry/
+/build/

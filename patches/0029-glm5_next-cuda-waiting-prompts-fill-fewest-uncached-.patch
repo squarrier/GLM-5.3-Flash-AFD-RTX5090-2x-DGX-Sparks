@@ -1,0 +1,1355 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 16:40:38 -0400
+Subject: [PATCH] glm5_next/cuda: waiting prompts fill fewest uncached tokens
+ first, with aging, TF_GLM_PREFILL_ORDER (extends MiaAI-Lab recipe patch
+ 0049's shortest-first chunk)
+
+With --parallel, a 4K prompt that arrives while a 100K prompt fills waits for the whole long fill (about 75 s on
+the attention/expert split): the prompt chunks go to the oldest filling stream, and TF_GLM_MULTI_PREFILL's grouped
+chunk (the recipe's 0049, fewest rows left first) only helps prompts shorter than one chunk. TF_GLM_PREFILL_ORDER=sjf
+orders the waiting prompts by their uncached tokens instead, with an aging bound, TF_GLM_PREFILL_AGE_MS (default
+30,000): a prompt that has waited that long is overtaken by no later arrival. Unset (or fifo), the code paths are the
+ones before.
+
+- prefill_order.py (new): the two settings (read before the AFD wire opens), the arrival stamp and the order's key:
+  foreground before background; every prompt that has waited the bound, by arrival; then fewest uncached tokens, then
+  arrival, then admission (or queue) order.
+- multi.py, MultiDecoder: _fill_turn picks the filling stream by the key (in place of the oldest), so a long fill
+  yields to a shorter prompt between two chunks; _group (0049) hands its row budget out in the same order (an aged
+  prompt first: it fills alone until its rows left fit beside others); a suspended layer-sliced chunk
+  (TF_GLM_FILL_BUDGET_MS) finishes its slices first, and a TF_GLM_PREFILL_PAIRS pair is planned from the order and
+  runs whole. uncached(): a queued request's prompt less the kept prefix it would resume. /health's prefill_order
+  counters (picks, reordered, aged, admits, admits_reordered).
+- multi.py, GlmScheduler: submit stamps the arrival; _admit takes the queued requests in the order (_admit_sjf,
+  _next_waiting); the request held for room competes with the queue, so a smaller one that fits goes past it until
+  it has aged; a request given back to the queue keeps its first arrival.
+- engine.py: the startup line names the setting.
+
+Exact: the order changes when each stream's rows fill, never which rows or how they are cut, so every reply, kept
+state and pool row is the one the request gets alone; rank 1 applies rank 0's FILL / MFILL / ADMIT messages as ever.
+
+Tests: tests/test_glm_prefill_order.py (the settings and the key; at two ranks a short prompt arriving 1 s after a long
+one takes the next chunk, one arriving after the long one aged waits, the aging bound as a setting, aging mid-fill,
+grouped chunks in the order and the aged long prompt alone, replies equal the solo ones and both ranks agree; at world
+1 a chunk pair planned from the order; admission fewest uncached first, a kept prefix counting as cached, the held
+request passed while young and first again once aged; unset == fifo message for message; the threaded scheduler with
+a follower thread under the setting; the arrival simulator at a small scale). tests/glm_prefill_sim.py: an arrival
+simulator driving the engine's own scheduler at world 1 on the layered fake model in virtual time.
+tests/test_glm_multi.py: test_one_message_an_iteration also accepts FILLPART / MFILLPART as a round's one message (a
+layer slice while another stream decodes): with the setting and TF_GLM_FILL_BUDGET_MS its short prompt decodes first
+and the long one fills in slices.
+
+Credit: THIRD_PARTY_NOTICES.md ("GLM multi-prompt prefill") records the change to the ported _group.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: this changes MiaAI-Lab's code from her GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patch 0049,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 1576746a04983b6eded0551dbf22512ee9e95654 (v1.5); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  The change is this recipe's; Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |   4 +-
+ .../families/glm5_next/cuda/engine.py         |   9 +-
+ .../families/glm5_next/cuda/multi.py          | 144 ++++-
+ .../families/glm5_next/cuda/prefill_order.py  | 101 ++++
+ tests/glm_prefill_sim.py                      | 299 ++++++++++
+ tests/test_glm_multi.py                       |   6 +-
+ tests/test_glm_prefill_order.py               | 532 ++++++++++++++++++
+ 7 files changed, 1086 insertions(+), 9 deletions(-)
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/prefill_order.py
+ create mode 100644 tests/glm_prefill_sim.py
+ create mode 100644 tests/test_glm_prefill_order.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index d4a292f..34d1c83 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -215,7 +215,9 @@ chunk of their own, so without the setting the forward's calls are the ones befo
+ pieces end at a stream's kept points (or its end) and cut in multiples of 64 rows; streams drafting with the MTP head
+ fill alone; on the attention/expert split's attention node a multi-prompt chunk is one prompt-chunk forward of at
+ most the expert nodes' `prefill_rows` rows (no wire change). `TF_GLM_MULTI_PREFILL` is off unless set (the recipe's
+-`config.sh` turns it on).
++`config.sh` turns it on). With `TF_GLM_PREFILL_ORDER=sjf` (this tree's `prefill_order.py`, not a recipe patch),
++`MultiDecoder._group` hands the chunk's rows out in that setting's order (every prompt that has waited
++`TF_GLM_PREFILL_AGE_MS` first, by arrival, then the recipe's fewest rows left first); unset, the recipe's order.
+ 
+ ## Smooth streaming (TF_GLM_STREAM_SMOOTH)
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index b1a0032..81b7ab6 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -659,6 +659,7 @@ class GlmEngine:
+         self.live: list[int] = []
+         self.cache_entries = self.kept_cap or self._cache_entries()
+         if parallel > 1:
++            from . import prefill_order
+             from .multi import GlmScheduler, MultiDecoder
+ 
+             self.multi = MultiDecoder(self, parallel)
+@@ -673,7 +674,8 @@ class GlmEngine:
+                       f"TF_GLM_FILL_SHARE {self.multi.share:g})"
+                       f"{'; waiting prompts share prompt chunks (TF_GLM_MULTI_PREFILL)' if self.multi.group else ''}; "
+                       f"{self.multi.tune.describe()}"
+-                      f"{f'; prompt layer slices target {self.multi.fill_budget:g} ms (TF_GLM_FILL_BUDGET_MS)' if self.multi.fill_budget else ''}",
++                      f"{f'; prompt layer slices target {self.multi.fill_budget:g} ms (TF_GLM_FILL_BUDGET_MS)' if self.multi.fill_budget else ''}"
++                      f"{'; ' + prefill_order.describe(self.multi.age_s) if self.multi.order == 'sjf' else ''}",
+                       flush=True)
+                 if self.multi.row_ms is not None:
+                     print("[tensorfold] --parallel batched window ms by rows: " +
+@@ -1204,7 +1206,7 @@ def afd_parallel_check(env=None) -> None:
+     """--parallel on the AFD attention node runs eager batched windows: refuse the multi-stream settings
+     that need CUDA graphs across the AFD wire, before the wire opens and the weights load."""
+ 
+-    from . import multi_prefill, sliced_fill
++    from . import multi_prefill, prefill_order, sliced_fill
+     from .multi_tune import MultiSettings
+ 
+     tune = MultiSettings.from_env(env)
+@@ -1214,6 +1216,9 @@ def afd_parallel_check(env=None) -> None:
+     # ... and the sliced fill's (0062): its slices are MODE_SLICE forwards of the wire, its costs timed over it
+     sliced_fill.budget_ms(None if env is None else env.get("TF_GLM_FILL_BUDGET_MS", ""))
+     sliced_fill.drafted_rounds(None if env is None else env.get("TF_GLM_FILL_DRAFTS", ""))
++    # ... and the prompts' order (TF_GLM_PREFILL_ORDER, TF_GLM_PREFILL_AGE_MS; ``prefill_order``, ours)
++    prefill_order.order(None if env is None else env.get(prefill_order.ENV, ""))
++    prefill_order.age_ms(None if env is None else env.get(prefill_order.AGE_ENV, ""))
+     if tune.depth == "joint":
+         raise ValueError("TF_GLM_MULTI_DEPTH=joint times the batched verify window's CUDA graphs, which --experts "
+                          "remote does not capture (eager windows over the AFD wire): unset it, or use policy / scale:A")
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index b743df1..9f1f3c4 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -17,7 +17,9 @@ a few layers at a time (``sliced_fill``; MiaAI-Lab recipe patch 0062): each slic
+ about that many ms, a decode round between two slices (one token per stream, or drafted with TF_GLM_FILL_DRAFTS=1;
+ TF_GLM_FILL_SHARE applies to unsliced fills), the chunk's buffers kept in the engine's prompt buffers meanwhile and
+ its commit after its last layer; a request alone fills whole forwards. On the AFD attention node each slice is one
+-forward of the wire (``afd.MODE_SLICE``). A round: each
++forward of the wire (``afd.MODE_SLICE``). With TF_GLM_PREFILL_ORDER=sjf (``prefill_order``, ours) the waiting prompts go
++fewest uncached tokens first instead of oldest first, into free slots and into prompt chunks, and none is overtaken by
++a later arrival once it has waited TF_GLM_PREFILL_AGE_MS. A round: each
+ decoding stream (admission order) proposes drafts under its own policy (DFlash2: every drafting stream's block in one
+ batched pass, ``dflash2_multi``; MTP: the stream's own chain on the MTP head), the combined window is capped at
+ ``MAX_WINDOW`` rows (the longest tails trimmed), one verify over every stream's rows (``forward_streams``:
+@@ -38,6 +40,7 @@ each round verifies depends on it."""
+ from __future__ import annotations
+ 
+ import hashlib
++import heapq
+ import json
+ import os
+ import queue
+@@ -53,7 +56,7 @@ from tensorfold.cuda.memory_gate import NoRoom as _NoRoom
+ from tensorfold.cuda.scheduler import Scheduler
+ from tensorfold.cuda.streams import Stream, next_fill
+ 
+-from . import cache_room, multi_prefill, prefill_pairs, sliced_fill
++from . import cache_room, multi_prefill, prefill_order, prefill_pairs, sliced_fill
+ from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
+ from .pool import ALIGN, Pool, align_up
+ from .verify import BatchedVerify, Segment, SerialVerify, Verified
+@@ -419,6 +422,9 @@ class MultiDecoder:
+     fill_drafts = decode_due = short_round_due = False
+     partial = fill_costs = None
+     grid = 0                           # TF_GLM_PROMPT_GRID (``engine.prompt_grid``; MiaAI-Lab recipe patch 0008): 0 off
++    order = "fifo"                     # TF_GLM_PREFILL_ORDER (``prefill_order``; ``__init__`` reads it): fifo or sjf
++    age_s = prefill_order.AGE_MS / 1000.0
++    ordered = None
+ 
+     def __init__(self, engine, streams: int, *, verify=None, drafts=None, draft_graphs: bool | None = None,
+                  tune: MultiSettings | None = None, row_ms: Sequence[float] | None = None, fill_costs=None) -> None:
+@@ -476,6 +482,11 @@ class MultiDecoder:
+         self.room_stats = cache_room.counters()
+         self.wanted: Callable[[], list] | None = None
+         self.laned = {"groups": 0, "chunks": 0, "rows": 0}               # groups of 3 or more lanes
++        # TF_GLM_PREFILL_ORDER=sjf (``prefill_order``, ours): rank 0 fills, and its scheduler admits, the waiting prompts
++        # fewest uncached tokens first, those that have waited TF_GLM_PREFILL_AGE_MS first by arrival
++        self.order = prefill_order.order()
++        self.age_s = prefill_order.age_ms() / 1000.0
++        self.ordered = {"picks": 0, "reordered": 0, "aged": 0, "admits": 0, "admits_reordered": 0}   # rank 0's, /health
+         self.mtp = self.w.mtp is not None                # MTP drafts: the head is loaded (engine.mtp_head)
+         self.drafts = drafts
+         if self.drafts is None and engine.drafter is not None:
+@@ -556,6 +567,8 @@ class MultiDecoder:
+                 **({"prefill_pairs": dict(self.paired)} if getattr(self, "pairs", False) else {}),
+                 **({"cache_room": dict(self.room_stats)} if getattr(self, "room", False) else {}),
+                 **({"prefill_lanes": dict(self.laned)} if getattr(self, "n_lanes", 1) >= 3 else {}),
++                **({"prefill_order": {"order": "sjf", "age_ms": round(self.age_s * 1000.0, 3),
++                                      **(self.ordered or {})}} if getattr(self, "order", "fifo") == "sjf" else {}),
+                 # how long rank 0's current iteration has run (0 between iterations): a stalled server keeps growing it
+                 "iteration_s": round(time.monotonic() - since, 1)
+                 if (since := getattr(self, "iteration_since", None)) is not None else 0.0}
+@@ -774,6 +787,8 @@ class MultiDecoder:
+ 
+         self._check()
+         g = self.g
++        if self.order == "sjf":               # its wait counts from its arrival (the scheduler's stamp, else now)
++            prefill_order.stamp(s)
+         prompt = [int(t) for t in s.prompt]
+         if not prompt:
+             raise ValueError("a request needs at least one prompt token")
+@@ -859,6 +874,41 @@ class MultiDecoder:
+ 
+         return code[0] >= 10 and self.drafts is not None, 0 < code[0] < 10 and self.mtp
+ 
++    # -- TF_GLM_PREFILL_ORDER=sjf (``prefill_order``, ours; rank 0) ----------------------------------------------------
++    def uncached(self, s: Stream) -> int:
++        """A queued request's uncached prompt tokens: its prompt less the kept prefix ``admit`` would resume it from
++        now (none for a reference request), for the scheduler's admission order."""
++
++        prompt = [int(t) for t in s.prompt]
++        if not (bool(s.draft) and not self.g.serial_only):
++            return len(prompt)
++        info = getattr(s, "glm", None) or {}
++        greedy = s.sampling is None or s.sampling.temperature <= 0
++        code = multi_code(info.get("code") or [0, 0, 0, 0], self.drafts is not None, self.mtp, self.dflash_code, greedy)
++        hit = self._resume(prompt, *self._drafters(code))
++        return len(prompt) - (len(hit.ids) if hit is not None else 0)
++
++    def _place(self, lane: Lane, now: float) -> tuple:
++        """A filling stream's place in ``prefill_order``'s order: its prompt rows not filled yet, its wait from its
++        arrival, its admission order."""
++
++        arrived = prefill_order.stamp(lane.s)
++        return prefill_order.key(lane.s.background, arrived, len(lane.s.prompt) - lane.st.pos, lane.order, now,
++                                 self.age_s)
++
++    def _first(self, filling: list[Lane]) -> Lane:
++        """TF_GLM_PREFILL_ORDER=sjf: the filling stream whose chunk goes next (``_place``'s smallest), in place of
++        ``next_fill``'s oldest; counted for /health."""
++
++        now = prefill_order.clock()
++        lane = min(filling, key=lambda x: self._place(x, now))
++        counts = self.ordered
++        if counts is not None:
++            counts["picks"] += 1
++            counts["reordered"] += int(lane.s is not next_fill([x.s for x in filling]))
++            counts["aged"] += int(prefill_order.aged(prefill_order.stamp(lane.s), now, self.age_s))
++        return lane
++
+     def _admitted(self, a: dict, s: Stream, constraint, spec: str = "") -> None:
+         """Both ranks: an ADMIT's stream in its slot and extent, resumed from its kept prompt if it names one."""
+ 
+@@ -1157,6 +1207,8 @@ class MultiDecoder:
+             if self.credit < 1:
+                 return None
+             self.credit -= 1
++        if self.order == "sjf":                                    # fewest uncached tokens first, aged ones first
++            return self._first(filling)
+         s = next_fill([l.s for l in filling])
+         return self.lanes[s.sid]
+ 
+@@ -1403,8 +1455,12 @@ class MultiDecoder:
+             return None
+         busy = any(x.decoding and not x.s.done for x in self.lanes.values())
+         left = self.fill_rows if busy else self.e.prefill_rows
+-        lanes = sorted((x for x in self.lanes.values() if plain(x)),
+-                       key=lambda x: (bool(x.s.background), len(x.s.prompt) - x.st.pos, x.order))
++        if self.order == "sjf":               # TF_GLM_PREFILL_ORDER=sjf: the chunk's rows in that order, aged ones first
++            now = prefill_order.clock()
++            lanes = sorted((x for x in self.lanes.values() if plain(x)), key=lambda x: self._place(x, now))
++        else:
++            lanes = sorted((x for x in self.lanes.values() if plain(x)),
++                           key=lambda x: (bool(x.s.background), len(x.s.prompt) - x.st.pos, x.order))
+         out: list[tuple[Lane, int]] = []
+         for x in lanes:
+             pos, n = x.st.pos, len(x.s.prompt)
+@@ -2010,6 +2066,8 @@ class GlmScheduler(Scheduler):
+         self.gather_s = multi_prefill.wait_ms() / 1000.0 if getattr(decoder, "group", False) else 0.0
+         if getattr(decoder, "room", False):           # TF_GLM_CACHE_ROOM: evictions spare what waiting requests resume
+             decoder.wanted = self._waiting_prompts
++        # TF_GLM_PREFILL_ORDER=sjf (``prefill_order``, ours): queued requests take free slots in the decoder's order
++        self.sjf = getattr(decoder, "order", "fifo") == "sjf"
+         super().__init__(decoder, max_streams=max_streams)
+ 
+     def _waiting_prompts(self) -> list[list[int]]:
+@@ -2035,6 +2093,8 @@ class GlmScheduler(Scheduler):
+         stream.emit = lambda new: (box.put(("tokens", new)), cancel[0])[1]
+         # the server's client poll (``feed.cancelled``): a sliced fill ends a filling request whose client left (0062)
+         stream.emit.cancelled = getattr(emit, "cancelled", None)
++        if getattr(self, "sjf", False):          # TF_GLM_PREFILL_ORDER=sjf: its wait counts from now
++            prefill_order.stamp(stream)
+         self.waiting.put((stream, box))
+         while True:
+             kind, value = box.get()
+@@ -2050,6 +2110,8 @@ class GlmScheduler(Scheduler):
+         """Waiting requests into free slots while they fit; ``until`` (a ``time.monotonic`` deadline): an empty queue
+         is waited on until then for more arrivals (TF_GLM_MULTI_PREFILL_WAIT_MS, MiaAI-Lab recipe patch 0049)."""
+ 
++        if getattr(self, "sjf", False):
++            return self._admit_sjf(first, until)
+         done: list[Stream] = []
+         while self.decoder.live() < self.max_streams:
+             if first is not None:
+@@ -2083,6 +2145,76 @@ class GlmScheduler(Scheduler):
+                 done.append(stream)
+         return done
+ 
++    def _admit_sjf(self, first=None, until: float | None = None) -> list[Stream]:
++        """TF_GLM_PREFILL_ORDER=sjf: ``_admit`` taking the waiting requests in ``prefill_order``'s order (fewest
++        uncached tokens first, those that have waited the aging bound first by arrival) instead of arrival order. The
++        request held for room goes back among them: one that fits can go first, until the held one has aged (then it
++        is first again, and waits for room as before). With an idle server's wait (``until``) the arrivals are taken
++        until the deadline or until they fill the free slots, then admitted in the order."""
++
++        for item in (self.held, first):          # back in the queue: everything waiting is ordered together
++            if item is not None:
++                self.waiting.put(item)
++        self.held = None
++        if until is not None:
++            free = self.max_streams - self.decoder.live()
++            with self.waiting.not_empty:
++                while self.waiting._qsize() < free:
++                    left = until - time.monotonic()
++                    if left <= 0:
++                        break
++                    self.waiting.not_empty.wait(left)
++        done: list[Stream] = []
++        while self.decoder.live() < self.max_streams:
++            item = self._next_waiting()
++            if item is None:
++                break
++            stream, box = item
++            if not self.decoder.fits(stream):
++                self.held = item                     # waits for room, and is ordered with the queue again next time
++                break
++            self.boxes[id(stream)] = box
++            try:
++                self.decoder.admit(stream)
++            except NoRoom:
++                self.boxes.pop(id(stream))
++                self.held = item
++                break
++            except Exception as exc:                 # noqa: BLE001  (this request fails, the others go on)
++                self.boxes.pop(id(stream)).put(("error", exc))
++                continue
++            if stream.done:
++                done.append(stream)
++        return done
++
++    def _next_waiting(self):
++        """The waiting request ``prefill_order`` puts first, taken out of the queue (None when none waits; ``close``'s
++        stop stays for the idle get). Only this worker thread takes from the queue, so the request is still there when
++        its key has been computed outside the queue's lock."""
++
++        with self.waiting.mutex:
++            entries = [x for x in self.waiting.queue if x[2] is not None]
++        if not entries:
++            return None
++        d = self.decoder
++        now = prefill_order.clock()
++
++        def place(entry):
++            prio, seq, (stream, _) = entry
++            return prefill_order.key(prio == 1, prefill_order.stamp(stream), d.uncached(stream), seq, now, d.age_s)
++
++        best = min(entries, key=place)
++        with self.waiting.mutex:
++            q = self.waiting.queue
++            q.pop(next(i for i, x in enumerate(q) if x is best))
++            heapq.heapify(q)
++        counts = d.ordered
++        if counts is not None:                   # reordered: not the earliest arrival (``first`` / ``held`` re-queued)
++            counts["admits"] += 1
++            fifo = min(entries, key=lambda x: (x[0], prefill_order.stamp(x[2][0]), x[1]))
++            counts["admits_reordered"] += int(best is not fifo)
++        return best[2]
++
+     def _yield(self) -> None:
+         """``Scheduler._yield``, the stream's GLM settings carried to its replay."""
+ 
+@@ -2098,6 +2230,8 @@ class GlmScheduler(Scheduler):
+         self.yields += 1
+         again = stream.continued()
+         again.glm = getattr(stream, "glm", {})
++        if getattr(stream, "arrived", None) is not None:      # TF_GLM_PREFILL_ORDER=sjf: it keeps its first arrival
++            again.arrived = stream.arrived
+         self.waiting.put((again, box))
+ 
+     def _requeue(self) -> None:
+@@ -2107,6 +2241,8 @@ class GlmScheduler(Scheduler):
+                 continue
+             again = stream.continued()
+             again.glm = getattr(stream, "glm", {})
++            if getattr(stream, "arrived", None) is not None:  # TF_GLM_PREFILL_ORDER=sjf: it keeps its first arrival
++                again.arrived = stream.arrived
+             self.yields += 1
+             self.waiting.put((again, box))
+         self.decoder.requeue = []
+diff --git a/src/tensorfold/families/glm5_next/cuda/prefill_order.py b/src/tensorfold/families/glm5_next/cuda/prefill_order.py
+new file mode 100644
+index 0000000..1f3c5ad
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/prefill_order.py
+@@ -0,0 +1,101 @@
++"""Shortest-first prompt fills with aging (``TF_GLM_PREFILL_ORDER=sjf``, --parallel): when several prompts wait, the one
++with the fewest uncached tokens goes first, so a short prompt's first token does not wait for a long prompt's whole
++fill; a prompt that has waited ``TF_GLM_PREFILL_AGE_MS`` (default 30,000) is overtaken by no prompt that arrived
++after it.
++
++Two places order waiting prompts (``multi``):
++
++- admission (``GlmScheduler._admit``): which queued request takes a free stream slot. Its uncached tokens are its
++  prompt less the longest kept prefix it would resume (``MultiDecoder.uncached``). The request held for room competes
++  with the queue (it no longer blocks it, until it has aged);
++- prompt chunks (``MultiDecoder._fill_turn``): which filling stream's rows the next prompt chunk holds. Its uncached
++  tokens are its prompt rows not filled yet, so a long prompt part-way through its fill yields between two chunks to
++  a shorter one. TF_GLM_MULTI_PREFILL's multi-prompt chunk hands its row budget out in the same order
++  (``MultiDecoder._group``; the recipe's own order there is fewest rows left first, MiaAI-Lab recipe patch 0049).
++
++The order (``key``): foreground before background, as before; then every prompt that has waited the aging bound,
++in arrival order; then the others by fewest uncached tokens, then arrival; then admission (or queue) order. A prompt's
++wait counts from its arrival at the server (``stamp``), across its admission and its chunks.
++
++What already runs keeps running: a chunk going in layer slices (TF_GLM_FILL_BUDGET_MS, MiaAI-Lab recipe patch 0062)
++finishes its slices, and a chunk pair (TF_GLM_PREFILL_PAIRS) is planned from the order and runs whole; the order is
++taken again between chunks. So a prompt that ages is overtaken by nothing that starts after that. Its wait past what
++arrival order gives it is at most the aging bound, the chunk running when it ages, and (for admission) the replies of
++the streams holding the slots.
++
++Exact: the order changes when each stream's rows fill, never which rows or how they are cut, so every reply, kept
++state and pool row is the one the request gets alone. Rank 0 decides it (its FILL / MFILL / ADMIT messages carry the
++decisions); rank 1 applies them as ever.
++
++Unset or ``fifo`` (the default): the arrival order, through the same code as before.
++
++This tree's own scheduling; not a MiaAI-Lab recipe patch.
++"""
++
++from __future__ import annotations
++
++import math
++import os
++import time
++
++ENV = "TF_GLM_PREFILL_ORDER"
++AGE_ENV = "TF_GLM_PREFILL_AGE_MS"
++AGE_MS = 30_000.0                 # the aging bound's default
++AGE_MOST = 3_600_000.0            # an hour
++
++clock = time.monotonic            # arrivals and ages, in seconds (a simulator may replace it)
++
++
++def order(value: str | None = None) -> str:
++    """TF_GLM_PREFILL_ORDER: ``fifo`` (unset, the default: arrival order) or ``sjf`` (fewest uncached tokens first,
++    with aging)."""
++
++    raw = os.environ.get(ENV, "") if value is None else value
++    value = raw.strip().lower() or "fifo"
++    if value not in ("fifo", "sjf"):
++        raise ValueError(f"{ENV}: fifo (the default) or sjf, not {raw!r}")
++    return value
++
++
++def age_ms(value: str | None = None) -> float:
++    """TF_GLM_PREFILL_AGE_MS: with TF_GLM_PREFILL_ORDER=sjf, how long a prompt may wait before no later arrival goes
++    first (default 30,000 ms; 0: arrival order)."""
++
++    raw = os.environ.get(AGE_ENV, "") if value is None else value
++    try:
++        ms = AGE_MS if raw.strip() == "" else float(raw)
++    except ValueError:
++        ms = -1.0
++    if not (math.isfinite(ms) and 0 <= ms <= AGE_MOST):
++        raise ValueError(f"{AGE_ENV}: milliseconds from 0 to {AGE_MOST:.0f} (default {AGE_MS:.0f}), not {raw!r}")
++    return ms
++
++
++def stamp(stream, at: float | None = None) -> float:
++    """The request's arrival (``stream.arrived``, in ``clock``'s seconds), set once: a request given back to the queue
++    keeps its first."""
++
++    if getattr(stream, "arrived", None) is None:
++        stream.arrived = clock() if at is None else float(at)
++    return stream.arrived
++
++
++def aged(arrived: float, now: float, age_s: float) -> bool:
++    return now - arrived >= age_s
++
++
++def key(background: bool, arrived: float, uncached: int, seq: int, now: float, age_s: float) -> tuple:
++    """A waiting prompt's place, smallest first: foreground before background; then every prompt that has waited
++    ``age_s`` seconds or longer by arrival; then the rest by fewest uncached tokens, then arrival; ``seq`` (admission
++    or queue order) breaks ties."""
++
++    if aged(arrived, now, age_s):
++        return (int(bool(background)), 0, arrived, 0, seq)
++    return (int(bool(background)), 1, int(uncached), arrived, seq)
++
++
++def describe(age_s: float) -> str:
++    """The startup line's words for the setting."""
++
++    return (f"waiting prompts fill fewest uncached tokens first, none overtaken by a later arrival after "
++            f"{age_s * 1000:g} ms (TF_GLM_PREFILL_ORDER=sjf, TF_GLM_PREFILL_AGE_MS)")
+diff --git a/tests/glm_prefill_sim.py b/tests/glm_prefill_sim.py
+new file mode 100644
+index 0000000..8e1a6b8
+--- /dev/null
++++ b/tests/glm_prefill_sim.py
+@@ -0,0 +1,299 @@
++"""An arrival simulator for the --parallel scheduler, for TF_GLM_PREFILL_ORDER (``prefill_order``): the engine's own
++``multi.GlmScheduler`` (driven by hand, one ``_iteration`` at a time) and ``multi.MultiDecoder`` at world 1 over the
++fake AFD wire, on tests/test_glm_sliced_fill.py's layered fake model (``layered``, ``SlicedWorld1``), in virtual time.
++
++Every iteration's work is what rank 0 decided (``MultiDecoder._emit``'s ops: FILL / MFILL prompt chunks, two of them
++for a TF_GLM_PREFILL_PAIRS pair, FILLPART / MFILLPART layer slices, ROUND decode rounds), and a cost model (``Costs``)
++gives its milliseconds, so the clock moves as the hardware's would. Requests come from ``users`` closed-loop clients:
++each sends a prompt of a size drawn from ``sizes``, waits for its reply, thinks an exponential time (mean ``think_s``:
++a Poisson source while idle) and sends the next; one seed gives FIFO and SJF the same clients, prompts and think times.
++Each request: its arrival, admission, first prompt chunk, first token (TTFT, at the end of the iteration that sampled
++it) and end.
++
++The aging check (``violations``): at every prompt chunk decided (a FILL, an MFILL, a pair, a sliced chunk's first
++slice) no filling stream that has waited ``age_ms`` is left out while a stream that arrived after it is in; at every
++admission no queued request that has waited ``age_ms`` and arrived earlier is still queued. A chunk going on (its later
++slices) is not a decision.
++
++The requests do not draft (``draft: false``: one token a round, no kept prompts), so the decode cost is per token;
++their replies are the fake model's and are not checked here (tests/test_glm_prefill_order.py checks replies).
++"""
++
++from __future__ import annotations
++
++import math
++import queue
++import random
++from dataclasses import dataclass, field
++
++ALIGN = 2048
++
++
++@dataclass
++class Costs:
++    """Milliseconds of the hardware's work, by default the final config's on the attention/expert split as measured: a
++    prompt chunk of R rows ``chunk_ms + row_ms * R`` (2,048 rows 1.92 s: a cold 100K alone ~94 s); a chunk pair
++    ``pair`` of its two chunks alone (pairs made prefill +23-25%); a decode round ``round_ms + stream_ms * n`` for n
++    streams, one token each (one stream ~85 tok/s, four ~122 tok/s together)."""
++
++    chunk_ms: float = 80.0
++    row_ms: float = 0.9
++    pair: float = 0.8
++    round_ms: float = 4.8
++    stream_ms: float = 7.0
++
++    def chunk(self, rows: int) -> float:
++        return self.chunk_ms + self.row_ms * rows
++
++    def round(self, n: int) -> float:
++        return self.round_ms + self.stream_ms * n
++
++
++@dataclass(eq=False)
++class Request:
++    user: int
++    k: int
++    size: int
++    arrival: float
++    admitted: float = math.nan
++    started: float = math.nan              # its first prompt chunk (or first slice) began
++    first: float = math.nan                # its first token (the end of that iteration)
++    done: float = math.nan
++    sid: int = -1
++
++    @property
++    def ttft(self) -> float:
++        return self.first - self.arrival
++
++    @property
++    def wait(self) -> float:
++        return self.started - self.arrival
++
++
++@dataclass
++class Config:
++    order: str | None                       # TF_GLM_PREFILL_ORDER (None: unset)
++    users: int = 5                          # concurrent clients (c)
++    per_user: int = 6                       # requests each
++    sizes: tuple = (2048, 8192, 32768, 100000)
++    think_s: float = 2.0
++    tg: int = 128
++    seed: int = 1
++    streams: int = 4                        # --parallel
++    pool: int = 626_688                     # the final config's pool (tokens)
++    prefill_rows: int = 2048
++    budget: str | None = "200"              # TF_GLM_FILL_BUDGET_MS
++    drafts: str | None = "1"                # TF_GLM_FILL_DRAFTS
++    group: bool = True                      # TF_GLM_MULTI_PREFILL
++    pairs: bool = True                      # TF_GLM_PREFILL_PAIRS
++    age_ms: float | None = None             # TF_GLM_PREFILL_AGE_MS (None: unset, 30,000)
++    costs: Costs = field(default_factory=Costs)
++
++
++def _env(mp, name: str, value) -> None:
++    if value is None:
++        mp.delenv(name, raising=False)
++    else:
++        mp.setenv(name, str(value))
++
++
++def run(env, cfg: Config) -> dict:
++    """One simulated run on ``env`` (tests/test_glm_multi_afd.py's ``afd_fake`` fixture). Returns the requests and
++    the run's counters."""
++
++    from tensorfold.cuda.scheduler import Waiting
++    from tensorfold.cuda.streams import Stream
++    from tensorfold.families.glm5_next.cuda import multi, prefill_order, sliced_fill
++    from tests import test_glm_multi as tm
++    from tests import test_glm_sliced_fill as tsf
++
++    mp = env.monkeypatch
++    _env(mp, prefill_order.ENV, cfg.order)
++    _env(mp, prefill_order.AGE_ENV, None if cfg.age_ms is None else f"{cfg.age_ms:g}")
++    _env(mp, "TF_GLM_MULTI_PREFILL", "1" if cfg.group else None)
++    _env(mp, "TF_GLM_PREFILL_PAIRS", "1" if cfg.pairs else None)
++    tsf.layered(mp, cfg.budget, drafts=cfg.drafts)
++    L = len(tsf.KINDS)
++    c = cfg.costs
++    # the startup layer costs from the cost model (not FakeEvent's), and kept so (nothing learned from fake events)
++    samples = {r: tuple([c.chunk(r) / L] * L) for r in (64, 256, 512, 1024, 2048) if r <= cfg.prefill_rows}
++    mp.setattr(multi.MultiDecoder, "_time_prompt_layers", lambda self: sliced_fill.LayerCosts(samples))
++    for name in ("observe", "observe_tail", "observe_overhead"):
++        mp.setattr(sliced_fill.LayerCosts, name, lambda self, *a: None)
++    now = [0.0]
++    mp.setattr(prefill_order, "clock", lambda: now[0])
++    node = tsf.SlicedWorld1(env, streams=cfg.streams, blocks=cfg.pool // ALIGN, prefill_rows=cfg.prefill_rows,
++                            entries=32)
++    d = node.d
++    assert d.order == (cfg.order or "fifo") and d.pairs == cfg.pairs and d.group == cfg.group
++    sched = multi.GlmScheduler.__new__(multi.GlmScheduler)     # Scheduler.__init__'s fields, no worker thread
++    sched.held, sched.gather_s, sched.sjf = None, 0.0, d.order == "sjf"
++    sched.decoder, sched.max_streams, sched.waiting, sched.boxes, sched.yields = d, cfg.streams, Waiting(), {}, 0
++    age_s = d.age_s
++
++    rng = random.Random(cfg.seed)
++    plans = [[(rng.choice(cfg.sizes), rng.expovariate(1.0 / cfg.think_s)) for _ in range(cfg.per_user)]
++             for _ in range(cfg.users)]
++    reqs: list[Request] = []
++    req_of: dict[int, Request] = {}                    # id(stream) -> its request
++    boxes: dict[int, tuple[Request, queue.Queue]] = {}
++    nxt = {u: (plans[u][0][1], 0) for u in range(cfg.users)}     # user -> (its next arrival, request index)
++    violations = {"fill": 0, "admit": 0}
++    work = {"fills": 0, "pairs": 0, "slices": 0, "rounds": 0}
++
++    def arrive(u: int, at: float, k: int) -> None:
++        size = plans[u][k][0]
++        r = Request(u, k, size, at)
++        box: queue.Queue = queue.Queue()
++        s = Stream(tm._prompt(size, cfg.seed * 1_000_003 + u * 1009 + k), cfg.tg, None, draft=False, stop_eos=False)
++        s.glm = {"code": [0, 0, 0, 0], "spec": "0"}
++        s.emit = lambda new, box=box: (box.put(("tokens", new)), False)[1]
++        if sched.sjf:
++            prefill_order.stamp(s, at)                 # what the scheduler's submit stamps: its arrival
++        reqs.append(r)
++        req_of[id(s)] = r
++        boxes[id(s)] = (r, box)
++        sched.waiting.put((s, box))
++
++    # -- each iteration's ops as rank 0 decides them, with the streams' positions then; the two checks
++    ops: list[tuple] = []
++    picked_now: set[int] = set()
++    emit, admit = d._emit, d.admit
++
++    def chosen(op: int, p: list[int]) -> set[int]:
++        if op in (multi.FILL, multi.FILLPART):
++            return {p[0]}
++        if op == multi.MFILL:
++            return set(p[1:1 + 2 * p[0]:2])
++        return set(p[3::2])                            # MFILLPART
++
++    def check_fill(picked: set[int]) -> None:
++        latest = max(req_of[id(d.lanes[s].s)].arrival for s in picked)
++        for sid, lane in d.lanes.items():
++            a = req_of[id(lane.s)].arrival
++            if sid not in picked and not lane.decoding and not lane.s.done and now[0] - a >= age_s and a < latest:
++                violations["fill"] += 1
++
++    def logged(op: int, payload):
++        p = [int(v) for v in payload]
++        ops.append((op, p, {sid: lane.st.pos for sid, lane in d.lanes.items()}))
++        decision = op in (multi.FILL, multi.MFILL) or (
++            op in (multi.FILLPART, multi.MFILLPART) and (p[2] if op == multi.FILLPART else p[1]) == 0)
++        if decision:                                   # a pair's two chunks are one decision
++            picked_now.update(chosen(op, p))
++            check_fill(picked_now)
++        return emit(op, payload)
++
++    def admitted(s):
++        me = req_of[id(s)].arrival
++        with sched.waiting.mutex:
++            queued = [x[2][0] for x in sched.waiting.queue if x[2] is not None]
++        if sched.held is not None and sched.held[0] is not s:
++            queued.append(sched.held[0])
++        for q in queued:
++            a = req_of[id(q)].arrival
++            if now[0] - a >= age_s and a < me:
++                violations["admit"] += 1
++        admit(s)
++        r = req_of[id(s)]
++        r.sid, r.admitted = s.sid, now[0]
++
++    d._emit, d.admit = logged, admitted
++
++    def cost() -> float:
++        fills, ms = [], 0.0
++        pos: dict[int, int] = {}
++        for op, p, at in ops:
++            if op in (multi.FILL, multi.MFILL):
++                pieces = [(p[0], p[1])] if op == multi.FILL else list(zip(p[1:1 + 2 * p[0]:2], p[2:2 + 2 * p[0]:2]))
++                rows = 0
++                for sid, stop in pieces:                # a pair's second chunk starts where its first stopped
++                    rows += stop - pos.get(sid, at[sid])
++                    pos[sid] = stop
++                fills.append(rows)
++            elif op in (multi.FILLPART, multi.MFILLPART):
++                pieces = [(p[0], p[1])] if op == multi.FILLPART else list(zip(p[3::2], p[4::2]))
++                lo, hi = (p[2], p[3]) if op == multi.FILLPART else (p[1], p[2])
++                rows = sum(stop - at[sid] for sid, stop in pieces)   # positions move only after the last slice
++                ms += c.chunk(rows) * (hi - lo) / L
++                work["slices"] += 1
++            elif op == multi.ROUND:
++                ms += c.round(p[0])
++                work["rounds"] += 1
++        if len(fills) == 2:
++            ms += c.pair * (c.chunk(fills[0]) + c.chunk(fills[1]))
++            work["pairs"] += 1
++        elif fills:
++            ms += c.chunk(fills[0])
++        work["fills"] += len(fills)
++        return ms / 1000.0
++
++    finished, total = 0, cfg.users * cfg.per_user
++    for _ in range(50_000_000):
++        if finished == total:
++            break
++        for u, (at, k) in sorted(nxt.items(), key=lambda x: x[1][0]):
++            if at <= now[0]:
++                arrive(u, at, k)
++                del nxt[u]
++        if not d.lanes and sched.held is None and sched.waiting.empty():
++            if not nxt:
++                raise AssertionError("nothing runs and nothing is to come")
++            now[0] = max(now[0], min(at for at, _ in nxt.values()))
++            continue
++        ops.clear()
++        picked_now.clear()
++        start = now[0]
++        sched._iteration()
++        now[0] = start + cost()
++        for sid in {s for op, p, _ in ops if op in (multi.FILL, multi.MFILL, multi.FILLPART, multi.MFILLPART)
++                    for s in chosen(op, p)}:
++            lane = d.lanes.get(sid)
++            r = req_of[id(lane.s)] if lane is not None else next((q for q in reqs if q.sid == sid), None)
++            if r is not None and math.isnan(r.started):
++                r.started = start
++        for key in list(boxes):
++            r, box = boxes[key]
++            while True:
++                try:
++                    kind, value = box.get_nowait()
++                except queue.Empty:
++                    break
++                if kind == "tokens" and math.isnan(r.first):
++                    r.first = now[0]
++                elif kind == "error":
++                    raise value
++                elif kind == "done":
++                    r.done = now[0]
++                    finished += 1
++                    del boxes[key]
++                    if r.k + 1 < cfg.per_user:
++                        nxt[r.user] = (now[0] + plans[r.user][r.k + 1][1], r.k + 1)
++                    break
++    else:
++        raise AssertionError("the simulation did not finish")
++    return {"config": cfg, "requests": reqs, "violations": dict(violations), "work": dict(work),
++            "ordered": dict(d.ordered or {}), "paired": dict(d.paired), "sliced": dict(d.sliced),
++            "grouped": dict(d.grouped), "end_s": now[0], "age_s": age_s}
++
++
++def pct(xs: list[float], q: float) -> float:
++    """The q-quantile of xs (nearest rank)."""
++
++    xs = sorted(xs)
++    return xs[max(0, math.ceil(q * len(xs)) - 1)] if xs else math.nan
++
++
++def stats(xs: list[float]) -> dict:
++    return {"n": len(xs), "mean": sum(xs) / len(xs) if xs else math.nan, "p50": pct(xs, 0.5), "p90": pct(xs, 0.9),
++            "max": max(xs) if xs else math.nan}
++
++
++def summary(res: dict) -> dict:
++    """TTFT (s) overall and by prompt size, the wait for the first chunk, and the run's counters."""
++
++    reqs = res["requests"]
++    return {"ttft": stats([r.ttft for r in reqs]), "wait": stats([r.wait for r in reqs]),
++            "by_size": {s: stats([r.ttft for r in reqs if r.size == s]) for s in sorted({r.size for r in reqs})},
++            "violations": res["violations"], "work": res["work"], "ordered": res["ordered"],
++            "paired": res["paired"], "sliced": res["sliced"], "grouped": res["grouped"], "end_s": res["end_s"]}
+diff --git a/tests/test_glm_multi.py b/tests/test_glm_multi.py
+index 634410d..903ca5e 100644
+--- a/tests/test_glm_multi.py
++++ b/tests/test_glm_multi.py
+@@ -668,7 +668,7 @@ def test_one_message_an_iteration(fake):
+     p = Pair(torch, streams=2)
+     p.submit(_prompt(80, 7), 30, None)
+     p.submit(_prompt(20, 8), 25, _sampling("topk", 3))
+-    from tensorfold.families.glm5_next.cuda.multi import FILL, IDLE, MFILL, ROUND
++    from tensorfold.families.glm5_next.cuda.multi import FILL, FILLPART, IDLE, MFILL, MFILLPART, ROUND
+ 
+     kinds = []
+     while p.d[0].lanes:
+@@ -676,7 +676,9 @@ def test_one_message_an_iteration(fake):
+         done = p.d[0].round()
+         assert len(p.sent) - before == 1                     # the round's own message
+         ops = [op for op, _ in _ops(p.sent[-1])]
+-        assert ops[-1] in (FILL, MFILL, ROUND)               # MFILL: TF_GLM_MULTI_PREFILL=1's multi-prompt chunk
++        # MFILL: TF_GLM_MULTI_PREFILL=1's multi-prompt chunk; FILLPART / MFILLPART: a layer slice of a chunk while
++        # others decode (TF_GLM_FILL_BUDGET_MS), which TF_GLM_PREFILL_ORDER=sjf reaches here (the short prompt first)
++        assert ops[-1] in (FILL, MFILL, ROUND, FILLPART, MFILLPART)
+         kinds.append(ops[-1])
+         p.d[0].finish(done)
+         extra = p.sent[before + 1:]
+diff --git a/tests/test_glm_prefill_order.py b/tests/test_glm_prefill_order.py
+new file mode 100644
+index 0000000..87bd305
+--- /dev/null
++++ b/tests/test_glm_prefill_order.py
+@@ -0,0 +1,532 @@
++"""TF_GLM_PREFILL_ORDER=sjf (``prefill_order``, ours) on CPU: waiting prompts go fewest uncached tokens first, a prompt
++that has waited TF_GLM_PREFILL_AGE_MS is overtaken by no later arrival, and every reply, kept state and pool row is
++still the one the request gets alone.
++
++- the settings, the order's key and the arrival stamp; the AFD startup check refuses a typo before the wire opens;
++- prompt chunks on #243's fake model at two ranks (tests/test_glm_multi.py's Pair): a short prompt arriving while a
++  long one fills takes the next chunk (in arrival order it waits for the long one's last); once the long one has aged,
++  no later arrival goes first; TF_GLM_MULTI_PREFILL's grouped chunk hands its rows out in the order; the replies are
++  the solo ones and both ranks agree after every message;
++- at world 1 over the fake AFD wire (tests/test_glm_multi_afd.py's World1) with chunk pairs: the pair is planned from
++  the order, so the short prompt's two chunks run as one pair;
++- admission (``GlmScheduler``, driven by hand): queued requests take a free slot fewest uncached tokens first, a kept
++  prefix counting as cached; the request held for room no longer blocks a smaller one, until it has aged;
++- unset and ``fifo`` send the same messages; /health's block only with the setting; the threaded scheduler with a
++  follower thread under the setting.
++"""
++
++from __future__ import annotations
++
++import queue
++from types import SimpleNamespace
++
++import pytest
++
++from tests import test_glm_multi as tm
++from tests import test_glm_multi_afd as ta
++from tests.test_cuda_geometry import allocations  # noqa: F401  (fixture: fake triton, so decode imports)
++
++pytestmark = pytest.mark.torch
++
++fake = tm.fake
++afd_fake = ta.afd_fake
++ALIGN = tm.ALIGN
++# the prompt switches that change how chunks are cut or grouped: each test sets the ones its scenario needs, so a run
++# with them exported (a whole-config test round) still checks these scenarios as written
++SWITCHES = ("TF_GLM_MULTI_PREFILL", "TF_GLM_MULTI_PREFILL_WAIT_MS", "TF_GLM_FILL_BUDGET_MS", "TF_GLM_FILL_DRAFTS",
++            "TF_GLM_SHARED_PREFIX", "TF_GLM_PREFILL_PAIRS", "TF_AFD_PREFILL_PAIRS", "TF_GLM_PROMPT_GRID",
++            "TF_GLM_PREFILL_ORDER", "TF_GLM_PREFILL_AGE_MS")
++
++
++@pytest.fixture(autouse=True)
++def _own_switches(monkeypatch):
++    for name in SWITCHES:
++        monkeypatch.delenv(name, raising=False)
++
++
++class Clock:
++    """``prefill_order.clock`` under the test's hand (seconds)."""
++
++    def __init__(self, t: float = 1000.0) -> None:
++        self.t = t
++
++    def __call__(self) -> float:
++        return self.t
++
++
++@pytest.fixture
++def clock(monkeypatch):
++    from tensorfold.families.glm5_next.cuda import prefill_order
++
++    c = Clock()
++    monkeypatch.setattr(prefill_order, "clock", c)
++    return c
++
++
++def _order(monkeypatch, value: str | None, age: str | None = None) -> None:
++    for name, v in (("TF_GLM_PREFILL_ORDER", value), ("TF_GLM_PREFILL_AGE_MS", age)):
++        if v is None:
++            monkeypatch.delenv(name, raising=False)
++        else:
++            monkeypatch.setenv(name, v)
++
++
++def _fills(sent) -> list[list[int]]:
++    """Each prompt chunk rank 0 told rank 1 about (FILL, MFILL), as the streams it holds, in order."""
++
++    from tensorfold.families.glm5_next.cuda.multi import FILL, MFILL
++
++    out = []
++    for m in sent:
++        for op, p in tm._ops(m):
++            if op == FILL:
++                out.append([p[0]])
++            elif op == MFILL:
++                out.append(list(p[1:1 + 2 * p[0]:2]))
++    return out
++
++
++def _logged(p) -> list:
++    log: list = []
++    share = p.g[0]._share
++    p.g[0]._share = lambda values: (log.append(list(values)), share(values))[1]
++    return log
++
++
++# -- settings ------------------------------------------------------------------------------------------------------
++def test_the_settings(allocations, monkeypatch):  # noqa: F811
++    from tensorfold.families.glm5_next.cuda import prefill_order as po
++    from tensorfold.families.glm5_next.cuda.engine import afd_parallel_check
++
++    _order(monkeypatch, None)
++    assert po.order() == "fifo" and po.order("") == "fifo" and po.order(" SJF ") == "sjf" and po.order("fifo") == "fifo"
++    for bad in ("1", "srpt", "on", "shortest"):
++        with pytest.raises(ValueError, match="TF_GLM_PREFILL_ORDER"):
++            po.order(bad)
++    assert po.age_ms() == 30_000.0 and po.age_ms("0") == 0.0 and po.age_ms("1500.5") == 1500.5
++    assert po.age_ms("3600000") == 3_600_000.0
++    for bad in ("-1", "x", "nan", "inf", "3600001"):
++        with pytest.raises(ValueError, match="TF_GLM_PREFILL_AGE_MS"):
++            po.age_ms(bad)
++    now, age = 100.0, 30.0
++
++    def k(background, arrived, uncached, seq):
++        return po.key(background, arrived, uncached, seq, now, age)
++
++    assert k(False, 90.0, 100_000, 0) < k(True, 99.0, 10, 1)             # foreground before background
++    assert k(False, 70.0, 100_000, 5) < k(False, 99.0, 10, 0)            # aged (30 s) before any fresh one
++    assert k(False, 60.0, 100_000, 5) < k(False, 70.0, 10, 0)            # two aged: by arrival
++    assert k(False, 99.0, 10, 9) < k(False, 80.0, 11, 0)                 # fresh: fewest uncached tokens
++    assert k(False, 80.0, 10, 9) < k(False, 90.0, 10, 0)                 # ... then arrival
++    assert k(False, 80.0, 10, 0) < k(False, 80.0, 10, 1)                 # ... then admission / queue order
++    assert po.key(False, 99.9, 5, 0, 100.0, 0.0)[1] == 0                 # age 0: all aged, i.e. arrival order
++    s = SimpleNamespace()
++    assert po.stamp(s, 5.0) == 5.0 and po.stamp(s, 9.0) == 5.0 and s.arrived == 5.0   # kept from the first
++    assert "TF_GLM_PREFILL_ORDER=sjf" in po.describe(30.0) and "30000 ms" in po.describe(30.0)
++    afd_parallel_check({"TF_GLM_PREFILL_ORDER": "sjf", "TF_GLM_PREFILL_AGE_MS": "15000"})     # allowed
++    with pytest.raises(ValueError, match="TF_GLM_PREFILL_ORDER"):                             # before the wire
++        afd_parallel_check({"TF_GLM_PREFILL_ORDER": "sfj"})
++    with pytest.raises(ValueError, match="TF_GLM_PREFILL_AGE_MS"):
++        afd_parallel_check({"TF_GLM_PREFILL_ORDER": "sjf", "TF_GLM_PREFILL_AGE_MS": "-5"})
++
++
++# -- prompt chunks at two ranks ------------------------------------------------------------------------------------
++LONG, SHORT, SHORT2 = (tm._prompt(600, 31), 10, None), (tm._prompt(40, 32), 10, tm._sampling("topk", 32)), \
++    (tm._prompt(50, 33), 10, tm._sampling("minp", 33))
++
++
++def _long_then_short(torch, monkeypatch, clock, order, *, late: float = 1.0, steps: int = 3, group: bool = False,
++                     **kw):
++    """The long prompt fills ``steps`` chunks; ``late`` seconds after it arrived the short one arrives. Returns the
++    Pair, both streams, the chunk log and the step each got its first token at."""
++
++    _order(monkeypatch, order)
++    if group:
++        monkeypatch.setenv("TF_GLM_MULTI_PREFILL", "1")
++    else:
++        monkeypatch.delenv("TF_GLM_MULTI_PREFILL", raising=False)
++    p = tm.Pair(torch, streams=2, **kw)
++    log = _logged(p)
++    a = p.submit(*LONG)
++    for _ in range(steps):
++        p.step()
++    clock.t += late
++    b = p.submit(*SHORT)
++    first = {}
++    for it in range(2000):
++        if not p.d[0].lanes:
++            break
++        p.step()
++        for name, s in (("long", a), ("short", b)):
++            if s.got and name not in first:
++                first[name] = it
++    for s, req in ((a, LONG), (b, SHORT)):
++        assert s.got == tm.solo(torch, *req)
++    return p, a, b, _fills(log), first
++
++
++def test_a_short_prompt_goes_before_a_long_fill(fake, monkeypatch, clock):
++    """Arrival order: the short prompt waits for the long one's whole fill. sjf: its two chunks (to its kept point,
++    then its last token) come next, then the long fill goes on; the same replies (the solo ones), the same kept
++    states and pool rows, both ranks agreeing after every message (Pair.check)."""
++
++    p0, _, _, f0, first0 = _long_then_short(fake, monkeypatch, clock, None)
++    p1, a1, b1, f1, first1 = _long_then_short(fake, monkeypatch, clock, "sjf")
++    assert first0["long"] < first0["short"] and first1["short"] < first1["long"]
++    la, lb = a1.sid, b1.sid
++    assert f0[:3] == f1[:3] == [[la]] * 3
++    assert f1[3:5] == [[lb], [lb]] and all(x == [la] for x in f1[5:5 + 6])        # then the long one's rest
++    assert [x for x in f0 if x == [lb]] and f0.index([lb]) > max(i for i, x in enumerate(f0) if x == [la])
++    assert sorted(map(tuple, f0)) == sorted(map(tuple, f1))                       # the same chunks, reordered
++    import tests.test_glm_multi_prefill as tmp
++
++    assert tmp.kept_view(p0.d[0]) == tmp.kept_view(p1.d[0]) == tmp.kept_view(p1.d[1])
++    h = p1.d[0].health()["prefill_order"]
++    assert h["order"] == "sjf" and h["age_ms"] == 30_000.0 and h["reordered"] >= 1 and h["aged"] == 0
++    assert "prefill_order" not in p0.d[0].health()
++
++
++def test_an_aged_prompt_is_overtaken_by_no_later_arrival(fake, monkeypatch, clock):
++    """The short prompt arrives 31 s after the long one (aging bound 30 s): the long one is aged, so its chunks all go
++    before the short one's, as in arrival order; /health counts the aged picks."""
++
++    _, _, _, f0, first0 = _long_then_short(fake, monkeypatch, clock, None, late=31.0)
++    p1, _, _, f1, first1 = _long_then_short(fake, monkeypatch, clock, "sjf", late=31.0)
++    assert f1 == f0 and first1 == first0
++    h = p1.d[0].health()["prefill_order"]
++    assert h["aged"] >= 1 and h["reordered"] == 0
++
++
++def test_the_aging_bound_is_a_setting(fake, monkeypatch, clock):
++    """TF_GLM_PREFILL_AGE_MS=500: the short prompt 1 s late finds the long one aged (arrival order); 0: always."""
++
++    for age in ("500", "0"):
++        monkeypatch.setenv("TF_GLM_PREFILL_AGE_MS", age)
++        _order(monkeypatch, "sjf", age)
++        p = tm.Pair(fake, streams=2)
++        assert p.d[0].age_s == float(age) / 1000.0
++        log = _logged(p)
++        a = p.submit(*LONG)
++        for _ in range(3):
++            p.step()
++        clock.t += 1.0
++        b = p.submit(*SHORT)
++        p.run()
++        f = _fills(log)
++        assert f.index([b.sid]) > max(i for i, x in enumerate(f) if x == [a.sid])
++        assert a.got == tm.solo(fake, *LONG) and b.got == tm.solo(fake, *SHORT)
++
++
++def test_aging_mid_fill(fake, monkeypatch, clock):
++    """A short prompt arriving 1 s after the long one goes first; a second short one arriving after the long one has
++    aged waits for the long one's last chunk."""
++
++    _order(monkeypatch, "sjf")
++    p = tm.Pair(fake, streams=3)
++    log = _logged(p)
++    a = p.submit(*LONG)
++    for _ in range(2):
++        p.step()
++    clock.t += 1.0
++    b = p.submit(*SHORT)
++    for _ in range(2):                                   # its two chunks
++        p.step()
++    clock.t += 30.0                                      # the long one has waited 31 s
++    c = p.submit(*SHORT2)
++    p.run()
++    f = _fills(log)
++    assert f[2:4] == [[b.sid], [b.sid]]
++    assert f.index([c.sid]) > max(i for i, x in enumerate(f) if x == [a.sid])
++    for s, req in ((a, LONG), (b, SHORT), (c, SHORT2)):
++        assert s.got == tm.solo(fake, *req)
++
++
++def test_grouped_chunks_in_the_order(fake, monkeypatch, clock):
++    """TF_GLM_MULTI_PREFILL=1 (128-row chunks; the long prompt 256 rows in when the short one arrives): fresh, they
++    share chunks shortest first, the recipe's own order (the very same chunks as unset); with the long one aged, it
++    takes the chunk's rows first, so it fills alone until its rows left fit beside the short one's."""
++
++    runs = {}
++    for order, late in ((None, 1.0), ("sjf", 1.0), (None, 31.0), ("sjf", 31.0)):
++        clock.t = 1000.0
++        _, a, b, f, _ = _long_then_short(fake, monkeypatch, clock, order, late=late, steps=2, group=True,
++                                         prefill_rows=128)
++        runs[(order, late)] = (f, a.sid, b.sid)
++    f_unset, la, lb = runs[(None, 1.0)]
++    assert runs[("sjf", 1.0)][0] == f_unset == runs[(None, 31.0)][0]
++    assert f_unset[2] == [lb, la]                                       # shortest first in the shared chunk
++    f_aged = runs[("sjf", 31.0)][0]
++    assert f_aged != f_unset and f_aged[2] == [la]                      # the aged long one alone
++    assert all(x[0] == la for x in f_aged if la in x)                   # and first in any chunk it shares
++
++
++# -- world 1: chunk pairs planned from the order -------------------------------------------------------------------
++def test_world1_pairs_follow_the_order(afd_fake, monkeypatch, clock):
++    """At world 1 with TF_GLM_PREFILL_PAIRS=1 and TF_GLM_MULTI_PREFILL=1: the short prompt's two chunks run as one
++    pair right after it arrives (arrival order: after the long fill), and every reply is the solo one."""
++
++    monkeypatch.setenv("TF_GLM_PREFILL_PAIRS", "1")
++    monkeypatch.setenv("TF_GLM_MULTI_PREFILL", "1")
++    got = {}
++    for order in (None, "sjf"):
++        _order(monkeypatch, order)
++        clock.t = 1000.0
++        n1 = ta.World1(afd_fake, streams=2)
++        assert n1.d.pairs and n1.d.order == (order or "fifo")
++        pairs = []
++        real = n1.d._fill_pair
++
++        def checked(first, second, real=real, pairs=pairs):
++            pairs.append(([x.sid for x, _ in first], [x.sid for x, _ in second]))
++            return real(first, second)
++
++        n1.d._fill_pair = checked
++        a = n1.submit(*LONG)
++        n1.step()
++        clock.t += 1.0
++        b = n1.submit(*SHORT)
++        n1.step()
++        got[order] = (pairs[-1], bool(b.got), bool(a.got), a.sid, b.sid)
++        n1.run()
++        assert a.got == tm.solo(afd_fake.torch, *LONG) and b.got == tm.solo(afd_fake.torch, *SHORT)
++    last, short_started, long_started, _, lb = got["sjf"]
++    assert last == ([lb], [lb]) and short_started and not long_started
++    last0, short0, _, la0, _ = got[None]
++    assert last0 == ([la0], [la0]) and not short0
++
++
++# -- world 1: a chunk in layer slices keeps them ---------------------------------------------------------------------
++def test_a_chunk_in_slices_keeps_them(afd_fake, monkeypatch, clock):
++    """TF_GLM_FILL_BUDGET_MS (tests/test_glm_sliced_fill.py's layered seams and checked slice wire): a long prompt's
++    chunk is suspended between two layer slices (another stream decodes) when a short prompt arrives. With sjf the
++    chunk's remaining slices still run first, and then the short prompt's rows go before the long prompt's next
++    chunk (in arrival order it waits for the long prompt's last); every reply is the solo one."""
++
++    from tests import test_glm_sliced_fill as tsf
++
++    short = (tm._prompt(30, 9), 8, None)
++    firsts = {}
++    for order in (None, "sjf"):
++        _order(monkeypatch, order)
++        clock.t = 1000.0
++        tsf.layered(monkeypatch, "2.5")
++        n1 = tsf.SlicedWorld1(afd_fake, streams=3)
++        d = n1.d
++        a, b, lane, _ = tsf._mid_fill(n1, d)
++        stop = d.partial.group[0][1]
++        assert d.partial.contains(b.sid) and lane.st.pos < stop
++        clock.t += 1.0
++        c = n1.submit(*short)
++        events = []
++        for _ in range(4000):
++            if b.got and c.got:
++                break
++            n1.step()
++            cl = d.lanes.get(c.sid)
++            if cl is not None and cl.st.pos > 0 and "c" not in events:
++                events.append("c")                                  # the short prompt's first rows
++            if lane.st.pos >= stop and "b" not in events:
++                events.append("b")                                  # the suspended chunk's last slice
++            for name, s in (("b first", b), ("c first", c)):
++                if s.got and name not in events:
++                    events.append(name)
++        firsts[order] = events
++        n1.run()
++        assert a.got == tm.solo(afd_fake.torch, tm._prompt(20, 5), 60, None)
++        assert b.got == tm.solo(afd_fake.torch, tm._prompt(200, 6), 12, tm._sampling("nucleus", 4))
++        assert c.got == tm.solo(afd_fake.torch, *short) and d.sliced["chunks"] > 0
++    assert firsts["sjf"][:3] == ["b", "c", "c first"] and firsts["sjf"].index("c first") < firsts["sjf"].index("b first")
++    assert firsts[None].index("b first") < firsts[None].index("c first")
++
++
++# -- admission -------------------------------------------------------------------------------------------------------
++def manual(d, max_streams: int):
++    """A ``GlmScheduler`` without its worker thread (the test calls ``_iteration``): ``Scheduler.__init__``'s fields."""
++
++    from tensorfold.cuda.scheduler import Waiting
++    from tensorfold.families.glm5_next.cuda.multi import GlmScheduler
++
++    s = GlmScheduler.__new__(GlmScheduler)
++    s.held, s.gather_s, s.sjf = None, 0.0, d.order == "sjf"
++    s.decoder, s.max_streams, s.waiting, s.boxes, s.yields = d, max_streams, Waiting(), {}, 0
++    return s
++
++
++def enqueue(sched, g, prompt, count, sampling=None, *, policy: str = "f3"):
++    """``GlmScheduler.submit``'s stream, queued without waiting for the reply; returns (stream, its tokens)."""
++
++    from tensorfold.cuda.streams import Stream
++    from tensorfold.families.glm5_next.cuda import prefill_order
++    from tensorfold.families.glm5_next.cuda.engine import encode_policy
++
++    box: queue.Queue = queue.Queue()
++    s = Stream(list(prompt), max(1, count), sampling, draft=True)
++    s.glm = {"code": g._effective(encode_policy(policy)), "spec": policy}
++    got: list[int] = []
++    s.emit = lambda new: (got.extend(new), box.put(("tokens", new)), False)[2]
++    if sched.sjf:
++        prefill_order.stamp(s)
++    sched.waiting.put((s, box))
++    return s, got
++
++
++def _drive(p, sched, most: int = 4000) -> None:
++    for _ in range(most):
++        if not p.d[0].lanes and sched.held is None and sched.waiting.empty():
++            return
++        sched._iteration()
++        p.follow()
++    raise AssertionError("the requests did not finish")
++
++
++def _admitted(sent) -> list[int]:
++    from tensorfold.families.glm5_next.cuda.multi import ADMIT
++
++    return [p[0] for m in sent for op, p in tm._ops(m) if op == ADMIT]
++
++
++def test_admission_fewest_uncached_first(fake, monkeypatch, clock):
++    """One slot, three requests queued (600, 300 and 40 tokens, in that order): arrival order admits them as they
++    came, sjf the 40, then the 300, then the 600; the replies are the solo ones either way."""
++
++    reqs = [(tm._prompt(600, 41), 6, None), (tm._prompt(300, 42), 6, tm._sampling("topk", 42)),
++            (tm._prompt(40, 43), 6, None)]
++    order_of = {}
++    for order in (None, "sjf"):
++        _order(monkeypatch, order)
++        p = tm.Pair(fake, streams=1)
++        log = _logged(p)
++        sched = manual(p.d[0], 1)
++        out = []
++        for k, r in enumerate(reqs):
++            clock.t = 1000.0 + k
++            out.append(enqueue(sched, p.g[0], *r))
++        _drive(p, sched)
++        sid_of = {s.sid: k for k, (s, _) in enumerate(out)}
++        order_of[order] = [sid_of[x] for x in _admitted(log)]
++        for (s, got), r in zip(out, reqs):
++            assert got == tm.solo(fake, *r)
++        if order == "sjf":
++            assert p.d[0].ordered["admits"] == 3 and p.d[0].ordered["admits_reordered"] == 2
++    assert order_of[None] == [0, 1, 2] and order_of["sjf"] == [2, 1, 0]
++
++
++def test_a_kept_prefix_counts_as_cached(fake, monkeypatch, clock):
++    """A request resuming a kept prompt counts only its uncached tokens: the 520-token turn of a 500-token
++    conversation (20 new) goes before a fresh 100-token prompt queued before it."""
++
++    _order(monkeypatch, "sjf")
++    p = tm.Pair(fake, streams=1)
++    sched = manual(p.d[0], 1)
++    base = tm._prompt(500, 51)
++    enqueue(sched, p.g[0], base, 4)
++    _drive(p, sched)
++    turn = base + tm._prompt(20, 52)
++    clock.t += 1.0
++    fresh, _ = enqueue(sched, p.g[0], tm._prompt(100, 53), 4)
++    clock.t += 1.0
++    nxt, _ = enqueue(sched, p.g[0], turn, 4)
++    assert p.d[0].uncached(nxt) == 21 and p.d[0].uncached(fresh) == 100
++    log = _logged(p)
++    _drive(p, sched)
++    assert _admitted(log) == [nxt.sid, fresh.sid] and nxt.cached == 499
++
++
++def test_the_held_request_blocks_until_it_has_aged(fake, monkeypatch, clock):
++    """Two slots in a 4-extent pool, one stream decoding: a 5,000-token request cannot be placed. In arrival order it
++    is held and a 100-token request queued after it waits behind it; with sjf the small one is admitted past it while
++    it is young, and once it has aged it is first again (held, waiting for room) and the next small one waits."""
++
++    for order in (None, "sjf"):
++        _order(monkeypatch, order)
++        clock.t = 1000.0
++        p = tm.Pair(fake, streams=2, blocks=4)
++        sched = manual(p.d[0], 2)
++        enqueue(sched, p.g[0], tm._prompt(3000, 61), 60)
++        for _ in range(60):                               # the 3,000-token prompt fills, then decodes
++            sched._iteration()
++            p.follow()
++            if p.d[0].lanes and all(x.decoding for x in p.d[0].lanes.values()):
++                break
++        clock.t += 1.0
++        big, _ = enqueue(sched, p.g[0], tm._prompt(5000, 62), 4)
++        clock.t += 1.0
++        small, _ = enqueue(sched, p.g[0], tm._prompt(100, 63), 4)
++        log = _logged(p)
++        sched._iteration()
++        p.follow()
++        if order is None:
++            assert _admitted(log) == [] and sched.held[0] is big       # the small one waits behind the held one
++        else:
++            assert _admitted(log) == [small.sid] and sched.held is None   # past the young big one (still queued)
++            clock.t += 31.0                                            # the big one has aged
++            small2, _ = enqueue(sched, p.g[0], tm._prompt(80, 64), 4)
++            while small.sid in p.d[0].lanes:                           # until a slot frees
++                sched._iteration()
++                p.follow()
++            log2 = _logged(p)
++            sched._iteration()
++            p.follow()
++            assert _admitted(log2) == [] and sched.held[0] is big      # first again, waiting for room
++            assert not small2.done                                     # ... and the small one behind it
++        _drive(p, sched)
++        assert big.done and small.done and big.error is None and small.error is None
++
++
++# -- the switch off, /health, the threaded scheduler ----------------------------------------------------------------
++@pytest.mark.parametrize("value", [None, "fifo", "FIFO "])
++def test_unset_and_fifo_send_the_same_messages(fake, monkeypatch, clock, value):
++    """#243's staggered requests (tests/test_glm_multi.py CASES) at two ranks: unset, ``fifo`` and ``FIFO `` send
++    the very same messages, and no stream gets an arrival stamp."""
++
++    def run(v):
++        _order(monkeypatch, v)
++        p = tm.Pair(fake, streams=2)
++        log = _logged(p)
++        streams, pending = [], list(enumerate(tm.CASES))
++        for it in range(4000):
++            while pending and it >= 3 * pending[0][0] and p.d[0].live() < 2:
++                i, (prompt, count, kind, policy, draft) = pending.pop(0)
++                streams.append(p.submit(prompt, count, tm._sampling(kind, 100 + i), policy=policy, draft=draft))
++            if not p.d[0].lanes and not pending:
++                break
++            if p.d[0].lanes:
++                p.step()
++        return log, streams, p
++
++    log0, s0, _ = run(None)
++    log1, s1, p1 = run(value)
++    assert log0 == log1 and [s.got for s in s0] == [s.got for s in s1]
++    assert not any(hasattr(s, "arrived") for s in s0 + s1) and p1.d[0].order == "fifo"
++    assert "prefill_order" not in p1.d[0].health()
++
++
++def test_the_scheduler_with_a_follower_thread_under_sjf(fake, monkeypatch):
++    """tests/test_glm_multi.py's threaded scheduler (rank 1 following in its own thread, requests from four threads)
++    with the setting on: the same replies (the solo ones)."""
++
++    _order(monkeypatch, "sjf", "0")
++    tm.test_the_scheduler_with_a_follower_thread(fake)
++    _order(monkeypatch, "sjf")
++    tm.test_the_scheduler_with_a_follower_thread(fake)
++
++
++# -- the arrival simulator (tests/glm_prefill_sim.py), small ---------------------------------------------------------
++def test_the_arrival_simulator(afd_fake):
++    """Three clients sending 2K and 32K prompts (three each, Poisson think times) to the engine's own scheduler at
++    world 1 with the final config's prompt switches (grouped chunks, pairs, 200 ms layer slices with drafted rounds),
++    in virtual time: every request gets its first token in both orders; with sjf the 2K prompts' first tokens come
++    sooner on average, and no prompt that had waited the aging bound was passed over by a later arrival."""
++
++    from tests import glm_prefill_sim as sim
++
++    out = {}
++    for order in (None, "sjf"):
++        res = sim.run(afd_fake, sim.Config(order, users=3, per_user=3, sizes=(2048, 32768), think_s=5.0, seed=1))
++        assert len(res["requests"]) == 9 and all(r.first == r.first and r.done >= r.first for r in res["requests"])
++        out[order] = sim.summary(res)
++    assert out["sjf"]["violations"] == {"fill": 0, "admit": 0}
++    assert out["sjf"]["by_size"][2048]["mean"] < out[None]["by_size"][2048]["mean"]
++    assert out["sjf"]["ordered"]["reordered"] + out["sjf"]["ordered"]["admits_reordered"] > 0
++    assert not any(out[None]["ordered"].values())
++    assert out["sjf"]["work"]["fills"] > 0 and out["sjf"]["work"]["slices"] > 0

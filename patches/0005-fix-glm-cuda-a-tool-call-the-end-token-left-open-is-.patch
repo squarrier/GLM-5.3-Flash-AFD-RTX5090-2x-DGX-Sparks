@@ -1,0 +1,410 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 01:38:22 +0300
+Subject: [PATCH] fix(glm cuda): a tool call the end token left open is sent
+ when it parses whole; a missing <arg_key> is put back
+
+GLM-5.3-Flash sometimes writes its end token before </tool_call>. The CUDA server then sent no call: the
+reply finished "stop" with the call's markup as its text, and agent clients stalled. When the model's end
+token (not a stop string, not the token limit) ends the reply inside a GLM call, the call is now closed
+(</arg_value> too when a value is open) and sent if it then parses strictly: one whole call to an offered
+tool, nothing but its markup, arguments a JSON object (close_glm_call). Otherwise its markup stays the text,
+as before. A call the token limit or a stop string cut is unchanged. Only models whose tokenizer has GLM's
+call marks as tokens take this path.
+
+GLM calls whose <arg_key> the model wrote as whitespace ("read path</arg_key><arg_value>..", or
+"</arg_value>\npath</arg_key>") get it back in the shared GLM parser (repair_glm_keys), so both servers'
+end parsers read them; before, the first form came back as text and the second lost the argument. Blocks
+with no unopened </arg_key> are unchanged.
+
+Reported on the GLM-5.3-Flash DGX Spark recipe, issue #22.
+
+Tests: tests/test_glm_tool_call_end.py.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+---
+Credit: MiaAI-Lab's pull request ashhart/TensorFold#285, her commit 88091c15d110480271baca3df7f2614035cf4e95,
+  https://github.com/ashhart/TensorFold/pull/285 (Apache-2.0, as TensorFold). Her authorship is kept.
+
+ src/tensorfold/cuda/reply_text.py |  16 ++
+ src/tensorfold/cuda/server.py     |  18 ++-
+ src/tensorfold/server/tools.py    |  25 +++-
+ tests/test_glm_tool_call_end.py   | 238 ++++++++++++++++++++++++++++++
+ 4 files changed, 294 insertions(+), 3 deletions(-)
+ create mode 100644 tests/test_glm_tool_call_end.py
+
+diff --git a/src/tensorfold/cuda/reply_text.py b/src/tensorfold/cuda/reply_text.py
+index 6fa1026..9f68859 100644
+--- a/src/tensorfold/cuda/reply_text.py
++++ b/src/tensorfold/cuda/reply_text.py
+@@ -92,6 +92,22 @@ def hide_tool_calls(text: str, *, finished: bool) -> str:
+         pos = end + len(_CALL_CLOSE)
+ 
+ 
++def close_glm_call(text: str, tools: list[dict[str, Any]]) -> str:
++    """What closes the GLM call a reply ended inside when it parses as a whole call to an offered tool (the model
++    wrote its end token before ``</tool_call>``): ``</tool_call>``, after ``</arg_value>`` when a value is open; ""
++    when the reply is not inside a call, or the closed call would not parse (its markup then stays the reply's text)."""
++
++    at = text.rfind(_CALL_OPEN)
++    if at < 0:
++        return ""
++    block = text[at + len(_CALL_OPEN):]
++    if _CALL_CLOSE in block or "</think>" in block:
++        return ""
++    suffix = ("</arg_value>" if block.rfind("<arg_value>") > block.rfind("</arg_value>") else "") + _CALL_CLOSE
++    # the strict reading (one whole call, nothing but its markup, arguments a JSON object)
++    return suffix if parse_tool_calls(_CALL_OPEN + block + suffix, tools, max_calls=1)[1] else ""
++
++
+ def _tool_name(tool: dict[str, Any]) -> str:
+     fn = tool.get("function") if isinstance(tool, dict) else None
+     return str((fn or tool).get("name") or "").strip() if isinstance(tool, dict) else ""
+diff --git a/src/tensorfold/cuda/server.py b/src/tensorfold/cuda/server.py
+index f083453..94b1cf6 100644
+--- a/src/tensorfold/cuda/server.py
++++ b/src/tensorfold/cuda/server.py
+@@ -27,7 +27,7 @@ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
+ 
+ from tensorfold.cuda import health
+ from tensorfold.cuda.chat_template import ChatTemplate
+-from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, hide_tool_calls, parse_tool_calls
++from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, close_glm_call, hide_tool_calls, parse_tool_calls
+ from tensorfold.cuda.turns import Turns, Yield
+ from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
+ from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
+@@ -412,11 +412,13 @@ class App:
+         # calls stream as argument deltas while written (as on the Mac); one-call requests keep the end parser
+         calls_stream = ToolCallStreamer(tools) if tools and not policy.single else None
+         answer_raw = [""]
++        closing = [""]                      # what closes a GLM call the model's end token left open (``run``'s end)
+ 
+         def visible(finished: bool) -> tuple[str, str]:
+             raw = stream.final() if finished else stream.text
+             # stop strings match the generated text, reasoning included, before it is split (as on the Mac)
+             raw = stops.visible(raw, partial=not finished) if stops.strings else raw
++            raw = raw + closing[0] if finished else raw
+             if chat and thinking:
+                 reasoning, answer = split_thinking(raw, finished=finished)
+             else:
+@@ -538,12 +540,16 @@ class App:
+         if stopped["client"]:                                        # as the Mac server: nothing more is written
+             raise RequestCancelled("the client left during the reply")
+         stats = {**(stats or {}), "token_sha": token_sha(out)}
++        # GLM: the model's end token (not a stop string or the token limit) ended the reply inside a call, before its
++        # </tool_call>: the call is closed and sent when it then parses whole; otherwise its markup stays the text
++        if tools and out and out[-1] in ends and not stopped["stop"] and self._glm_calls():
++            closing[0] = close_glm_call(stops.visible(stream.final()) if stops.strings else stream.final(), tools)
+         reasoning, answer = visible(True)
+         final: dict[str, Any] = {}
+         if len(reasoning) > sent["reasoning"]:
+             final["reasoning_content"] = reasoning[sent["reasoning"]:]
+         raw_text = self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False)
+-        text = stops.visible(raw_text)
++        text = stops.visible(raw_text) + closing[0]
+         raw_answer = split_thinking(text, finished=True)[1] if chat and thinking else text
+         content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
+         content = policy.content(content) if tools else content
+@@ -568,6 +574,14 @@ class App:
+                 "reasoning_tokens": reasoning_count(out, self.tok.token_to_id("</think>") if chat and thinking else None),
+                 "stats": stats, "calls_streamed": streamed}
+ 
++    def _glm_calls(self) -> bool:
++        """Whether this model writes GLM's ``<arg_key>``/``<arg_value>`` calls: its tokenizer has those marks as
++        tokens."""
++
++        lookup = getattr(self.tok, "token_to_id", None)
++        return lookup is not None and all(lookup(mark) is not None
++                                          for mark in ("<tool_call>", "<arg_key>", "</arg_value>"))
++
+     def _turns(self) -> Turns:
+         """The engine's turns (one request at a time, background ones last), made on first use."""
+ 
+diff --git a/src/tensorfold/server/tools.py b/src/tensorfold/server/tools.py
+index d7042f8..e543cc4 100644
+--- a/src/tensorfold/server/tools.py
++++ b/src/tensorfold/server/tools.py
+@@ -147,6 +147,29 @@ def _loose_tool_arguments(payload: dict[str, Any], explicit: Any) -> Any:
+ # GLM-4.5 and later (GLM-5.3-Flash): <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>
+ _GLM_ARG_RE = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL)
+ _GLM_NAME_RE = re.compile(r"[\w.:-]+")
++_GLM_TAG_RE = re.compile(r"</?arg_(?:key|value)>")
++_GLM_LAST_WORD_RE = re.compile(r"(\S+)\s*$")
++
++
++def repair_glm_keys(block: str) -> str:
++    """A GLM call whose ``<arg_key>`` the model left out, writing whitespace where that token belongs
++    (``read path</arg_key><arg_value>..``, or ``</arg_value>\npath</arg_key>``), with it put back: the word before an
++    unopened ``</arg_key>`` is its key. A block where nothing is missing comes back as it is."""
++
++    if block.count("</arg_key>") <= block.count("<arg_key>"):
++        return block
++    out, at, prev, prev_end = [], 0, None, 0     # prev: the last tag seen (ending at prev_end); at: text copied
++    for tag in _GLM_TAG_RE.finditer(block):
++        if tag.group(0) == "</arg_key>" and prev in (None, "</arg_value>"):
++            seg_start = 0 if prev is None else prev_end
++            word = _GLM_LAST_WORD_RE.search(block, seg_start, tag.start())
++            # the name's segment keeps a name before the key (``read path``): no word, or no name, is not repaired
++            if word is None or (prev is None and not block[seg_start:word.start()].strip()):
++                return block
++            out += [block[at:word.start()], "<arg_key>"]
++            at = word.start()
++        prev, prev_end = tag.group(0), tag.end()
++    return "".join(out) + block[at:]
+ 
+ 
+ def parse_glm_tool_call_block(block: str, tools: Any, *, complete: bool = False) -> tuple[str, dict[str, Any]] | None:
+@@ -159,7 +182,7 @@ def _parse_glm_payload(block: str, schemas: dict[str, dict[str, Any]] | None, *,
+                        complete: bool = False) -> tuple[str, dict[str, Any]] | None:
+     """A GLM call (the bare name without arguments), values decoded as Qwen's so a history renders as written."""
+ 
+-    name, found, rest = block.partition("<arg_key>")
++    name, found, rest = repair_glm_keys(block).partition("<arg_key>")
+     name = name.strip()
+     if _GLM_NAME_RE.fullmatch(name) is None:
+         return None
+diff --git a/tests/test_glm_tool_call_end.py b/tests/test_glm_tool_call_end.py
+new file mode 100644
+index 0000000..9b23cae
+--- /dev/null
++++ b/tests/test_glm_tool_call_end.py
+@@ -0,0 +1,238 @@
++"""A GLM tool call the model's end token left open (written before ``</tool_call>``) is closed and sent as a call when it
++then parses whole; otherwise its markup stays the reply's text. A call whose ``<arg_key>`` the model wrote as
++whitespace gets it back in both servers' parsers. A call the token limit cut, and every other reply, is unchanged."""
++
++from __future__ import annotations
++
++import json
++import threading
++
++import pytest
++
++from tensorfold.cuda.reply_text import close_glm_call, parse_tool_calls
++from tensorfold.server.tools import parse_tool_calls_from_content, repair_glm_keys
++
++TOOLS = [
++    {"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {
++        "path": {"type": "string"}, "limit": {"type": "integer"}}}}},
++    {"type": "function", "function": {"name": "run", "parameters": {"type": "object", "properties": {
++        "command": {"type": "string"}}}}},
++    {"type": "function", "function": {"name": "now", "parameters": {"type": "object", "properties": {}}}},
++]
++PARSERS = pytest.mark.parametrize("parser", [parse_tool_calls, parse_tool_calls_from_content],
++                                  ids=["cuda-server", "http-server"])
++
++
++def args(text, tools=TOOLS, parser=parse_tool_calls, **kw):
++    return [(c["function"]["name"], json.loads(c["function"]["arguments"]))
++            for c in parser(text, tools, **kw)[1] or []]
++
++
++# -- the missing <arg_key> --------------------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("block, repaired", [
++    ("read_file path</arg_key><arg_value>/x</arg_value>",
++     "read_file <arg_key>path</arg_key><arg_value>/x</arg_value>"),
++    ("read_file\npath</arg_key><arg_value>/x</arg_value>",
++     "read_file\n<arg_key>path</arg_key><arg_value>/x</arg_value>"),
++    ("read_file<arg_key>path</arg_key><arg_value>/x</arg_value>\nlimit</arg_key><arg_value>3</arg_value>",
++     "read_file<arg_key>path</arg_key><arg_value>/x</arg_value>\n<arg_key>limit</arg_key><arg_value>3</arg_value>"),
++    ("read_file path</arg_key><arg_value>/x</arg_value> limit</arg_key><arg_value>3</arg_value>",
++     "read_file <arg_key>path</arg_key><arg_value>/x</arg_value> <arg_key>limit</arg_key><arg_value>3</arg_value>"),
++])
++def test_a_missing_arg_key_is_put_back(block, repaired):
++    assert repair_glm_keys(block) == repaired
++    assert repair_glm_keys(repaired) == repaired
++
++
++@pytest.mark.parametrize("block", [
++    "read_file<arg_key>path</arg_key><arg_value>/x</arg_value>",      # nothing missing
++    "read_file",
++    "read_filepath</arg_key><arg_value>/x</arg_value>",               # no space: no name left before the key
++    " path</arg_key><arg_value>/x</arg_value>",                       # no name at all
++    '{"name": "run", "arguments": {"command": "ls"}}',
++])
++def test_blocks_without_a_missing_key_are_unchanged(block):
++    assert repair_glm_keys(block) == block
++
++
++@PARSERS
++def test_both_parsers_read_a_repaired_call(parser):
++    # before: the first came back as text, the second lost its second argument (or was refused as one call)
++    text = "<tool_call>read_file filePath</arg_key><arg_value>/home/a/main.go</arg_value></tool_call>"
++    tools = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {
++        "filePath": {"type": "string"}}}}}]
++    assert args(text, tools, parser) == [("read_file", {"filePath": "/home/a/main.go"})]
++    assert args(text, tools, parser, max_calls=1) == [("read_file", {"filePath": "/home/a/main.go"})]
++    later = ("<tool_call>read_file<arg_key>path</arg_key><arg_value>a</arg_value>\nlimit</arg_key><arg_value>3"
++             "</arg_value></tool_call>")
++    assert args(later, parser=parser) == [("read_file", {"path": "a", "limit": 3})]
++    assert args(later, parser=parser, max_calls=1) == [("read_file", {"path": "a", "limit": 3})]
++
++
++# -- closing a call the end token left open ------------------------------------------------------------------------
++
++@pytest.mark.parametrize("text, suffix", [
++    ("<tool_call>read_file<arg_key>path</arg_key><arg_value>x</arg_value>", "</tool_call>"),
++    ("<tool_call>run<arg_key>command</arg_key><arg_value>ls -la", "</arg_value></tool_call>"),
++    ("Let me look:<tool_call>now", "</tool_call>"),
++    ("<tool_call>now</tool_call>\n<tool_call>read_file<arg_key>path</arg_key><arg_value>x</arg_value>\n",
++     "</tool_call>"),
++    ("<tool_call>read_file path</arg_key><arg_value>x", "</arg_value></tool_call>"),       # and repaired
++])
++def test_a_call_that_parses_once_closed_is_closed(text, suffix):
++    assert close_glm_call(text, TOOLS) == suffix
++    assert args(text + suffix)[-1][0] in ("read_file", "run", "now")
++
++
++@pytest.mark.parametrize("text", [
++    "no call at all",
++    "<tool_call>now</tool_call>",                                       # closed already
++    "<tool_call>launch<arg_key>x</arg_key><arg_value>1",                # a tool the client did not offer
++    "<tool_call>run<arg_key>comm",                                      # a key with no value
++    "<tool_call>run<arg_key>command</arg_key>",                         # ... or no value yet
++    "<tool_call>run command=ls",                                        # not GLM's markup
++    "<tool_call>",                                                      # nothing written
++    "<tool_call>now</think>The answer.",                                # the think block went on past it
++    "<tool_call>run<arg_key>command</arg_key><arg_value>ls</arg_value> and then",       # text after an argument
++])
++def test_a_call_that_would_not_parse_is_left_open(text):
++    assert close_glm_call(text, TOOLS) == ""
++
++
++# -- through the CUDA server's GlmApp ------------------------------------------------------------------------------
++
++tokenizers = pytest.importorskip("tokenizers")
++pytest.importorskip("jinja2")
++
++from tokenizers import Tokenizer, decoders, models, pre_tokenizers  # noqa: E402
++
++from tensorfold.cuda import server  # noqa: E402
++from tensorfold.families.glm5_next.cuda.app import GlmApp, ThinkingOffTemplate  # noqa: E402
++from tests.test_cuda_admission import http_server, post  # noqa: E402
++from tests.test_cuda_stop_strings import GlmEngine, events, write_template  # noqa: E402
++
++END = "<|observation|>"
++MARKS = ("<tool_call>", "</tool_call>", "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>", "<think>",
++         "</think>")
++
++
++def glm_tokenizer() -> Tokenizer:
++    """One token a byte, plus GLM's call and think marks and an end token as single tokens (as GLM-5.3's are)."""
++
++    alphabet = sorted(pre_tokenizers.ByteLevel.alphabet())
++    tok = Tokenizer(models.BPE(vocab={ch: i for i, ch in enumerate(alphabet)}, merges=[]))
++    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
++    tok.decoder = decoders.ByteLevel()
++    tok.add_special_tokens([END, *MARKS])
++    return tok
++
++
++TOK = glm_tokenizer()
++END_ID = TOK.token_to_id(END)
++
++
++class Engine(GlmEngine):
++    eos = (END_ID,)
++
++
++def make_app(tmp_path, reply_ids, thinking):
++    write_template(tmp_path)
++    app = GlmApp.__new__(GlmApp)
++    app.engine = Engine(reply_ids)
++    app.served = "fake-glm"
++    app.tok = TOK
++    app.template = ThinkingOffTemplate(server.ChatTemplate(tmp_path))
++    app.default_thinking = thinking
++    app.sampling = {"temperature": 0.0}
++    app.max_tokens = 4096
++    app.native_context_window = app.context_window = 0
++    app.lock = threading.Lock()
++    return app
++
++
++def _reply(tmp_path, written, streamed, *, ended=True, thinking=False, **fields):
++    """(content, reasoning, calls, finish) of a reply that writes ``written`` (then the end token when ``ended``)."""
++
++    reply_ids = TOK.encode(written, add_special_tokens=False).ids + ([END_ID] if ended else [])
++    app = make_app(tmp_path, reply_ids, thinking)
++    body = {"messages": [{"role": "user", "content": "x"}], "tools": TOOLS, "temperature": 0, "stream": streamed,
++            **fields}
++    with http_server(app) as port:
++        status, text = post(port, body, True)
++    assert status == 200, text
++    if not streamed:
++        choice = json.loads(text)["choices"][0]
++        message = choice["message"]
++        calls = [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in message.get("tool_calls") or []]
++        return message.get("content") or "", message.get("reasoning_content") or "", calls, choice["finish_reason"]
++    content, reasoning, calls, finish = "", "", {}, None
++    for chunk in events(text):
++        if not chunk.get("choices"):
++            continue
++        delta = chunk["choices"][0].get("delta", {})
++        content += delta.get("content") or ""
++        reasoning += delta.get("reasoning_content") or ""
++        for t in delta.get("tool_calls", []):
++            entry = calls.setdefault(t["index"], ["", ""])
++            entry[0] += t["function"].get("name") or ""
++            entry[1] += t["function"].get("arguments") or ""
++        finish = chunk["choices"][0].get("finish_reason") or finish
++    return content, reasoning, [(n, json.loads(a)) for n, a in (calls[i] for i in sorted(calls))], finish
++
++
++OPEN = [   # (the reply, ended by the end token; the calls; the content)
++    ("Reading it.<tool_call>read_file<arg_key>path</arg_key><arg_value>notes.txt</arg_value>",
++     [("read_file", {"path": "notes.txt"})], "Reading it."),
++    ("<tool_call>run<arg_key>command</arg_key><arg_value>ls -la", [("run", {"command": "ls -la"})], ""),
++    ("The time:<tool_call>now", [("now", {})], "The time:"),
++    ("<tool_call>now</tool_call><tool_call>run<arg_key>command</arg_key><arg_value>date</arg_value>",
++     [("now", {}), ("run", {"command": "date"})], ""),
++    ("<tool_call>read_file path</arg_key><arg_value>notes.txt</arg_value>", [("read_file", {"path": "notes.txt"})], ""),
++]
++
++
++@pytest.mark.parametrize("streamed", [False, True])
++@pytest.mark.parametrize("written, calls, content", OPEN, ids=range(len(OPEN)))
++def test_a_call_the_end_token_left_open_is_a_call(tmp_path, written, calls, content, streamed):
++    got_content, _, got_calls, finish = _reply(tmp_path, written, streamed)
++    assert (got_content.strip(), got_calls, finish) == (content, calls, "tool_calls")
++
++
++@pytest.mark.parametrize("streamed", [False, True])
++def test_a_call_at_the_end_of_an_unclosed_think_block_is_a_call(tmp_path, streamed):
++    got = _reply(tmp_path, "I need the file.<tool_call>read_file<arg_key>path</arg_key><arg_value>x</arg_value>",
++                 streamed, thinking=True)
++    assert got == ("", "I need the file.", [("read_file", {"path": "x"})], "tool_calls")
++
++
++@pytest.mark.parametrize("streamed", [False, True])
++@pytest.mark.parametrize("written", [
++    "<tool_call>launch_rocket<arg_key>when</arg_key><arg_value>now</arg_value>",   # a tool not offered
++    "<tool_call>run<arg_key>comm",                                                 # a key with no value
++    "<tool_call>",
++])
++def test_a_call_left_open_that_would_not_parse_stays_text(tmp_path, written, streamed):
++    content, _, calls, finish = _reply(tmp_path, "Trying." + written, streamed)
++    assert (content, calls, finish) == ("Trying." + written, [], "stop")
++
++
++@pytest.mark.parametrize("streamed", [False, True])
++def test_a_call_the_token_limit_cut_is_not_closed(tmp_path, streamed):
++    written = "Removing it. <tool_call>run<arg_key>command</arg_key><arg_value>rm -rf build"
++    content, _, calls, finish = _reply(tmp_path, written, streamed, ended=False,
++                                       max_tokens=len(TOK.encode(written, add_special_tokens=False).ids))
++    assert (content, calls, finish) == (written, [], "length")
++
++
++@pytest.mark.parametrize("streamed", [False, True])
++def test_a_call_a_stop_string_cut_is_not_closed(tmp_path, streamed):
++    written = "Removing it. <tool_call>run<arg_key>command</arg_key><arg_value>rm -rf build STOP and more"
++    content, _, calls, finish = _reply(tmp_path, written, streamed, stop=" STOP")
++    assert (content, calls, finish) == (written[:written.find(" STOP")], [], "stop")
++
++
++@pytest.mark.parametrize("streamed", [False, True])
++def test_a_closed_call_with_a_missing_key_is_a_call(tmp_path, streamed):
++    got = _reply(tmp_path, "<tool_call>read_file path</arg_key><arg_value>notes.txt</arg_value></tool_call>", streamed)
++    assert got == ("", "", [("read_file", {"path": "notes.txt"})], "tool_calls")

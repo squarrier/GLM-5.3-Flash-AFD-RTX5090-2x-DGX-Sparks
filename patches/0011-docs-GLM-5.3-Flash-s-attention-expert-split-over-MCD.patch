@@ -1,0 +1,206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 15:45:56 -0400
+Subject: [PATCH] docs: GLM-5.3-Flash's attention/expert split over MCDMA, with
+ Mia's AI Lab's GLM work
+
+docs/recipes/glm-5.3-flash-afd.md: the three nodes and their commands, the MCDMA wire (daemons, link names, the
+GPU-driven mode and its CPU-driven fallback, the probe), the settings MiaAI-Lab's work adds on the attention node
+(--parallel, the tool-call and stop fixes, TF_GLM_DENSE=q4, TF_GLM_KV=fp8) and their sources, memory, limits,
+troubleshooting, and the credits and licences of every component. The recipe index links it.
+
+THIRD_PARTY_NOTICES.md: MCDMA (Apache-2.0) is a runtime dependency, installed separately, none of its code copied.
+
+Measurements stay out of the tree (CONTRIBUTING); they go in the pull request.
+
+Assisted-by: Claude Opus 5.5 (planning) and GLM-5.3-Flash (execution), via Hermes
+
+---
+ THIRD_PARTY_NOTICES.md            |   3 +
+ docs/recipes/README.md            |   2 +-
+ docs/recipes/glm-5.3-flash-afd.md | 149 ++++++++++++++++++++++++++++++
+ 3 files changed, 153 insertions(+), 1 deletion(-)
+ create mode 100644 docs/recipes/glm-5.3-flash-afd.md
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index dab410e..5bdd03e 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -54,6 +54,9 @@ The MLX engine of `glm5_next` (`src/tensorfold/families/glm5_next/`: the forward
+ 
+ CUDA backends use [PyTorch](https://github.com/pytorch/pytorch), BSD-3-Clause, and
+ [Triton](https://github.com/triton-lang/triton), MIT, supplied by NVIDIA's container rather than bundled.
++GLM-5.3-Flash's attention/expert split (`--experts remote`) exchanges its MoE rows through
++[MCDMA](https://github.com/ashhart/MCDMA)'s link daemons and `libmcdma-rpc`, Apache-2.0, installed separately rather
++than bundled; the split copies none of MCDMA's code.
+ Dense Qwen implements mlx-lm's model math. CUDA DFlash2 implementations port z-lab's architecture under
+ the MIT License, Copyright © 2026 Z Lab.
+ 
+diff --git a/docs/recipes/README.md b/docs/recipes/README.md
+index cf55a2b..98ea1da 100644
+--- a/docs/recipes/README.md
++++ b/docs/recipes/README.md
+@@ -8,7 +8,7 @@ Each family page describes its supported checkpoint, kernels and operating limit
+ | Qwen3.8-27B | [MLX, quantization and CUDA](qwen3.8-27b.md) |
+ | Qwen3.8 Flash Next | [MLX prefill and CUDA](qwen3.8-flash-next.md), [CUDA images](flash-next-vision.md) |
+ | Ternary Bonsai 2 27B | [MLX](ternary-bonsai-2.md) |
+-| GLM-5.3-Flash | [MLX on a 256 GB Mac, two-rank CUDA](glm-5.3-flash.md) |
++| GLM-5.3-Flash | [MLX on a 256 GB Mac, two-rank CUDA](glm-5.3-flash.md), [attention/expert split over MCDMA](glm-5.3-flash-afd.md) |
+ | Gemma 4 26B-A4B | [MLX, fused one-row decode](gemma-4.md) |
+ | DeepSeek-V4-Flash | [MLX on a 256 GB Mac, DSpark and MTP drafts](deepseek-v4-flash.md) |
+ | Qwen3.6-35B-A3B | [MLX with MTP drafts, one-GPU CUDA](qwen3.6-moe.md) |
+diff --git a/docs/recipes/glm-5.3-flash-afd.md b/docs/recipes/glm-5.3-flash-afd.md
+new file mode 100644
+index 0000000..aec90ad
+--- /dev/null
++++ b/docs/recipes/glm-5.3-flash-afd.md
+@@ -0,0 +1,149 @@
++# GLM-5.3-Flash: the attention/expert split (`--experts remote`)
++
++`--experts remote` serves GLM-5.3-Flash's attention, KV cache, drafter and sampling on one CUDA GPU and puts the
++routed experts on two `tensorfold experts` nodes. The three machines form one three-rank group: the attention node
++is rank 0, and each expert node holds one two-way half of the routed experts as ranks 1 and 2. In every MoE layer the
++attention node sends the layer's rows, the router's picks and the routing weights to both expert nodes; each runs its
++half's experts and returns its partial sum, while the attention node runs the layer's shared expert; the three are
++added and the forward goes on.
++
++The exchange runs over Ash Hart's [MCDMA](https://github.com/ashhart/MCDMA) link daemons: per MoE layer one packed
++request into each expert node's mailbox and one reply back. It is GPU-driven where the device supports it (the
++mailbox words are written and awaited as stream memory operations on the serving stream, with no host sync per
++layer) and CPU-driven otherwise.
++
++The attention node holds only the non-expert weights, the KV cache and the drafter, so a 32 GB GPU carries a
++262,144-token window, and each expert node needs no HTTP, tokenizer or drafter: only its half of the experts.
++
++## The three nodes
++
++| Role | Command | Holds |
++| --- | --- | --- |
++| Attention (rank 0) | `tensorfold serve CKPT --experts remote --master <attention-ip>` | non-expert weights, the KV cache, the drafter; serves HTTP |
++| Expert half 0 (rank 1) | `tensorfold experts CKPT --rank 0 --master <attention-ip>` | its half of every MoE layer's routed experts |
++| Expert half 1 (rank 2) | `tensorfold experts CKPT --rank 1 --master <attention-ip>` | the other half |
++
++`CKPT` is the same EXL3 checkpoint on all three machines (the [CUDA recipe](glm-5.3-flash.md)); the attention node
++refuses other formats at load. `--master` is the attention node's address on the network the experts reach it by,
++and both commands default to `--master-port 29551`. The experts take the window and chunking from the attention
++node. `--experts remote` refuses `--tp`, because the expert nodes are the second and third ranks.
++
++Start the attention node first: it hosts the rendezvous and publishes the settings the experts must match. An expert
++whose checkpoint, wire or link map disagrees exits with a message naming both values. Each expert writes a loaded
++mark once its half is resident; then the attention's `/health` answers, and both experts keep beating every 5 s. 20 s
++of silence, a link failure or an expert error raises the attention's watchdog: in-flight requests fail with HTTP 503
++and the attention logs `afd: ...; in-flight requests fail, restart the serving stack`. Restart the whole stack, not
++one node.
++
++## The MCDMA wire
++
++Each host needs:
++
++- a `mcdma-rpcd` link daemon: the attention node is the connect end of both links, and each expert node is the
++  listen end of its own link (its socket is found through `MCDMA_RPCD_SOCKET`);
++- `TF_AFD_MCDMA_LIB` pointing at a `libmcdma-rpc.so` build (ABI 1) for the host's architecture; the loader also
++  probes `/mcdma/libmcdma-rpc.so` and `/usr/local/lib/libmcdma-rpc.so`;
++- link names: `TF_AFD_MCDMA_LINKS=<link-for-rank1>,<link-for-rank2>` on the attention node and
++  `TF_AFD_MCDMA_LINK=<name>` on each expert node.
++
++Mailboxes are created under `/dev/shm` (`TF_AFD_MCDMA_SHM_DIR`). `TF_AFD_MCDMA_MODE=auto` (the default) runs a
++capability probe and drives the exchange from the GPU when it passes, else from the CPU with a loud startup line;
++`gpu` and `cpu` force a mode. `tools/mcdma_streamops_probe.py` runs the same checks on a node before its first boot.
++A request may stay unanswered `TF_AFD_MCDMA_TIMEOUT` seconds (default 30) before the attention's watchdog calls the
++link dead. The startup line names the mode: `afd transport mcdma, gpu-driven` or `cpu-driven`.
++
++## Mia's AI Lab's GLM work on the split
++
++The split carries MiaAI-Lab's GLM work for TensorFold: her own pull requests, kept as she wrote them, and ports of her
++[GLM-5.3-Flash EXL3 2x DGX Sparks recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)
++patches. On the attention node they run at world 1, beside the wire:
++
++| Setting | What | From |
++| --- | --- | --- |
++| `--parallel N` (2 to 4) | several requests decode together: one cache pool, batched verify windows, DFlash2 drafts for every stream | #243 (MiaAI-Lab); the world-1 glue is the split's |
++| with `--parallel` | `/health`'s `iteration_s` and `TF_GLM_MULTI_WATCHDOG_EXIT`; its sealed rank messages are for two ranks (world 1 sends none) | #243 (MiaAI-Lab) |
++| (always) | a tool call the end token left open is still sent when it parses whole | #285 (MiaAI-Lab) |
++| (always) | a client that leaves, or a stop string, ends its run within a round | #301 (MiaAI-Lab) |
++| `TF_GLM_DENSE=q4` | dense weights in MSE-searched 4-bit groups of 64, the head in FP8 | recipe patches 0002, 0005, 0013, 0028 (ported) |
++| `TF_GLM_KV=fp8` | the DSA latent and indexer caches as e4m3 rows with a power-of-two scale each | recipe patch 0038 and 0041's ring span (ported) |
++
++Her recipe's defaults are her checkpoint, the DFlash2 drafter, 4-bit dense weights, the FP8 KV cache and four
++streams. On the split:
++
++```bash
++TF_GLM_DENSE=q4 TF_GLM_KV=fp8 \
++  tensorfold serve CKPT --experts remote --master <attention-ip> --drafter DRAFTER --context 262144 --parallel 4
++```
++
++The expert nodes take no part in any of these settings, and serve unchanged.
++
++Under `--parallel` the attention node verifies every stream's window in one eager forward over the wire: it captures
++no batched CUDA graphs (`TF_GLM_MULTI_GRAPHS` is ignored, and the startup line says so), and it refuses
++`TF_GLM_MULTI_DEPTH=joint` and `TF_GLM_MULTI_LONE=1`, which need them, before the wire opens. Each reply equals the
++one its request gets alone, as on two ranks. Without the flags, the attention node runs as described above.
++
++## Memory
++
++Attention node, 32 GB card (32,607 MiB), BF16 dense weights and BF16 caches at a 262,144-token window: non-expert
++weights 17.3 GiB, the DFlash2 drafter 0.9 GiB, caches and fixed buffers 10.2 GiB; the startup estimate asks 28.18 GiB.
++On a discrete card TensorFold's default reserve is the larger of 4 GiB and a tenth of the card, which leaves about
++26.7 GiB, so set `TENSORFOLD_MEMORY_RESERVE_GIB=2` (admission then measures 28.18 within a 28.65 GiB budget) or take
++a smaller window.
++
++With `TF_GLM_DENSE=q4` the weights are 10.4 GiB smaller, and `TF_GLM_KV=fp8` takes 6,716 bytes a window token
++instead of 18,112. Together the estimate at 262,144 is about 15.0 GiB with one stream and 16.1 GiB with
++`--parallel 4`. The streams share one cache pool, which `TF_GLM_CACHE_GIB` sizes (default 3 GiB, about 512K tokens
++with FP8 caches); four streams at full depth at once need a larger pool.
++
++Expert node: its half of the routed experts, 71.1 GiB, a 2,048-row chunk's scratch (about 1.9 GiB) and the CUDA
++context; measured peak allocation 72.4 GiB on one half. On each 128 GB unified-memory host, 28 to 31 GiB stayed
++available after load.
++
++## Limits
++
++- The `glm5_next` CUDA family and EXL3 checkpoints only; `tensorfold experts` refuses other families, and the
++  Mac/MLX lane is untouched.
++- Eager execution only: graphs.py captures nothing on the attention node. A captured exchange measured within 0.5%
++  of eager, so graph capture is not part of this change.
++- `--parallel` up to 4 requests; the 262,144-token window is the tested one, and the startup estimate admits what
++  fits.
++- The wire check (`TF_AFD_CHECK=1`) clones each layer's wire tensors (about 3.4 GB at a 2,048-row chunk), so on a
++  32 GB card a checked wide chunk fits only at a 98,304-token window or less. Serve 262,144 with the check off.
++- The MTP head does not cross the wire: the attention node does not load it, and `TF_GLM_MTP=1` is refused.
++  TensorFold's EXL3 auto policy drafts with DFlash2 anyway.
++- The recipe's FP8 dense weights (`TF_GLM_DENSE=fp8`) are not ported.
++
++## Troubleshooting
++
++- **Startup hangs at the handshake.** Order: the attention node first, then the experts in either order; the same
++  `--master-port` on all three; the attention waits for both loaded marks.
++- **`afd: ...` and 503s.** An expert died or its beats went stale (5 s beats, 20 s stale), or a link failed. The log
++  names the cause; restart the serving stack.
++- **MCDMA link loss.** A stopped or replaced daemon, or a hung expert, fails the forward with a `LinkError`; the
++  attention's watchdog calls a link dead after `TF_AFD_MCDMA_TIMEOUT` (30 s) of an unanswered request.
++- **CPU-driven when GPU-driven was expected.** Run `tools/mcdma_streamops_probe.py` on that node: it names the
++  missing device attribute or the failing stream memory operation.
++- **Building `libmcdma-rpc`.** At MCDMA e672c14, GCC 11.4 and 13.3 stop the rpc build on
++  `-Werror=format-truncation` (`rpcd_connect.c:42`); the open ashhart/MCDMA#5 fixes it.
++- **CUDA extensions.** Build them before serving, into a persistent `TORCH_EXTENSIONS_DIR`. Compiling inside
++  `serve`, after about 90 GiB of weights were resident on a stock two-rank node, drove a 128 GB host down to 5.7 GiB
++  available.
++- **Wire audit.** `TF_AFD_CHECK=1` hashes both sides' wire tensors every layer for `TF_AFD_CHECK_FORWARDS` forwards
++  (default 4096) and prints `afd-check: window complete, N forwards, M mismatches total, rows checked [...]`.
++  `TF_AFD_TIME=1` times the per-layer exchanges.
++
++## Credits and licences
++
++- [TensorFold](https://github.com/ashhart/TensorFold) by Ash Hart (@ashhart): Apache-2.0 since v0.6.0. The split's
++  code is offered under the same license.
++- [MCDMA](https://github.com/ashhart/MCDMA) by Ash Hart: Apache-2.0. The split uses it at runtime through its
++  daemons and `libmcdma-rpc`; none of its code is copied.
++- The attention/expert split's design: Hugh Madden (@dangerm00se), glm53f-afd and mimo26f-afd; tpurtell
++  (@wrldsuksgo2mars), ds41rt, glmrt and cuteafd.
++- Mia's AI Lab (@MiaAI-Lab): #243, #285 and #301, her commits with her authorship, and the recipe patches ported
++  for `TF_GLM_DENSE=q4` and `TF_GLM_KV=fp8` (Apache-2.0, Copyright 2026 MiaAI-Lab; THIRD_PARTY_NOTICES.md). The
++  MTP concurrency idea is @aditya1503's (#200, superseded by #243).
++- Thanks to Jay Leaton (@jayleaton).
++- Weights used for testing, not shipped: Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold at revision 078455ff, a
++  quantization (Apache-2.0 per its model card) of Z.AI's MIT-licensed GLM-5.3-Flash; the drafter
++  incoai/GLM-5.3-Flash-DFlash2 at revision bf582e4e, CC BY-NC-ND 4.0, referenced by name and never redistributed.

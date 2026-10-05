@@ -1,0 +1,2226 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 22:32:55 -0400
+Subject: [PATCH] glm5_next/cuda: layer-sliced prompt fills over a slice-aware
+ AFD wire (MiaAI-Lab recipe patch 0062)
+
+TF_GLM_FILL_BUDGET_MS > 0 runs a prompt chunk started while other streams decode a few layers at a time: each slice
+sized from startup layer timings (sliced_fill.LayerCosts) to about that many ms, a decode round between two slices
+(one token a stream, or drafted with TF_GLM_FILL_DRAFTS=1), the chunk's rows kept in the engine's prompt buffers and
+its commit after its last layer. A request alone fills whole forwards. Off unless set: unset or 0, every prompt chunk
+is one forward and the messages are the ones before.
+
+- sliced_fill.py: the recipe's file unchanged, with the credit header.
+- decode.prefill_chunk_steps, forward.compute_steps (the recipe's unsplit branch only: no hyper-connection split
+  here, so split_layer_steps is not taken), multi_prefill.prefill_piece_steps.
+- multi.py: the suspended chunk (FILLPART / MFILLPART ops, checked in parse), slices sized by LayerCosts, short
+  rounds between slices, grouped fills, cache moves (_used counts the chunk's rows) and cancellation mid-fill (the
+  server's client poll on the engine's callback), /health's sliced_fill counters; engine.py: both ranks' settings
+  check and the startup line; afd_parallel_check reads the two settings before the wire opens.
+
+The AFD wire's slice mode is this tree's own design, not part of the recipe: MODE_SLICE = 5, wire version 2 in the
+settings handshake (a node of the old wire is refused at settings_mismatch). A slice is a forward over MoE positions
+a .. a + n - 1 of a chunk's rows; its first request's MCDMA header has word 3 = a and word 6 = n (modes 1 and 3 and
+every word they use unchanged); the expert's next_forward takes a slice's first request at its own position and
+_window runs only those layers; the attention's begin(rows, chunk=True, slice=(a, n)) keeps per-slice bookkeeping,
+its out-of-step refusal now also covers a slice that stopped early, and TF_AFD_CHECK keys a slice's hashes
+afd_chk/{seq}/{a}+{n}/{peer}. The startup layer timings run as whole prompt-chunk forwards with the experts live.
+
+Tests: tests/test_glm_sliced_fill.py (sliced == unsliced at world 1 over a checked wire whose header table the real
+McdmaTransport.header writes, and at two ranks; grouped chunks; fp8 rings; MTP and DFlash2; a round between slices;
+a move between slices, with a mutant; cancellation mid-fill; the startup timings; parse; the settings),
+tests/test_glm_afd_slice_wire.py (slices round-trip over the fake MCDMA pair between eager windows, the header words,
+the old wire refused both ways, a slice stopped early, malformed slice headers, the check's keys).
+
+Credit: THIRD_PARTY_NOTICES.md ("GLM sliced prompt fills") and the ported code's comments name MiaAI-Lab and the patch.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patch 0062,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 1576746a04983b6eded0551dbf22512ee9e95654 (v1.5); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |  21 +
+ src/tensorfold/cuda/server.py                 |   3 +
+ src/tensorfold/families/glm5_next/cuda/afd.py |  96 +++-
+ .../families/glm5_next/cuda/afd_mcdma.py      |  42 +-
+ .../families/glm5_next/cuda/afd_transport.py  |  10 +-
+ .../families/glm5_next/cuda/decode.py         |  29 +
+ .../families/glm5_next/cuda/engine.py         |  14 +-
+ .../families/glm5_next/cuda/experts_node.py   |  27 +-
+ .../families/glm5_next/cuda/forward.py        |  25 +
+ .../families/glm5_next/cuda/multi.py          | 318 ++++++++++-
+ .../families/glm5_next/cuda/multi_prefill.py  |  30 +
+ .../families/glm5_next/cuda/sliced_fill.py    | 172 ++++++
+ tests/test_glm_afd_slice_wire.py              | 267 +++++++++
+ tests/test_glm_afd_transport.py               |   3 +-
+ tests/test_glm_multi_afd.py                   |   3 +-
+ tests/test_glm_sliced_fill.py                 | 522 ++++++++++++++++++
+ 16 files changed, 1512 insertions(+), 70 deletions(-)
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/sliced_fill.py
+ create mode 100644 tests/test_glm_afd_slice_wire.py
+ create mode 100644 tests/test_glm_sliced_fill.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index a441135..3dbca76 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -225,3 +225,24 @@ made just before the engine runs (the recipe makes them with the request's helpe
+ good when a request is refused or cancelled before it runs); an engine failure sends the text still queued before the
+ error, as unsmoothed (the recipe drops it). `TF_GLM_STREAM_SMOOTH` is off unless set, and unset or 0
+ the server writes the events it wrote before.
++
++## GLM sliced prompt fills (TF_GLM_FILL_BUDGET_MS)
++
++`families/glm5_next/cuda/sliced_fill.py` (`budget_ms`, `drafted_rounds`, `LayerCosts`, `PendingFill`, `advance`) and
++the `TF_GLM_FILL_BUDGET_MS` paths of `decode.py` (`prefill_chunk_steps`), `forward.py` (`compute_steps`),
++`multi_prefill.py` (`prefill_piece_steps`), `multi.py` (`MultiDecoder._time_prompt_layers`, `_part_iteration`,
++`_part`, the FILLPART and MFILLPART ops and their checks in `parse`, the suspended chunk in `_fill_turn`, `_iterate`,
++`_used`, `_finish` and `_abort`, the short rounds of `_round`, the client poll, `health`), `engine.py` (the ranks'
++settings check and the startup line) and `cuda/server.py` (the client poll on the engine's callback) are ported from
++MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/1576746)
++patch 0062-glm-sliced-fill, Apache License 2.0, Copyright 2026 MiaAI-Lab (see
++[the license text](LICENSES/Apache-2.0.txt)). `sliced_fill.py` is the recipe's file unchanged, with a credit header.
++Changes in the port: `compute_steps` is the recipe's unsplit branch only (this tree has no hyper-connection split
++between ranks, so `split_layer_steps` is not taken, nor the recipe's prompt-feature injection); `prefill_chunk_steps`
++keeps this tree's MTP head rows after the last layer, and MTP streams still draft in the short rounds between slices;
++the recipe's copy drafts and replayed heads are not in this tree. On the attention/expert split's attention node each
++slice is one forward of the AFD wire over the chunk's MoE layers in it (`afd.MODE_SLICE`, wire version 2: the MCDMA
++request header's word 6 carries a slice's layer count); that wire mode is this tree's own design, not part of the
++recipe, and the startup layer timings run as whole prompt-chunk forwards with the expert nodes live.
++`TF_GLM_FILL_BUDGET_MS` is off unless set (0: every prompt chunk one forward, as before).
+diff --git a/src/tensorfold/cuda/server.py b/src/tensorfold/cuda/server.py
+index e474b6e..af23265 100644
+--- a/src/tensorfold/cuda/server.py
++++ b/src/tensorfold/cuda/server.py
+@@ -550,6 +550,9 @@ class App:
+                 same = list(ids) == list(prepared.vision.token_ids)
+                 extra["vision"] = prepared.vision if same else continued(prepared.vision, ids,
+                                                                        self.vision.frontend.config)
++            # the client poll rides on the callback the engine gets (generate_gated wraps on_tokens): a GLM
++            # --parallel sliced prompt fill ends a filling request whose client left (MiaAI-Lab recipe patch 0062)
++            feed.cancelled = cancelled
+             stats = self.engine.generate(ids, count, sampling, feed, **extra)
+             if not cached:
+                 cached.append(int((stats or {}).get("cached") or 0))
+diff --git a/src/tensorfold/families/glm5_next/cuda/afd.py b/src/tensorfold/families/glm5_next/cuda/afd.py
+index 7f849be..80d6292 100644
+--- a/src/tensorfold/families/glm5_next/cuda/afd.py
++++ b/src/tensorfold/families/glm5_next/cuda/afd.py
+@@ -7,6 +7,11 @@ watchdog, the forward's ``seq``/``rows``/``mode``, the wire check and the exchan
+ ``afd_transport.ExpertTransport``, MCDMA's link daemons (``afd_mcdma``). Idle waits are on the TCPStore, never a spin on the wire. ``TF_AFD_CHECK=1`` hashes both sides' wire tensors for
+ the first ``TF_AFD_CHECK_FORWARDS`` forwards and compares them through the store; ``TF_AFD_TIME=1`` events-times
+ each layer's exchange and prints a p50 every so often.
++
++A forward is every MoE layer's exchange in order (MODE_EAGER, MODE_CHUNK), or a layer slice of a prompt chunk
++(MODE_SLICE, wire 2: TF_GLM_FILL_BUDGET_MS's sliced fills, MiaAI-Lab recipe patch 0062 over this wire): MoE positions
++a .. a + n - 1 only, so a decode round's forward can run between two slices of a chunk. The slice mode is this
++tree's own wire design, not part of the recipe.
+ """
+ 
+ from __future__ import annotations
+@@ -20,9 +25,11 @@ from datetime import timedelta
+ 
+ from .afd_transport import WireError
+ 
+-# the header's mode word: the attention sends only these two, and the experts refuse any other value
++# the header's mode word: the attention sends only these three, and the experts refuse any other value
+ MODE_EAGER = 1          # an eager window
+ MODE_CHUNK = 3          # a prompt chunk: eager, the expert's wide scratch
++MODE_SLICE = 5          # MoE positions a .. a + n - 1 of a prompt chunk (TF_GLM_FILL_BUDGET_MS's layer slices)
++WIRE = 2                # the wire's version in the settings handshake: 2 adds MODE_SLICE (an older node refuses)
+ CHECK_ENV = "TF_AFD_CHECK"
+ TIME_ENV = "TF_AFD_TIME"
+ CHECK_FORWARDS = int(os.environ.get("TF_AFD_CHECK_FORWARDS", "4096"))
+@@ -45,7 +52,16 @@ def settings_for(model_dir, cfg, *, prefill_rows: int) -> dict:
+     index = Path(model_dir) / "model.safetensors.index.json"
+     digest = hashlib.sha256(index.read_bytes()).hexdigest() if index.is_file() else ""
+     return {"digest": digest, "layers": moe_layers(cfg), "max_rows": 8, "mtp": 0, "prefill_rows": int(prefill_rows),
+-            "quant": cfg.quant, "experts": cfg.experts, "top_k": cfg.top_k}
++            "quant": cfg.quant, "experts": cfg.experts, "top_k": cfg.top_k, "wire": WIRE}
++
++
++def moe_span(cfg, lo: int, hi: int) -> tuple[int, int]:
++    """Model layers ``lo .. hi - 1`` as the wire's MoE positions: the first one's position ``a`` and their count ``n``
++    (``(a, 0)`` when the range holds no MoE layer). A layer-sliced prompt chunk sends each slice as one forward of
++    ``n`` exchanges from position ``a`` (``AfdWire.begin(..., slice=(a, n))``)."""
++
++    kinds = list(cfg.mlp_kinds)
++    return sum(k == "moe" for k in kinds[:lo]), sum(k == "moe" for k in kinds[lo:hi])
+ 
+ 
+ def settings_mismatch(mine: dict, theirs: dict) -> str:
+@@ -146,6 +162,13 @@ def sha(tensor) -> str:
+     return hashlib.sha256(tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
+ 
+ 
++def check_key(seq: int, peer: int, span: tuple[int, int] | None = None) -> str:
++    """The wire check's store key for expert ``peer``'s hashes of forward ``seq``; a layer slice's (MODE_SLICE)
++    also carries its MoE positions ``(a, n)``, so a slice the two sides disagree on finds no hashes."""
++
++    return f"afd_chk/{seq}/{peer}" if span is None else f"afd_chk/{seq}/{span[0]}+{span[1]}/{peer}"
++
++
+ def p50_p90(v: list[float]) -> tuple[float, float]:
+     """The sample set's p50 and p90; empty samples read 0."""
+ 
+@@ -179,6 +202,10 @@ def make_afd(master: str, port: int, model_dir=None):
+ class AfdWire:
+     """The attention node's side: the engine hooks, the watchdog and the wire check, over an ``ExpertTransport``."""
+ 
++    start = end = 0                              # the current forward's MoE positions (set by ``begin``)
++    span: tuple[int, int] | None = None          # a MODE_SLICE forward's (a, n)
++    _sliced = 0
++
+     def __init__(self, master: str, port: int, model_dir=None, transport=None) -> None:
+         import torch
+ 
+@@ -200,12 +227,16 @@ class AfdWire:
+         self.seq = 0
+         self.layer = 0                           # the exchange's index within the forward
+         self.nlayers = 0                         # the MoE exchanges a forward makes, once announced
++        self.start = self.end = 0                # the forward's MoE positions: 0 .. nlayers, or a slice's a .. a + n
++        self.span: tuple[int, int] | None = None   # a MODE_SLICE forward's (a, n), else None
+         self.rows = self.mode = 0
+         self.dead: str | None = None
+         self.check = os.environ.get(CHECK_ENV, "").strip() == "1"
+         self.checked = 0
+         self.mismatches = 0
+         self._seen: set[int] = set()             # the window widths the check covered, for the check's summary line
++        self._spans: set[tuple[int, int]] = set()   # the slices the check covered (MODE_SLICE), for the same line
++        self._sliced = 0                         # slice forwards checked
+         self._chk: list | None = None
+         self._why = ""
+         self.timing = os.environ.get(TIME_ENV, "").strip() == "1"
+@@ -278,25 +309,43 @@ class AfdWire:
+         raise self._cap(f"the AFD expert link failed ({exc}); restart the serving stack") from exc
+ 
+     # -- the forward's host side ---------------------------------------------------------------------------------
+-    def begin(self, rows: int, *, chunk: bool = False) -> None:
+-        """The forward's header to both experts, before this forward's eager kernels."""
++    def begin(self, rows: int, *, chunk: bool = False, slice: tuple[int, int] | None = None) -> None:
++        """The forward's header to both experts, before this forward's eager kernels. ``slice=(a, n)`` (a prompt
++        chunk's layer slice, ``chunk`` only): this forward makes the chunk's MoE exchanges a .. a + n - 1 (MODE_SLICE);
++        a slice of every MoE layer is the whole chunk (MODE_CHUNK)."""
+ 
+         if self.dead is not None:
+             raise self._cap(f"the AFD expert nodes are gone ({self.dead}); restart the serving stack")
+-        if self.layer not in (0, self.nlayers):
+-            why = f"a forward stopped after {self.layer} of {self.nlayers} MoE exchanges; the experts are out of step"
++        if self.layer not in (self.start, self.end):
++            what = "a forward" if self.span is None else f"a slice of MoE layers {self.start} .. {self.end - 1}"
++            why = (f"{what} stopped after {self.layer - self.start} of {self.end - self.start} MoE exchanges; the experts "
++                   f"are out of step")
+             self.die(why)
+             raise self._cap(f"the AFD expert nodes are gone ({why}); restart the serving stack")
++        if slice is not None:
++            a, n = int(slice[0]), int(slice[1])
++            if not chunk or a < 0 or n < 1 or a + n > self.nlayers:
++                raise ValueError(f"a forward slice needs a prompt chunk and MoE positions within 0 .. "
++                                 f"{self.nlayers - 1}, not {n} from {a} (chunk {chunk})")
++            slice = None if (a, n) == (0, self.nlayers) else (a, n)
+         if self.check:
+             self._finish_check()
+         if self.timing:
+             self._sample_times()
+         self.seq += 1
+-        self.layer = 0
+         self.rows = rows
+-        mode = MODE_CHUNK if chunk else MODE_EAGER
+-        self.mode = mode
+-        self.tr.header(self.seq, rows, mode)
++        self.span = slice
++        if slice is None:
++            self.start, self.end = 0, self.nlayers
++            mode = MODE_CHUNK if chunk else MODE_EAGER
++            self.layer = 0
++            self.mode = mode
++            self.tr.header(self.seq, rows, mode)
++        else:
++            self.start, self.end = slice[0], slice[0] + slice[1]
++            self.layer = self.start
++            self.mode = MODE_SLICE
++            self.tr.header(self.seq, rows, MODE_SLICE, slice=slice)
+ 
+     def forces_eager(self) -> bool:
+         """Always: the AFD wire runs every window eager; graphs.py captures nothing for it."""
+@@ -335,21 +384,31 @@ class AfdWire:
+         return b.afd_recv[:3 * n].view(3, rows, d)
+ 
+     # -- the wire check ------------------------------------------------------------------------------------------
++    def check_key(self, peer: int) -> str:
++        """The store key of the expert ``peer``'s hashes for the current forward: by its seq, and a slice's by its
++        MoE positions too (``experts_node.forwards`` writes the same key)."""
++
++        return check_key(self.seq, peer, self.span)
++
+     def _finish_check(self) -> None:
+         pend, self._chk = self._chk, None
+         if not pend:
+             return
+         self.checked += 1
+         self._seen.add(self.rows)
++        if self.span is not None:
++            self._sliced += 1
++            self._spans.add(self.span)
+         self.torch.cuda.synchronize()
+         theirs = []
+         for peer in self.peers:
+-            raw = get_store(self.store, f"afd_chk/{self.seq}/{peer}", 15.0)
++            raw = get_store(self.store, self.check_key(peer), 15.0)
+             theirs.append(json.loads(bytes(raw).decode()) if raw else None)
+         bad = layers = 0
+         first = ""
+         for i, row in enumerate(pend):
+             layers += 1
++            pos = self.start + i                         # the MoE position (a slice's first is a)
+             mine = [sha(row[0]), sha(row[1]), sha(row[2])]
+             for peer, blob in enumerate(theirs):
+                 if not blob:
+@@ -360,28 +419,33 @@ class AfdWire:
+                     if a != b:
+                         bad += 1
+                         if not first:
+-                            first = f"layer {i} peer {peer} in{k}: {a[:8]} vs {b[:8] if isinstance(b, str) else b}"
++                            first = f"layer {pos} peer {peer} in{k}: {a[:8]} vs {b[:8] if isinstance(b, str) else b}"
+                 out = blob["out"][i] if i < len(blob["out"]) else ""
+                 if out and out != sha(row[3 + peer]):
+                     bad += 1
+                     if not first:
+-                        first = f"layer {i} peer {peer} out: {sha(row[3 + peer])[:8]} vs {out[:8]}"
++                        first = f"layer {pos} peer {peer} out: {sha(row[3 + peer])[:8]} vs {out[:8]}"
+         self.mismatches += bad
+         if bad and not self._why:
+             self._why = first          # the first difference, printed once, naming the cause
+             print(f"[tensorfold] afd-check first mismatch: {first}", flush=True)
+         if self.checked == CHECK_FORWARDS:
++            sliced = ""
++            if self._sliced:            # MODE_SLICE forwards among the checked ones, named by their MoE positions
++                sliced = (f"; {self._sliced} of them layer slices (MoE positions from "
++                          f"{sorted({a for a, _ in self._spans})}, {len(self._spans)} distinct slices)")
+             print(f"[tensorfold] afd-check: window complete, {CHECK_FORWARDS} forwards, "
+-                  f"{self.mismatches} mismatches total, rows checked {sorted(self._seen)}", flush=True)
++                  f"{self.mismatches} mismatches total, rows checked {sorted(self._seen)}{sliced}", flush=True)
+         if bad:
+-            print(f"[tensorfold] afd-check seq {self.seq}: {bad} mismatches over {layers} layers x 4 hashes",
++            what = "" if self.span is None else f" (slice of MoE layers {self.start} .. {self.end - 1})"
++            print(f"[tensorfold] afd-check seq {self.seq}{what}: {bad} mismatches over {layers} layers x 4 hashes",
+                   flush=True)
+ 
+     # -- TF_AFD_TIME: the exchange's device time per layer -------------------------------------------------------
+     def _sample_times(self) -> None:
+         if self.ev is None:
+             return
+-        for a, b in self.ev[:max(self.layer, 0)]:
++        for a, b in self.ev[self.start:max(self.layer, 0)]:
+             try:
+                 dt = a.elapsed_time(b) * 1e3
+             except Exception:  # noqa: BLE001  not both recorded yet
+diff --git a/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py b/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py
+index 43a399c..c36594d 100644
+--- a/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py
++++ b/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py
+@@ -11,7 +11,7 @@ check and timer are ``afd.AfdWire``'s and ``experts_node.serve``'s.
+ from __future__ import annotations
+ 
+ from . import mcdma, mcdma_cuda
+-from .afd import MODE_CHUNK, MODE_EAGER, get_store
++from .afd import MODE_CHUNK, MODE_EAGER, MODE_SLICE, get_store
+ from .afd_transport import WireError
+ 
+ 
+@@ -51,6 +51,7 @@ class McdmaTransport:
+     links, two replies back. ``links``, ``comm``, ``device`` and ``hidden`` stand in for a GPU host in the tests."""
+ 
+     name = "mcdma"
++    sliced: int | None = None                              # the header row whose word 6 holds a slice's count
+ 
+     def __init__(self, master: str, port: int, model_dir=None, *, links=None, comm=None, device: str = "cuda",
+                  hidden: int | None = None) -> None:
+@@ -73,6 +74,7 @@ class McdmaTransport:
+             self.hidden = Config.read(model_dir).hidden
+         self.layout = None
+         self.hdr_tab = self.hdr_tab_cpu = self.req_dev = self.zeros = None
++        self.sliced: int | None = None                     # the header row whose word 6 holds a slice's count
+         self.down = False                                  # aborted: the forward in flight runs on without the wire
+         # rank 0 hosts the store and waits for both experts' clients
+         self.comm = comm if comm is not None else StoreComm(0, 3, master, port, links)
+@@ -103,14 +105,21 @@ class McdmaTransport:
+         for peer, base in zip((1, 2), self.mc.base):       # each expert counts its link's sequence from here
+             store.set(f"afd_mcdma/base/{peer}", str(base).encode())
+ 
+-    def header(self, seq: int, rows: int, mode: int) -> None:
++    def header(self, seq: int, rows: int, mode: int, slice: tuple[int, int] | None = None) -> None:
+         """No doorbell of its own: the first layer's request carries the forward. One blocking copy of the
+-        forward's request headers."""
++        forward's request headers. ``slice=(a, n)`` (MODE_SLICE): word 6 of position a's header, the slice's first
++        request, carries n; every other forward leaves words 6-63 zero."""
+ 
+         tab = self.hdr_tab_cpu
+         tab[:, 1] = seq & 0x7FFFFFFF
+         tab[:, 2] = rows
+         tab[:, 4] = mode
++        if self.sliced is not None:              # the last slice's count word back to zero
++            tab[self.sliced, 6] = 0
++            self.sliced = None
++        if slice is not None:
++            tab[slice[0], 6] = slice[1]
++            self.sliced = slice[0]
+         self.hdr_tab.copy_(tab)                  # blocking: the next forward's rewrite must not race this copy
+ 
+     def send(self, b, rows: int, layer: int) -> None:
+@@ -207,8 +216,15 @@ class McdmaExpertLink:
+         self.seq = link.base                     # the next request's sequence
+         self.landing = None                      # the widest request's bytes past the header slot, on the device
+         self.fseq = self.rows = self.n_req = self.n_rep = 0
++        self.first, self.count = 0, layers       # the forward's MoE positions: every layer, or a slice's (MODE_SLICE)
+         self.x = self.src = self.dst = self.rep = self._routed = self._out = None
+ 
++    @property
++    def span(self) -> tuple[int, int]:
++        """The current forward's MoE positions as (first, count): (0, layers) unless it is a slice."""
++
++        return self.first, self.count
++
+     def next_forward(self) -> tuple[int, int, int]:
+         import torch
+ 
+@@ -217,15 +233,21 @@ class McdmaExpertLink:
+             self.landing = torch.empty((lay.req(self.prefill_rows) - mcdma.HDR_BYTES,), dtype=torch.uint8,
+                                        device=self.device)
+         w = link.wait(self.seq)
+-        magic, fseq, rows, layer, mode, nl = link.box.header()[:6]
+-        if (magic != mcdma.WIRE_MAGIC or layer != 0 or nl != L or not 1 <= rows <= self.prefill_rows
+-                or mcdma.word_len(w) != lay.req(rows)):
++        magic, fseq, rows, layer, mode, nl, count = link.box.header()[:7]
++        # a slice (MODE_SLICE, wire 2) starts at its first MoE position a (word 3) and runs n of them (word 6);
++        # every other forward starts at 0 and runs them all
++        first, count = (layer, count) if mode == MODE_SLICE else (0, L)
++        if (magic != mcdma.WIRE_MAGIC or layer != first or nl != L or not 1 <= rows <= self.prefill_rows
++                or mcdma.word_len(w) != lay.req(rows) or not (0 <= first and 1 <= count and first + count <= L)):
+             raise mcdma.LinkError(f"link {link.name}: request {self.seq} is no forward's first: magic {magic:#x}, "
+-                                  f"layer {layer} of {nl}, {rows} rows, {mcdma.word_len(w)} bytes (expected layer 0 "
+-                                  f"of {L}, rows 1..{self.prefill_rows}, {lay.req(rows) if 0 < rows else '?'} bytes)")
+-        if mode not in (MODE_EAGER, MODE_CHUNK):
++                                  f"layer {layer} of {nl}, {rows} rows, {mcdma.word_len(w)} bytes, mode {mode}"
++                                  f"{f' slice of {count}' if mode == MODE_SLICE else ''} (expected layer 0 of {L}, or "
++                                  f"a slice's first within it, rows 1..{self.prefill_rows}, "
++                                  f"{lay.req(rows) if 0 < rows else '?'} bytes)")
++        if mode not in (MODE_EAGER, MODE_CHUNK, MODE_SLICE):
+             raise mcdma.LinkError(f"link {link.name}: forward mode {mode}: the MCDMA wire carries eager windows only")
+         self.fseq, self.rows = fseq, rows
++        self.first, self.count = first, count
+         self.n_req, self.n_rep = lay.req(rows), lay.rep(rows)
+         self.x = lay.views(self.landing, rows)
+         self.src, self.dst = link.box.req_bytes[mcdma.HDR_BYTES:self.n_req], self.landing[:self.n_req - mcdma.HDR_BYTES]
+@@ -236,7 +258,7 @@ class McdmaExpertLink:
+         """The request into the landing buffer, one copy; the compute reads its sections there (not ``views``)."""
+ 
+         link = self.link
+-        if layer:
++        if layer != self.first:                 # the forward's first request was awaited by next_forward
+             if self.gpu:
+                 link.wait_gpu(self.seq, self.n_req)
+             else:
+diff --git a/src/tensorfold/families/glm5_next/cuda/afd_transport.py b/src/tensorfold/families/glm5_next/cuda/afd_transport.py
+index ac4e4d0..62e2e9a 100644
+--- a/src/tensorfold/families/glm5_next/cuda/afd_transport.py
++++ b/src/tensorfold/families/glm5_next/cuda/afd_transport.py
+@@ -37,8 +37,9 @@ class ExpertTransport(Protocol):
+         """Once the attention's store exists: what the experts read before their first forward."""
+         ...
+ 
+-    def header(self, seq: int, rows: int, mode: int) -> None:
+-        """Once per forward, before layer 0: the forward's ``seq``, ``rows`` and ``mode`` to both experts."""
++    def header(self, seq: int, rows: int, mode: int, slice: tuple[int, int] | None = None) -> None:
++        """Once per forward, before its first exchange: the forward's ``seq``, ``rows`` and ``mode`` to both experts;
++        a layer slice's (``mode`` MODE_SLICE) MoE positions ``slice=(a, n)``, its first exchange at position a."""
+         ...
+ 
+     def send(self, b, rows: int, layer: int) -> None:
+@@ -69,6 +70,11 @@ class ExpertLink(Protocol):
+         """Wait for the next forward; its ``(seq, rows, mode)``."""
+         ...
+ 
++    @property
++    def span(self) -> tuple[int, int]:
++        """The forward ``next_forward`` returned as MoE positions ``(first, count)``: a slice's (MODE_SLICE)."""
++        ...
++
+     def land(self, layer: int, views):
+         """This layer's request; ``views`` are the node's ``(normed, pick, wts)`` slots. Returns the views it landed
+         in, which the compute reads."""
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index 97d5801..3e04c63 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -581,6 +581,35 @@ def prefill_chunk(e: Engine, prompt: Sequence[int], start: int, R: int, *, draft
+     return out
+ 
+ 
++def prefill_chunk_steps(e: Engine, prompt: Sequence[int], start: int, R: int, *, drafter=None, mtp: bool = False,
++                        head: bool = True):
++    """``prefill_chunk`` as a generator for layer-sliced fills (TF_GLM_FILL_BUDGET_MS, MiaAI-Lab recipe patch 0062):
++    the chunk's forward yields after each layer (``forward.compute_steps``); the taps, the MTP head's rows and the
++    commit run only after the last layer; returns what ``prefill_chunk`` returns. On the AFD attention node the
++    caller sends each slice's header (``multi.MultiDecoder._afd_slice``), not this function."""
++
++    from .forward import compute_steps
++
++    w, st, b = e.w, e.st, e.pbuf
++    if st.pos != start or not 0 < R <= e.prefill_rows or start + R > len(prompt):
++        raise ValueError(f"a prompt chunk {start} .. {start + R} of {len(prompt)} at position {st.pos}")
++    chunk = list(prompt[start:start + R])
++    out = yield from compute_steps(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos,
++                                   head=head)
++    out = out.clone() if head else None
++    e.last_hidden = b.fnormed[R - 1:R].clone()
++    if drafter is not None:
++        drafter.add_taps(e.tap_rows(R, b))
++    if mtp and w.mtp is not None:
++        nxt = list(prompt[start + 1:start + R + 1])
++        if nxt:
++            with prof.timed("mtp absorb"):
++                _absorb_rows(e, b.fnormed[:len(nxt)], nxt)
++    with prof.timed("commit"):
++        commit(w, st, b, R, R)
++    return out
++
++
+ def _absorb_rows(e: Engine, hidden: torch.Tensor, next_tokens: Sequence[int]) -> None:
+     """A prompt's rows into the MTP cache through the prefill buffers (the prefill arithmetic, like the prompt)."""
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 0b28f8b..c29885c 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -366,8 +366,11 @@ class GlmEngine:
+         if parallel > 1:                      # serial and batched verify windows make different collectives
+             from .multi import verify_kind
+             from .multi_tune import MultiSettings
++            from .sliced_fill import budget_ms
+ 
+-            multi_code = [1 + ("batched", "serial").index(verify_kind())] + MultiSettings.from_env().code()
++            # TF_GLM_FILL_BUDGET_MS (MiaAI-Lab recipe patch 0062): both ranks time and slice alike
++            multi_code = ([1 + ("batched", "serial").index(verify_kind())] + MultiSettings.from_env().code()
++                          + _f64_ints(budget_ms()))
+         # TF_GLM_SHARED_PREFIX (MiaAI-Lab recipe patch 0015): rank 0 picks the shared-prefix points (the request header
+         # or the ADMIT carries them), but both ranks keep, save and evict alike, so both must agree
+         self.shared = shared_prefix()
+@@ -491,7 +494,9 @@ class GlmEngine:
+                       f"chunks of {self.multi.fill_rows} rows while others decode (TF_GLM_FILL_ROWS, "
+                       f"TF_GLM_FILL_SHARE {self.multi.share:g})"
+                       f"{'; waiting prompts share prompt chunks (TF_GLM_MULTI_PREFILL)' if self.multi.group else ''}; "
+-                      f"{self.multi.tune.describe()}", flush=True)
++                      f"{self.multi.tune.describe()}"
++                      f"{f'; prompt layer slices target {self.multi.fill_budget:g} ms (TF_GLM_FILL_BUDGET_MS)' if self.multi.fill_budget else ''}",
++                      flush=True)
+                 if self.multi.row_ms is not None:
+                     print("[tensorfold] --parallel batched window ms by rows: " +
+                           " ".join(f"{i + 1}:{ms:.1f}" for i, ms in enumerate(self.multi.row_ms)), flush=True)
+@@ -977,13 +982,16 @@ def afd_parallel_check(env=None) -> None:
+     """--parallel on the AFD attention node runs eager batched windows: refuse the multi-stream settings
+     that need CUDA graphs across the AFD wire, before the wire opens and the weights load."""
+ 
+-    from . import multi_prefill
++    from . import multi_prefill, sliced_fill
+     from .multi_tune import MultiSettings
+ 
+     tune = MultiSettings.from_env(env)
+     # TF_GLM_MULTI_PREFILL and its wait read now: a typo fails before the wire opens (MiaAI-Lab recipe patch 0049)
+     multi_prefill.enabled(None if env is None else env.get("TF_GLM_MULTI_PREFILL", ""))
+     multi_prefill.wait_ms(None if env is None else env.get("TF_GLM_MULTI_PREFILL_WAIT_MS", ""))
++    # ... and the sliced fill's (0062): its slices are MODE_SLICE forwards of the wire, its costs timed over it
++    sliced_fill.budget_ms(None if env is None else env.get("TF_GLM_FILL_BUDGET_MS", ""))
++    sliced_fill.drafted_rounds(None if env is None else env.get("TF_GLM_FILL_DRAFTS", ""))
+     if tune.depth == "joint":
+         raise ValueError("TF_GLM_MULTI_DEPTH=joint times the batched verify window's CUDA graphs, which --experts "
+                          "remote does not capture (eager windows over the AFD wire): unset it, or use policy / scale:A")
+diff --git a/src/tensorfold/families/glm5_next/cuda/experts_node.py b/src/tensorfold/families/glm5_next/cuda/experts_node.py
+index 21d1937..3635d42 100644
+--- a/src/tensorfold/families/glm5_next/cuda/experts_node.py
++++ b/src/tensorfold/families/glm5_next/cuda/experts_node.py
+@@ -10,8 +10,8 @@ import torch
+ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
+ 
+ from . import exl3_generic, glue
+-from .afd import ALIVE_EVERY, CHECK_ENV, CHECK_FORWARDS, MODE_CHUNK, MODE_EAGER, Store, get_store, sha
+-from .afd import settings_for, settings_mismatch
++from .afd import ALIVE_EVERY, CHECK_ENV, CHECK_FORWARDS, MODE_CHUNK, MODE_EAGER, MODE_SLICE, Store, check_key, get_store
++from .afd import settings_for, settings_mismatch, sha
+ from .split import RankReader
+ from .weights import PREFIX, Config
+ 
+@@ -114,12 +114,17 @@ class ExpertNode:
+         return b.routed[:R]
+ 
+ 
+-def _window(node: ExpertNode, link, R: int, collect: tuple[list, list] | None = None) -> None:
+-    """One forward's device body: per layer land, compute, reply; hashes when ``collect``."""
++def _window(node: ExpertNode, link, R: int, collect: tuple[list, list] | None = None, first: int = 0,
++            count: int | None = None) -> None:
++    """One forward's device body: per layer land, compute, reply; hashes when ``collect``. ``first``/``count``: a
++    layer slice's MoE positions (MODE_SLICE), else every layer from 0. Each layer's compute reads only its own
++    request, so a slice is the same calls as those layers of a whole forward."""
+ 
+     b = node.buf
+     slots, routed = (b.normed[:R], b.pick[:R], b.wts[:R]), b.routed[:R]
+-    for pos, i in enumerate(node.layers):
++    count = len(node.layers) - first if count is None else count
++    for pos in range(first, first + count):
++        i = node.layers[pos]
+         x = link.land(pos, slots)
+         if collect is not None:
+             collect[0].append([sha(x[0]), sha(x[1]), sha(x[2])])
+@@ -131,18 +136,22 @@ def _window(node: ExpertNode, link, R: int, collect: tuple[list, list] | None =
+ 
+ def forwards(node: ExpertNode, link, store, rank: int, *, check_on: bool = False) -> None:
+     """The per-forward loop over the expert's end of the wire (returns only by raising): every forward eager, the
+-    wire check's hashes to the store."""
++    wire check's hashes to the store (a layer slice's under a key with its MoE positions)."""
+ 
+     checked = 0
+     while True:
+         seq, rows, mode = link.next_forward()
+-        if mode not in (MODE_EAGER, MODE_CHUNK):
++        if mode not in (MODE_EAGER, MODE_CHUNK, MODE_SLICE):
+             raise RuntimeError(f"forward mode {mode}: the expert runs eager windows only")
++        span = link.span if mode == MODE_SLICE else None
+         collect = ([], []) if check_on and checked < CHECK_FORWARDS else None
+-        _window(node, link, rows, collect)
++        if span is None:
++            _window(node, link, rows, collect)
++        else:
++            _window(node, link, rows, collect, first=span[0], count=span[1])
+         if collect is not None:
+             checked += 1
+-            store.set(f"afd_chk/{seq}/{rank}", json.dumps({"in": collect[0], "out": collect[1]}).encode())
++            store.set(check_key(seq, rank, span), json.dumps({"in": collect[0], "out": collect[1]}).encode())
+ 
+ 
+ def serve(model_dir, half: int, master: str, port: int, *, device: str = "cuda") -> None:
+diff --git a/src/tensorfold/families/glm5_next/cuda/forward.py b/src/tensorfold/families/glm5_next/cuda/forward.py
+index 4d2aba0..59df9ed 100644
+--- a/src/tensorfold/families/glm5_next/cuda/forward.py
++++ b/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -800,6 +800,31 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
+     return mm(b, b.fnormed[:R], w.head, b.fxs[:R], b.logits[:R])
+ 
+ 
++def compute_steps(w: Weights, st: State, b: Buffers, R: int, *, nch: int | None = None, host_pos: int | None = None,
++                  head: bool = True, mixer=None):
++    """A prompt chunk's ``compute`` as a generator that yields after each layer (layer-sliced fills,
++    TF_GLM_FILL_BUDGET_MS; MiaAI-Lab recipe patch 0062's non-split branch: this tree has no hyper-connection split
++    between ranks). The same calls in the same order as ``compute(..., head=head)``; returns the head's logits of the
++    last row with ``head``, else None after the final norm (b.fnormed's rows). Everything a chunk carries from one
++    layer to the next is in the prompt buffers ``b`` (Engine.pbuf), which the decode rounds run between two slices do
++    not use; the KDA and DSA scratch a layer uses is consumed within it."""
++
++    if not b.prefill:
++        raise ValueError("layer-sliced forwards need the prompt buffers")
++    c = w.cfg
++    glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
++    for layer in w.layers:
++        layer_forward(layer, w, st, b, R, nch, host_pos, mixer=mixer)
++        for slot in b.tap_at.get(layer.index, ()):
++            glue.stream_mean(b.x[:R], b.taps[slot][:R])
++        yield layer.index
++    glue.stream_mean(b.x[:R], b.hidden[:R])
++    glue.rmsnorm(b.hidden[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
++    if head:
++        return mm(b, b.fnormed[R - 1:R], w.head, b.fxs[R - 1:R], b.logits[:1])
++    return None
++
++
+ def chunks_for(st: State, R: int) -> int:
+     from .attention import CHUNK
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index 05f1389..b0a9f50 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -12,7 +12,12 @@ filling stream (FIFO, at most TF_GLM_FILL_ROWS rows while others decode, the eng
+ decode round, alternating by TF_GLM_FILL_SHARE; a prompt chunk never shares a forward with decode rows. With
+ TF_GLM_MULTI_PREFILL=1 a prompt chunk holds the next rows of several filling streams (``multi_prefill``: each
+ stream's rows get the bits of a chunk of their own; the shortest remaining prompts first, within the same row
+-budget; MiaAI-Lab recipe patch 0049). A round: each
++budget; MiaAI-Lab recipe patch 0049). With TF_GLM_FILL_BUDGET_MS > 0 a prompt chunk started while others decode runs
++a few layers at a time (``sliced_fill``; MiaAI-Lab recipe patch 0062): each slice sized from startup layer timings to
++about that many ms, a decode round between two slices (one token per stream, or drafted with TF_GLM_FILL_DRAFTS=1;
++TF_GLM_FILL_SHARE applies to unsliced fills), the chunk's buffers kept in the engine's prompt buffers meanwhile and
++its commit after its last layer; a request alone fills whole forwards. On the AFD attention node each slice is one
++forward of the wire (``afd.MODE_SLICE``). A round: each
+ decoding stream (admission order) proposes drafts under its own policy (DFlash2: every drafting stream's block in one
+ batched pass, ``dflash2_multi``; MTP: the stream's own chain on the MTP head), the combined window is capped at
+ ``MAX_WINDOW`` rows (the longest tails trimmed), one verify over every stream's rows (``forward_streams``:
+@@ -21,7 +26,8 @@ batched pass, ``dflash2_multi``; MTP: the stream's own chain on the MTP head), t
+ candidates in one all-gather, each stream accepts and commits its own.
+ 
+ Rank 0 decides everything that depends on time, clients or placement; rank 1 applies it. Each iteration rank 0 sends
+-ONE message (``GlmEngine._share``): ops ADMIT, EVICT, MOVE, GROW, FILL, MFILL, ROUND, FINISH, IDLE, SLOT, which both
++ONE message (``GlmEngine._share``): ops ADMIT, EVICT, MOVE, GROW, FILL, MFILL, FILLPART, MFILLPART, ROUND, FINISH,
++IDLE, SLOT, which both
+ ranks apply in order through the same code (rank 0 as it decides them). Rank 1 derives drafts itself and checks the
+ depths rank 0 sent. An idle rank 1 waits on the doorbell (``GlmEngine._await_bell``), not in an all-gather. After an
+ error the two ranks cannot be trusted to agree: ``broken`` latches and every later call fails until both restart.
+@@ -47,14 +53,14 @@ from tensorfold.cuda.memory_gate import NoRoom as _NoRoom
+ from tensorfold.cuda.scheduler import Scheduler
+ from tensorfold.cuda.streams import Stream, next_fill
+ 
+-from . import multi_prefill
++from . import multi_prefill, sliced_fill
+ from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
+ from .pool import ALIGN, Pool, align_up
+ from .verify import BatchedVerify, Segment, SerialVerify, Verified
+ 
+-ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL = range(1, 11)
++ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL, FILLPART, MFILLPART = range(1, 13)
+ OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
+-       IDLE: "IDLE", SLOT: "SLOT", MFILL: "MFILL"}
++       IDLE: "IDLE", SLOT: "SLOT", MFILL: "MFILL", FILLPART: "FILLPART", MFILLPART: "MFILLPART"}
+ 
+ 
+ def watchdog_seconds(value: str | None = None) -> float:
+@@ -404,11 +410,16 @@ class NoRoom(_NoRoom):
+ class MultiDecoder:
+     """The ``GlmScheduler``'s decoder, on rank 0 (deciding) and rank 1 (``follow``, applying)."""
+ 
++    fill_budget = 0.0                    # TF_GLM_FILL_BUDGET_MS (``__init__`` reads it; 0: unsliced fills)
++    fill_drafts = decode_due = short_round_due = False
++    partial = fill_costs = None
++
+     def __init__(self, engine, streams: int, *, verify=None, drafts=None, draft_graphs: bool | None = None,
+-                 tune: MultiSettings | None = None, row_ms: Sequence[float] | None = None) -> None:
++                 tune: MultiSettings | None = None, row_ms: Sequence[float] | None = None, fill_costs=None) -> None:
+         """``drafts``: the multi-stream drafter (``dflash2_multi.MultiDrafter``; default one over the engine's
+         drafter, its graphs captured unless TF_GLM_MULTI_DRAFT_GRAPHS=0); ``verify``: the verify seam (default
+-        ``BatchedVerify``, or ``SerialVerify`` with TF_GLM_MULTI_VERIFY=serial)."""
++        ``BatchedVerify``, or ``SerialVerify`` with TF_GLM_MULTI_VERIFY=serial); ``fill_costs``: the prompt layers'
++        ``sliced_fill.LayerCosts`` under TF_GLM_FILL_BUDGET_MS (default: timed at startup)."""
+         from .engine import DFLASH_POLICY, encode_policy
+ 
+         self.g = engine
+@@ -423,6 +434,15 @@ class MultiDecoder:
+         self.pool = Pool(e.caches.rows)
+         self.arena = e.caches.arena
+         self.fill_rows = fill_rows(e.prefill_rows)
++        # TF_GLM_FILL_BUDGET_MS (MiaAI-Lab recipe patch 0062): a prompt chunk started while others decode runs in
++        # layer slices of about this many ms, a decode round between two (drafted with TF_GLM_FILL_DRAFTS=1)
++        self.fill_budget = sliced_fill.budget_ms()
++        self.fill_drafts = sliced_fill.drafted_rounds()     # rank 0 decides; the ROUND message carries it
++        self.partial = None                              # the suspended chunk (``sliced_fill.PendingFill``), or None
++        self.fill_costs = None
++        self.decode_due = False
++        self.short_round_due = False
++        self.sliced = {"chunks": 0, "slices": 0, "rounds": 0}    # rank 0's sliced chunks, for /health
+         self.share = fill_share()
+         self.credit = 0.0
+         # TF_GLM_MULTI_PREFILL (MiaAI-Lab recipe patch 0049): rank 0 groups filling streams into one chunk (rank 1
+@@ -487,6 +507,8 @@ class MultiDecoder:
+         self.requeue: list[Stream] = []                  # rank 0: streams given back to the scheduler's queue
+         self.eos = tuple(self.w.cfg.eos)
+         self.dflash_code = encode_policy(DFLASH_POLICY)
++        if self.fill_budget:
++            self.fill_costs = fill_costs if fill_costs is not None else self._time_prompt_layers()
+ 
+     # -- the scheduler's view ----------------------------------------------------------------------------------------
+     @property
+@@ -509,6 +531,7 @@ class MultiDecoder:
+                 "pool_tokens": self.pool.rows, "pool_free_tokens": self.pool.free_rows(),
+                 "kept_prompts": len(self.kept),
+                 **({"multi_prefill": dict(self.grouped)} if getattr(self, "group", False) else {}),
++                **({"sliced_fill": dict(self.sliced)} if getattr(self, "fill_budget", 0) else {}),
+                 # how long rank 0's current iteration has run (0 between iterations): a stalled server keeps growing it
+                 "iteration_s": round(time.monotonic() - since, 1)
+                 if (since := getattr(self, "iteration_since", None)) is not None else 0.0}
+@@ -534,7 +557,8 @@ class MultiDecoder:
+             return
+         msg, self.outbox = seal(self.outbox, self.sent), []
+         self.sent = (self.sent + 1) % SEAL_MOD
+-        if self.tune.async_msg:
++        # a sliced fill's slices and the short rounds between them do not wait for rank 1's copy (recipe 0062)
++        if self.tune.async_msg or (self.fill_budget and (self.partial is not None or self.short_round_due)):
+             self._send(msg)
+         else:
+             self.g._share(msg)
+@@ -623,12 +647,86 @@ class MultiDecoder:
+         ms = self.row_ms
+         return ms[min(max(rows, 1), len(ms)) - 1] + max(0, rows - len(ms)) * (ms[-1] - ms[-2] if len(ms) > 1 else 0)
+ 
++    @torch.no_grad()
++    def _time_prompt_layers(self):
++        """TF_GLM_FILL_BUDGET_MS (at startup, both ranks, before any request): each layer's ms of a prompt chunk of
++        64 .. TF_GLM_FILL_ROWS rows (the slower rank's), for ``sliced_fill.LayerCosts``. Nothing is kept or
++        published; the home state is reset after. On the AFD attention node the experts are live by now, so the
++        timings include each MoE layer's exchange. (MiaAI-Lab recipe patch 0062)"""
++
++        from .decode import prefill_chunk_steps
++        from .verify import timing_tokens
++
++        e = self.e
++        L = len(self.w.layers)
++        samples = {}
++        prev = e.use(e.home)
++
++        def steps(rows: int):
++            self._afd_slice(rows, 0, L)                  # AFD: the whole chunk, one forward (MODE_CHUNK)
++            return prefill_chunk_steps(e, timing_tokens(self.w.cfg.vocab, rows), 0, rows, head=False)
++
++        try:
++            e.reset()                                    # kernels warm first; nothing here is kept or drafted from
++            for _ in steps(64):
++                pass
++            for rows in sorted({min(r, self.fill_rows) for r in (64, 256, 512, 1024)} | {self.fill_rows}):
++                e.reset()
++                for _ in steps(rows):
++                    pass                                 # this shape's warm-up before its measured pass
++                e.reset()
++                events = [torch.cuda.Event(enable_timing=True) for _ in range(L + 2)]
++                timed = steps(rows)
++                events[0].record()
++                for i, _ in enumerate(timed):
++                    events[i + 1].record()
++                events[-1].record()
++                events[-1].synchronize()
++                costs = [events[i].elapsed_time(events[i + 1]) for i in range(L)]
++                mine = torch.tensor(costs, dtype=torch.float32, device=self.w.device)
++                if self.w.comm is not None:
++                    got = torch.empty((self.w.world * mine.numel(),), dtype=mine.dtype, device=mine.device)
++                    self.w.comm.all_gather(mine, got)
++                    costs = got.view(self.w.world, -1).max(dim=0).values.cpu().tolist()
++                samples[rows] = costs
++        finally:
++            e.reset()
++            e.last_hidden = None
++            e.use(prev)
++        return sliced_fill.LayerCosts(samples)
++
++    def _afd_slice(self, rows: int, lo: int, hi: int) -> None:
++        """The AFD attention node: a prompt chunk's layers lo .. hi - 1 as one forward of the wire, before their first
++        MoE exchange: the chunk's MoE positions a .. a + n - 1 (``afd.AfdWire.begin(rows, chunk=True, slice=(a, n))``,
++        MODE_SLICE; all of them: a whole chunk, MODE_CHUNK). Nothing when the layers hold no MoE layer. Without the
++        wire, nothing. (This tree's wire; the recipe has none.)"""
++
++        afd = getattr(self.w, "afd", None)
++        if afd is None:
++            return
++        from .afd import moe_span
++
++        a, n = moe_span(self.w.cfg, lo, hi)
++        if n:
++            afd.begin(rows, chunk=True, slice=(a, n))
++
+     @staticmethod
+     def parse(msg: Sequence[int]) -> list[tuple[int, list[int]]]:
++        """A message's ops; a truncated or unknown op, or a slice payload out of shape, fails (recipe 0062)."""
++
+         ops, i = [], 0
+         while i < len(msg):
++            if i + 2 > len(msg):
++                raise RuntimeError("truncated multi-stream op header")
+             op, n = int(msg[i]), int(msg[i + 1])
+-            ops.append((op, [int(v) for v in msg[i + 2:i + 2 + n]]))
++            if op not in OPS or n < 0 or i + 2 + n > len(msg):
++                raise RuntimeError("invalid multi-stream op or payload length")
++            p = [int(v) for v in msg[i + 2:i + 2 + n]]
++            if op == FILLPART and (len(p) != 4 or not 0 <= p[2] < p[3]):
++                raise RuntimeError("invalid FILLPART payload")
++            if op == MFILLPART and (len(p) < 5 or p[0] < 1 or len(p) != 3 + 2 * p[0] or not 0 <= p[1] < p[2]):
++                raise RuntimeError("invalid MFILLPART payload")
++            ops.append((op, p))
+             i += 2 + n
+         return ops
+ 
+@@ -899,6 +997,8 @@ class MultiDecoder:
+         used = max([len(k.ids) for k in x.kept], default=0)
+         if x.owner is not None:
+             used = max(used, self.lanes[x.owner].st.pos)
++        if self.partial is not None:          # a suspended chunk's rows already written past its streams' positions
++            used = max([used] + [stop for lane, stop in self.partial.group if lane.extent is x])
+         return used
+ 
+     def _move(self, x, base: int, size: int) -> None:
+@@ -998,7 +1098,12 @@ class MultiDecoder:
+         if not filling:
+             return None
+         decoding = [l for l in self.lanes.values() if l.decoding and not l.paused and not l.s.done]
+-        if decoding:
++        if decoding and self.fill_budget and self.decode_due:      # a decode round between two slices (0062)
++            self.decode_due = False
++            return None
++        if self.partial is not None:                               # the suspended chunk goes on
++            return self.partial.group[0][0]
++        if decoding and not self.fill_budget:
+             self.credit += self.share
+             if self.credit < 1:
+                 return None
+@@ -1007,9 +1112,27 @@ class MultiDecoder:
+         return self.lanes[s.sid]
+ 
+     def _iterate(self) -> list[Stream]:
++        if self.fill_budget:                  # TF_GLM_FILL_BUDGET_MS (0062): a filling request's client left mid-fill
++            cancelled = []
++            for lane in self.lanes.values():
++                poll = getattr(lane.s.emit, "cancelled", None)
++                if not lane.decoding and not lane.s.done and poll is not None and poll():
++                    lane.s.done = True
++                    lane.s.started = lane.s.finished = time.perf_counter()
++                    cancelled.append(lane.s)
++            if cancelled:
++                return cancelled              # finish() mirrors the cancellation and retires partial groups
+         prof = self.profiles[False] if self.profiles is not None else None      # prompt chunks count there
+         lane = self._fill_turn()
++        if self.partial is not None and lane is not None:
++            return self._part_iteration()
+         group = self._group(lane) if lane is not None and getattr(self, "group", False) else None
++        busy = any(x.decoding and not x.s.done and not x.paused for x in self.lanes.values())
++        if lane is not None and busy and self.fill_budget:     # a new chunk while others decode: in layer slices
++            self.partial = sliced_fill.PendingFill(group if group is not None else [(lane, self._stop(lane))],
++                                                  many=group is not None)
++            self.sliced["chunks"] += 1
++            return self._part_iteration()
+         if group is not None:                 # TF_GLM_MULTI_PREFILL: several streams' rows in one chunk (0049)
+             t = time.perf_counter()
+             rows = sum(stop - x.st.pos for x, stop in group)
+@@ -1056,15 +1179,96 @@ class MultiDecoder:
+         if prof is not None:
+             prof.begin(t_begin)
+         plan = [(l.sid, l.depth) for l in active]
+-        self._emit(ROUND, [len(plan), *[v for p in plan for v in p], int(lone)])
++        short = self.short_round_due          # between two slices with TF_GLM_FILL_DRAFTS=0: one token a stream (0062)
++        self._emit(ROUND, [len(plan), *[v for p in plan for v in p], int(lone),
++                           *([int(short)] if self.fill_budget else [])])
+         if prof is not None:
+             prof.mark("plan")
+         self._flush()
++        self.short_round_due = False
++        if self.partial is not None:
++            self.sliced["rounds"] += 1
+         if prof is not None:
+             prof.mark("message")
+-        self._round(active, lone=lone)
++        self._round(active, lone=lone, short=short)
+         return [l.s for l in active if l.s.done]
+ 
++    def _part_iteration(self) -> list[Stream]:
++        """Rank 0, TF_GLM_FILL_BUDGET_MS: the suspended chunk's next layer slice (FILLPART, or MFILLPART for a
++        multi-prompt chunk), sized by ``fill_costs`` to the budget while others decode (else the rest of its layers);
++        the slice's timings refine the costs, and a decode round is due next. (MiaAI-Lab recipe patch 0062)"""
++
++        pending = self.partial
++        lo = pending.layer
++        busy = any(x.decoding and not x.paused and not x.s.done for x in self.lanes.values())
++        hi = self.fill_costs.stop(pending.rows, lo, self.fill_budget) if busy else len(self.w.layers)
++        if pending.many:
++            payload = [len(pending.group), lo, hi, *[v for lane, stop in pending.group for v in (lane.sid, stop)]]
++            self._emit(MFILLPART, payload)
++        else:
++            lane, stop = pending.group[0]
++            self._emit(FILLPART, [lane.sid, stop, lo, hi])
++        self._flush()
++        self.sliced["slices"] += 1
++        done = self._part(pending.group, lo, hi, pending.many)
++        pending.layer_ms += pending.slice_layer_ms
++        if hi == len(self.w.layers):
++            tail = max(0.0, pending.slice_wall_ms - pending.slice_layer_ms - self.fill_costs.overhead)
++            self.fill_costs.observe_tail(pending.rows, tail)
++            self.fill_costs.observe(pending.rows, 0, hi, pending.layer_ms)
++        else:
++            self.fill_costs.observe_overhead(max(0.0, pending.slice_wall_ms - pending.slice_layer_ms))
++        self.decode_due = True
++        self.short_round_due = not self.fill_drafts
++        return done
++
++    @torch.no_grad()
++    def _part(self, group, lo: int, hi: int, many: bool) -> list[Stream]:
++        """Both ranks: one contiguous layer slice lo .. hi - 1 of the suspended chunk; its kept states, first tokens
++        and positions only with its last layer. (MiaAI-Lab recipe patch 0062)"""
++
++        if not group or any(x.decoding or stop != self._stop_bound(x, stop) for x, stop in group):
++            raise RuntimeError("a prompt slice contains a decoding stream or crosses a kept point")
++        if self.partial is None:
++            if lo:
++                raise RuntimeError("a resumed prompt slice has no pending chunk")
++            self.partial = sliced_fill.PendingFill(list(group), many=many)
++        pending = self.partial
++        if pending.many != many or [(x.sid, stop) for x, stop in group] != [(x.sid, stop) for x, stop in pending.group]:
++            raise RuntimeError("a prompt slice changed its chunk")
++        t = time.perf_counter()
++        begin = torch.cuda.Event(enable_timing=True)
++        pending.layer_event = torch.cuda.Event(enable_timing=True)
++        begin.record()
++        before = [lane.s.prefill_s for lane, _ in group]
++        if many:
++            firsts = self._fill_many(group, layers=(lo, hi))
++        else:
++            lane, stop = group[0]
++            firsts = [self._fill(lane, stop, layers=(lo, hi))]
++        if hi < len(self.w.layers):
++            pending.layer_event.record()
++        torch.cuda.synchronize(self.w.device)          # the slice's device work done before a decode round runs
++        dt = time.perf_counter() - t
++        pending.slice_wall_ms = dt * 1000
++        pending.slice_layer_ms = begin.elapsed_time(pending.layer_event)
++        for (lane, _), elapsed in zip(group, before):
++            lane.s.prefill_s = elapsed + dt           # the slice's device time too, not just its launches
++        for (lane, _), first in zip(group, firsts):
++            if first is not None and lane.sid not in pending.retired:
++                lane.s.take([first], self._ends(lane))
++        done = [x.s for x, _ in group if x.s.done and x.sid not in pending.retired]
++        if hi == len(self.w.layers):
++            pending.close()
++            self.partial = None
++            for sid in pending.retired:
++                self._finish(sid)
++            if many and self.rank == 0:
++                self.grouped["chunks"] += 1
++                self.grouped["pieces"] += len(group)
++                self.grouped["rows"] += pending.rows
++        return done
++
+     def _home(self, lane: Lane) -> bool:
+         """Rank 0: a lone stream into the one-stream graphs' home, slot 0 at the pool's first rows (SLOT, then
+         kept prompts in the way evicted and its extent MOVEd); True once it is there."""
+@@ -1163,11 +1367,12 @@ class MultiDecoder:
+         return self.eos if lane.s.stop_eos else ()
+ 
+     @torch.no_grad()
+-    def _fill(self, lane: Lane, stop: int) -> int | None:
++    def _fill(self, lane: Lane, stop: int, *, layers: tuple[int, int] | None = None) -> int | None:
+         """Both ranks: the lane's prompt rows pos .. stop in one chunk; its kept states; at the prompt's end its first
+-        token (the stream then decodes)."""
++        token (the stream then decodes). ``layers=(lo, hi)``: only those layers of the suspended chunk
++        (``sliced_fill``, MiaAI-Lab recipe patch 0062); what follows the chunk runs with its last slice."""
+ 
+-        from .decode import prefill_chunk
++        from .decode import prefill_chunk, prefill_chunk_steps
+ 
+         e = self.e
+         s = lane.s
+@@ -1179,8 +1384,19 @@ class MultiDecoder:
+         t = time.perf_counter()
+         prev = e.use(lane.st)
+         try:
+-            out = prefill_chunk(e, prompt, start, stop - start, drafter=self._ctx(lane) if lane.dflash else None,
+-                                mtp=lane.mtp, head=stop == n)
++            if layers is None:
++                out = prefill_chunk(e, prompt, start, stop - start, drafter=self._ctx(lane) if lane.dflash else None,
++                                    mtp=lane.mtp, head=stop == n)
++            else:
++                self._afd_slice(stop - start, *layers)
++                complete, out = sliced_fill.advance(
++                    self.partial, *layers, len(self.w.layers),
++                    lambda: prefill_chunk_steps(e, prompt, start, stop - start,
++                                                drafter=self._ctx(lane) if lane.dflash else None, mtp=lane.mtp,
++                                                head=stop == n),
++                    before_finalize=self.partial.layer_event.record)
++                if not complete:
++                    return None
+             if stop < n:
+                 if stop in lane.stops:
+                     self._keep(lane, stop)
+@@ -1213,12 +1429,13 @@ class MultiDecoder:
+             lane.depth = min(lane.policy.next(0, 0), s.count - 1)
+ 
+     @torch.no_grad()
+-    def _fill_many(self, group: Sequence[tuple[Lane, int]]) -> list[int | None]:
++    def _fill_many(self, group: Sequence[tuple[Lane, int]], *,
++                   layers: tuple[int, int] | None = None) -> list[int | None]:
+         """Both ranks, TF_GLM_MULTI_PREFILL: every (lane, stop)'s prompt rows pos .. stop in ONE chunk
+         (``multi_prefill.prefill_pieces``: each lane's rows the bits of a chunk of their own); then per lane, in
+         order, what ``_fill`` does after its chunk: its kept states, and at its prompt's end its first token (all
+         first tokens sampled together, each as alone: ``sample_streams``). Returns each lane's first token or None.
+-        (MiaAI-Lab recipe patch 0049)"""
++        ``layers=(lo, hi)``: only those layers of the suspended chunk (0062). (MiaAI-Lab recipe patch 0049)"""
+ 
+         e = self.e
+         pieces = []
+@@ -1231,9 +1448,22 @@ class MultiDecoder:
+             pieces.append(multi_prefill.Piece(lane.st, list(lane.s.prompt[start:stop]),
+                                               drafter=self._ctx(lane) if lane.dflash else None, head=stop == n))
+         t = time.perf_counter()
+-        heads = multi_prefill.prefill_pieces(e, pieces)
++        if layers is None:
++            heads = multi_prefill.prefill_pieces(e, pieces)
++        else:
++            self._afd_slice(sum(p.rows for p in pieces), *layers)
++            complete, heads = sliced_fill.advance(self.partial, *layers, len(self.w.layers),
++                                                  lambda: multi_prefill.prefill_piece_steps(e, pieces),
++                                                  before_finalize=self.partial.layer_event.record)
++            if not complete:
++                dt = time.perf_counter() - t
++                for lane, _ in group:
++                    lane.s.prefill_s += dt
++                return [None] * len(group)
+         parts, who = [], []
+         for k, ((lane, stop), out) in enumerate(zip(group, heads)):
++            if self.partial is not None and lane.sid in self.partial.retired:
++                continue                              # its request ended during the chunk's slices (0062)
+             n = len(lane.s.prompt)
+             if stop < n:
+                 if stop in lane.stops:
+@@ -1274,9 +1504,12 @@ class MultiDecoder:
+             e.use(prev)
+ 
+     @torch.no_grad()
+-    def _round(self, lanes: list[Lane], depths: list[int] | None = None, lone: bool = False) -> None:
++    def _round(self, lanes: list[Lane], depths: list[int] | None = None, lone: bool = False,
++               short: bool = False) -> None:
+         """Both ranks: one decode round over ``lanes`` (``depths``: rank 0's, checked on rank 1); ``lone``: one
+-        stream at home, verified through the one-stream graphs when its window fits them."""
++        stream at home, verified through the one-stream graphs when its window fits them. ``short``: between two
++        slices of a sliced fill, the DFlash2 streams propose no drafts (one token each, the same sample, a cheaper
++        round; MiaAI-Lab recipe patch 0062); MTP streams draft as ever (their head absorbs the last round's rows)."""
+ 
+         from .dflash2_multi import DraftRequest
+ 
+@@ -1292,7 +1525,7 @@ class MultiDecoder:
+                 continue
+             if l.mtp:
+                 drafts[-1] = list(self._mtp_draft(l))
+-            elif l.dflash:
++            elif l.dflash and not short:
+                 conf = l.policy.confidence
+                 if tune.depth == "scale":
+                     conf = scaled_confidence(conf, len(lanes), tune.alpha)
+@@ -1331,7 +1564,8 @@ class MultiDecoder:
+             if l.window is not None:
+                 l.constraint.mask(logits, l.window, self.w.vocab_offset)
+             parts.append((logits, [l.st.pos + 1 + r for r in range(len(seg.tokens))], l.s.sampling))
+-        sampled = sample_packed(self.w, parts) if tune.sampler == "packed" else sample_streams(self.w, parts)
++        # a short round has one row a stream: its nucleus gathers packed too, the same exact draws (0062)
++        sampled = sample_packed(self.w, parts) if short or tune.sampler == "packed" else sample_streams(self.w, parts)
+         if prof is not None:
+             prof.mark("sample")
+         keeps = []
+@@ -1365,7 +1599,9 @@ class MultiDecoder:
+             s.counted(len(seg.tokens))                     # Stream.take counts the accepted drafts
+             room = s.count - len(s.out)
+             s.take(new[:max(0, room)], self._ends(l))
+-            if l.policy is not None:
++            if short and not l.mtp:                     # no drafts this round: the policy's state stays (0062)
++                l.depth = min(l.depth, max(0, s.count - len(s.out)))
++            elif l.policy is not None:
+                 l.depth = min(l.policy.next(ndrafts, keep - 1), max(0, s.count - len(s.out)))
+         if prof is not None:
+             prof.mark("emit")
+@@ -1407,6 +1643,7 @@ class MultiDecoder:
+             self._emit(FINISH, [lane.sid, reason])
+             self._finish(lane.sid)
+         if not self.lanes and not self.idle and self.broken is None:
++            self.decode_due = self.short_round_due = False
+             self._emit(IDLE, [])
+             self._flush()
+             self.idle = True
+@@ -1414,8 +1651,21 @@ class MultiDecoder:
+         self.iteration_since = None
+ 
+     def _finish(self, sid: int) -> None:
+-        """Both ranks: the stream's slot frees; its extent stays for its kept prompts (shrunk to them) or goes."""
+-
++        """Both ranks: the stream's slot frees; its extent stays for its kept prompts (shrunk to them) or goes. A
++        stream in the suspended chunk keeps its slot and extent until the chunk's last slice, unless every stream in it
++        has ended (then the chunk is dropped). (MiaAI-Lab recipe patch 0062)"""
++
++        pending = self.partial
++        if pending is not None and pending.contains(sid):
++            pending.retired.add(sid)
++            if len(pending.retired) < len(pending.group):
++                self.lanes[sid].s.done = True
++                return                              # its slot and extent stay reserved until the chunk completes
++            pending.close()
++            torch.cuda.synchronize(self.w.device)
++            self.partial = None
++            for retired in pending.retired - {sid}:
++                self._finish(retired)
+         lane = self.lanes.pop(sid)
+         x = lane.extent
+         x.owner = None
+@@ -1446,6 +1696,9 @@ class MultiDecoder:
+         """After an error in an iteration: forget every stream (the ranks can no longer be trusted to agree)."""
+ 
+         live = [l.s for l in self.lanes.values()]
++        if self.partial is not None:
++            self.partial.close()
++            self.partial = None
+         self.lanes = {}
+         if self.broken is None:
+             self.broken = RuntimeError("an iteration failed")
+@@ -1517,11 +1770,18 @@ class MultiDecoder:
+                 for (lane, _), first in zip(group, self._fill_many(group)):
+                     if first is not None:
+                         lane.s.take([first], self._ends(lane))
++            elif op == FILLPART:              # TF_GLM_FILL_BUDGET_MS's layer slices (MiaAI-Lab recipe patch 0062)
++                sid, stop, lo, hi = p
++                self._part([(self.lanes[sid], stop)], lo, hi, False)
++            elif op == MFILLPART:
++                lo, hi = p[1:3]
++                self._part([(self.lanes[sid], stop) for sid, stop in zip(p[3::2], p[4::2])], lo, hi, True)
+             elif op == ROUND:
+                 n = p[0]
+                 sids, depths = p[1:1 + 2 * n:2], p[2:2 + 2 * n:2]
+                 lone = bool(p[1 + 2 * n]) if len(p) > 1 + 2 * n else False
+-                self._round([self.lanes[sid] for sid in sids], depths, lone=lone)
++                short = bool(p[2 + 2 * n]) if len(p) > 2 + 2 * n else False
++                self._round([self.lanes[sid] for sid in sids], depths, lone=lone, short=short)
+             elif op == SLOT:
+                 self._reslot(self.lanes[p[0]], p[1])
+             elif op == FINISH:
+@@ -1564,6 +1824,8 @@ class GlmScheduler(Scheduler):
+         stream.glm = dict(glm or {})
+         cancel = [False]
+         stream.emit = lambda new: (box.put(("tokens", new)), cancel[0])[1]
++        # the server's client poll (``feed.cancelled``): a sliced fill ends a filling request whose client left (0062)
++        stream.emit.cancelled = getattr(emit, "cancelled", None)
+         self.waiting.put((stream, box))
+         while True:
+             kind, value = box.get()
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi_prefill.py b/src/tensorfold/families/glm5_next/cuda/multi_prefill.py
+index 466d622..648a5c4 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi_prefill.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi_prefill.py
+@@ -194,3 +194,33 @@ def prefill_pieces(e, pieces: Sequence[Piece]) -> list[torch.Tensor | None]:
+     for p in pieces:
+         commit(w, p.st, b, p.rows, p.rows)
+     return heads
++
++
++def prefill_piece_steps(e, pieces: Sequence[Piece]):
++    """``prefill_pieces`` as a generator for layer-sliced fills (TF_GLM_FILL_BUDGET_MS, MiaAI-Lab recipe patch 0062):
++    the chunk's forward yields after each layer; the heads, the taps and every piece's commit (no position or tap
++    moves) only after the last layer. On the AFD attention node the caller sends each slice's header
++    (``multi.MultiDecoder._afd_slice``)."""
++
++    from . import latent
++    from .forward import commit, compute_steps, mm
++
++    if not latent.ENABLED:
++        raise ValueError("multi-prompt chunks need the latent cache (TF_GLM_LATENT=1)")
++    w, b = e.w, e.pbuf
++    R = layout(pieces, min(b.rows, e.prefill_rows))
++    _stage(w, b, pieces, R)
++    yield from compute_steps(w, None, b, R, head=False, mixer=PieceMixer(w, b, pieces, R))
++    heads: list[torch.Tensor | None] = []
++    for p in pieces:
++        if p.head:
++            r = p.lo + p.rows - 1
++            heads.append(mm(b, b.fnormed[r:r + 1], w.head, b.fxs[r:r + 1], b.logits[:1]).clone())
++        else:
++            heads.append(None)
++    for p in pieces:
++        if p.drafter is not None:
++            p.drafter.add_taps(torch.cat([t[p.lo:p.lo + p.rows] for t in b.taps], dim=1))
++    for p in pieces:
++        commit(w, p.st, b, p.rows, p.rows)
++    return heads
+diff --git a/src/tensorfold/families/glm5_next/cuda/sliced_fill.py b/src/tensorfold/families/glm5_next/cuda/sliced_fill.py
+new file mode 100644
+index 0000000..1b736b7
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/sliced_fill.py
+@@ -0,0 +1,172 @@
++# Ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe @ 1576746, patch 0062-glm-sliced-fill
++# (Apache-2.0, Copyright 2026 MiaAI-Lab; THIRD_PARTY_NOTICES.md "GLM sliced prompt fills").
++"""CPU policy and saved control state for opt-in layer-sliced concurrent prompt fills.
++
++The GPU rows live in Engine.pbuf, already counted by the startup memory estimate. Only one prompt chunk may
++be suspended; its generator retains the HC split loop's next-front/done state. No additional GPU storage.
++"""
++from __future__ import annotations
++
++import math
++import os
++from collections.abc import Sequence
++from dataclasses import dataclass, field
++from typing import Any
++
++
++def budget_ms(value: str | None = None) -> float:
++    value = os.environ.get("TF_GLM_FILL_BUDGET_MS", "") if value is None else value
++    try:
++        ms = float(value.strip() or "0")
++    except ValueError:
++        ms = -1.0
++    if not math.isfinite(ms) or ms < 0:
++        raise ValueError(f"TF_GLM_FILL_BUDGET_MS: finite milliseconds >= 0 (0: off), not {value!r}")
++    return ms
++
++
++def drafted_rounds(value: str | None = None) -> bool:
++    """TF_GLM_FILL_DRAFTS: 1 makes the decode rounds between prompt slices full drafted rounds (more tokens for the
++    decoding streams during a fill, a later first token for the filling one); 0 (default): one token per stream."""
++
++    raw = (os.environ.get("TF_GLM_FILL_DRAFTS", "") if value is None else value).strip() or "0"
++    if raw not in ("0", "1"):
++        raise ValueError(f"TF_GLM_FILL_DRAFTS: 0 or 1, not {raw!r}")
++    return raw == "1"
++
++
++class LayerCosts:
++    """Startup timings at several row counts, interpolated separately for every KDA/DSA/dense layer.
++
++    The first cost includes embedding. Tail work and per-slice overhead are learned separately. A layer slower than the budget runs alone: CUDA
++    kernels cannot be preempted, so this setting is a target, not a hard latency guarantee.
++    """
++    def __init__(self, samples: dict[int, Sequence[float]]) -> None:
++        if not samples:
++            raise ValueError("prompt cost model needs samples")
++        self.samples = {r: tuple(float(v) for v in costs) for r, costs in sorted(samples.items())}
++        self.layers = len(next(iter(self.samples.values())))
++        if (not self.layers or any(r <= 0 or len(c) != self.layers or
++                                  any(not math.isfinite(v) or v <= 0 for v in c)
++                                  for r, c in self.samples.items())):
++            raise ValueError("prompt costs need positive rows and equally sized finite positive layer timings")
++        self.scale = 1.0
++        self.overhead = 0.0
++        self.tails: dict[int, float] = {}
++
++    def tail_cost(self, rows: int) -> float:
++        if not self.tails:
++            return 0.0
++        lo = max((r for r in self.tails if r <= rows), default=min(self.tails))
++        hi = min((r for r in self.tails if r >= rows), default=max(self.tails))
++        if lo == hi:
++            return self.tails[lo] * rows / lo
++        t = (rows - lo) / (hi - lo)
++        return self.tails[lo] + t * (self.tails[hi] - self.tails[lo])
++
++    def observe_tail(self, rows: int, ms: float) -> None:
++        if rows > 0 and math.isfinite(ms) and ms >= 0:
++            self.tails[rows] = 0.8 * self.tails[rows] + 0.2 * ms if rows in self.tails else ms
++
++    def observe_overhead(self, ms: float) -> None:
++        if math.isfinite(ms) and ms >= 0:
++            self.overhead = 0.8 * self.overhead + 0.2 * ms
++
++    def costs(self, rows: int) -> tuple[float, ...]:
++        keys = list(self.samples)
++        lo = max((r for r in keys if r <= rows), default=keys[0])
++        hi = min((r for r in keys if r >= rows), default=keys[-1])
++        if lo == hi:
++            return tuple(v * self.scale for v in self.samples[lo])
++        t = (rows - lo) / (hi - lo)
++        return tuple((a + t * (b - a)) * self.scale for a, b in zip(self.samples[lo], self.samples[hi]))
++
++    def stop(self, rows: int, lo: int, budget: float) -> int:
++        if not 0 <= lo < self.layers or not math.isfinite(budget) or budget <= 0:
++            raise ValueError("slice needs a valid first layer and positive finite budget")
++        costs = list(self.costs(rows))
++        costs[-1] += self.tail_cost(rows)
++        budget = max(0.001, budget - self.overhead)
++        def greedy_end(start):
++            end, ms = start + 1, costs[start]
++            while end < self.layers and ms + costs[end] <= budget:
++                ms += costs[end]
++                end += 1
++            return end
++
++        def pieces(start):
++            count = 0
++            while start < self.layers:
++                start = greedy_end(start)
++                count += 1
++            return count
++
++        # Greedy gives the minimum number of contiguous slices. Among first cuts
++        # that preserve that count, approach the mean cost instead of leaving a
++        # tiny tail after several near-budget stalls. Never exceed the budget
++        # except for one indivisible layer, as on the ordinary greedy path.
++        count = pieces(lo)
++        target = sum(costs[lo:]) / count
++        ends = [hi for hi in range(lo + 1, greedy_end(lo) + 1) if pieces(hi) <= count - 1]
++        return min(ends, key=lambda hi: (abs(sum(costs[lo:hi]) - target), -hi))
++
++    def observe(self, rows: int, lo: int, hi: int, ms: float) -> None:
++        # Layer GPU time only: tail and dispatch cost must not inflate every layer's prediction.
++        predicted = sum(self.costs(rows)[lo:hi])
++        if predicted > 0 and math.isfinite(ms) and ms > 0:
++            self.scale = min(8.0, max(0.5, self.scale * (0.8 + 0.2 * ms / predicted)))
++
++
++@dataclass
++class PendingFill:
++    group: list[tuple[Any, int]]
++    many: bool = False
++    layer: int = 0
++    steps: Any = None
++    retired: set[int] = field(default_factory=set)
++    layer_ms: float = 0.0
++    layer_event: Any = None
++    slice_layer_ms: float = 0.0
++    slice_wall_ms: float = 0.0
++    starts: list[int] = field(init=False)
++
++    def __post_init__(self) -> None:
++        self.starts = [lane.st.pos for lane, _ in self.group]
++
++    @property
++    def rows(self) -> int:
++        return sum(stop - start for (_, stop), start in zip(self.group, self.starts))
++
++    def contains(self, sid: int) -> bool:
++        return any(lane.sid == sid for lane, _ in self.group)
++
++    def close(self) -> None:
++        if self.steps is not None:
++            self.steps.close()
++            self.steps = None
++
++
++def advance(pending: PendingFill, lo: int, hi: int, layers: int, make_steps, before_finalize=None):
++    """Run the requested contiguous layer range; return (complete, forward result)."""
++    if not lo == pending.layer < hi <= layers:
++        raise RuntimeError(f"out-of-order prompt slice [{lo}, {hi}), expected layer {pending.layer} of {layers}")
++    if pending.steps is None:
++        if lo:
++            raise RuntimeError("a resumed prompt slice has no saved forward")
++        pending.steps = make_steps()
++    for _ in range(lo, hi):
++        try:
++            next(pending.steps)
++        except StopIteration as exc:
++            raise RuntimeError("prompt forward ended before its final layer") from exc
++    pending.layer = hi
++    if hi < layers:
++        return False, None
++    if before_finalize is not None:
++        before_finalize()
++    try:
++        next(pending.steps)                   # final norm, taps, commit (after the last layer's yield)
++    except StopIteration as result:
++        pending.steps = None
++        return True, result.value
++    raise RuntimeError("prompt forward has more layers than the slice protocol")
+diff --git a/tests/test_glm_afd_slice_wire.py b/tests/test_glm_afd_slice_wire.py
+new file mode 100644
+index 0000000..449f682
+--- /dev/null
++++ b/tests/test_glm_afd_slice_wire.py
+@@ -0,0 +1,267 @@
++"""The AFD wire's layer slices (``afd.MODE_SLICE``, wire version 2; this tree's design for MiaAI-Lab recipe patch
++0062's sliced prompt fills) end to end on one host, CPU only: the attention's ``AfdWire`` over ``McdmaTransport`` and
++the experts' ``forwards`` loops over ``McdmaExpertLink``, through the fake mcdma-rpcd pair of ``glm_afd_fakes``.
++
++A slice is a forward over MoE positions a .. a + n - 1 of a prompt chunk's rows: its first request's header has word 3
++= a, word 4 = 5 and word 6 = n; the expert's ``next_forward`` takes a slice's first request at its own position and
++``_window`` runs only those layers, so a decode round's eager window can run between two slices of a chunk. Covered:
++slice headers round-trip between eager windows and whole chunks (every reply checked against the fake experts'
++function), the header words, an expert of the old wire (settings without ``wire: 2``) refused at the handshake both
++ways, a slice that stops early refused like an out-of-step forward, the experts' refusal of malformed slice headers,
++and ``TF_AFD_CHECK``'s hashes keyed by slice.
++"""
++
++from __future__ import annotations
++
++import struct
++import threading
++
++import pytest
++import torch
++
++from tensorfold.families.glm5_next.cuda import afd as afd_mod
++from tensorfold.families.glm5_next.cuda import afd_mcdma, mcdma
++from tensorfold.server.errors import CapacityError
++from tests import glm_afd_fakes as fx
++from tests.glm_afd_fakes import (
++    LAYERS,
++    PREFILL,
++    D,
++    Expert,
++    FakeNode,
++    S,
++    buffers,
++    fake_cfg,
++    finish,
++    forward,
++    free_port,
++    mcdma_attention,
++    partial,
++    setup_pair,
++    wait_attached,
++)
++
++pytestmark = pytest.mark.torch
++# the fakes' fixtures (daemon, env, libpath, master, words), bound here by assignment
++daemon_fixture, env_fixture, libpath_fixture = fx.daemon_fixture, fx.env_fixture, fx.libpath_fixture
++master_fixture, words_fixture = fx.master_fixture, fx.words_fixture
++
++L = len(LAYERS)
++
++
++def slice_forward(a, b, rows, gen, first: int, count: int, stop_after: int | None = None) -> list:
++    """One layer slice of a prompt chunk: ``begin(rows, chunk=True, slice=(first, count))``, then MoE positions
++    first .. first + count - 1, every reply checked against the fake experts' function for that position's layer."""
++
++    a.begin(rows, chunk=True, slice=(first, count))
++    out = []
++    for k, pos in enumerate(range(first, first + count)):
++        if stop_after is not None and k == stop_after:
++            return out
++        assert a.layer == pos
++        b.normed[:rows] = torch.randn((rows, D), generator=gen).to(torch.bfloat16)
++        b.pick[:rows] = torch.randint(0, 16, (rows, S), generator=gen, dtype=torch.int32)
++        b.wts[:rows] = torch.rand((rows, S), generator=gen)
++        b.sy[:rows] = torch.randn((rows, D), generator=gen)
++        a.exchange(b, rows)
++        got = a.collect(b, rows, D)
++        for half in (0, 1):
++            want = partial(b.normed[:rows], b.pick[:rows], b.wts[:rows], LAYERS[pos], half)
++            assert torch.equal(got[half], want), f"slice ({first}, {count}) position {pos} half {half}"
++        assert torch.equal(got[2], b.sy[:rows])
++        out.append(got.clone())
++    return out
++
++
++def header_words(a) -> list[list[int]]:
++    """The attention's header table, words 0 .. 7 of each MoE position's request header."""
++
++    return [[int(v) for v in row[:8]] for row in a.tr.hdr_tab.tolist()]
++
++
++# -- round trips --------------------------------------------------------------------------------------------------
++@pytest.mark.parametrize("attn", ["cpu", "gpu"])
++def test_slices_round_trip_between_eager_windows(env, daemon, words, master, attn):
++    """The scheduler's order on the wire: a chunk in slices (0, 2), (2, 2) with an eager window (a decode round)
++    before and between them, a whole chunk, a chunk in four one-layer slices with windows between, a lone window;
++    each expert ran exactly the layers of each forward, in order."""
++
++    links, eps, _ = setup_pair(daemon, words, attn=attn, record=True)
++    wait_attached(daemon)
++    a, b, gen = mcdma_attention(links, master), buffers(), torch.Generator().manual_seed(7)
++    forward(a, b, 2, gen)                                             # a decode round
++    slice_forward(a, b, 40, gen, 0, 2)
++    forward(a, b, 3, gen)                                             # the round between two slices
++    slice_forward(a, b, 40, gen, 2, 2)
++    forward(a, b, PREFILL, gen, chunk=True)                           # a whole chunk: MODE_CHUNK
++    for pos in range(L):
++        slice_forward(a, b, 17, gen, pos, 1)
++        forward(a, b, 1, gen)
++    expected = ([(i, 2) for i in LAYERS] + [(i, 40) for i in LAYERS[:2]] + [(i, 3) for i in LAYERS]
++                + [(i, 40) for i in LAYERS[2:]] + [(i, PREFILL) for i in LAYERS]
++                + [x for pos in range(L) for x in ((LAYERS[pos], 17), *[(i, 1) for i in LAYERS])])
++    finish(daemon, eps)
++    for e in eps:
++        assert e.node.seen == expected
++
++
++def test_the_header_words_of_a_slice(env, daemon, words, master):
++    """MODE_SLICE: word 4 = 5 on every row, word 6 = n on the slice's first row only (word 3 there = a); the next
++    forward's header resets it; modes 1 and 3 leave words 6 .. 63 zero; a slice of every MoE layer is a whole chunk
++    (MODE_CHUNK, no count word); begin refuses a slice of no chunk or out of range."""
++
++    links, eps, _ = setup_pair(daemon, words)
++    wait_attached(daemon)
++    a = mcdma_attention(links, master)
++    a.begin(9, chunk=True, slice=(1, 2))
++    w = header_words(a)
++    assert [r[4] for r in w] == [afd_mod.MODE_SLICE] * L and [r[6] for r in w] == [0, 2, 0, 0]
++    assert w[1][:6] == [mcdma.WIRE_MAGIC, a.seq, 9, 1, afd_mod.MODE_SLICE, L] and (a.start, a.end, a.span) == (1, 3, (1, 2))
++    a.begin(1)
++    assert [r[6] for r in header_words(a)] == [0] * L and [r[4] for r in header_words(a)] == [afd_mod.MODE_EAGER] * L
++    a.begin(9, chunk=True, slice=(0, L))
++    assert [r[4] for r in header_words(a)] == [afd_mod.MODE_CHUNK] * L and a.span is None and (a.start, a.end) == (0, L)
++    a.begin(9, chunk=True, slice=(3, 1))
++    a.begin(5, chunk=True)
++    assert not a.tr.hdr_tab[:, 6:].any() and not a.tr.hdr_tab_cpu[:, 6:].any()
++    for kw in ({"slice": (0, 1)}, {"chunk": True, "slice": (0, 0)}, {"chunk": True, "slice": (3, 2)},
++               {"chunk": True, "slice": (-1, 1)}):
++        with pytest.raises(ValueError, match="slice"):
++            a.begin(4, **kw)
++    finish(daemon, eps)
++
++
++def test_a_slice_stopped_early_kills_the_wire(env, daemon, words, master):
++    links, eps, _ = setup_pair(daemon, words)
++    wait_attached(daemon)
++    a, b = mcdma_attention(links, master), buffers()
++    slice_forward(a, b, 6, torch.Generator().manual_seed(3), 1, 3, stop_after=1)
++    with pytest.raises(CapacityError, match=r"a slice of MoE layers 1 \.\. 3 stopped after 1 of 3"):
++        forward(a, b, 1, torch.Generator().manual_seed(4))
++    assert a.dead is not None
++    finish(daemon, eps)
++
++
++@pytest.mark.parametrize("bad", ["count 0", "past the last layer", "other layer count"])
++def test_expert_refuses_a_bad_slice_header(env, daemon, words, bad):
++    """A slice's first request out of shape is no forward's first (the expert's link fails, as for a bad header)."""
++
++    links, eps, _ = setup_pair(daemon, words)
++    wait_attached(daemon)
++    pos, count, nl = {"count 0": (1, 0, L), "past the last layer": (3, 2, L), "other layer count": (0, 1, L + 1)}[bad]
++    box = links.boxes[0]
++    struct.pack_into(mcdma.HDR_FMT, box.mm, mcdma.CTRL, mcdma.WIRE_MAGIC, 1, 1, pos, afd_mod.MODE_SLICE, nl, count, 0)
++    words.store(box.req_word, mcdma.word(links.base[0], mcdma.Layout(D, S).req(1)))
++    eps[0].join()
++    assert isinstance(eps[0].error, mcdma.LinkError) and "no forward's first" in str(eps[0].error)
++    assert "mode 5 slice of" in str(eps[0].error)
++    daemon.bye("a1")
++    eps[1].join()
++
++
++# -- the handshake --------------------------------------------------------------------------------------------------
++def test_the_settings_name_the_wire():
++    cfg = fake_cfg()
++    s = afd_mod.settings_for("/nonexistent", cfg, prefill_rows=PREFILL)
++    assert s["wire"] == afd_mod.WIRE == 2
++    old = {k: v for k, v in s.items() if k != "wire"}
++    assert afd_mod.settings_mismatch(old, s) == "wire: attention 2 != expert None"
++    assert afd_mod.settings_mismatch(s, old) == "wire: attention None != expert 2"
++    assert afd_mod.settings_mismatch(dict(s, wire=1), s) == "wire: attention 2 != expert 1"
++    assert afd_mod.moe_span(cfg, 0, 3) == (0, 0) and afd_mod.moe_span(cfg, 3, 5) == (0, 2)
++    assert afd_mod.moe_span(cfg, 2, 6) == (0, 3) and afd_mod.moe_span(cfg, 5, 7) == (2, 2)
++
++
++@pytest.mark.parametrize("old", ["expert", "attention"])
++def test_a_node_of_the_old_wire_is_refused(env, daemon, words, tmp_path, old):
++    """serve()'s handshake: an expert node whose settings lack ``wire`` (an older tree) is refused by this
++    attention's settings, and this tree's experts refuse an attention that announces none."""
++
++    from tensorfold.families.glm5_next.cuda import experts_node
++
++    env.setattr(afd_mod, "WATCH_EVERY", 3600)
++    env.setattr(experts_node, "ALIVE_EVERY", 3600)
++    env.setattr(experts_node.Config, "read", staticmethod(lambda _d: fake_cfg()))
++    real = afd_mod.settings_for
++
++    def wire1(*a, **k):
++        return {key: v for key, v in real(*a, **k).items() if key != "wire"}
++
++    if old == "expert":
++        env.setattr(experts_node, "settings_for", wire1)
++    port, errors = free_port(), {}
++
++    def run(half):
++        try:
++            experts_node.serve(tmp_path, half, "127.0.0.1", port, device="cpu")
++        except BaseException as exc:  # noqa: BLE001
++            errors[half] = exc
++
++    threads = [threading.Thread(target=run, args=(h,), name=f"x{h}", daemon=True) for h in (0, 1)]
++    for t in threads:
++        t.start()
++    links = mcdma.AttentionLinks(["a2", "a1"], words=words, mode="cpu", stream=lambda: 0, timeout=10,
++                                 shm_dir=str(daemon.shm), linkup_wait=2)
++    tr = afd_mcdma.McdmaTransport("127.0.0.1", port, links=links, device="cpu", hidden=D)
++    a = afd_mod.AfdWire("127.0.0.1", port, transport=tr)
++    mine = (real if old == "expert" else wire1)(tmp_path, fake_cfg(), prefill_rows=PREFILL)
++    a.announce(mine)
++    for t in threads:
++        t.join(20)
++        assert not t.is_alive()
++    want = "wire: attention 2 != expert None" if old == "expert" else "wire: attention None != expert 2"
++    for h in (0, 1):
++        assert isinstance(errors[h], SystemExit) and want in str(errors[h]), errors
++
++
++# -- TF_AFD_CHECK -------------------------------------------------------------------------------------------------
++class CheckedExpert(Expert):
++    """``Expert`` with the wire check on, its hashes into the attention's store."""
++
++    def _run(self) -> None:
++        from tensorfold.families.glm5_next.cuda import experts_node
++
++        try:
++            experts_node.forwards(self.node, self.link, self.store, self.node.half + 1, check_on=True)
++        except BaseException as exc:  # noqa: BLE001
++            self.error = exc
++
++
++def test_the_wire_check_keys_its_hashes_by_slice(env, daemon, words, master, capsys):
++    """TF_AFD_CHECK=1 over slices: both sides key a slice's hashes ``afd_chk/{seq}/{a}+{n}/{peer}`` (a whole
++    forward's stay ``afd_chk/{seq}/{peer}``), every hash meets its peer's, and the window's line names the slices."""
++
++    from tensorfold.families.glm5_next.cuda import experts_node
++
++    env.setenv(afd_mod.CHECK_ENV, "1")
++    env.setattr(torch.cuda, "synchronize", lambda *a, **k: None)      # the check's device sync, on a CPU-only box
++    env.setattr(afd_mod, "CHECK_FORWARDS", 6)
++    env.setattr(experts_node, "CHECK_FORWARDS", 6)
++    assert afd_mod.check_key(7, 1) == "afd_chk/7/1" and afd_mod.check_key(7, 2, (2, 3)) == "afd_chk/7/2+3/2"
++    links = mcdma.AttentionLinks(["a2", "a1"], words=words, mode="cpu", stream=lambda: 0, timeout=10,
++                                 shm_dir=str(daemon.shm), linkup_wait=2)
++    a = mcdma_attention(links, master)
++    assert a.check
++    eps = []
++    for half, name in enumerate(["a2", "a1"]):
++        link = mcdma.ExpertLink(name, words=words, mode="cpu", socket_path=daemon.sock(name),
++                                shm_dir=str(daemon.shm), stream=lambda: 0)
++        link.base = links.base[half]
++        end = afd_mcdma.McdmaExpertLink(link, D, S, L, PREFILL, device="cpu")
++        eps.append(CheckedExpert(end, FakeNode(LAYERS, half), store=a.store))
++    wait_attached(daemon)
++    b, gen = buffers(), torch.Generator().manual_seed(5)
++    forward(a, b, 3, gen)                                             # seq 1: a whole forward
++    slice_forward(a, b, 20, gen, 0, 1)                                # seq 2
++    forward(a, b, 2, gen)                                             # seq 3
++    slice_forward(a, b, 20, gen, 1, 3)                                # seq 4
++    slice_forward(a, b, 11, gen, 0, L)                                # seq 5: a whole chunk (MODE_CHUNK)
++    forward(a, b, 1, gen)                                             # seq 6
++    a.begin(1)                                                        # the last forward's check
++    assert a.checked == 6 and a.mismatches == 0 and a._sliced == 2 and a._spans == {(0, 1), (1, 3)}
++    for seq, span in ((1, None), (2, (0, 1)), (3, None), (4, (1, 3)), (5, None), (6, None)):
++        for peer in (1, 2):
++            assert afd_mod.get_store(a.store, afd_mod.check_key(seq, peer, span), 5.0), (seq, span, peer)
++    line = [x for x in capsys.readouterr().out.splitlines() if "window complete" in x]
++    assert line and "0 mismatches" in line[0] and "2 of them layer slices" in line[0], line
++    finish(daemon, eps)
+diff --git a/tests/test_glm_afd_transport.py b/tests/test_glm_afd_transport.py
+index 879890c..ba12f9d 100644
+--- a/tests/test_glm_afd_transport.py
++++ b/tests/test_glm_afd_transport.py
+@@ -105,7 +105,8 @@ def test_the_mcdma_wire_implements_the_interface():
+             list(inspect.signature(getattr(afd_transport.ExpertLink, m)).parameters), m
+     for hook in ("begin", "exchange", "collect", "forces_eager", "announce", "wait_loaded", "die"):
+         assert hasattr(afd_mod.AfdWire, hook)
+-    assert str(inspect.signature(afd_mod.AfdWire.begin)) == "(self, rows: 'int', *, chunk: 'bool' = False) -> 'None'"
++    assert str(inspect.signature(afd_mod.AfdWire.begin)) == \
++        "(self, rows: 'int', *, chunk: 'bool' = False, slice: 'tuple[int, int] | None' = None) -> 'None'"   # wire 2
+     assert str(inspect.signature(afd_mod.AfdWire.exchange)) == "(self, b, rows: 'int') -> 'None'"
+     assert str(inspect.signature(afd_mod.AfdWire.collect)) == "(self, b, rows: 'int', d: 'int')"
+ 
+diff --git a/tests/test_glm_multi_afd.py b/tests/test_glm_multi_afd.py
+index cd91b9c..713effc 100644
+--- a/tests/test_glm_multi_afd.py
++++ b/tests/test_glm_multi_afd.py
+@@ -524,7 +524,8 @@ def test_batched_window_shapes_on_the_wire(R, monkeypatch):
+     cfg = SimpleNamespace(mlp_kinds=["dense"] * 3 + ["moe"] * 42, quant="exl3", experts=288, top_k=8)
+     s = afd_mod.settings_for("/nonexistent", cfg, prefill_rows=2048)
+     assert s == {"digest": "", "layers": list(range(3, 45)), "max_rows": 8,
+-                 "mtp": 0, "prefill_rows": 2048, "quant": "exl3", "experts": 288, "top_k": 8}
++                 "mtp": 0, "prefill_rows": 2048, "quant": "exl3", "experts": 288, "top_k": 8,
++                 "wire": afd_mod.WIRE}           # wire 2: MODE_SLICE; the same with and without --parallel
+     assert "parallel" not in s
+ 
+ 
+diff --git a/tests/test_glm_sliced_fill.py b/tests/test_glm_sliced_fill.py
+new file mode 100644
+index 0000000..afe91f1
+--- /dev/null
++++ b/tests/test_glm_sliced_fill.py
+@@ -0,0 +1,522 @@
++"""TF_GLM_FILL_BUDGET_MS (MiaAI-Lab recipe patch 0062, ``sliced_fill``) on CPU: a prompt chunk started while other
++streams decode runs a few layers at a time, a decode round between two slices, over this tree's slice-aware AFD wire
++(``afd.MODE_SLICE``, wire version 2).
++
++The model is tests/test_glm_multi.py's fake (logits that hash what each stream committed, read back from its pool rows
++and its slot) with six layers here (dense, moe, moe, dense, moe, moe: MoE positions 0 .. 3) and a layer-by-layer
++prompt forward (``fake_compute_steps``): the rows' latents go into the pool at layer 0 and the state is folded from
++the pool at the end, so a slice that ran on the wrong rows, a lost row or a decode round that touched the suspended
++chunk changes the replies. At world 1 the AFD wire is ``SliceWire``: the real ``afd.AfdWire.begin`` / ``exchange``
++over a transport whose header table is written by the real ``McdmaTransport.header`` and read back per request as
++the expert's ``McdmaExpertLink.next_forward`` reads it. Covered:
++
++- sliced == unsliced (and == the solo reference): replies, kept states and their pool rows, at world 1 over the
++  checked wire and at two ranks (FILLPART messages, both ranks equal after every message), with TF_GLM_MULTI_PREFILL's
++  grouped chunks (MFILLPART), with TF_GLM_KV=fp8's rings, MTP and DFlash2 streams, TF_GLM_FILL_DRAFTS 0 and 1;
++- a decode round really runs between two slices of one chunk; a request alone fills whole forwards;
++- a cache MOVE between two slices carries the rows the chunk already wrote; cancellation mid-fill frees the extent;
++- the startup layer timings (``_time_prompt_layers``) as whole MODE_CHUNK forwards of the wire;
++- every switch off: no slice op, ROUND messages as before, no ``sliced_fill`` in /health; the messages' parse refuses
++  slice payloads out of shape.
++"""
++
++from __future__ import annotations
++
++from itertools import pairwise
++from types import SimpleNamespace
++
++import pytest
++
++from tests import test_glm_kv8_multi as tk
++from tests import test_glm_multi as tm
++from tests import test_glm_multi_afd as ta
++from tests import test_glm_multi_prefill as tmp
++from tests.test_cuda_geometry import allocations  # noqa: F401  (fixture: fake triton, so decode imports)
++from tests.test_glm_multi import CASES, _prompt, _sampling, fake, fold, solo  # noqa: F401
++from tests.test_glm_multi_afd import afd_fake  # noqa: F401
++
++pytestmark = pytest.mark.torch
++rings = tk.rings                                              # fixture: TF_GLM_KV=fp8's per-slot indexer rings
++
++KINDS = ("dense", "moe", "moe", "dense", "moe", "moe")        # the fake's layers: MoE positions 0 .. 3 on the wire
++MOE = KINDS.count("moe")
++LAYER_MS = 1000.0       # FakeEvent's elapsed ms: slice >> wall time, so no overhead/tail is learned (deterministic)
++STARTS = {0: 0, 1: 2, 2: 3, 3: 7, 4: 11, 5: 12}               # tests/test_glm_multi.py's staggered admissions
++
++
++# -- the fake model's layer-by-layer prompt forward --------------------------------------------------------------
++class FakeEvent:
++    """torch.cuda.Event on a CPU-only box."""
++
++    def __init__(self, enable_timing: bool = False) -> None:
++        pass
++
++    def record(self, stream=None) -> None:
++        pass
++
++    def synchronize(self) -> None:
++        pass
++
++    def elapsed_time(self, other) -> float:
++        return LAYER_MS
++
++
++def fake_compute_steps(w, st, b, R, *, nch=None, host_pos=None, head=True, mixer=None):
++    """``forward.compute_steps`` on the fake: one yield a layer; at layer 0 every row's latent (and pooled key) into
++    its stream's pool rows; each MoE layer's exchange on the AFD wire; after the last layer each stream's state folded
++    through its rows READ BACK from the pool, its taps, and its last row's logits (a piece's by ``fake_head``)."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda.multi_prefill import PieceMixer
++
++    assert b.prefill and len(b.ids) == R
++    if mixer is not None:                                # TF_GLM_MULTI_PREFILL's multi-prompt chunk (0049)
++        assert st is None and isinstance(mixer, PieceMixer) and not head and mixer.R == R
++        pieces = [(p.st, list(p.tokens), p.lo, p.rows) for p in mixer.pieces]
++    else:
++        assert host_pos == st.pos
++        pieces = [(st, list(b.ids), 0, R)]
++    assert sum(n for *_, n in pieces) == R
++    wire = getattr(w, "afd", None)
++    for i in range(len(w.layers)):
++        if i == 0:
++            for s, toks, _, _ in pieces:
++                for k, t in enumerate(toks):
++                    s.write(s.pos + k, int(t))
++        if wire is not None and w.cfg.mlp_kinds[i] == "moe":
++            wire.exchange(None, R)
++        yield i
++    taps, heads = [], {}
++    for s, toks, lo, n in pieces:
++        h = s.h()
++        for k in range(n):
++            q = s.pos + k
++            h = fold(h, q, int(s.lat[q, 0]) - 1)          # from the pool: a lost or moved-away row shows
++        cur = s.cur[0]
++        s.rec[1 - cur][0] = h
++        s.cur = [1 - cur]
++        s.conv.copy_(torch.tensor(([0, 0, 0] + list(s.conv.tolist()) + toks)[-3:]))
++        taps += [[s.pos + k, t] for k, t in enumerate(toks)]
++        heads[lo + n - 1] = s.logits(s.pos + n - 1, h)
++    if mixer is None:
++        b.taps = torch.tensor(taps, dtype=torch.int64)
++        b.fnormed = b.taps.clone()
++        return heads[R - 1][None] if head else None
++    b.taps = [torch.tensor(taps, dtype=torch.int64)]
++    b.fnormed = torch.arange(R, dtype=torch.int64)[:, None]
++    b.fxs = torch.zeros((R, 1))
++    b.logits = torch.zeros((1, tm.V))
++    b.head_rows = heads
++    b.engine.chunks.append([(p.st.slot, p.st.pos, p.rows) for p in mixer.pieces])
++    return None
++
++
++def layered(monkeypatch, budget: str | None, *, drafts: str | None = None):
++    """The fake model with ``KINDS``'s layers and the sliced fill's seams (``fake_compute_steps``, ``FakeEvent``,
++    startup costs of 1 ms a layer, rank 0's slice messages through the harness's message box). ``budget``: the
++    TF_GLM_FILL_BUDGET_MS value (None: unset). Returns the real ``_time_prompt_layers``."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import forward, multi, sliced_fill
++
++    for name, value in (("TF_GLM_FILL_BUDGET_MS", budget), ("TF_GLM_FILL_DRAFTS", drafts)):
++        if value is None:
++            monkeypatch.delenv(name, raising=False)
++        else:
++            monkeypatch.setenv(name, value)
++    real = tm.FakeEngine.__init__
++
++    def init(self, *a, **k):
++        real(self, *a, **k)
++        self.w.layers = [SimpleNamespace(index=i) for i in range(len(KINDS))]
++        self.w.cfg.mlp_kinds = list(KINDS)
++        self.w.device = "cpu"
++
++    timing = multi.MultiDecoder._time_prompt_layers
++    monkeypatch.setattr(tm.FakeEngine, "__init__", init)
++    monkeypatch.setattr(forward, "compute_steps", fake_compute_steps)
++    monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
++    monkeypatch.setattr(multi.MultiDecoder, "_time_prompt_layers",
++                        lambda self: sliced_fill.LayerCosts({64: [1.0] * len(KINDS), 1024: [1.0] * len(KINDS)}))
++    monkeypatch.setattr(multi.MultiDecoder, "_send", lambda self, values: self.g._share(values))
++    return timing
++
++
++# -- the AFD wire: the real attention side over a checked header table --------------------------------------------
++class CheckedLink:
++    """The MCDMA attention transport's header table, written by the real ``McdmaTransport.header``, read back at each
++    request as the expert's link reads it (``McdmaExpertLink.next_forward``): a forward's first request at its first MoE
++    position (0, or a slice's a, word 6 its count n), one header a forward (seq + 1), the rows within the mailboxes',
++    words 7 .. 63 zero and word 6 only on a slice's first row, then the forward's requests in order; a new header only
++    after the forward's last request. ``events`` is the wire's sequence."""
++
++    def __init__(self, layers: int, prefill: int) -> None:
++        import torch
++
++        from tensorfold.families.glm5_next.cuda import mcdma
++
++        tab = torch.zeros((layers, 64), dtype=torch.int32)
++        tab[:, 0] = mcdma.WIRE_MAGIC
++        tab[:, 3] = torch.arange(layers, dtype=torch.int32)
++        tab[:, 5] = layers
++        self.hdr_tab_cpu, self.hdr_tab, self.sliced = tab, tab.clone(), None
++        self.L, self.prefill = layers, prefill
++        self.fwd = self.next = None
++        self.last = 0
++        self.events: list[tuple] = []
++
++    def header(self, seq: int, rows: int, mode: int, slice=None) -> None:
++        from tensorfold.families.glm5_next.cuda.afd_mcdma import McdmaTransport
++
++        assert self.next is None, ("a header before the last forward's requests all went", self.fwd)
++        McdmaTransport.header(self, seq, rows, mode, slice=slice)
++        self.events.append(("begin", int(rows), int(mode), None if slice is None else tuple(slice)))
++
++    def send(self, b, rows: int, layer: int) -> None:
++        from tensorfold.families.glm5_next.cuda import mcdma
++        from tensorfold.families.glm5_next.cuda.afd import MODE_CHUNK, MODE_EAGER, MODE_SLICE
++
++        h = [int(v) for v in self.hdr_tab[layer].tolist()]
++        if self.next is None:                             # the forward's first request
++            magic, seq, r, pos, mode, nl, count = h[:7]
++            first, n = (pos, count) if mode == MODE_SLICE else (0, self.L)
++            assert magic == mcdma.WIRE_MAGIC and nl == self.L and pos == first == layer, h[:7]
++            assert mode in (MODE_EAGER, MODE_CHUNK, MODE_SLICE) and 1 <= r <= self.prefill, h[:7]
++            assert 1 <= n and first + n <= self.L and seq == (self.last + 1) & 0x7FFFFFFF, h[:7]
++            self.fwd, self.next, self.last = (seq, r, mode, first, n), first, seq
++        seq, r, mode, first, n = self.fwd
++        assert layer == self.next and rows == r and h[1:3] == [seq, r] and h[4] == mode, (layer, h[:7], self.fwd)
++        assert h[6] == (n if mode == MODE_SLICE and layer == first else 0) and not any(h[7:]), h
++        self.events.append(("moe", int(layer)))
++        self.next = None if layer + 1 == first + n else layer + 1
++
++    def recv(self, *a) -> None:
++        pass
++
++
++def slice_wire(layers: int = MOE, prefill: int = 64):
++    """``afd.AfdWire`` (its real begin, exchange, out-of-step refusal and slice bookkeeping) over ``CheckedLink``;
++    ``forward(kind, rows)`` runs an unsliced forward's exchanges (the fakes' chunk and batched windows)."""
++
++    from tensorfold.families.glm5_next.cuda.afd import MODE_CHUNK, MODE_EAGER, AfdWire
++
++    class SliceWire(AfdWire):
++        def __init__(self) -> None:          # no store, watchdog or link daemons: the forward's bookkeeping only
++            self.tr = CheckedLink(layers, prefill)
++            self.events = self.tr.events
++            self.dead, self.seq, self.layer, self.nlayers = None, 0, 0, layers
++            self.start = self.end = 0
++            self.span = None
++            self.rows = self.mode = 0
++            self.check = self.timing = False
++            self.checked, self._chk, self.ev = 0, None, None
++
++        def forward(self, kind: str, rows: int) -> None:
++            assert self.span is None and self.layer == 0 and rows == self.rows, (kind, rows, self.rows, self.span)
++            assert self.mode == {"chunk": MODE_CHUNK, "batched": MODE_EAGER}[kind]
++            for _ in range(self.nlayers):
++                self.exchange(None, rows)
++            self.events.append(("forward", kind, int(rows)))
++
++    return SliceWire()
++
++
++class SlicedWorld1(ta.World1):
++    """tests/test_glm_multi_afd.py's AFD attention node with ``slice_wire`` for its wire."""
++
++    def __init__(self, env, **kw) -> None:
++        super().__init__(env, **kw)
++        self.wire = slice_wire(prefill=self.g.e.prefill_rows)
++        self.g.e.w.afd = self.wire
++
++    def begins(self) -> list[tuple]:
++        return [e for e in self.wire.events if e[0] == "begin"]
++
++
++# -- scenarios ------------------------------------------------------------------------------------------------------
++def staggered(node, d, streams: int, cases=CASES):
++    """tests/test_glm_multi.py's six requests admitted as they come (the decoder ``d``, rank 0's); every reply checked
++    against its solo reference."""
++
++    admitted, pending = [], list(enumerate(cases))
++    for it in range(6000):
++        while pending and it >= STARTS[pending[0][0]] and d.live() < streams:
++            i, (prompt, count, kind, policy, draft) = pending.pop(0)
++            admitted.append((i, node.submit(prompt, count, _sampling(kind, 100 + i), policy=policy, draft=draft)))
++        if not d.lanes and not pending:
++            break
++        if d.lanes:
++            node.step()
++        elif getattr(node, "sent", None):
++            node.follow()
++    assert not pending and not d.lanes
++    for i, s in admitted:
++        prompt, count, kind, _, _ = cases[i]
++        assert s.got == solo(node.torch, prompt, count, _sampling(kind, 100 + i)), i
++    return [s.got for _, s in sorted(admitted, key=lambda x: x[0])]
++
++
++def burst(node, d, k: int = 4, long: bool = True):
++    """One stream decoding, then ``k`` short prompts at once (TF_GLM_MULTI_PREFILL groups them), then a long one."""
++
++    first = node.submit(_prompt(30, 41), 70, _sampling("topk", 9))
++    while not (first.sid in d.lanes and d.lanes[first.sid].decoding):
++        node.step()
++    reqs = [(_prompt(n, seed), 24, _sampling(kind, seed)) for n, seed, kind in tmp.BURST[:k]]
++    if long:
++        reqs.append((_prompt(150, 77), 20, None))
++    streams = [node.submit(p, c, s) for p, c, s in reqs]
++    node.run()
++    for s, (p, c, sp) in zip([first, *streams], [(_prompt(30, 41), 70, _sampling("topk", 9)), *reqs]):
++        assert s.got == solo(node.torch, p, c, sp)
++    return [s.got for s in (first, *streams)]
++
++
++def slice_ops(sent) -> dict[str, int]:
++    from tensorfold.families.glm5_next.cuda.multi import FILL, FILLPART, MFILL, MFILLPART, ROUND
++
++    ops = [op for m in sent for op, _ in tm._ops(m)]
++    return {"FILL": ops.count(FILL), "MFILL": ops.count(MFILL), "FILLPART": ops.count(FILLPART),
++            "MFILLPART": ops.count(MFILLPART), "ROUND": ops.count(ROUND)}
++
++
++class LoggedPair(tm.Pair):
++    """tests/test_glm_multi.py's two ranks, every message rank 0 sent kept."""
++
++    def __init__(self, torch, **kw) -> None:
++        super().__init__(torch, **kw)
++        self.log: list[list[int]] = []
++        share = self.g[0]._share
++        self.g[0]._share = lambda values: (self.log.append(list(values)), share(values))[1]
++
++
++def _between(begins) -> bool:
++    """A batched (eager) forward between two slices of one chunk on the wire."""
++
++    from tensorfold.families.glm5_next.cuda.afd import MODE_EAGER, MODE_SLICE
++
++    for x, y, z in zip(begins, begins[1:], begins[2:]):
++        if x[2] == MODE_SLICE and y[2] == MODE_EAGER and z[2] == MODE_SLICE and z[3][0] > x[3][0]:
++            return True
++    return False
++
++
++# -- world 1 over the checked wire -----------------------------------------------------------------------------------
++@pytest.mark.parametrize("streams", [2, 4])
++def test_world1_sliced_equals_unsliced(afd_fake, monkeypatch, streams):  # noqa: F811
++    """The staggered requests at world 1: unsliced, then sliced (budget 2.5 ms of 1-ms layers): the same replies (each
++    its solo one) and kept states; slices of the chunks started while others decode, each a MODE_SLICE forward whose
++    header and exchanges the checked wire accepted, a batched round between two slices of one chunk."""
++
++    from tensorfold.families.glm5_next.cuda.afd import MODE_CHUNK, MODE_SLICE
++
++    runs = {}
++    for budget in (None, "2.5"):
++        layered(monkeypatch, budget)
++        n1 = SlicedWorld1(afd_fake, streams=streams)
++        runs[budget] = (staggered(n1, n1.d, streams), tmp.kept_view(n1.d), n1)
++    (g0, k0, n0), (g1, k1, n1) = runs[None], runs["2.5"]
++    assert g0 == g1 and k0 == k1
++    assert n0.d.sliced == {"chunks": 0, "slices": 0, "rounds": 0} and "sliced_fill" not in n0.d.health()
++    assert all(m != MODE_SLICE for _, _, m, _ in n0.begins())
++    sl = n1.d.sliced
++    assert sl["chunks"] > 0 and sl["slices"] > sl["chunks"] and sl["rounds"] > 0, sl
++    assert n1.d.health()["sliced_fill"] == sl
++    slices = [b for b in n1.begins() if b[2] == MODE_SLICE]
++    assert slices and all(1 <= n and a + n <= MOE for _, _, _, (a, n) in slices)
++    assert any(b[2] == MODE_CHUNK for b in n1.begins())            # alone or the costs' whole chunks
++    assert _between(n1.begins())
++    assert n1.wire.tr.next is None and n1.d.partial is None and n1.shared == []
++
++
++def test_world1_grouped_burst_and_fp8_rings(afd_fake, rings, monkeypatch):  # noqa: F811
++    """TF_GLM_MULTI_PREFILL=1 (grouped chunks) with TF_GLM_KV=fp8's rings: a burst while one stream decodes,
++    sliced == unsliced, and a grouped chunk went in slices."""
++
++    from tensorfold.families.glm5_next.cuda.multi import MultiDecoder
++
++    tk._ringed(afd_fake.torch)
++    tmp._mode(monkeypatch, True)
++    sliced_groups, real = [], MultiDecoder._fill_many
++    monkeypatch.setattr(MultiDecoder, "_fill_many", lambda self, group, **kw: (
++        sliced_groups.append(kw.get("layers")), real(self, group, **kw))[1])
++    runs = {}
++    for budget in (None, "2.5"):
++        layered(monkeypatch, budget)
++        n1 = SlicedWorld1(afd_fake, streams=4, prefill_rows=256)        # the fake's rings hold 4 slots
++        runs[budget] = (burst(n1, n1.d, 3, long=False), tmp.kept_view(n1.d), n1)
++    (g0, k0, _), (g1, k1, n1) = runs[None], runs["2.5"]
++    assert g0 == g1 and k0 == k1
++    assert n1.d.grouped["chunks"] > 0 and n1.d.sliced["chunks"] > 0 and _between(n1.begins())
++    assert any(layers is not None and layers[0] > 0 for layers in sliced_groups)    # a grouped chunk resumed
++
++
++def test_a_request_alone_fills_whole_forwards(afd_fake, monkeypatch):  # noqa: F811
++    from tensorfold.families.glm5_next.cuda.afd import MODE_SLICE
++
++    layered(monkeypatch, "2.5")
++    n1 = SlicedWorld1(afd_fake, streams=2)
++    s = n1.submit(_prompt(210, 4), 30, _sampling("minp", 3))
++    n1.run()
++    assert s.got == solo(afd_fake.torch, _prompt(210, 4), 30, _sampling("minp", 3))
++    assert n1.d.sliced["chunks"] == 0 and all(b[2] != MODE_SLICE for b in n1.begins())
++
++
++def _mid_fill(n1, d):
++    """Admit a decoding stream, then a long prompt; step until its first chunk is suspended after a slice that wrote
++    its rows (layer > 0). Returns (decoding stream, filling stream, its lane, the pool's free rows before it came)."""
++
++    a = n1.submit(_prompt(20, 5), 60, None)
++    while not (a.sid in d.lanes and d.lanes[a.sid].decoding):
++        n1.step()
++    free = d.pool.free_rows()
++    b = n1.submit(_prompt(200, 6), 12, _sampling("nucleus", 4))
++    for _ in range(200):
++        n1.step()
++        if d.partial is not None and d.partial.layer > 0:
++            return a, b, d.lanes[b.sid], free
++    raise AssertionError("no suspended chunk")
++
++
++@pytest.mark.parametrize("mutant", [False, True], ids=["used-counts-the-chunk", "mutant-used-without-it"])
++def test_a_move_between_slices_carries_the_chunks_rows(afd_fake, monkeypatch, mutant):  # noqa: F811
++    """A MOVE of the suspended chunk's extent between two slices copies the rows its earlier layers wrote
++    (``_used`` counts the chunk's rows up to its stop): the replies are still the solo ones. The mutant (``_used``
++    without the chunk) loses them, and the filling stream's reply changes."""
++
++    from tensorfold.families.glm5_next.cuda.multi import MOVE, MultiDecoder
++
++    layered(monkeypatch, "2.5")
++    if mutant:
++        def used(self, x):
++            n = max([len(k.ids) for k in x.kept], default=0)
++            return max(n, self.lanes[x.owner].st.pos) if x.owner is not None else n
++
++        monkeypatch.setattr(MultiDecoder, "_used", used)
++    n1 = SlicedWorld1(afd_fake, streams=2)
++    d = n1.d
++    a, b, lane, _ = _mid_fill(n1, d)
++    x = lane.extent
++    assert d._used(x) == (lane.st.pos if mutant else d.partial.group[0][1]) and lane.st.pos < d.partial.group[0][1]
++    top = max(e.base + e.size for e in d.pool.extents)
++    assert top + x.size <= d.pool.rows
++    d._emit(MOVE, [x.eid, top, x.size])
++    d._move(x, top, x.size)
++    assert x.base == top and lane.st.base == top
++    n1.run()
++    assert a.got == solo(afd_fake.torch, _prompt(20, 5), 60, None)
++    want = solo(afd_fake.torch, _prompt(200, 6), 12, _sampling("nucleus", 4))
++    assert (b.got != want) if mutant else (b.got == want)
++
++
++def test_cancellation_mid_fill_frees_the_extent(afd_fake, monkeypatch):  # noqa: F811
++    """The filling request's client leaves between two slices (the server's poll, ``emit.cancelled``): the chunk is
++    dropped (its generator closed, the wire's forward complete), the stream leaves and its extent is freed; the
++    decoding stream's reply is its solo one."""
++
++    layered(monkeypatch, "2.5")
++    n1 = SlicedWorld1(afd_fake, streams=2)
++    d = n1.d
++    a, b, lane, free = _mid_fill(n1, d)
++    pending, x = d.partial, lane.extent
++    left = [False]
++    b.emit.cancelled = lambda: left[0]
++    n1.step()                                            # not cancelled yet: a round or the next slice
++    left[0] = True
++    done = n1.step()
++    assert done == [b] and b.done and b.sid not in d.lanes and d.partial is None and pending.steps is None
++    assert all(e is not x for e in d.pool.extents) and n1.wire.tr.next is None and d.pool.free_rows() == free
++    n1.run()
++    assert a.got == solo(afd_fake.torch, _prompt(20, 5), 60, None)
++
++
++def test_startup_layer_timings_are_whole_chunk_forwards(afd_fake, monkeypatch):  # noqa: F811
++    """``_time_prompt_layers`` (the real one, its CUDA events faked): each layer's ms at every row count up to
++    TF_GLM_FILL_ROWS, each timed chunk one whole MODE_CHUNK forward of the wire (the experts' exchange included);
++    the home state reset after."""
++
++    from tensorfold.families.glm5_next.cuda import verify
++    from tensorfold.families.glm5_next.cuda.afd import MODE_CHUNK
++
++    timing = layered(monkeypatch, "2.5")
++    monkeypatch.setattr(verify, "timing_tokens", lambda vocab, n: [i % vocab for i in range(n)])   # the fake's 48
++    n1 = SlicedWorld1(afd_fake, streams=2, prefill_rows=256)
++    costs = timing(n1.d)
++    assert sorted(costs.samples) == [64, 256] and costs.samples[64] == (LAYER_MS,) * len(KINDS)
++    assert {(r, m, s) for _, r, m, s in n1.begins()} == {(64, MODE_CHUNK, None), (256, MODE_CHUNK, None)}
++    assert len(n1.begins()) == 1 + 2 * 2 and n1.wire.tr.next is None      # warm-up, then per size warm + timed
++    e = n1.g.e
++    assert e.st is e.home and e.home.pos == 0 and e.last_hidden is None
++
++
++# -- two ranks: the slice messages ------------------------------------------------------------------------------
++@pytest.mark.parametrize("drafters,drafts", [("dflash2", None), ("both", "1"), ("mtp", None)])
++def test_two_ranks_sliced_equals_unsliced(fake, monkeypatch, drafters, drafts):  # noqa: F811
++    """At two ranks (rank 1 applying rank 0's FILLPART and ROUND messages, both ranks equal after every message): the
++    staggered requests sliced == unsliced, each reply its solo one; between two slices a ROUND whose short flag is
++    TF_GLM_FILL_DRAFTS's opposite; unsliced, no slice op and ROUND payloads as before."""
++
++    from tensorfold.families.glm5_next.cuda.multi import FILLPART, ROUND
++
++    runs = {}
++    for budget in (None, "2.5"):
++        layered(monkeypatch, budget, drafts=drafts)
++        p = LoggedPair(fake, streams=4, drafter=drafters != "mtp", mtp=drafters != "dflash2")
++        runs[budget] = (staggered(p, p.d[0], 4), tmp.kept_view(p.d[0]), p)
++    (g0, k0, p0), (g1, k1, p1) = runs[None], runs["2.5"]
++    assert g0 == g1 and k0 == k1 == tmp.kept_view(p1.d[1])
++    off, on = slice_ops(p0.log), slice_ops(p1.log)
++    assert off["FILLPART"] == off["MFILLPART"] == 0 and on["FILLPART"] > 0, (off, on)
++    rounds = [p for m in p0.log for op, p in tm._ops(m) if op == ROUND]
++    assert rounds and all(len(p) == 2 + 2 * p[0] for p in rounds)            # no short flag with the switch off
++    ops = [(op, p) for m in p1.log for op, p in tm._ops(m)]
++    after = [q for (o, _), (r, q) in pairwise(ops) if o == FILLPART and r == ROUND]
++    assert after and all(q[-1] == (0 if drafts == "1" else 1) for q in after)
++    assert p1.d[1].partial is None and p1.d[1].idle
++
++
++def test_two_ranks_grouped_slices(fake, monkeypatch):  # noqa: F811
++    """TF_GLM_MULTI_PREFILL=1 at two ranks: the burst's grouped chunk goes in MFILLPART slices; replies and kept
++    states as unsliced, both ranks equal after every message."""
++
++    tmp._mode(monkeypatch, True)
++    runs = {}
++    for budget in (None, "2.5"):
++        layered(monkeypatch, budget)
++        p = LoggedPair(fake, streams=6, prefill_rows=256)
++        runs[budget] = (burst(p, p.d[0]), tmp.kept_view(p.d[0]), p)
++    (g0, k0, _), (g1, k1, p1) = runs[None], runs["2.5"]
++    assert g0 == g1 and k0 == k1
++    assert slice_ops(p1.log)["MFILLPART"] > 0 and p1.d[0].grouped["chunks"] > 0
++
++
++def test_parse_refuses_slice_payloads_out_of_shape():
++    from tensorfold.families.glm5_next.cuda.multi import FILL, FILLPART, MFILLPART, MultiDecoder
++
++    parse = MultiDecoder.parse
++    assert parse([FILLPART, 4, 3, 64, 0, 2]) == [(FILLPART, [3, 64, 0, 2])]
++    assert parse([MFILLPART, 7, 2, 2, 6, 1, 9, 3, 12]) == [(MFILLPART, [2, 2, 6, 1, 9, 3, 12])]
++    for bad in ([FILLPART, 3, 3, 64, 0], [FILLPART, 4, 3, 64, 2, 2], [MFILLPART, 5, 1, 0, 2, 1, 9, 3],
++                [MFILLPART, 5, 0, 0, 2, 1, 9], [MFILLPART, 5, 1, 3, 2, 1, 9], [99, 0], [FILL], [FILL, 5, 1]):
++        with pytest.raises(RuntimeError):
++            parse(bad)
++
++
++def test_the_settings_and_the_afd_check():
++    from tensorfold.families.glm5_next.cuda import sliced_fill
++    from tensorfold.families.glm5_next.cuda.engine import afd_parallel_check
++
++    assert sliced_fill.budget_ms("") == 0.0 and sliced_fill.budget_ms("200") == 200.0
++    assert sliced_fill.drafted_rounds("") is False and sliced_fill.drafted_rounds("1") is True
++    for bad in ("-1", "nan", "inf", "x"):
++        with pytest.raises(ValueError, match="TF_GLM_FILL_BUDGET_MS"):
++            sliced_fill.budget_ms(bad)
++    with pytest.raises(ValueError, match="TF_GLM_FILL_DRAFTS"):
++        sliced_fill.drafted_rounds("2")
++    afd_parallel_check({"TF_GLM_FILL_BUDGET_MS": "200", "TF_GLM_FILL_DRAFTS": "1"})
++    with pytest.raises(ValueError, match="TF_GLM_FILL_BUDGET_MS"):
++        afd_parallel_check({"TF_GLM_FILL_BUDGET_MS": "fast"})
++    with pytest.raises(ValueError, match="TF_GLM_FILL_DRAFTS"):
++        afd_parallel_check({"TF_GLM_FILL_DRAFTS": "yes"})

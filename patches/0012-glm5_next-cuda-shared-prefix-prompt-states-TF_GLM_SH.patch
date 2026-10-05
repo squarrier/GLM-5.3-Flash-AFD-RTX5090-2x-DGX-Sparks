@@ -1,0 +1,1119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 19:31:32 -0400
+Subject: [PATCH] glm5_next/cuda: shared-prefix prompt states,
+ TF_GLM_SHARED_PREFIX (MiaAI-Lab recipe patches 0015, 0063)
+
+MiaAI-Lab's recipe (github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold @ 1576746, with
+TF_GLM_SHARED_PREFIX=1 in its config) keeps, besides a prompt's own state before its last token, up to two
+shared-prefix states: where the prompt stops sharing a kept prompt, and at the end of its system block (its first
+<|user|>), each at least 256 tokens past the resume point. A later request that shares only that prefix (a new user
+turn on the same system prompt, as llama-benchy's prefix-caching mode sends, or a new agent session) then resumes the
+whole system block instead of prefilling it again. This ports recipe patch 0015-glm-shared-prefix, its multi-stream
+parts from 0030-glm-multi-stream-engine, and 0063-glm-kept-cap-superseded-first (Apache License 2.0, Copyright 2026
+MiaAI-Lab):
+
+- engine.py: shared_prefix, common_prefix, shared_points and user_opener are the recipe's functions. GlmEngine._shared
+  (rank 0 picks the points; two slots of the request header carry them to rank 1), _kept_drafter, and 0015's hunks of
+  _run_once (each point prefilled to as a prompt of its own and kept, then resumed from; what a request resumed from
+  becomes the newest), _take_over, generate and follow are applied by hand: TensorFold's engine keeps a prompt's own
+  state inside a prompt chunk (prefill's keep_at), and that stays as it is.
+- decode.py: _drafter_views, _saved_views, save_rows, row_bytes and load_rows are the recipe's, so saved rows keep
+  DFlash2's window and a saved state still fits a DFlash2 request. prefill(sample=False) commits a prefix without
+  sampling a first token (it still runs the head on its last row).
+- multi.py (PR #243's engine): SHARED_SLOTS; rank 0's points ride in the ADMIT, inside its sealed message;
+  Lane.shared, and lane.stops = shared + [point] in _admitted, so #243's own _fill and _keep keep those states on
+  both ranks; kept states are marked shared. cap_victim (0063) past TF_GLM_CACHE_ENTRIES: a conversation's
+  superseded states go first, non-shared before shared, then the least recently used.
+
+Differences from the recipe: there is no prompt grid here (the recipe's 0008 rounds the points down to 64 rows for
+its chunked KDA kernels), so the points are exact; GlmEngine.grid = 0 is the hook a grid would set. The setting is
+off unless TF_GLM_SHARED_PREFIX is set (the recipe's config turns it on); unset, the kept states, replies and cached
+counts are the ones before. cap_victim is unconditional, as in the recipe; the single-stream engine keeps its
+oldest-first cap, as the recipe does. The rank messages carry the two slots either way (zeros when off).
+
+On llama-benchy's shape ([system: C, user: "."], then [system: C, user: P]) the second request now reports
+cached = the tokens before its first <|user|> ([gMASK]<sop><|system|> and C), with the reply it gets served alone.
+Under --parallel each kept state's KDA state and DFlash2 window come out of TF_GLM_CACHE_GIB, so raising
+TF_GLM_CACHE_ENTRIES (the recipe keeps 32) wants a larger TF_GLM_CACHE_GIB too.
+
+Tests: tests/test_glm_shared_prefix.py (CPU: the setting, shared_points, user_opener, cap_victim's order, saved
+DFlash2 windows; the single-stream engine on both ranks; the multi-stream engine at two ranks, at world 1 over the
+fake AFD wire, and with TF_GLM_KV=fp8's rings; replies against the requests served alone; the setting off).
+
+Credit: THIRD_PARTY_NOTICES.md and the ported functions' comments name MiaAI-Lab and the patches.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patches 0015, 0063,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 1576746a04983b6eded0551dbf22512ee9e95654 (v1.5); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |  17 +
+ .../families/glm5_next/cuda/decode.py         |  52 +-
+ .../families/glm5_next/cuda/engine.py         | 184 ++++++-
+ .../families/glm5_next/cuda/multi.py          |  50 +-
+ tests/test_glm_shared_prefix.py               | 506 ++++++++++++++++++
+ 5 files changed, 776 insertions(+), 33 deletions(-)
+ create mode 100644 tests/test_glm_shared_prefix.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index 5bdd03e..289b35e 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -155,3 +155,20 @@ functions verbatim. Changes in the port: the indexer's per-slot key and gate rin
+ bytes are the ones before; TensorFold's own launch settings (`select_tokens`, one pipeline stage) are kept; a kept
+ prompt taken inside a prompt chunk (`decode.prefill`'s `keep_at`) and a stream moved to another slot
+ (`multi._reslot`) keep their ring rows.
++
++## GLM shared-prefix prompt states (TF_GLM_SHARED_PREFIX)
++
++`families/glm5_next/cuda/engine.py`'s `shared_prefix`, `common_prefix`, `shared_points` and `user_opener`,
++`decode.py`'s `_drafter_views`, `_saved_views`, `save_rows`, `row_bytes` and `load_rows`, `multi.py`'s `cap_victim`,
++and the `TF_GLM_SHARED_PREFIX` paths of `engine.py` (`GlmEngine._run_once`, `_take_over`, `_kept_drafter`, `_shared`,
++`generate`, `follow`) and `multi.py` (`admit`, `_parse_admit`, `_admitted`, `_keep`) are ported from MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/1576746)
++patches 0015-glm-shared-prefix and 0063-glm-kept-cap-superseded-first (and the shared-prefix parts of
++0030-glm-multi-stream-engine), Apache License 2.0, Copyright 2026 MiaAI-Lab (see
++[the license text](LICENSES/Apache-2.0.txt)). The named functions are the recipe's, docstrings aside. Changes in the
++port: TensorFold has no prompt grid here (the recipe's 0008), so the points are exact (`GlmEngine.grid` is 0); the
++single-stream engine still keeps a prompt's own state inside a prompt chunk (`decode.prefill`'s `keep_at`), and each
++shared-prefix state is a prefill of its own (`sample=False`, which still runs the head on its last row);
++`known_ids` makes the kept prompts' id arrays once for both engines; `TF_GLM_SHARED_PREFIX` is off unless set (the
++recipe's `config.sh` turns it on), and with it unset the kept states, replies and cached counts are the ones before,
++while `cap_victim` (unconditional, as in the recipe) only changes which kept prompt goes past `TF_GLM_CACHE_ENTRIES`.
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index 5b5167d..97d5801 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -399,18 +399,39 @@ def _row_views(st, n: int, m: int) -> list[torch.Tensor]:
+     return views
+ 
+ 
+-def save_rows(e: Engine, snap: Snapshot) -> None:
+-    """Copy a snapshot's attention rows out of the live caches before another conversation overwrites them; DFlash2 caches are not kept."""
+-    views = _row_views(e.st, len(snap.ids), max(snap.mtp_len, 0))
++# MiaAI-Lab recipe patch 0015: saved rows keep DFlash2's window (_drafter_views, _saved_views, save_rows, row_bytes,
++# load_rows are the recipe's functions)
++def _drafter_views(drafter, n: int) -> list[torch.Tensor]:
++    """DFlash2's context rows a snapshot of n tokens depends on: its sliding window's keys and values before n (every
++    later query sits at n or past it, and masks older rows), per draft layer."""
++    lo = max(0, n - drafter.window - 1)
++    return [c[:, lo:n] for c in drafter.kc] + [c[:, lo:n] for c in drafter.vc]
++
++
++def _saved_views(e: Engine, snap: Snapshot, drafter=None) -> list[torch.Tensor]:
++    """The rows ``save_rows`` copies: the attention rows, and with ``drafter`` (whose context the snapshot ends at)
++    DFlash2's window rows."""
++    n = len(snap.ids)
++    views = _row_views(e.st, n, max(snap.mtp_len, 0))
++    if drafter is not None and snap.drafter_end == n:
++        views += _drafter_views(drafter, n)
++    return views
++
++
++def save_rows(e: Engine, snap: Snapshot, drafter=None) -> None:
++    """Copy a snapshot's attention rows out of the live caches before another conversation overwrites them; DFlash2's
++    context goes with them only given ``drafter`` (TF_GLM_SHARED_PREFIX), otherwise the snapshot no longer fits it."""
++    views = _saved_views(e, snap, drafter)
+     snap.rows = [v.clone() for v in views]
+     snap.nbytes = sum(r.numel() * r.element_size() for r in snap.rows)
+-    snap.drafter_end = -1
+-    snap.drafter_rows = None
++    if drafter is None or snap.drafter_end != len(snap.ids):
++        snap.drafter_end = -1
++        snap.drafter_rows = None
+ 
+ 
+-def row_bytes(e: Engine, snap: Snapshot) -> int:
++def row_bytes(e: Engine, snap: Snapshot, drafter=None) -> int:
+     """What ``save_rows`` would copy for this snapshot."""
+-    return sum(v.numel() * v.element_size() for v in _row_views(e.st, len(snap.ids), max(snap.mtp_len, 0)))
++    return sum(v.numel() * v.element_size() for v in _saved_views(e, snap, drafter))
+ 
+ 
+ def snapshot_bytes(snap: Snapshot) -> int:
+@@ -421,9 +442,12 @@ def snapshot_bytes(snap: Snapshot) -> int:
+     return sum(t.numel() * t.element_size() for t in held) + (snap.nbytes if snap.rows is not None else 0)
+ 
+ 
+-def load_rows(e: Engine, snap: Snapshot) -> None:
+-    """Put a saved snapshot's attention rows back into the live caches."""
+-    for dst, src in zip(_row_views(e.st, len(snap.ids), max(snap.mtp_len, 0)), snap.rows):
++def load_rows(e: Engine, snap: Snapshot, drafter=None) -> None:
++    """Put a saved snapshot's attention rows (and DFlash2's, when it saved them: the same ``drafter``) back."""
++    views = _saved_views(e, snap, drafter)
++    if len(views) != len(snap.rows):
++        raise ValueError("a saved snapshot's rows do not match the caches they go back to")
++    for dst, src in zip(views, snap.rows):
+         dst.copy_(src)
+ 
+ 
+@@ -448,8 +472,10 @@ def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
+ # -- prefill ----------------------------------------------------------------------------------------------------
+ @torch.no_grad()
+ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True, drafter=None,
+-            resume: Snapshot | None = None, keep_at: int | None = None, keep=None) -> int:
+-    """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state."""
++            resume: Snapshot | None = None, keep_at: int | None = None, keep=None, sample: bool = True) -> int | None:
++    """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state;
++    ``sample=False`` (MiaAI-Lab recipe patch 0015's shared-prefix points): commit only, no first token (None), leaving
++    the state a prompt of this length leaves before its sample."""
+ 
+     if not prompt:
+         raise ValueError("prefill requires at least one token")
+@@ -516,6 +542,8 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+         keep(kept)
+     prof.active = False
+     prof.report(len(prompt) - begin)
++    if not sample:
++        return None
+     if e.constraint is not None:                         # the first token's row, under the reply's grammar
+         e.window = e.constraint.window([0], [-1])
+     first = e.sample(last, [len(prompt)], sampling)[0]
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 0a9baf6..676d397 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -154,6 +154,100 @@ def kept_most(entries: int, spare: int, state: int) -> int:
+     return max(1, min(int(entries), int(spare) // max(1, int(state))))
+ 
+ 
++# MiaAI-Lab recipe patch 0015 (TF_GLM_SHARED_PREFIX): shared-prefix prompt states
++SHARED_DEFAULT = 256                  # TF_GLM_SHARED_PREFIX=1: the fewest tokens a shared-prefix state adds
++SHARED_MIN = 16
++SHARED_MOST = 2                       # shared-prefix states a request keeps at most (the header's two slots)
++
++
++def shared_prefix(value: str | None = None) -> int:
++    """TF_GLM_SHARED_PREFIX: 0 (off, the default), or the fewest tokens past a request's resume point a shared-prefix
++    state must add (1 or on: 256; else 16 or more).
++
++    On, a drafted request also keeps its state where its prompt stops sharing a kept one and at the end of its system
++    block (its first user message), so a later prompt sharing only that prefix resumes from it; saved states keep
++    DFlash2's context window too. (MiaAI-Lab recipe patch 0015; the points are exact here, ``GlmEngine.grid``.)"""
++
++    value = os.environ.get("TF_GLM_SHARED_PREFIX", "") if value is None else value
++    value = value.strip().lower()
++    if value in ("", "0", "off"):
++        return 0
++    if value in ("1", "on"):
++        return SHARED_DEFAULT
++    if not value.isdecimal() or int(value) < SHARED_MIN:
++        raise ValueError(f"TF_GLM_SHARED_PREFIX: 0 (off), 1 (on: {SHARED_DEFAULT} tokens) or the fewest tokens a "
++                         f"shared-prefix state adds past a request's resume point, {SHARED_MIN} or more; not {value!r}")
++    return int(value)
++
++
++def common_prefix(a, b) -> int:
++    """How many leading tokens two id sequences (lists or int64 arrays) share. (MiaAI-Lab recipe patch 0015)"""
++
++    import numpy as np
++
++    n = min(len(a), len(b))
++    if n == 0:
++        return 0
++    x = np.asarray(a[:n], dtype=np.int64)
++    y = np.asarray(b[:n], dtype=np.int64)
++    diff = np.flatnonzero(x != y)
++    return int(diff[0]) if len(diff) else n
++
++
++def shared_points(prompt: list[int], cut: int, point: int | None, grid: int, least: int, known,
++                  opener: int | None = None) -> list[int]:
++    """Where a request resumed at ``cut``, keeping its own state at ``point``, also keeps shared-prefix states: at the
++    longest prefix it shares with any of ``known`` (id sequences: the kept prompts; not the live reply, which a
++    conversation's next prompt extends anyway) and at its first ``opener`` token (the end of the system block), each
++    rounded down to ``grid`` (0: exact), kept when it adds at least ``least`` tokens past ``cut`` (and past the other
++    point) and lies short of ``point``. Sorted, at most SHARED_MOST. (MiaAI-Lab recipe patch 0015)"""
++
++    if not least or point is None:
++        return []
++    import numpy as np
++
++    arr = np.asarray(prompt, dtype=np.int64)
++    # only a sequence longer than cut + least can share enough (known may hold int64 arrays of the ids)
++    wanted = [max((common_prefix(arr, ids) for ids in known if len(ids) >= cut + least), default=0)]
++    if opener is not None:
++        at = np.flatnonzero(arr == opener)
++        if len(at):
++            wanted.append(int(at[0]))
++    out: list[int] = []
++    for p in sorted(p // grid * grid if grid else p for p in wanted):
++        if p - (out[-1] if out else cut) >= least and p < point:
++            out.append(p)
++    return out[-SHARED_MOST:]
++
++
++def known_ids(kept) -> list:
++    """The kept prompts' ids as int64 arrays for ``shared_points``, each made once (a kept prompt's ids never
++    change). (MiaAI-Lab recipe patch 0015's ``ids_array``)"""
++
++    import numpy as np
++
++    out = []
++    for c in kept:
++        if getattr(c, "ids_array", None) is None:
++            c.ids_array = np.asarray(c.ids, dtype=np.int64)
++        out.append(c.ids_array)
++    return out
++
++
++def user_opener(model_dir: Path) -> int | None:
++    """The id of GLM's ``<|user|>`` role token (the first one ends the system block), or None without a tokenizer.
++    (MiaAI-Lab recipe patch 0015)"""
++
++    path = Path(model_dir) / "tokenizer.json"
++    if not path.is_file():
++        return None
++    try:
++        added = json.loads(path.read_text()).get("added_tokens", [])
++    except (OSError, ValueError):
++        return None
++    return next((int(t["id"]) for t in added if t.get("content") == "<|user|>"), None)
++
++
+ class GlmEngine:
+     """GLM-5.3-Flash on two ranks (this one ``rank``): weights, MTP and DFlash2 drafting, per-request policies."""
+ 
+@@ -162,6 +256,9 @@ class GlmEngine:
+     multi = None                # --parallel > 1: the ``multi.MultiDecoder`` (both ranks)
+     scheduler = None            # ... and rank 0's ``multi.GlmScheduler``
+     kept_cap = None             # --parallel at world 1 (AFD): kept prompts within what the window leaves (kept_most)
++    shared = 0                  # TF_GLM_SHARED_PREFIX (``shared_prefix``): 0 off, else the fewest tokens it adds
++    opener = None               # rank 0, shared on: ``<|user|>``'s id, whose first appearance ends the system block
++    grid = 0                    # the prompt grid shared-prefix points round down to: 0, exact (serial KDA prompts)
+ 
+     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
+                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
+@@ -271,8 +368,12 @@ class GlmEngine:
+             from .multi_tune import MultiSettings
+ 
+             multi_code = [1 + ("batched", "serial").index(verify_kind())] + MultiSettings.from_env().code()
++        # TF_GLM_SHARED_PREFIX (MiaAI-Lab recipe patch 0015): rank 0 picks the shared-prefix points (the request header
++        # or the ADMIT carries them), but both ranks keep, save and evict alike, so both must agree
++        self.shared = shared_prefix()
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
+-                prefill_rows, int(self.mtp_on), int(DRAFT_RING), parallel, *multi_code, KV_KINDS.index(kv)]
++                prefill_rows, int(self.mtp_on), int(DRAFT_RING), parallel, *multi_code, self.shared,
++                KV_KINDS.index(kv)]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -281,7 +382,8 @@ class GlmEngine:
+         if len(both) > 1 and both[0][:-1] != both[1][:-1]:
+             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
+                                "TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING, --parallel, TF_GLM_MULTI_VERIFY, "
+-                               "TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, TF_GLM_KV): "
++                               "TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, TF_GLM_KV, "
++                               "TF_GLM_SHARED_PREFIX): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+                                "(or pass --drafter none to both) and give both the same flags")
+         self.cache_bytes = (min(both[0][-1], both[1][-1]) if len(both) > 1 else both[0][-1]) << 20
+@@ -351,6 +453,13 @@ class GlmEngine:
+             print("[tensorfold] TF_GLM_KV=fp8: the DSA latent cache and the indexer's pooled keys as e4m3 rows with a "
+                   "power-of-two scale each (lossy; drafted replies still equal serial ones); "
+                   f"caches {c.arena.nbytes() / 2 ** 30:.2f} GiB over {c.rows} tokens, {rings}", flush=True)
++        # rank 0: the role token whose first appearance ends a prompt's system block (a shared-prefix point, 0015)
++        self.opener = user_opener(model_dir) if self.shared and rank == 0 else None
++        if rank == 0 and self.shared:
++            print(f"[tensorfold] shared-prefix prompt states: kept where a prompt stops sharing another and at the end "
++                  f"of its system block, when they add {self.shared}+ tokens (TF_GLM_SHARED_PREFIX; MiaAI-Lab recipe "
++                  f"patch 0015)" + ("" if self.opener is not None else "; no <|user|> token in tokenizer.json, so "
++                                    "only the first kind"), flush=True)
+         if self.drafter is not None:
+             self.drafter.capture()
+         self.costs = self._calibrate()
+@@ -572,6 +681,9 @@ class GlmEngine:
+         """Save the rows of every kept snapshot the next prefill overwrites, dropping the oldest entries past the memory budget; both ranks decide alike."""
+         from .decode import row_bytes, save_rows
+ 
++        # TF_GLM_SHARED_PREFIX (MiaAI-Lab recipe patch 0015): saved rows keep DFlash2's window
++        drafter = self._kept_drafter()
++        kw = {"drafter": drafter} if drafter is not None else {}
+         live = self.live
+         dropped = False
+ 
+@@ -585,7 +697,7 @@ class GlmEngine:
+             if live[:n] != snap.ids:                  # its rows are already gone: nothing to resume from
+                 self._drop(snap)
+                 continue
+-            need = row_bytes(self.e, snap)
++            need = row_bytes(self.e, snap, **kw)
+             while self._held_bytes() + need > self.cache_bytes:
+                 old = next((c for c in self.cache if c is not snap and not resumes(c)), None)
+                 if old is None:
+@@ -596,27 +708,46 @@ class GlmEngine:
+                 self._drop(snap)
+                 dropped = True
+                 continue
+-            save_rows(self.e, snap)
++            save_rows(self.e, snap, **kw)
+         if dropped:
+             import torch
+ 
+             torch.cuda.empty_cache()             # give the freed rows back rather than keep them in torch's pool
+ 
++    def _kept_drafter(self):
++        """The drafter whose context window saved snapshots keep (TF_GLM_SHARED_PREFIX), or None: they drop it.
++        (MiaAI-Lab recipe patch 0015)"""
++
++        return getattr(self, "drafter", None) if self.shared else None
++
++    def _shared(self, prompt: list[int], hit) -> list[int]:
++        """Rank 0: the shared-prefix points a drafted request keeps (``shared_points``), sent to rank 1 in the header.
++        (MiaAI-Lab recipe patch 0015)"""
++
++        if not self.shared:
++            return []
++        cut = len(hit.ids) if hit is not None else 0
++        return shared_points(prompt, cut, max(1, len(prompt) - 1), self.grid, self.shared, known_ids(self.cache),
++                             self.opener)
++
+     def _held_bytes(self) -> int:
+         from .decode import snapshot_bytes
+ 
+         return sum(snapshot_bytes(c) for c in self.cache)
+ 
+     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable[[list[int]], Any],
+-             code: list[int], hit, draft: bool, constraint=None) -> dict[str, Any]:
++             code: list[int], hit, draft: bool, constraint=None, shared=()) -> dict[str, Any]:
++        """``shared``: rank 0's shared-prefix points (``_shared``), which both ranks keep states at."""
++
+         self.e.constraint, self.e.window = constraint, None       # both ranks walk and mask the same rows
+         try:
+-            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft)
++            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, shared)
+         finally:
+             self.e.constraint = self.e.window = self.e.vote = None
+ 
+     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
+-                  on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool) -> dict[str, Any]:
++                  on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool,
++                  shared=()) -> dict[str, Any]:
+         from .decode import DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode
+         from .drafter_choice import DrafterChoice, auto_decode
+         from .stop import StopVote
+@@ -630,13 +761,33 @@ class GlmEngine:
+         cut = len(hit.ids) if hit is not None else 0
+         self._take_over(list(hit.ids) if hit is not None else [])
+         if hit is not None and hit.rows is not None:
+-            load_rows(self.e, hit)
++            kept_drafter = self._kept_drafter()
++            load_rows(self.e, hit, **({"drafter": kept_drafter} if kept_drafter is not None else {}))
+             hit.rows, hit.nbytes = None, 0            # live again
+         self.live = list(prompt)
+-        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit,
+-                        keep_at=max(1, len(prompt) - 1) if draft else None, keep=self._remember)
++        point = max(1, len(prompt) - 1) if draft else None
++        # TF_GLM_SHARED_PREFIX (MiaAI-Lab recipe patch 0015): rank 0's shared-prefix points (past the resume point, short
++        # of ``point``) are kept the same way, each prefilled to as a prompt of its length and resumed from, so fresh
++        # and resumed prompts pass through the same states there too
++        stops = sorted(p for p in set(shared) if point is not None and cut < p < point)
++        kept: list = []
++        resume = hit
++        for stop in stops:
++            prefill(self.e, prompt[:stop], sampling, mtp=use_mtp, drafter=drafter, resume=resume, keep_at=stop,
++                    keep=kept.append, sample=False)
++            resume = kept[-1]
++        sharing = bool(self.shared and draft)
++        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=resume,
++                        keep_at=point, keep=kept.append if sharing else self._remember)
+         prefill_s = time.perf_counter() - t0
++        if sharing:
++            if hit is not None:                       # what it resumed from is used again
++                self.cache = [c for c in self.cache if c is not hit] + [hit]
++            for snap in kept:
++                self._remember(snap)
+         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
++        if stops:
++            stats["shared"] = list(stops)
+         on_tokens = StopVote(on_tokens)             # rank 0's stop reaches every rank on the next verify sample
+         on_tokens([first])
+         if max_tokens <= 1 or (stop_eos and first in self.eos):
+@@ -697,12 +848,13 @@ class GlmEngine:
+             stats.update(policy=spec, drafts=draft)
+             return stats
+         hit = self._resume(list(prompt), code) if draft else None
++        shared = self._shared(list(prompt), hit) if draft else []
+         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
+         header = [max_tokens, int(stop_eos), int(draft), len(hit.ids) if hit is not None else 0,
+                   seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,
+                   *_f64_ints(sampling.temperature if sampling else 0.0), int(sampling.top_k) if sampling else 0,
+                   *_f64_ints(sampling.top_p if sampling else 1.0), *_f64_ints(sampling.min_p if sampling else 0.0),
+-                  int(constraint is not None)] + code
++                  int(constraint is not None), *(shared + [0] * SHARED_MOST)[:SHARED_MOST]] + code
+         from tensorfold.engine.grammar import pack
+ 
+         self._ring()                                   # wakes rank 1, which idles on the store, not in the all-gather
+@@ -710,7 +862,8 @@ class GlmEngine:
+         self._share(list(prompt))
+         if constraint is not None:                     # the request's grammar: rank 1 compiles the same
+             self._share(pack(constraint))
+-        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint)
++        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint,
++                          shared)
+         stats.update(policy=spec, drafts=draft)
+         return stats
+ 
+@@ -774,7 +927,9 @@ class GlmEngine:
+                 self._score_local(prompt, labels)
+                 continue
+             (max_tokens, stop_eos, draft, cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, m_lo, m_hi, shaped,
+-             *code) = header
++             *rest) = header
++            # rank 0's shared-prefix points (TF_GLM_SHARED_PREFIX, MiaAI-Lab recipe patch 0015), then the policy code
++            shared, code = [p for p in rest[:SHARED_MOST] if p], rest[SHARED_MOST:]
+             prompt = self._share(None)
+             packed = self._share(None) if shaped else []
+             constraint = None
+@@ -792,7 +947,7 @@ class GlmEngine:
+                 if hit is None:
+                     raise RuntimeError(f"rank 1 has no snapshot of the {cached} tokens rank 0 resumes from")
+             self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
+-                      constraint)
++                      constraint, shared)
+ 
+ 
+ class AfdEngine(GlmEngine):
+@@ -809,6 +964,7 @@ class AfdEngine(GlmEngine):
+             raise ValueError(f"--parallel: 1 to {PARALLEL_MOST} requests at once for GLM-5.3-Flash, not {parallel}")
+         if int(parallel) > 1:
+             afd_parallel_check()
++        shared_prefix()                           # TF_GLM_SHARED_PREFIX read now: a typo fails before the wire opens
+         afd = make_afd(master, port, model_dir)   # AFD rank 0: the store lives here; the experts join
+         super().__init__(model_dir, rank=0, master=master, port=port, policy=policy, drafter=drafter,
+                          context=context, context_explicit=context_explicit, serial_only=serial_only,
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index 4cbeb6d..8b1c4fb 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -127,6 +127,7 @@ def unseal(msg: Sequence[int], seq: int) -> list[int]:
+ LONE_LEFT = 16                            # a lone stream moves home only with at least this many tokens still to go
+ DONE, CANCELLED, REQUEUED = 0, 1, 2      # FINISH reasons
+ MAX_WINDOW = 32                          # rows of every stream's windows together in one round
++SHARED_SLOTS = 2                         # shared-prefix points an ADMIT carries (engine.SHARED_MOST; recipe 0015, 0030)
+ MTP_GREEDY = [3, 3, 350000, 0]           # auto without a draft model: the single-stream auto's MTP rules (c3:0.35)
+ MTP_SAMPLED = [2, 3, 600000, 850000]     # ... and for sampled requests (a:0.6:0.85)
+ 
+@@ -347,6 +348,7 @@ class Lane:
+     window: Any = None                 # the grammar's window of this round's rows
+     stops: list[int] = field(default_factory=list)   # prompt positions whose states are kept (before the end)
+     point: int | None = None           # where the prompt's state is kept (``keep_point``), or None
++    shared: list[int] = field(default_factory=list)  # rank 0's shared-prefix points among ``stops`` (recipe 0015)
+     hidden: Any = None                 # MTP: the last committed rows' final-normed hidden rows, not absorbed yet
+     nexts: list[int] = field(default_factory=list)   # ... and the tokens after them
+     decoding: bool = False
+@@ -363,6 +365,24 @@ def keep_point(n: int, cut: int) -> int | None:
+     return point if point > cut else None
+ 
+ 
++def cap_victim(kept: list):
++    """The kept prompt to drop past TF_GLM_CACHE_ENTRIES (``kept``: least recently used first). An extent's kept
++    prompts are prefixes of its rows, so one shorter than another in its extent is an earlier point of that
++    conversation, superseded by the longer one: those go first (the oldest that is not a shared-prefix state, then
++    the oldest of any), then the least recently used. A conversation taking many turns thus drops its own earlier
++    turns instead of the only state of a conversation that is waiting on a long reply. Deterministic in ``kept``'s
++    order and extents, so both ranks drop the same one. (MiaAI-Lab recipe patch 0063)"""
++
++    longest: dict[int, int] = {}
++    for c in kept:
++        longest[id(c.extent)] = max(longest.get(id(c.extent), 0), len(c.ids))
++    superseded = [c for c in kept if len(c.ids) < longest[id(c.extent)]]
++    for c in superseded:
++        if not getattr(c, "shared", False):
++            return c
++    return superseded[0] if superseded else kept[0]
++
++
+ class NoRoom(_NoRoom):
+     """The pool cannot place a stream now (it waits for others to finish)."""
+ 
+@@ -647,9 +667,19 @@ class MultiDecoder:
+             if base is None:
+                 raise NoRoom(f"no room for a {need}-token extent in the {self.pool.rows}-token pool now")
+             copy = int(hit is not None)
++        # TF_GLM_SHARED_PREFIX (MiaAI-Lab recipe patches 0015, 0030): rank 0 picks the shared-prefix points; they ride in
++        # the ADMIT (inside its sealed message), so both ranks keep the same states
++        cut = len(hit.ids) if hit is not None else 0
++        shared: list[int] = []
++        if draft and g.shared:
++            from .engine import known_ids, shared_points
++
++            shared = shared_points(prompt, cut, keep_point(len(prompt), cut), g.grid, g.shared, known_ids(self.kept),
++                                   g.opener)
+         sid = self.next_sid
+         payload = [sid, slot, base, need, hit.kid if hit is not None else -1, copy, s.count, int(s.stop_eos),
+-                   int(draft), *pack_sampling(s.sampling), *code, len(prompt), *prompt]
++                   int(draft), *pack_sampling(s.sampling), *(shared + [0] * SHARED_SLOTS)[:SHARED_SLOTS], *code,
++                   len(prompt), *prompt]
+         from tensorfold.engine.grammar import pack
+ 
+         packed = pack(s.constraint) if s.constraint is not None else []
+@@ -665,15 +695,17 @@ class MultiDecoder:
+     def _parse_admit(p: list[int]) -> dict:
+         (sid, slot, base, size, kid, copy, count, stop_eos, draft) = p[:9]
+         sampling = unpack_sampling(p[9:19])
+-        code = p[19:23]
+-        i = 23
++        shared = [v for v in p[19:19 + SHARED_SLOTS] if v]
++        i = 19 + SHARED_SLOTS
++        code = p[i:i + 4]
++        i += 4
+         n = p[i]
+         prompt = p[i + 1:i + 1 + n]
+         i += 1 + n
+         n = p[i]
+         packed = p[i + 1:i + 1 + n]
+         return dict(sid=sid, slot=slot, base=base, size=size, kid=kid, copy=copy, count=count, stop_eos=bool(stop_eos),
+-                    draft=bool(draft), sampling=sampling, code=code, prompt=prompt, packed=packed)
++                    draft=bool(draft), sampling=sampling, shared=shared, code=code, prompt=prompt, packed=packed)
+ 
+     def _drafters(self, code: list[int]) -> tuple[bool, bool]:
+         """(DFlash2, MTP) drafts for a ``multi_code`` policy code."""
+@@ -738,10 +770,13 @@ class MultiDecoder:
+                 finally:
+                     e.use(prev)
+             self._touch(hit)
+-        # a drafted prompt keeps its state before its last token (``keep_point``)
++        # a drafted prompt keeps its state before its last token (``keep_point``), and at rank 0's shared-prefix points
++        # (TF_GLM_SHARED_PREFIX, MiaAI-Lab recipe patches 0015, 0030)
+         if a["draft"]:
+             lane.point = keep_point(len(prompt), cut)
+-            lane.stops = [lane.point] if lane.point is not None and lane.point < len(prompt) else []
++            lane.shared = sorted(p for p in set(a["shared"]) if lane.point is not None and cut < p < lane.point)
++            lane.stops = list(lane.shared) + ([lane.point] if lane.point is not None and lane.point < len(prompt)
++                                              else [])
+         s.started = time.perf_counter()
+         lane.t0 = s.started
+         self.lanes[lane.sid] = lane
+@@ -799,12 +834,13 @@ class MultiDecoder:
+         snap.kid = self.next_kid
+         self.next_kid += 1
+         snap.extent = lane.extent
++        snap.shared = n in lane.shared                    # a shared-prefix state (recipe 0063's cap_victim)
+         for c in [c for c in self.kept if c.ids == snap.ids]:
+             self._drop(c)
+         lane.extent.kept.append(snap)
+         self.kept.append(snap)
+         while len(self.kept) > max(1, self.g.cache_entries):
+-            self._drop(self.kept[0])
++            self._drop(cap_victim(self.kept))             # superseded states first (MiaAI-Lab recipe patch 0063)
+ 
+     def _drop(self, c) -> None:
+         """Forget a kept prompt; its extent goes when nothing else holds it, else shrinks to what is kept."""
+diff --git a/tests/test_glm_shared_prefix.py b/tests/test_glm_shared_prefix.py
+new file mode 100644
+index 0000000..e427c1a
+--- /dev/null
++++ b/tests/test_glm_shared_prefix.py
+@@ -0,0 +1,506 @@
++"""TF_GLM_SHARED_PREFIX: shared-prefix prompt states (MiaAI-Lab recipe patches 0015 and 0063, with 0030's shared-prefix
++parts), on the CPU.
++
++llama-benchy's prefix-caching mode sends ``[system: C, user: "."]``, then ``[system: C, user: P]``. Rendered by the GLM
++chat template, the second prompt parts from the first right after its first ``<|user|>``, before the first prompt's
++kept state (its length less one), so the kept-prompt rule alone prefills the whole context again. With the setting
++on, a drafted request also keeps its state at the end of its system block (its first ``<|user|>``) and where it stops
++sharing a kept prompt; the second request then resumes the whole system block, and its reply is the one it gets
++served alone (``draft: false``).
++
++Covered: the setting, ``shared_points``, ``user_opener``, ``cap_victim``'s order, saved rows that keep DFlash2's window;
++the single-stream engine (kept states and cached counts, rank 1 alike, a DFlash2 request resumed from a saved
++shared-prefix state with its window, replies on the multi-stream tests' fake model, with and without TF_GLM_KV=fp8's
++rings); the multi-stream engine at two ranks (DFlash2 and MTP drafts), at world 1 over the fake AFD wire
++(``afd.Solo``), with fp8 rings, and the kept-state cap at two ranks; with the setting off, the cached counts and kept
++states of the same requests as before.
++"""
++
++from __future__ import annotations
++
++import importlib
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from tests import test_glm_kv8_multi as tk
++from tests import test_glm_multi as tm
++from tests import test_glm_multi_afd as ta
++from tests.test_cuda_geometry import allocations  # noqa: F401  (fixture: fake triton, so decode imports)
++
++pytestmark = pytest.mark.torch
++
++fake = tm.fake
++afd_fake = ta.afd_fake
++rings = tk.rings
++
++HEAD, USER, DOT, TAIL = [40, 41, 42], 43, 44, [45, 46, 39]      # [gMASK]<sop><|system|>, <|user|>, ".", the tail
++LEAST = 256                                                       # TF_GLM_SHARED_PREFIX=1
++
++
++def benchy(context, user):
++    return HEAD + list(context) + [USER] + list(user) + TAIL
++
++
++def shapes(seed: int = 500, n: int = 600):
++    """llama-benchy's context load and inference request on one context, and its prompt."""
++    context, prompt = tm._prompt(n, seed), tm._prompt(64, seed + 1)
++    return benchy(context, [DOT]), benchy(context, prompt), prompt
++
++
++def sharing(gs, least: int = LEAST, opener: int | None = USER) -> None:
++    """TF_GLM_SHARED_PREFIX on these engines (every rank); rank 0 knows ``<|user|>``."""
++    for g in gs:
++        g.shared, g.opener = least, opener if g.rank == 0 else None
++
++
++# -- the setting and the points -------------------------------------------------------------------------------------
++def test_the_setting(monkeypatch):
++    from tensorfold.families.glm5_next.cuda import engine
++
++    monkeypatch.delenv("TF_GLM_SHARED_PREFIX", raising=False)
++    assert engine.shared_prefix() == 0 and engine.GlmEngine.shared == 0 and engine.GlmEngine.grid == 0
++    for value, want in [("", 0), ("0", 0), ("off", 0), (" OFF ", 0), ("1", 256), ("on", 256), ("16", 16),
++                        ("4096", 4096)]:
++        assert engine.shared_prefix(value) == want, value
++    for bad in ("2", "15", "-1", "x", "1.5"):
++        with pytest.raises(ValueError, match="TF_GLM_SHARED_PREFIX"):
++            engine.shared_prefix(bad)
++    monkeypatch.setenv("TF_GLM_SHARED_PREFIX", "1")
++    assert engine.shared_prefix() == engine.SHARED_DEFAULT == 256
++
++
++def test_shared_points():
++    from tensorfold.families.glm5_next.cuda.engine import SHARED_MOST, common_prefix, shared_points
++
++    load, inference, _ = shapes()
++    at = len(HEAD) + 600                                          # the first <|user|>: the system block's end
++    own = len(inference) - 1
++    assert common_prefix(load, inference) == at + 1 and common_prefix([], load) == 0
++    assert shared_points(inference, 0, own, 0, LEAST, [], USER) == [at]                    # exact, no grid
++    assert shared_points(inference, 0, own, 64, LEAST, [], USER) == [at // 64 * 64]       # the recipe's grid
++    assert shared_points(inference, at - LEAST + 1, own, 0, LEAST, [], USER) == []         # adds too little
++    assert shared_points(inference, 0, at, 0, LEAST, [], USER) == []                       # not short of its point
++    assert shared_points(inference, 0, None, 0, LEAST, [], USER) == []
++    assert shared_points(inference, 0, own, 0, 0, [], USER) == []                          # off
++    assert shared_points(inference, 0, own, 0, LEAST, [], None) == []                      # no <|user|> known
++    # where it stops sharing a kept prompt, and the system block's end, each LEAST past the one before
++    other = inference[:300] + [99] * 400
++    assert shared_points(inference, 0, own, 0, LEAST, [other], USER) == [300, at]
++    assert shared_points(inference, 0, own, 0, 301, [other], USER) == [at]                 # 300 adds too little
++    assert shared_points(inference, 0, own, 0, LEAST, [inference[:500] + [99] * 400], USER) == [500]   # 603: 103
++    assert shared_points(inference, 0, own, 0, LEAST, [other[:LEAST - 1]], USER) == [at]  # too short to count
++    assert shared_points(inference, 0, own, 0, LEAST, [load], USER) == [at]                # shares at + 1: one
++    assert len(shared_points(inference, 0, own, 0, 16, [other, load], USER)) <= SHARED_MOST
++
++
++def test_user_opener(tmp_path):
++    from tensorfold.families.glm5_next.cuda.engine import user_opener
++
++    assert user_opener(tmp_path) is None
++    (tmp_path / "tokenizer.json").write_text("{not json")
++    assert user_opener(tmp_path) is None
++    (tmp_path / "tokenizer.json").write_text(json.dumps({"added_tokens": [
++        {"id": 154820, "content": "[gMASK]"}, {"id": 154827, "content": "<|user|>"},
++        {"id": 154828, "content": "<|assistant|>"}]}))
++    assert user_opener(tmp_path) == 154827
++
++
++def test_cap_victim_order():
++    """Past TF_GLM_CACHE_ENTRIES (least recently used first): a conversation's superseded states (shorter than another
++    in its extent), the oldest that is not a shared-prefix state, then the oldest of those; then the oldest."""
++    from tensorfold.families.glm5_next.cuda.multi import cap_victim
++
++    x, y = SimpleNamespace(), SimpleNamespace()
++
++    def kept(n, extent, shared=False):
++        return SimpleNamespace(ids=list(range(n)), extent=extent, shared=shared)
++
++    a, b, c, d = kept(10, x), kept(20, x, True), kept(30, x), kept(5, y)
++    assert cap_victim([d, a, b, c]) is a
++    assert cap_victim([d, b, a, c]) is a                                  # a non-shared one before an older shared
++    assert cap_victim([d, b, c]) is b
++    assert cap_victim([d, c]) is d                                        # nothing superseded: the oldest
++    assert cap_victim([kept(5, y)]).ids == list(range(5))
++
++
++@pytest.mark.parametrize("ring", [False, True], ids=["flat", "ring"])
++def test_saved_rows_keep_the_drafters_window(fake, ring):
++    """``save_rows`` with the drafter copies DFlash2's window rows with the attention rows and keeps the snapshot's
++    drafter end; ``load_rows`` puts both back. Without it (the setting off) the window is dropped, as before."""
++    torch = fake
++    from tensorfold.families.glm5_next.cuda.decode import Snapshot, load_rows, row_bytes, save_rows
++
++    window, n = 6, 40
++    st = SimpleNamespace(kc=[torch.arange(64, dtype=torch.int64)[:, None] + 1], vc=[None], index=None, caches=None)
++    cap = 16 if ring else 64
++    d = SimpleNamespace(window=window, ring=cap if ring else 0,
++                        kc=[torch.arange(cap, dtype=torch.int64)[None, :, None] + 100],
++                        vc=[torch.arange(cap, dtype=torch.int64)[None, :, None] + 200])
++    e = SimpleNamespace(st=st)
++
++    def snap():
++        s = Snapshot(list(range(n)), torch.zeros(1), torch.zeros(3), None, -1, n)
++        s.drafter_rows = [torch.zeros(1)] if ring else None
++        return s
++
++    off = snap()
++    save_rows(e, off)
++    assert off.drafter_end == -1 and off.drafter_rows is None and len(off.rows) == 1
++    on = snap()
++    lo = n - window - 1
++    if ring:      # past the ring the window lives in the snapshot's own copy (drafter_rows), which save_rows keeps
++        assert row_bytes(e, on, drafter=d) == row_bytes(e, on) and d.kc[0][:, lo:n].numel() == 0
++    else:         # a flat context: the window's rows are copied out with the attention rows
++        assert row_bytes(e, on, drafter=d) == row_bytes(e, on) + 2 * (n - lo) * 8
++    save_rows(e, on, drafter=d)
++    assert on.drafter_end == n and len(on.rows) == 3 and (on.drafter_rows is not None) == ring
++    want_k, want_v = d.kc[0][:, lo:n].clone(), d.vc[0][:, lo:n].clone()
++    st.kc[0].zero_()
++    d.kc[0].zero_()
++    d.vc[0].zero_()
++    load_rows(e, on, drafter=d)
++    assert torch.equal(st.kc[0][:n, 0], torch.arange(n) + 1)
++    assert torch.equal(d.kc[0][:, lo:n], want_k) and torch.equal(d.vc[0][:, lo:n], want_v)
++    with pytest.raises(ValueError, match="do not match"):
++        load_rows(e, on)                                  # rows saved with the window go back with it
++
++
++# -- the single-stream engine: bookkeeping ------------------------------------------------------------------------
++class Single:
++    """``GlmEngine``'s single-stream bookkeeping as it is (generate, _resume, _shared, _run_once, _remember, _take_over;
++    rank 1's follow), the real save_rows / load_rows, with a prefill that records its calls and writes the rows a real
++    one writes: one attention row a token (token + 1) and, drafting with DFlash2, a flat context row a token. It checks
++    every resume finds its prefix's rows, and its DFlash2 window, in place."""
++
++    def __init__(self, torch, monkeypatch, *, rank: int = 0, rows: int = 4096, window: int = 6) -> None:
++        from tensorfold.families.glm5_next.cuda import decode
++        from tensorfold.families.glm5_next.cuda.engine import GlmEngine
++
++        self.torch, self.calls, self.window = torch, [], window
++        g = self.g = GlmEngine.__new__(GlmEngine)
++        g.rank, g.limit, g.serial_only, g.policy = rank, rows - 64, False, "0"
++        g.cache, g.live, g.cache_bytes, g.cache_entries = [], [], 1 << 40, 8
++        st = SimpleNamespace(kc=[torch.zeros((rows, 1), dtype=torch.int64)], vc=[None], index=None, caches=None)
++        g.e = SimpleNamespace(st=st, constraint=None, window=None)
++        g.w = SimpleNamespace(cfg=SimpleNamespace(quant="exl3", eos=(1,)), mtp=object())
++        g.drafter = SimpleNamespace(window=window, ring=0, kc=[torch.zeros((1, rows, 1), dtype=torch.int64)],
++                                    vc=[torch.zeros((1, rows, 1), dtype=torch.int64)])
++        g.scheduler = None
++        g.request = SimpleNamespace(policy="f3", stop_eos=True)
++        g._ring = lambda: None
++        self.sent: list = []
++        g._share = lambda values: (self.sent.append(list(values)), list(values))[1]
++        self.decode = decode
++        monkeypatch.setattr(decode, "prefill", self.prefill)
++
++    def prefill(self, e, prompt, sampling, *, mtp=True, drafter=None, resume=None, keep_at=None, keep=None,
++                sample=True):
++        torch, d = self.torch, self.g.drafter
++        begin = len(resume.ids) if resume is not None else 0
++        if resume is not None:
++            assert list(prompt[:begin]) == resume.ids and begin < len(prompt)
++            ids = torch.tensor(resume.ids, dtype=torch.int64) + 1
++            assert torch.equal(e.st.kc[0][:begin, 0], ids), "a resume without its rows"
++            if drafter is not None:
++                assert resume.drafter_end == begin
++                lo = max(0, begin - self.window - 1)
++                assert torch.equal(d.kc[0][0, lo:begin, 0], ids[lo:]), "a DFlash2 resume without its window"
++        tokens = torch.tensor(list(prompt[begin:]), dtype=torch.int64) + 1
++        e.st.kc[0][begin:len(prompt), 0] = tokens
++        if drafter is not None:
++            d.kc[0][0, begin:len(prompt), 0] = tokens
++            d.vc[0][0, begin:len(prompt), 0] = tokens
++        self.calls.append((len(prompt), begin, keep_at, sample))
++        if keep_at is not None:
++            assert keep is not None and begin <= keep_at <= len(prompt)
++            keep(resume if keep_at == begin else self.decode.Snapshot(
++                list(prompt[:keep_at]), torch.zeros(1), torch.zeros(3), torch.zeros((1, 1)) if mtp else None,
++                keep_at - 1 if mtp else -1, keep_at if drafter is not None else -1))
++        return 7 if sample else None
++
++    def ask(self, prompt, policy: str = "f3", draft: bool = True) -> int:
++        self.g.request.policy = policy
++        return int(self.g.generate(list(prompt), 1, None, lambda new: None, draft=draft)["cached"])
++
++    def kept(self) -> list[int]:
++        return [len(c.ids) for c in self.g.cache]
++
++
++@pytest.mark.parametrize("policy", ["f3", "2"], ids=["dflash2", "mtp"])
++def test_single_stream_benchy_shape(fake, monkeypatch, policy):
++    load, inference, prompt = shapes()
++    at = len(HEAD) + 600
++    on = Single(fake, monkeypatch)
++    sharing([on.g])
++    assert on.ask(load, policy) == 0
++    assert on.calls == [(at, 0, at, False), (len(load), at, len(load) - 1, True)]
++    assert on.kept() == [at, len(load) - 1]
++    assert on.ask(inference, policy) == at                          # the whole system block
++    assert on.calls[2:] == [(len(inference), at, len(inference) - 1, True)]
++    assert on.kept() == [len(load) - 1, at, len(inference) - 1]     # what it resumed from is newest but its own
++    assert on.ask(benchy(tm._prompt(600, 500), tm._prompt(64, 777)), policy) == at
++    turn = load + [11, 12] + [USER] + prompt + TAIL
++    assert on.ask(turn, policy) == len(load) - 1                    # the kept prompt plus a new suffix, as before
++    assert on.ask(inference, policy) == len(inference) - 1          # the same prompt again
++    assert on.ask(inference, policy, draft=False) == 0              # the reference: no resume, nothing kept
++    # off: the inference request misses; the next turn resumes the context load's state, as before, unless that state
++    # was saved out (the inference request took the caches) and the turn drafts with DFlash2: saved states drop it
++    off = Single(fake, monkeypatch)
++    resumed = len(load) - 1 if policy == "2" else 0
++    assert [off.ask(load, policy), off.ask(inference, policy), off.ask(turn, policy)] == [0, 0, resumed]
++    assert off.calls == [(len(load), 0, len(load) - 1, True), (len(inference), 0, len(inference) - 1, True),
++                         (len(turn), resumed, len(turn) - 1, True)]
++    assert off.kept() == [len(load) - 1, len(inference) - 1, len(turn) - 1]
++    assert all(h[15:17] == [0, 0] for h in off.sent[::2])        # the header's two slots, empty
++    assert on.sent[0][15:17] == [at, 0] and on.sent[2][15:17] == [0, 0]
++
++
++def test_single_stream_rank1_keeps_the_same_states(fake, monkeypatch):
++    """Rank 1 takes the points from the header and keeps, saves and resumes alike."""
++
++    class Stop(Exception):
++        pass
++
++    load, inference, prompt = shapes()
++    r0, r1 = Single(fake, monkeypatch), Single(fake, monkeypatch, rank=1)
++    sharing([r0.g, r1.g])
++    rounds = []
++    for p in (load, benchy(tm._prompt(700, 9), [DOT]), inference, load + [11] + [USER] + prompt + TAIL):
++        monkeypatch.setattr(r0.decode, "prefill", r0.prefill)
++        r0.ask(p)
++        monkeypatch.setattr(r1.decode, "prefill", r1.prefill)
++        bell = iter([None])
++        r1.g._share = lambda values: r0.sent.pop(0)
++
++        def await_once(bell=bell):
++            try:
++                next(bell)
++            except StopIteration:
++                raise Stop from None
++
++        r1.g._await_bell = await_once
++        with pytest.raises(Stop):
++            r1.g.follow()
++        rounds.append((r0.kept(), r1.kept()))
++    assert all(a == b for a, b in rounds) and r0.calls == r1.calls and not r0.sent
++    assert [c.rows is None for c in r0.g.cache] == [c.rows is None for c in r1.g.cache]
++
++
++def test_single_stream_dflash2_resumes_a_saved_shared_state_with_its_window(fake, monkeypatch):
++    """Another conversation takes the live caches: the kept states' rows are saved with DFlash2's window, and DFlash2
++    requests later resume them, the shared-prefix state included (the recording prefill checks that a resume finds its
++    rows and its window in place). Off, a saved state drops the window, so a DFlash2 request cannot resume it."""
++
++    load, inference, _ = shapes()
++    other = benchy(tm._prompt(900, 3), [DOT])
++    at = len(HEAD) + 600
++    on = Single(fake, monkeypatch)
++    sharing([on.g])
++    assert [on.ask(load), on.ask(other)] == [0, 0]
++    saved = [c for c in on.g.cache if c.rows is not None]
++    assert [len(c.ids) for c in saved] == [at, len(load) - 1] and all(c.drafter_end == len(c.ids) for c in saved)
++    assert all(len(c.rows) == 3 for c in saved)                   # attention rows, DFlash2's keys and values
++    assert on.ask(inference) == at                                # the saved shared-prefix state, with its window
++    assert on.ask(load) == len(load) - 1                          # a saved own state, with its window
++    off = Single(fake, monkeypatch)
++    assert [off.ask(load), off.ask(other)] == [0, 0]
++    assert [(len(c.ids), c.drafter_end, len(c.rows)) for c in off.g.cache if c.rows is not None] == \
++        [(len(load) - 1, -1, 1)]
++    assert [off.ask(load), off.ask(inference)] == [0, 0]
++
++
++# -- the single-stream engine: replies on the multi-stream tests' fake model --------------------------------------
++def _cut_compute(monkeypatch):
++    """The fake prompt chunk with ``decode.prefill``'s cut inside it (the kept point of a drafted prompt): the state
++    and conv window at the cut row, then the rest of the chunk."""
++    decode = importlib.import_module("tensorfold.families.glm5_next.cuda.decode")
++    chunk = decode.compute
++
++    def compute(w, st, b, R, *, nch=None, host_pos=None, cut=None, **kw):
++        if cut is None:
++            return chunk(w, st, b, R, nch=nch, host_pos=host_pos, **kw)
++        torch = b.engine.torch
++        before = list(st.conv.tolist())
++        h = st.h()
++        for i, t in enumerate(b.ids):
++            q = st.pos + i
++            st.write(q, t)
++            h = tm.fold(h, q, t)
++            if i + 1 == cut.point:
++                cut.rec[0] = h
++                cut.conv.copy_(torch.tensor(([0, 0, 0] + before + b.ids[:cut.point])[-3:]))
++        cur = st.cur[0]
++        st.rec[1 - cur][0] = h
++        st.cur = [1 - cur]
++        st.conv.copy_(torch.tensor(([0, 0, 0] + before + b.ids)[-3:]))
++        b.taps = torch.tensor([[st.pos + i, t] for i, t in enumerate(b.ids)], dtype=torch.int64)
++        b.fnormed = b.taps.clone()
++        return st.logits(st.pos + R - 1, h)[None]
++
++    monkeypatch.setattr(decode, "compute", compute)
++
++
++def _engine(torch, *, prefill_rows: int = 64):
++    g = tm.shell(torch, 0, pool=16 * tm.ALIGN, streams=1, prefill_rows=prefill_rows, mtp=True)
++    g._share = lambda values: list(values)
++    from tensorfold.families.glm5_next.cuda.decode import has_rings
++
++    st = g.e.st                                   # what _row_views saves: every plane the fake's logits read
++    if not has_rings(st):
++        st.index = [(st.lat, st.lat, st.pk)]
++    st.mtp_kc = st.mtpv
++    g.request.policy = "2"                        # MTP drafts (the fake's single-stream drafter)
++    return g
++
++
++def _ask(g, prompt, count: int, sampling=None):
++    out: list[int] = []
++    stats = g.generate(list(prompt), count, sampling, out.extend)
++    return stats["cached"], out
++
++
++@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8-rings"])
++def test_single_stream_replies_equal_their_solo_replies(fake, monkeypatch, request, fp8):
++    if fp8:
++        request.getfixturevalue("rings")
++    torch = fake
++    _cut_compute(monkeypatch)
++    load, inference, prompt = shapes()
++    at = len(HEAD) + 600
++    g = _engine(torch)
++    sharing([g])
++    first = _ask(g, load, 12)
++    assert first[0] == 0 and [len(c.ids) for c in g.cache] == [at, len(load) - 1]
++    other = benchy(tm._prompt(500, 4), [DOT])                        # another conversation takes the caches
++    assert _ask(g, other, 8)[0] == 0
++    cached, got = _ask(g, inference, 20)
++    assert cached == at and got == tm.solo(torch, inference, 20, None)
++    turn = load + first[1] + [USER] + prompt + TAIL
++    cached, got = _ask(g, turn, 20, tm._sampling("topk", 3))
++    assert cached == len(load) - 1 and got == tm.solo(torch, turn, 20, tm._sampling("topk", 3))
++    assert first[1] == tm.solo(torch, load, 12, None)
++
++
++# -- the multi-stream engine (two ranks, world 1, fp8 rings) --------------------------------------------------------
++def scenario(torch, node, policy: str, gs) -> dict:
++    """llama-benchy's two requests, then the context load's next turn: on, the inference request resumes the system
++    block; every reply equals its request served alone."""
++    sharing(gs)
++    load, inference, prompt = shapes()
++    at = len(HEAD) + 600
++    first = node.submit(load, 12, None, policy=policy)
++    node.run()
++    d = node.d[0] if isinstance(node.d, list) else node.d
++    assert first.cached == 0 and [(len(k.ids), k.shared) for k in d.kept] == [(at, True), (len(load) - 1, False)]
++    turn = load + first.got + [USER] + prompt + TAIL
++    nxt = node.submit(turn, 20, tm._sampling("topk", 3), policy=policy)
++    assert nxt.cached == len(load) - 1                               # the kept prompt plus a new suffix, as before
++    node.run()
++    assert nxt.got == tm.solo(torch, turn, 20, tm._sampling("topk", 3))
++    phase2 = node.submit(inference, 20, None, policy=policy)
++    assert phase2.cached == at                                       # the whole system block
++    node.run()
++    assert phase2.got == tm.solo(torch, inference, 20, None)
++    again = node.submit(benchy(tm._prompt(600, 500), tm._prompt(64, 9)), 16, None, policy=policy)
++    assert again.cached == at
++    node.run()
++    assert again.got == tm.solo(torch, again.prompt, 16, None)
++    assert first.got == tm.solo(torch, load, 12, None)
++    return {"kept": sorted(len(k.ids) for k in d.kept), "at": at}
++
++
++@pytest.mark.parametrize("policy,mtp", [("f3", False), ("2", True)], ids=["dflash2", "mtp"])
++def test_two_ranks(fake, policy, mtp):
++    p = tm.Pair(fake, streams=2, blocks=8, mtp=mtp)
++    scenario(fake, p, policy, p.g)
++    p.check()
++
++
++def test_two_ranks_fp8_rings(fake, rings):
++    tk._ringed(fake)
++    p = tm.Pair(fake, streams=2, blocks=8)
++    scenario(fake, p, "f3", p.g)
++    p.check()
++
++
++def test_world1_afd(afd_fake):
++    n1 = ta.World1(afd_fake, streams=2)
++    scenario(afd_fake.torch, n1, "f3", [n1.g])
++    assert n1.shared == [] and n1.d.world == 1
++
++
++def test_world1_afd_fp8_rings(afd_fake, rings):
++    tk._ringed(afd_fake.torch)
++    n1 = ta.World1(afd_fake, streams=2)
++    scenario(afd_fake.torch, n1, "f3", [n1.g])
++
++
++def test_the_admit_carries_the_points(fake):
++    """Rank 0's points ride in the ADMIT, inside its sealed message; rank 1 keeps the same states."""
++    from tensorfold.families.glm5_next.cuda.multi import ADMIT, SHARED_SLOTS, MultiDecoder, unseal
++
++    p = tm.Pair(fake, streams=2, blocks=8)
++    sharing(p.g)
++    sent: list = []
++    real = p.g[0]._share
++    p.g[0]._share = lambda values: (sent.append(list(values)), real(values))[1]
++    load, _, _ = shapes()
++    at = len(HEAD) + 600
++    p.submit(load, 4, None)
++    p.run()
++    p.check()
++    admits = [a for op, a in MultiDecoder.parse(unseal(sent[0], 0)) if op == ADMIT]
++    assert len(admits) == 1 and len(admits[0]) == 9 + 10 + SHARED_SLOTS + 4 + 1 + len(load) + 1
++    assert admits[0][19:19 + SHARED_SLOTS] == [at, 0] and MultiDecoder._parse_admit(admits[0])["shared"] == [at]
++    for d in p.d:
++        assert [(len(k.ids), k.shared) for k in d.kept] == [(at, True), (len(load) - 1, False)]
++
++
++def test_off_keeps_the_states_as_before(fake):
++    """Off (the default): the same requests keep and resume as without the setting (the miss included)."""
++    p = tm.Pair(fake, streams=2, blocks=8)
++    load, inference, prompt = shapes()
++    first = p.submit(load, 12, None)
++    p.run()
++    phase2 = p.submit(inference, 20, None)
++    assert phase2.cached == 0
++    p.run()
++    turn = load + first.got + [USER] + prompt + TAIL
++    nxt = p.submit(turn, 20, None)
++    assert nxt.cached == len(load) - 1
++    p.run()
++    assert sorted(len(k.ids) for k in p.d[0].kept) == [len(load) - 1, len(inference) - 1, len(turn) - 1]
++    assert not any(getattr(k, "shared", False) for k in p.d[0].kept)
++    p.check()
++
++
++@pytest.mark.parametrize("rule", ["cap_victim", "oldest"])
++def test_the_cap_drops_a_conversations_superseded_states_first(fake, monkeypatch, rule):
++    """TF_GLM_CACHE_ENTRIES=3 (recipe patch 0063): a conversation that takes turns drops its own earlier turns, not the
++    only state of another conversation (the oldest), which then still resumes; both ranks drop the same ones. The
++    oldest-first rule before it dropped the other conversation's state."""
++    from tensorfold.families.glm5_next.cuda import multi
++
++    if rule == "oldest":
++        monkeypatch.setattr(multi, "cap_victim", lambda kept: kept[0])
++    p = tm.Pair(fake, streams=2, blocks=8, entries=3)
++    other = tm._prompt(300, 21)
++    p.submit(other, 6, None)
++    p.run()
++    convo, before = tm._prompt(200, 22), 0
++    for turn in range(3):
++        s = p.submit(convo, 6, None)
++        assert s.cached == max(before - 1, 0)
++        p.run()
++        p.check()
++        before, convo = len(convo), convo + s.got + tm._prompt(5, 30 + turn)
++    kept = [len(k.ids) for k in p.d[0].kept]
++    assert len(kept) == 3 and ((len(other) - 1 in kept) == (rule == "cap_victim"))
++    again = other + tm._prompt(4, 40)
++    s = p.submit(again, 6, None)
++    assert s.cached == (len(other) - 1 if rule == "cap_victim" else 0)
++    p.run()
++    p.check()
++    assert s.got == tm.solo(fake, again, 6, None)

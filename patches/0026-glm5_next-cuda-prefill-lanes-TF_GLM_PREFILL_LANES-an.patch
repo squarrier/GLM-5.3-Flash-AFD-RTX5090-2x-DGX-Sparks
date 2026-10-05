@@ -1,0 +1,2775 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 16:49:53 -0400
+Subject: [PATCH] glm5_next/cuda: prefill lanes (TF_GLM_PREFILL_LANES) and FP8
+ wire rows (TF_GLM_WIRE_FP8), glm53f-afd's prefill pipeline on the AFD split
+
+Hugh Madden (@dangerm00se, github.com/hughmadden) authored the two pieces of glm53f-afd's prefill pipeline that this
+brings to the attention/expert split, both behind switches that are off by default: the prefill in up to four lanes
+(the two-lane prefill of whole prompt chunks in mimo26f-afd @ bab9fa2, crates/mimo26-coordinator/src/dforward.rs;
+four lanes of 2,048 rows by default in glm53f-afd @ 91db3cc, crates/glm53f-forward/src/forward.rs run_lanes,
+src/experts.rs ExpertBackend::depth) and the FP8 E4M3 wire rows with a UE8M0 scale per 32 values (Fp8E4m3Ue8m0K32:
+glm53f-afd @ 91db3cc crates/glm53f-coordinator/kernels/wire.cu, src/wire.rs, src/fp8.rs, from mimo26f-afd's kernels).
+MIT, Copyright (c) 2026 Turquoise Bay AI Pty Ltd. The wire row format is DS41RT's, by T.J. Purtell (@wrldsuksgo2mars,
+tpurtell/ds41rt, MIT), carried through mimo26f-afd. No code is copied.
+
+TF_GLM_PREFILL_LANES=N (1 .. 4; unset follows TF_GLM_PREFILL_PAIRS: 2 with it on, else 1):
+- prefill_pairs.py: run_lanes runs N consecutive whole prompt chunks through the layers together, the prompt chunk pairs
+  generalized. _forward_lanes interleaves their layer loops by three rules: the next exchange goes out in lane order
+  when fewer than the wire's depth are in flight; else a lane that needs no reply runs its attention once the lane
+  before it ran that layer's; else the oldest exchange is collected. Two lanes make exactly the pairs' schedule
+  (run_pair and _forward_pair are run_lanes and _forward_lanes of two; the tests keep the pairs' _forward_pair as the
+  oracle). Lanes 1 .. N - 1 of a group of three or more hold their own routed rows (lane_buffers), since a lane can
+  wait to send while later lanes run their attention; the reply rows and the shared expert's output stay shared,
+  which needs one exchange in flight (depth 1, the MCDMA wire's: a deeper wire is refused). buffers_for picks the
+  pair's or the lanes' buffers (a pair in a run of more lanes reuses the first lane's). Held states at every lane's
+  end but the last's.
+- multi.py: _pair_plan plans up to N chunks, each the next as a pair's second is to its first, with the pairs' rules
+  for each (no stream decoding, no sliced chunk suspended, no MTP stream, no replay); a chunk that ends a prompt is
+  the last; two chunks run as a pair, three or more as lanes. _fill_pair does each chunk's host work in order as
+  for a pair. /health's prefill_lanes counters (groups, chunks, rows) when N >= 3.
+- afd.py: MODE_LANES (9), header word 10 the lanes' count; begin_lanes opens N windows (begin_pair's code for N);
+  the check names lane groups; TF_AFD_TIME's lane groups get their own line, keyed by N and R.
+- afd_mcdma.py / experts_node.py: the attention writes N windows' header tables (word 8 the next lane's rows); the
+  expert takes window k's first request after window k - 1's layer-0 reply and serves each layer's lanes in lane
+  order, checking each later lane's header against the first's; MODE_LANES only when the settings handshake carried
+  "lanes" (an older expert refuses the settings), and no more lanes than it agreed to.
+- engine.py: the later lanes' buffers at startup and in the capacity plan (160.8 MiB a lane at 2,048 rows on
+  GLM-5.3-Flash with DFlash2's taps, against the pair's 144.2), the handshake's "pairs" and "lanes", the setting read
+  before the wire opens.
+
+TF_GLM_WIRE_FP8=1 (changes the experts' inputs, so outputs; gated on KL before use):
+- wire_fp8.py: the codec, glm53f-afd's arithmetic: per 32 values the UE8M0 byte clamp(ceil(log2(amax / 448)) + 127,
+  0, 254) (0 for zeros, NaN skipped), each value times 2^(127 - s) in fp32, the nearest E4M3 code with ties to the
+  larger magnitude, saturating at 448, the sign of the fp32 product; decode e4m3 x 2^(s - 127) rounded once to bf16.
+  The scales are torch operations, the codes a table of every bf16 magnitude's code made with reference_code, a
+  plain-Python transcription of glm53f-afd's device encoder; 512 rows a pass.
+- mcdma.py: Layout(fp8=True): the request's rows section holds the codes, then the scale bytes padded to 256 bytes
+  (4,224 bytes a row at hidden 4,096 against 8,192; 8.25 MiB a request at 2,048 rows against 16 MiB).
+- afd_mcdma.py: the attention encodes into its own buffers and packs them as the rows' section; the expert decodes
+  after each landing into its own bf16 rows and computes with those. afd.py's wire check hashes the rows the experts
+  decode (the transport's wire_rows). The handshake's "wire_fp8": an older expert refuses the settings.
+
+With both switches unset nothing changes: the settings, headers, buffers and every call are the ones before; with
+TF_GLM_PREFILL_PAIRS=1 alone the pairs run exactly as before.
+
+Tests: tests/test_glm_prefill_lanes.py (the setting, handshake and bytes; two lanes equal the pairs' schedule on
+four layer layouts; the lane schedule's rules for 3 and 4 lanes; each lane's recorded kernel calls equal its solo
+chunk's over the real forward, one stream and TF_GLM_MULTI_PREFILL's chunks, with held states; lanes over the real
+wire and the fake MCDMA pair, CPU- and GPU-driven, followed by a pair and a plain forward; an expert without lanes,
+or with fewer, refuses; lanes stopped early; the lane timer line; at world 1 on the fake model, 3 and 4 lanes equal
+the pairs and the setting off in replies, cached counts and kept states for prompts of 1 to 5 chunks, with
+TF_GLM_SHARED_PREFIX and TF_GLM_MULTI_PREFILL; no lanes while a stream decodes or a sliced chunk is suspended).
+tests/test_glm_wire_fp8.py (the setting, handshake and sizes; every code and back, ties, saturation, NaN, zeros, the
+scale bytes; rows of random, tied, tiny, huge, zero, NaN and infinite values byte for byte as the reference; the
+table on every bf16 magnitude; the decode exact; the error bound; FP8 rows over the real wire for plain forwards, a
+pair and lanes, the experts computing with exactly the decoded rows; the wire check with 0 mismatches).
+tests/test_glm_multi_afd.py's and tests/test_glm_sliced_fill.py's fakes take lanes too; the pair tests pin
+TF_GLM_PREFILL_LANES unset.
+
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+ THIRD_PARTY_NOTICES.md                        |  22 +
+ src/tensorfold/families/glm5_next/cuda/afd.py | 115 ++-
+ .../families/glm5_next/cuda/afd_mcdma.py      | 147 +++-
+ .../families/glm5_next/cuda/engine.py         |  34 +-
+ .../families/glm5_next/cuda/experts_node.py   |  47 +-
+ .../families/glm5_next/cuda/mcdma.py          |  26 +-
+ .../families/glm5_next/cuda/multi.py          |  98 ++-
+ .../families/glm5_next/cuda/prefill_pairs.py  | 254 ++++--
+ .../families/glm5_next/cuda/wire_fp8.py       | 229 ++++++
+ tests/test_glm_multi_afd.py                   |  12 +-
+ tests/test_glm_prefill_lanes.py               | 746 ++++++++++++++++++
+ tests/test_glm_prefill_pairs.py               |   2 +
+ tests/test_glm_sliced_fill.py                 |   6 +
+ tests/test_glm_wire_fp8.py                    | 314 ++++++++
+ 14 files changed, 1875 insertions(+), 177 deletions(-)
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/wire_fp8.py
+ create mode 100644 tests/test_glm_prefill_lanes.py
+ create mode 100644 tests/test_glm_wire_fp8.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index c6cf2de..3397dfd 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -368,3 +368,25 @@ plan's pair `row * slots + slot`; `prompt_plan_kernel` (new) lays the universal
+ `TF_GLM_EXL3_ROWROT`), and the AFD expert node (`experts_node.py`) takes the kernel for prompt chunks only, as the
+ recipe's prompt-chunk buffers do. A prompt row's expert outputs are then the recipe's prompt bits, not the grouped
+ kernel's. `TF_GLM_EXL3_PROMPT` is off unless set (the recipe's code turns it on).
++
++## GLM prefill lanes and FP8 wire rows (TF_GLM_PREFILL_LANES, TF_GLM_WIRE_FP8)
++
++Hugh Madden ([@dangerm00se](https://x.com/dangerm00se), [hughmadden](https://github.com/hughmadden)) authored the
++prefill lanes and the FP8 wire rows of the AFD design that `families/glm5_next/cuda/prefill_pairs.py`'s
++`run_lanes` / `_forward_lanes` / `lane_buffers` and `wire_fp8.py` bring to this tree's attention/expert split:
++the two-lane prefill of whole prompt chunks in [mimo26f-afd](https://github.com/hughmadden/mimo26f-afd/tree/bab9fa2f2fc1e22ae67b56fbc1c209278f6a9d79)
++(`crates/mimo26-coordinator/src/dforward.rs`), the prefill in up to four lanes (four lanes of 2,048 rows by default,
++the exchanges in flight bounded by the expert backend's depth) and the FP8 E4M3 wire rows with a UE8M0 scale per 32
++values (`Fp8E4m3Ue8m0K32`: `crates/glm53f-coordinator/kernels/wire.cu`, `src/wire.rs`, `src/fp8.rs`, from mimo26f-afd's
++`crates/mimo26-coordinator/kernels/glue.cu`, `crates/mimo26-attn/kernels/include/mimo26_attn_device.cuh`,
++`crates/mimo26-attn/kernels/kv_cache_fp8.cu` and `crates/mimo26-load/src/e4m3.rs`) in
++[glm53f-afd](https://github.com/hughmadden/glm53f-afd/tree/91db3cc6fe672e2724efa3464f63bd31493f63f6)
++(`crates/glm53f-forward/src/forward.rs` `run_lanes`, `src/experts.rs` `ExpertBackend::depth`), MIT License, Copyright
++(c) 2026 Turquoise Bay AI Pty Ltd (the MIT text above). The wire row format is DS41RT's, by T.J. Purtell
++([@wrldsuksgo2mars](https://x.com/wrldsuksgo2mars), [tpurtell/ds41rt](https://github.com/tpurtell/ds41rt), MIT),
++carried through mimo26f-afd. No code is copied: the lanes are written for this tree's whole prompt chunks over the
++MCDMA wire (one exchange in flight per link, so the lanes go in lane order and a lane's attention runs inside the
++exchange windows of the lanes before it); the codec is torch operations and a table of every bf16 magnitude's code
++computed with a plain-Python transcription of glm53f-afd's device encoder, and the tests check it byte for byte
++against that transcription. Both are off unless set: `TF_GLM_PREFILL_LANES` (1 .. 4; unset follows
++`TF_GLM_PREFILL_PAIRS`, 2 being this tree's pairs) and `TF_GLM_WIRE_FP8=1` (which changes the experts' inputs).
+diff --git a/src/tensorfold/families/glm5_next/cuda/afd.py b/src/tensorfold/families/glm5_next/cuda/afd.py
+index 4d11bcc..f28b11a 100644
+--- a/src/tensorfold/families/glm5_next/cuda/afd.py
++++ b/src/tensorfold/families/glm5_next/cuda/afd.py
+@@ -15,7 +15,11 @@ tree's own wire design, not part of the recipe.
+ 
+ Prompt chunk pairs (MODE_PAIR, TF_GLM_PREFILL_PAIRS, ``prefill_pairs``; ours) open two whole-chunk forwards at once
+ (``begin_pair``): their MoE exchanges alternate, window 0's layer, window 1's, window 0's next ..., with one request
+-on each link at a time, so one chunk's attention runs while the experts compute the other's exchange.
++on each link at a time, so one chunk's attention runs while the experts compute the other's exchange. Prompt chunk
++lanes (MODE_LANES, TF_GLM_PREFILL_LANES of 3 or 4, ``begin_lanes``) open N such windows, their exchanges in lane order.
++
++TF_GLM_WIRE_FP8=1 sends each exchange's FFN input rows as FP8 E4M3 rows with one UE8M0 scale per 32 values
++(``wire_fp8``, the transport's codec); the expert nodes decode them to the same bf16 values before their experts.
+ """
+ 
+ from __future__ import annotations
+@@ -36,8 +40,12 @@ MODE_SLICE = 5          # MoE positions a .. a + n - 1 of a prompt chunk (TF_GLM
+ MODE_PAIR = 7           # a prompt chunk of a pair (TF_GLM_PREFILL_PAIRS, ``prefill_pairs``): eager, the wide scratch, its
+ #                         MoE exchanges alternating with the other window's; the experts take it only after the
+ #                         settings handshake's ``pairs``
++MODE_LANES = 9          # a prompt chunk of N >= 3 lanes (TF_GLM_PREFILL_LANES, ``prefill_pairs.run_lanes``): as a pair's,
++#                         the lanes' MoE exchanges in lane order; the experts take it only after the handshake's ``lanes``
+ PAIR_SLOT, PAIR_OTHER, PAIR_FIRST = 7, 8, 9    # a MODE_PAIR header's words: its slot (0, 1), the other window's rows,
+ #                                                the pair's first forward seq (words 6 and 10-63 stay 0)
++LANE_COUNT = 10         # a MODE_LANES header's word 10: the lanes' count N; words 7 and 9 as a pair's (its slot 0 .. N-1,
++#                         the first lane's seq), word 8 the next lane's rows (slot k + 1's; the last lane's: lane 0's)
+ WIRE = 2                # the wire's version in the settings handshake: 2 adds MODE_SLICE (an older node refuses)
+ CHECK_ENV = "TF_AFD_CHECK"
+ TIME_ENV = "TF_AFD_TIME"
+@@ -53,10 +61,12 @@ def moe_layers(cfg) -> list[int]:
+     return [i for i, kind in enumerate(cfg.mlp_kinds) if kind == "moe"]
+ 
+ 
+-def settings_for(model_dir, cfg, *, prefill_rows: int, pairs: bool = False) -> dict:
++def settings_for(model_dir, cfg, *, prefill_rows: int, pairs: bool = False, lanes: int = 0,
++                 wire_fp8: bool = False) -> dict:
+     """Everything both sides must agree on before the first forward; a mismatch refuses to start. ``pairs``
+     (TF_GLM_PREFILL_PAIRS on the attention node) adds ``"pairs": 1``: expert nodes of a tree without MODE_PAIR refuse
+-    it here; without it the settings are unchanged."""
++    it here; without it the settings are unchanged. ``lanes`` (TF_GLM_PREFILL_LANES of 3 or more) adds ``"lanes": N``
++    and ``wire_fp8`` (TF_GLM_WIRE_FP8) ``"wire_fp8": 1`` the same way (an expert node of a tree without them refuses)."""
+ 
+     from pathlib import Path
+ 
+@@ -66,6 +76,10 @@ def settings_for(model_dir, cfg, *, prefill_rows: int, pairs: bool = False) -> d
+            "quant": cfg.quant, "experts": cfg.experts, "top_k": cfg.top_k, "wire": WIRE}
+     if pairs:
+         out["pairs"] = 1
++    if lanes >= 3:
++        out["lanes"] = int(lanes)
++    if wire_fp8:
++        out["wire_fp8"] = 1
+     return out
+ 
+ 
+@@ -219,19 +233,24 @@ class AfdWire:
+     start = end = 0                              # the current forward's MoE positions (set by ``begin``)
+     span: tuple[int, int] | None = None          # a MODE_SLICE forward's (a, n)
+     _sliced = 0
++    depth = 1                                    # exchanges in flight at once: one request on each link (protocol 1)
+     # TF_GLM_PREFILL_PAIRS (``begin_pair``): an open pair's two windows (the inactive one's fields saved there), the
+     # active one, its offset among the check's forwards, the request on the wire (window, layer), the checked paired
+     # forwards' seqs, TF_AFD_TIME's pair events (per window and MoE layer: send / collect / reply), the sampled pairs'
+     # (window, wait) ms by window rows and how many pairs it sampled. Class defaults: no pair (replaced, never
+-    # appended to, here).
++    # appended to, here). TF_GLM_PREFILL_LANES (``begin_lanes``): the same fields for N windows; the checked lanes'
++    # forwards' seqs and the lane groups timed apart from the pairs'.
+     _pair: list[dict] | None = None
+     _slot = 0
+     _ahead = 0
+     _busy: tuple[int, int] | None = None
+     _paired: list[int] | tuple = ()
++    _laned: list[tuple[int, int]] | tuple = ()   # checked MODE_LANES forwards: (seq, the first lane's seq)
+     _pev: list | None = None
+     _overlap: dict[int, list[tuple[float, float]]] | None = None
+     _pairs_timed = 0
++    _lane_overlap: dict[tuple[int, int], list[tuple[float, float]]] | None = None
++    _lanes_timed = 0
+ 
+     def __init__(self, master: str, port: int, model_dir=None, transport=None) -> None:
+         import torch
+@@ -392,21 +411,42 @@ class AfdWire:
+         ``begin_pair``) closes the pair: both windows must have made all their exchanges."""
+ 
+         ra, rb = (int(r) for r in rows)
+-        self.begin(ra, chunk=True)               # the refusals and the last forward's check and timing, as begin's
++        self._begin_windows((ra, rb))
++
++    def begin_lanes(self, rows) -> None:
++        """N >= 3 prompt chunks' headers (TF_GLM_PREFILL_LANES), before any's eager kernels: forwards seq + 1 .. seq + N
++        (slots 0 .. N - 1), all MODE_LANES; their MoE exchanges go in lane order, slot 0's layer L, slot 1's, ...,
++        then slot 0's layer L + 1, one request on each link at a time, as a pair's (``begin_pair``)."""
++
++        rows = tuple(int(r) for r in rows)
++        if len(rows) < 3:
++            raise ValueError(f"prompt chunk lanes open 3 or more windows (two are a pair), not {len(rows)}")
++        if not hasattr(self.tr, "header_lanes"):
++            raise RuntimeError(f"the {self.tr.name} wire carries no prompt chunk lanes")
++        self._begin_windows(rows)
++
++    def _begin_windows(self, rows: tuple[int, ...]) -> None:
++        n = len(rows)
++        self.begin(rows[0], chunk=True)          # the refusals and the last forward's check and timing, as begin's
+         first = self.seq                         # (begin wrote slot 0's seq; the header tables are rewritten below)
+-        win = {"seq": first, "rows": ra, "mode": MODE_PAIR, "layer": 0, "_chk": None, "_ahead": 0}
+-        self._pair = [win, dict(win, seq=first + 1, rows=rb, _ahead=1)]
++        mode = MODE_PAIR if n == 2 else MODE_LANES
++        win = {"seq": first, "rows": rows[0], "mode": mode, "layer": 0, "_chk": None, "_ahead": 0}
++        self._pair = [dict(win, seq=first + k, rows=r, _ahead=k) for k, r in enumerate(rows)]
+         self._slot, self._busy = 0, None
+-        self._load(win)
+-        self.tr.header_pair((first, first + 1), (ra, rb))
+-        if self.timing and self._pev is None:
++        self._load(self._pair[0])
++        seqs = tuple(first + k for k in range(n))
++        if n == 2:
++            self.tr.header_pair(seqs, rows)
++        else:
++            self.tr.header_lanes(seqs, rows)
++        if self.timing and (self._pev is None or len(self._pev) < n):
+             self._pev = [[[self.torch.cuda.Event(enable_timing=True) for _ in range(3)] for _ in range(self.nlayers)]
+-                         for _ in range(2)]
++                         for _ in range(n)]
+ 
+     def use(self, slot: int) -> None:
+         """The open pair's window that the next ``exchange`` / ``collect`` act for."""
+ 
+-        if self._pair is None or slot not in (0, 1):
++        if self._pair is None or slot not in range(len(self._pair)):
+             raise RuntimeError(f"no prompt chunk pair window {slot} is open")
+         if slot != self._slot:
+             self._pair[self._slot] = {k: getattr(self, k) for k in self._WIN}
+@@ -426,10 +466,12 @@ class AfdWire:
+         wins, self._pair = self._pair, None
+         self._slot, self._busy = 0, None
+         self.tr.close_pair()
++        lanes = len(wins) > 2
+         for k, win in enumerate(wins):
+             if win["layer"] != self.nlayers:
+-                why = (f"a prompt chunk pair's window {k} (seq {win['seq']}) stopped after {win['layer']} of "
+-                       f"{self.nlayers} MoE exchanges; the experts are out of step")
++                what = f"prompt chunk lane {k}" if lanes else f"prompt chunk pair's window {k}"
++                why = (f"a {what} (seq {win['seq']}) stopped after {win['layer']} of {self.nlayers} MoE exchanges; the "
++                       "experts are out of step")
+                 self.die(why)
+                 raise self._cap(f"the AFD expert nodes are gone ({why}); restart the serving stack")
+         if self.check:
+@@ -437,12 +479,14 @@ class AfdWire:
+                 self._load(win)
+                 self._finish_check()
+         if self.timing:
+-            self._sample_pair(rows=(wins[0]["rows"], wins[1]["rows"]))
+-        self._load(dict(wins[1], layer=0, _chk=None, _ahead=0))
++            self._sample_pair(rows=tuple(win["rows"] for win in wins))
++        self._load(dict(wins[-1], layer=0, _chk=None, _ahead=0))
+ 
+     def _named(self) -> str:
+         """A paired window's name in the check's lines."""
+ 
++        if self.mode == MODE_LANES:
++            return f" (prompt chunk lane {self._ahead}, lanes from seq {self.seq - self._ahead})"
+         if self.mode != MODE_PAIR:
+             return ""
+         other = self.seq + 1 if self._ahead == 0 else self.seq - 1
+@@ -463,7 +507,9 @@ class AfdWire:
+             self.ev[self.layer][0].record()
+         if self.check and self.checked + self._ahead < CHECK_FORWARDS:
+             self._chk = self._chk or []
+-            self._chk.append([b.normed[:rows].clone(), b.pick[:rows].clone(), b.wts[:rows].clone(), None, None])
++            seen = getattr(self.tr, "wire_rows", None)   # TF_GLM_WIRE_FP8: the bf16 rows the experts decode
++            rows_in = seen(b.normed[:rows]) if seen is not None else b.normed[:rows].clone()
++            self._chk.append([rows_in, b.pick[:rows].clone(), b.wts[:rows].clone(), None, None])
+         try:
+             self.tr.send(b, rows, self.layer)
+         except WireError as exc:
+@@ -549,6 +595,8 @@ class AfdWire:
+             print(f"[tensorfold] afd-check first mismatch: {lead}{first}", flush=True)
+         if self.mode == MODE_PAIR:
+             self._paired = [*self._paired, self.seq]
++        elif self.mode == MODE_LANES:
++            self._laned = [*self._laned, (self.seq, self.seq - self._ahead)]
+         if self.checked == CHECK_FORWARDS:
+             sliced = ""
+             if self._sliced:            # MODE_SLICE forwards among the checked ones, named by their MoE positions
+@@ -559,6 +607,13 @@ class AfdWire:
+                 firsts = [s for s in self._paired if s + 1 in self._paired]
+                 named = (f" ({len(self._paired)} of them in prompt chunk pairs, seqs "
+                          f"{', '.join(f'{s}-{s + 1}' for s in firsts[:8])}{' ...' if len(firsts) > 8 else ''})")
++            if self._laned:             # MODE_LANES forwards among the checked ones, named by their lane groups' seqs
++                groups: dict[int, int] = {}
++                for s, f in self._laned:
++                    groups[f] = max(groups.get(f, s), s)
++                named += (f" ({len(self._laned)} of them in prompt chunk lanes, seqs "
++                          f"{', '.join(f'{f}-{last}' for f, last in sorted(groups.items())[:8])}"
++                          f"{' ...' if len(groups) > 8 else ''})")
+             print(f"[tensorfold] afd-check: window complete, {CHECK_FORWARDS} forwards{named}, "
+                   f"{self.mismatches} mismatches total, rows checked {sorted(self._seen)}{sliced}", flush=True)
+         if bad:
+@@ -596,6 +651,9 @@ class AfdWire:
+         if self._pev is None:
+             return
+         self.torch.cuda.synchronize()
++        if len(rows) > 2:               # lane groups: their own sample set and line, keyed by R the same way
++            self._sample_lanes(rows, every)
++            return
+         ov = dict(self._overlap or {})
+         for r, win in zip(rows, self._pev):
+             ov[r] = [*ov.get(r, ()), *((send.elapsed_time(w1), w0.elapsed_time(w1)) for send, w0, w1 in win)]
+@@ -612,3 +670,26 @@ class AfdWire:
+                   f"last {every} pairs ({self._pairs_timed} so far; in-window work: the shared expert + the other "
+                   f"chunk's attention); {'; '.join(parts)}", flush=True)
+             self._overlap = {}
++
++    def _sample_lanes(self, rows: tuple[int, ...], every: int = 8) -> None:
++        """``_sample_pair`` for a lane group of N >= 3 windows (TF_GLM_PREFILL_LANES): the same window and wait per
++        exchange by the window's rows R; between a lane's send and its collect the stream runs that layer's shared
++        expert and the other lanes' work. Every ``every`` lane groups, one line per N and R."""
++
++        ov = dict(self._lane_overlap or {})
++        n = len(rows)
++        for r, win in zip(rows, self._pev or ()):
++            ov[(n, r)] = [*ov.get((n, r), ()), *((send.elapsed_time(w1), w0.elapsed_time(w1)) for send, w0, w1 in win)]
++        self._lane_overlap = ov
++        self._lanes_timed += 1
++        if self._lanes_timed % every == 0 and ov:
++            parts = []
++            for (nl, r), v in sorted(ov.items()):
++                spans, waits, work = [s for s, _ in v], [wt for _, wt in v], [s - wt for s, wt in v]
++                parts.append(f"N{nl} R{r} n{len(v)} window p50 {p50_p90(spans)[0]:.2f} ms p90 {p50_p90(spans)[1]:.2f}, "
++                             f"wait for the reply p50 {p50_p90(waits)[0]:.2f} ms p90 {p50_p90(waits)[1]:.2f}, "
++                             f"in-window work p50 {p50_p90(work)[0]:.2f} ms p90 {p50_p90(work)[1]:.2f}")
++            print(f"[tensorfold] afd lane overlap: {sum(len(v) for v in ov.values())} lane MoE exchanges over the last "
++                  f"{every} lane groups ({self._lanes_timed} so far; in-window work: the shared expert + the other "
++                  f"lanes' attention); {'; '.join(parts)}", flush=True)
++            self._lane_overlap = {}
+diff --git a/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py b/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py
+index 922723a..cf2f694 100644
+--- a/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py
++++ b/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py
+@@ -13,10 +13,22 @@ from __future__ import annotations
+ import struct
+ 
+ from . import mcdma, mcdma_cuda
+-from .afd import MODE_CHUNK, MODE_EAGER, MODE_PAIR, MODE_SLICE, PAIR_FIRST, PAIR_OTHER, PAIR_SLOT, get_store
++from .afd import (
++    LANE_COUNT,
++    MODE_CHUNK,
++    MODE_EAGER,
++    MODE_LANES,
++    MODE_PAIR,
++    MODE_SLICE,
++    PAIR_FIRST,
++    PAIR_OTHER,
++    PAIR_SLOT,
++    get_store,
++)
+ from .afd_transport import WireError
+ 
+-PAIR_WORDS = "<10i"             # a request header's words 0-9 (mcdma.HDR_FMT reads 0-7; a MODE_PAIR's are 7-9)
++PAIR_WORDS = "<11i"             # a request header's words 0-10 (mcdma.HDR_FMT reads 0-7; a MODE_PAIR's are 7-9, a
++#                                 MODE_LANES' 7-10)
+ 
+ 
+ def _bytes(t):
+@@ -79,7 +91,9 @@ class McdmaTransport:
+         self.layout = None
+         self.hdr_tab = self.hdr_tab_cpu = self.req_dev = self.zeros = None
+         self.sliced: int | None = None                     # the header row whose word 6 holds a slice's count
+-        self._tabs = None                                  # a prompt chunk pair's two windows' header tables
++        self._tabs = None                                  # a prompt chunk pair's / lanes' windows' header tables
++        self.fp8 = False                                   # TF_GLM_WIRE_FP8 (the handshake's ``wire_fp8``)
++        self.codes = self.scales = None                    # fp8: the encoded rows, before they are packed
+         self.down = False                                  # aborted: the forward in flight runs on without the wire
+         # rank 0 hosts the store and waits for both experts' clients
+         self.comm = comm if comm is not None else StoreComm(0, 3, master, port, links)
+@@ -93,7 +107,8 @@ class McdmaTransport:
+             raise RuntimeError("the MCDMA wire needs the checkpoint's hidden size: build it with the model dir")
+         layers = len(settings["layers"])
+         rows = max(int(settings["prefill_rows"]), int(settings["max_rows"]))
+-        self.layout = mcdma.Layout(self.hidden, int(settings["top_k"]) + 1)
++        self.fp8 = settings.get("wire_fp8") == 1
++        self.layout = mcdma.Layout(self.hidden, int(settings["top_k"]) + 1, fp8=self.fp8)
+         self.mc.check_room(self.layout, rows)
+         dev = self.device
+         tab = torch.zeros((layers, mcdma.HDR_INTS), dtype=torch.int32, pin_memory=dev != "cpu")
+@@ -104,6 +119,12 @@ class McdmaTransport:
+         self.hdr_tab = torch.zeros(tab.shape, dtype=torch.int32, device=dev)
+         self.req_dev = torch.empty((self.layout.req(rows),), dtype=torch.uint8, device=dev)
+         self.zeros = torch.zeros((mcdma.ALIGN,), dtype=torch.uint8, device=dev)
++        if self.fp8:                             # TF_GLM_WIRE_FP8: the encoded rows, then packed as normed's section
++            from . import wire_fp8
++
++            self.codes = torch.empty((rows, self.hidden), dtype=torch.uint8, device=dev)
++            self.scales = torch.empty((rows, self.hidden // wire_fp8.BLOCK), dtype=torch.uint8, device=dev)
++            self.wire_rows = wire_fp8.roundtrip  # the rows the experts decode (the wire check's)
+         return {"transport": "mcdma", "mcdma_links": list(self.mc.names)}
+ 
+     def start(self, store) -> None:
+@@ -132,18 +153,31 @@ class McdmaTransport:
+         writes them with MODE_PAIR, plus word 7 its slot, word 8 the other window's rows and word 9 the pair's first
+         seq; one blocking copy each (the second window's tables are made at the first pair)."""
+ 
++        self._windows(seqs, rows, MODE_PAIR)
++
++    def header_lanes(self, seqs, rows) -> None:
++        """N >= 3 prompt chunk lanes' forwards (``AfdWire.begin_lanes``): each lane's request headers as a pair's
++        window's with MODE_LANES, word 8 the next lane's rows (the last lane's: the first's) and word 10 N."""
++
++        self._windows(seqs, rows, MODE_LANES)
++
++    def _windows(self, seqs, rows, mode: int) -> None:
+         torch = self.torch
++        n = len(rows)
+         if self._tabs is None:
++            self._tabs = [(self.hdr_tab, self.hdr_tab_cpu)]
++        while len(self._tabs) < n:
+             cpu = torch.zeros(self.hdr_tab_cpu.shape, dtype=torch.int32, pin_memory=self.device != "cpu")
+-            cpu.copy_(self.hdr_tab_cpu)
+-            self._tabs = [(self.hdr_tab, self.hdr_tab_cpu), (torch.zeros_like(self.hdr_tab), cpu)]
+-        for k, (dev, tab) in enumerate(self._tabs):
++            cpu.copy_(self._tabs[0][1])
++            self._tabs.append((torch.zeros_like(self.hdr_tab), cpu))
++        for k, (dev, tab) in enumerate(self._tabs[:n]):
+             tab[:, 1] = seqs[k] & 0x7FFFFFFF
+             tab[:, 2] = rows[k]
+-            tab[:, 4] = MODE_PAIR
++            tab[:, 4] = mode
+             tab[:, PAIR_SLOT] = k
+-            tab[:, PAIR_OTHER] = rows[1 - k]
++            tab[:, PAIR_OTHER] = rows[(k + 1) % n]
+             tab[:, PAIR_FIRST] = seqs[0] & 0x7FFFFFFF
++            tab[:, LANE_COUNT] = n if mode == MODE_LANES else 0
+             dev.copy_(tab)                       # blocking, as header's
+         self.use(0)
+ 
+@@ -157,17 +191,28 @@ class McdmaTransport:
+ 
+         if self._tabs is not None:
+             self.use(0)
+-            self.hdr_tab_cpu[:, PAIR_SLOT:PAIR_FIRST + 1] = 0
++            self.hdr_tab_cpu[:, PAIR_SLOT:LANE_COUNT + 1] = 0
+ 
+     def send(self, b, rows: int, layer: int) -> None:
+-        """[header | normed | pick | pad | wts] packed on the device, then into both mailboxes."""
++        """[header | normed | pick | pad | wts] packed on the device, then into both mailboxes. TF_GLM_WIRE_FP8:
++        normed's section is the rows' E4M3 codes, their scale bytes and zeros to the next 256 bytes (``wire_fp8``)."""
+ 
+         if self.down:
+             return
+         torch = self.torch
+         lay = self.layout
+         n = lay.req(rows)
+-        parts = [self.hdr_tab[layer].view(torch.uint8), _bytes(b.normed[:rows]), _bytes(b.pick[:rows])]
++        parts = [self.hdr_tab[layer].view(torch.uint8)]
++        if self.fp8:
++            from . import wire_fp8
++
++            wire_fp8.encode(b.normed[:rows], self.codes[:rows], self.scales[:rows])
++            parts += [_bytes(self.codes[:rows]), _bytes(self.scales[:rows])]
++            if lay.scales_pad(rows):
++                parts.append(self.zeros[:lay.scales_pad(rows)])
++        else:
++            parts.append(_bytes(b.normed[:rows]))
++        parts.append(_bytes(b.pick[:rows]))
+         pad = lay.pad(rows)
+         if pad:
+             parts.append(self.zeros[:pad])
+@@ -228,7 +273,8 @@ def open_expert_link(theirs: dict, rank: int, cfg, store, device: str = "cuda",
+     flags = mcdma_cuda.flush_flag(driver, ordinal) if mode == "gpu" else 0
+     link = mcdma.ExpertLink(name, driver=driver, mode=mode, flags=flags, log=log)
+     rows = int(theirs["prefill_rows"])
+-    link.check_room(mcdma.Layout(cfg.hidden, cfg.top_k + 1), max(rows, int(theirs["max_rows"])))
++    fp8 = theirs.get("wire_fp8") == 1
++    link.check_room(mcdma.Layout(cfg.hidden, cfg.top_k + 1, fp8=fp8), max(rows, int(theirs["max_rows"])))
+     raw = get_store(store, f"afd_mcdma/base/{rank}", 60.0)
+     if raw is None:
+         link.close()
+@@ -238,7 +284,7 @@ def open_expert_link(theirs: dict, rank: int, cfg, store, device: str = "cuda",
+         f"{link.box.req >> 20}+{link.box.rep >> 20} MiB, socket {link.socket_path}, first sequence {link.base}",
+         flush=True)
+     return McdmaExpertLink(link, cfg.hidden, cfg.top_k + 1, len(theirs["layers"]), rows, device,
+-                           pairs=theirs.get("pairs") == 1)
++                           pairs=theirs.get("pairs") == 1, lanes=int(theirs.get("lanes", 0)), fp8=fp8)
+ 
+ 
+ class McdmaExpertLink:
+@@ -246,11 +292,14 @@ class McdmaExpertLink:
+     request is awaited on the host: its header gives rows and mode. Every layer then lands the request (one copy)
+     and stages the partial back: as stream operations (GPU-driven: the later layers' requests are stream waits) or
+     with a host wait and one sync per layer (CPU-driven). ``pairs`` (the handshake's): MODE_PAIR forwards come two at
+-    a time, their layers alternating (``next_partner``, ``use``); the link still carries one request at a time."""
++    a time, their layers alternating (``next_partner``, ``use``); the link still carries one request at a time.
++    ``lanes`` (the handshake's, 3 or more): MODE_LANES forwards come N at a time (the header's word 10), their layers
++    in lane order, as a pair's. ``fp8`` (the handshake's ``wire_fp8``): the request's rows are FP8 wire rows, decoded
++    to bf16 after each landing (``wire_fp8.decode``)."""
+ 
+     def __init__(self, link, hidden: int, slots: int, layers: int, prefill_rows: int, device: str = "cuda", *,
+-                 pairs: bool = False) -> None:
+-        self.link, self.lay = link, mcdma.Layout(hidden, slots)
++                 pairs: bool = False, lanes: int = 0, fp8: bool = False) -> None:
++        self.link, self.lay = link, mcdma.Layout(hidden, slots, fp8=fp8)
+         self.layers, self.prefill_rows, self.device = layers, prefill_rows, device
+         self.gpu = link.mode == "gpu"
+         self.seq = link.base                     # the next request's sequence
+@@ -259,8 +308,12 @@ class McdmaExpertLink:
+         self.first, self.count = 0, layers       # the forward's MoE positions: every layer, or a slice's (MODE_SLICE)
+         self.x = self.src = self.dst = self.rep = self._routed = self._out = None
+         self.pairs = pairs
+-        self.slot: int | None = None             # a pair's active window, else None
+-        self.partner = 0                         # a pair's second window's rows
++        self.lanes = lanes if lanes >= 3 else 0
++        self.fp8 = fp8
++        self.slot: int | None = None             # a pair's (or lanes') active window, else None
++        self.partner = 0                         # the next window's rows (a pair's second's; lanes: the next lane's)
++        self.wmode = MODE_PAIR                   # the open windows' mode (MODE_PAIR or MODE_LANES)
++        self.n_windows = 2                       # the open windows' count
+         self._wins: list = [None, None]
+ 
+     def _words(self) -> tuple:
+@@ -298,12 +351,20 @@ class McdmaExpertLink:
+                 raise mcdma.LinkError(f"link {link.name}: request {self.seq} opens no prompt chunk pair: slot "
+                                       f"{h[PAIR_SLOT]}, first seq {h[PAIR_FIRST]} (forward {fseq}), the other "
+                                       f"window's rows {h[PAIR_OTHER]}")
+-            self.partner = h[PAIR_OTHER]
++            self.partner, self.wmode, self.n_windows = h[PAIR_OTHER], MODE_PAIR, 2
++        elif mode == MODE_LANES and self.lanes:
++            h = self._words()
++            if (h[PAIR_SLOT] != 0 or h[PAIR_FIRST] != fseq or not 1 <= h[PAIR_OTHER] <= self.prefill_rows
++                    or not 3 <= h[LANE_COUNT] <= self.lanes):
++                raise mcdma.LinkError(f"link {link.name}: request {self.seq} opens no prompt chunk lanes: slot "
++                                      f"{h[PAIR_SLOT]}, first seq {h[PAIR_FIRST]} (forward {fseq}), the next lane's "
++                                      f"rows {h[PAIR_OTHER]}, {h[LANE_COUNT]} lanes (3 .. {self.lanes})")
++            self.partner, self.wmode, self.n_windows = h[PAIR_OTHER], MODE_LANES, h[LANE_COUNT]
+         elif mode not in (MODE_EAGER, MODE_CHUNK, MODE_SLICE):
+             raise mcdma.LinkError(f"link {link.name}: forward mode {mode}: the MCDMA wire carries eager windows only")
+         self._open(fseq, rows, first, count)
+-        if mode == MODE_PAIR:
+-            self.slot, self._wins = 0, [self._win(), None]
++        if mode in (MODE_PAIR, MODE_LANES):
++            self.slot, self._wins = 0, [self._win()] + [None] * (self.n_windows - 1)
+         return fseq, rows, mode
+ 
+     def _open(self, fseq: int, rows: int, first: int = 0, count: int | None = None) -> None:
+@@ -321,20 +382,34 @@ class McdmaExpertLink:
+         return {k: getattr(self, k) for k in self._FIELDS}
+ 
+     def next_partner(self) -> tuple[int, int]:
+-        """A pair's second window: its first request (after the first window's layer-0 reply) awaited on the host and
+-        its header checked against the first's; then it is the active window. Returns (seq, rows)."""
++        """A pair's second window (lanes: the next lane's): its first request (after the window before's layer-0
++        reply) awaited on the host and its header checked against the first's; then it is the active window. Returns
++        (seq, rows)."""
+ 
+         link, first = self.link, self._wins[0]
++        k = next((j for j, win in enumerate(self._wins) if win is None), None)
++        if k is None:
++            raise mcdma.LinkError(f"link {link.name}: request {self.seq}: the {self.n_windows} windows of forward "
++                                  f"{first['fseq']} are all open")
+         w = link.wait(self.seq)
+         h = self._words()
+-        want = (mcdma.WIRE_MAGIC, first["fseq"] + 1, self.partner, 0, MODE_PAIR, self.layers)
+-        if (tuple(h[:6]) != want or h[PAIR_SLOT] != 1 or h[PAIR_OTHER] != first["rows"]
+-                or h[PAIR_FIRST] != first["fseq"] or mcdma.word_len(w) != self.lay.req(self.partner)):
+-            raise mcdma.LinkError(f"link {link.name}: request {self.seq} header {list(h)} is not the second window of "
+-                                  f"the pair that forward {first['fseq']} opened ({first['rows']} + {self.partner} rows)")
++        want = (mcdma.WIRE_MAGIC, first["fseq"] + k, self.partner, 0, self.wmode, self.layers)
++        if self.wmode == MODE_PAIR:
++            bad = h[PAIR_SLOT] != 1 or h[PAIR_OTHER] != first["rows"]
++        else:
++            bad = (h[PAIR_SLOT] != k or h[LANE_COUNT] != self.n_windows
++                   or not 1 <= h[PAIR_OTHER] <= self.prefill_rows
++                   or (k == self.n_windows - 1 and h[PAIR_OTHER] != first["rows"]))
++        if (tuple(h[:6]) != want or bad or h[PAIR_FIRST] != first["fseq"]
++                or mcdma.word_len(w) != self.lay.req(self.partner)):
++            what = ("the second window of the pair" if self.wmode == MODE_PAIR else
++                    f"lane {k} of the {self.n_windows} lanes")
++            raise mcdma.LinkError(f"link {link.name}: request {self.seq} header {list(h)} is not {what} that forward "
++                                  f"{first['fseq']} opened ({first['rows']} + {self.partner} rows)")
+         self._open(h[1], h[2])
+-        self._wins[1] = self._win()
+-        self.slot = 1
++        self._wins[k] = self._win()
++        self.slot = k
++        self.partner = h[PAIR_OTHER]
+         return h[1], h[2]
+ 
+     def use(self, slot: int) -> None:
+@@ -346,7 +421,8 @@ class McdmaExpertLink:
+             self.slot = slot
+ 
+     def land(self, layer: int, views):
+-        """The request into the landing buffer, one copy; the compute reads its sections there (not ``views``)."""
++        """The request into the landing buffer, one copy; the compute reads its sections there (not ``views``).
++        TF_GLM_WIRE_FP8: the rows decoded from there into ``views[0]`` (the node's own bf16 rows), read from there."""
+ 
+         link = self.link
+         if layer != self.first:                 # the forward's first request was awaited by next_forward
+@@ -357,11 +433,16 @@ class McdmaExpertLink:
+                 h = link.box.header()
+                 if (h[0] != mcdma.WIRE_MAGIC or h[1] != self.fseq or h[2] != self.rows or h[3] != layer
+                         or mcdma.word_len(w) != self.n_req
+-                        or (self.slot is not None and (h[4] != MODE_PAIR or h[PAIR_SLOT] != self.slot))):
++                        or (self.slot is not None and (h[4] != self.wmode or h[PAIR_SLOT] != self.slot))):
+                     raise mcdma.LinkError(f"link {link.name}: request {self.seq} header {h[:6]} is not layer {layer} "
+                                           f"of forward {self.fseq} ({self.rows} rows, {self.n_req} bytes"
+                                           f"{'' if self.slot is None else f', pair window {self.slot}'})")
+         self.dst.copy_(self.src, non_blocking=True)    # the request, header slot skipped: normed | pick | pad | wts
++        if self.fp8:
++            from . import wire_fp8
++
++            codes, scales, pick, wts = self.x
++            return wire_fp8.decode(codes, scales, views[0]), pick, wts
+         return self.x
+ 
+     def reply(self, layer: int, routed) -> None:
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 63791d9..494c34d 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -466,11 +466,15 @@ class GlmEngine:
+             extra = (parallel - 1) * slot_bytes(text, world)
+             if kv != "bf16":                    # TF_GLM_KV=fp8: each slot's indexer rings (0038)
+                 extra += (parallel - 1) * mla_ring_bytes(text, ring_rows)
+-            if afd is not None:                 # TF_GLM_PREFILL_PAIRS: the second prompt chunk's buffers
++            if afd is not None:                 # TF_GLM_PREFILL_PAIRS / _LANES: the later prompt chunks' buffers
+                 from . import prefill_pairs
+ 
+-                if prefill_pairs.enabled():
++                lanes = prefill_pairs.lanes()
++                if lanes == 2:
+                     extra += prefill_pairs.plan_bytes(text, ring_rows, taps=5 if drafter is not None else 0)
++                elif lanes >= 3:
++                    extra += (lanes - 1) * prefill_pairs.plan_bytes(text, ring_rows, taps=5 if drafter is not None
++                                                                    else 0, routed=True)
+             per = 4 * MULTI_WINDOW // 4
+             return Geometry(lambda slots: g.bytes_at(slots) + extra + per * slots, g.reserve, g.minimum_slots)
+ 
+@@ -495,11 +499,18 @@ class GlmEngine:
+         # on multiples of G and kept prompt states sit on them. Read before anything reaches the AFD wire
+         self.grid = prompt_grid(prefill_rows)
+         if afd is not None:
+-            from . import prefill_pairs
++            from . import prefill_pairs, wire_fp8
+             from .afd import settings_for
+ 
+-            # the experts size off this; TF_GLM_PREFILL_PAIRS adds "pairs" (expert nodes without MODE_PAIR refuse it)
+-            afd.announce(settings_for(model_dir, cfg, prefill_rows=prefill_rows, pairs=prefill_pairs.enabled()))
++            # the experts size off this; TF_GLM_PREFILL_PAIRS adds "pairs" (expert nodes without MODE_PAIR refuse it),
++            # TF_GLM_PREFILL_LANES of 3 or 4 "lanes" too (without MODE_LANES: refused), TF_GLM_WIRE_FP8 "wire_fp8"
++            lanes = prefill_pairs.lanes()
++            afd.announce(settings_for(model_dir, cfg, prefill_rows=prefill_rows, pairs=lanes >= 2,
++                                      lanes=lanes if lanes >= 3 else 0, wire_fp8=wire_fp8.enabled()))
++            if wire_fp8.enabled():
++                print(f"[tensorfold] TF_GLM_WIRE_FP8=1: the MoE exchanges' FFN input rows go as FP8 E4M3 rows, one "
++                      f"UE8M0 scale per {wire_fp8.BLOCK} values ({wire_fp8.row_bytes(cfg.hidden)} bytes a row instead of "
++                      f"{2 * cfg.hidden}); the expert nodes decode them to bf16", flush=True)
+         multi_code = [0]
+         if parallel > 1:                      # serial and batched verify windows make different collectives
+             from .multi import verify_kind
+@@ -591,11 +602,18 @@ class GlmEngine:
+         if afd is not None and parallel > 1:
+             from . import prefill_pairs
+ 
+-            if prefill_pairs.enabled():          # the second chunk's prompt buffers now, before the caches fill the GPU
++            lanes = prefill_pairs.lanes()
++            if lanes == 2:                       # the second chunk's prompt buffers now, before the caches fill the GPU
+                 self.e.pbuf2 = prefill_pairs.slot_buffers(self.e.pbuf)
+                 print(f"[tensorfold] TF_GLM_PREFILL_PAIRS=1: prompt chunks fill in pairs while no stream decodes (one "
+                       f"chunk's attention while the experts compute the other's); the second chunk's buffers "
+                       f"{prefill_pairs.slot_bytes(self.e.pbuf) / 2 ** 20:.0f} MiB", flush=True)
++            elif lanes >= 3:                     # the later lanes' prompt buffers now, as the pair's
++                self.e.pbuf_lanes = [prefill_pairs.lane_buffers(self.e.pbuf) for _ in range(lanes - 1)]
++                print(f"[tensorfold] TF_GLM_PREFILL_LANES={lanes}: up to {lanes} prompt chunks fill as lanes while no "
++                      f"stream decodes (the later lanes' attention while the experts compute an earlier lane's); the "
++                      f"later lanes' buffers {lanes - 1} x {prefill_pairs.lane_bytes(self.e.pbuf) / 2 ** 20:.0f} MiB",
++                      flush=True)
+         self.e.grid = self.grid                  # a resumed prompt starts on it (``decode.prefill``; recipe 0008)
+         if rank == 0 and kv != "bf16":
+             c = self.e.caches
+@@ -1163,9 +1181,11 @@ class AfdEngine(GlmEngine):
+             afd_parallel_check()
+         shared_prefix()                           # TF_GLM_SHARED_PREFIX read now: a typo fails before the wire opens
+         dflash_policy_check()                     # and TF_GLM_DFLASH_POLICY (0021)
+-        from . import prefill_pairs
++        from . import prefill_pairs, wire_fp8
+ 
+         prefill_pairs.enabled()                   # TF_GLM_PREFILL_PAIRS read now: a typo fails before the wire opens
++        prefill_pairs.lanes()                     # TF_GLM_PREFILL_LANES too
++        wire_fp8.enabled()                        # and TF_GLM_WIRE_FP8
+         from tensorfold.cuda.geometry import PREFILL_ROWS
+ 
+         prompt_grid(PREFILL_ROWS)                 # TF_GLM_PROMPT_GRID / TF_GLM_KDA_CHUNKED too (0008, 0039)
+diff --git a/src/tensorfold/families/glm5_next/cuda/experts_node.py b/src/tensorfold/families/glm5_next/cuda/experts_node.py
+index 56741c2..c2f76a7 100644
+--- a/src/tensorfold/families/glm5_next/cuda/experts_node.py
++++ b/src/tensorfold/families/glm5_next/cuda/experts_node.py
+@@ -10,13 +10,23 @@ import torch
+ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
+ 
+ from . import exl3_generic, glue
+-from .afd import (ALIVE_EVERY, CHECK_ENV, CHECK_FORWARDS, MODE_CHUNK, MODE_EAGER, MODE_PAIR, MODE_SLICE, Store,
+-                  check_key, get_store)
++from .afd import (ALIVE_EVERY, CHECK_ENV, CHECK_FORWARDS, MODE_CHUNK, MODE_EAGER, MODE_LANES, MODE_PAIR, MODE_SLICE,
++                  Store, check_key, get_store)
+ from .afd import settings_for, settings_mismatch, sha
+ from .split import RankReader
+ from .weights import PREFIX, Config
+ 
+ 
++def _lanes_asked(theirs: dict) -> int:
++    """The attention's prompt chunk lanes (its handshake's ``lanes``, 3 .. 4), echoed; 0 without (refused if out of
++    range: the settings then mismatch)."""
++
++    from .prefill_pairs import MAX_LANES
++
++    n = theirs.get("lanes", 0)
++    return n if isinstance(n, int) and 3 <= n <= MAX_LANES else 0
++
++
+ def _expert_names(i: int, experts: int) -> list[str]:
+     """Layer ``i``'s EXL3 routed-expert tensors in ``weights.load``'s order (no shared: the attention node keeps it)."""
+ 
+@@ -144,12 +154,21 @@ def _pair(node: ExpertNode, link, collect: list) -> int:
+     awaited after the first window's layer-0 reply. Each window's land, compute and reply are ``_window``'s for its
+     rows; ``collect``: per window its hashes, or None. Returns the second window's seq."""
+ 
++    return _lanes(node, link, collect)[1]
++
++
++def _lanes(node: ExpertNode, link, collect: list) -> list[int]:
++    """N windows' device body (a pair's, or MODE_LANES' N prompt chunk lanes, TF_GLM_PREFILL_LANES): each layer's
++    requests in lane order, window 0's, window 1's, ... window N - 1's, then the next layer's; window k's first request
++    is awaited after window k - 1's layer-0 reply. ``collect``: per window its hashes, or None. Returns the windows'
++    seqs from the second on (the first's is ``next_forward``'s)."""
++
+     b = node.buf
+-    seq = 0
++    seqs = [0] * len(collect)
+     for pos, i in enumerate(node.layers):
+-        for slot in (0, 1):
+-            if pos == 0 and slot == 1:
+-                seq = link.next_partner()[0]
++        for slot in range(len(collect)):
++            if pos == 0 and slot >= 1:
++                seqs[slot] = link.next_partner()[0]
+             link.use(slot)
+             R = link.rows
+             x = link.land(pos, (b.normed[:R], b.pick[:R], b.wts[:R]))
+@@ -159,7 +178,7 @@ def _pair(node: ExpertNode, link, collect: list) -> int:
+             if collect[slot] is not None:
+                 collect[slot][1].append(sha(routed))
+             link.reply(pos, routed)
+-    return seq
++    return seqs
+ 
+ 
+ def forwards(node: ExpertNode, link, store, rank: int, *, check_on: bool = False) -> None:
+@@ -178,6 +197,15 @@ def forwards(node: ExpertNode, link, store, rank: int, *, check_on: bool = False
+                     checked += 1
+                     store.set(check_key(s, rank, None), json.dumps({"in": collect[0], "out": collect[1]}).encode())
+             continue
++        if mode == MODE_LANES and getattr(link, "lanes", 0):
++            n = link.n_windows
++            every = [([], []) if check_on and checked + k < CHECK_FORWARDS else None for k in range(n)]
++            seqs = [seq, *_lanes(node, link, every)[1:]]
++            for s, collect in zip(seqs, every):
++                if collect is not None:
++                    checked += 1
++                    store.set(check_key(s, rank, None), json.dumps({"in": collect[0], "out": collect[1]}).encode())
++            continue
+         if mode not in (MODE_EAGER, MODE_CHUNK, MODE_SLICE):
+             raise RuntimeError(f"forward mode {mode}: the expert runs eager windows only")
+         span = link.span if mode == MODE_SLICE else None
+@@ -224,9 +252,10 @@ def serve(model_dir, half: int, master: str, port: int, *, device: str = "cuda")
+             raw = get_store(store, "afd_settings", 3600.0)
+             theirs = json.loads(bytes(raw).decode()) if raw else None
+         # the attention's wire must be this one; its link map is checked by open_expert_link; this tree serves
+-        # prompt chunk pairs (MODE_PAIR) when the attention asks for them
++        # prompt chunk pairs (MODE_PAIR), lanes (MODE_LANES) and FP8 wire rows when the attention asks for them
+         mine = dict(settings_for(model_dir, cfg, prefill_rows=int(theirs["prefill_rows"]),
+-                                 pairs=theirs.get("pairs") == 1), transport="mcdma",
++                                 pairs=theirs.get("pairs") == 1, lanes=_lanes_asked(theirs),
++                                 wire_fp8=theirs.get("wire_fp8") == 1), transport="mcdma",
+                     mcdma_links=theirs.get("mcdma_links"))
+         bad = settings_mismatch(mine, theirs)
+         if bad:
+diff --git a/src/tensorfold/families/glm5_next/cuda/mcdma.py b/src/tensorfold/families/glm5_next/cuda/mcdma.py
+index fc0675c..c70c79e 100644
+--- a/src/tensorfold/families/glm5_next/cuda/mcdma.py
++++ b/src/tensorfold/families/glm5_next/cuda/mcdma.py
+@@ -120,14 +120,16 @@ def spin_ns() -> int:
+ class Layout:
+     """One exchange's payloads for ``rows`` rows, after each half's control page. Request: the 256-B header slot,
+     normed bf16 [rows, D], pick int32 [rows, S], wts fp32 [rows, S], each section 256-B aligned. Reply: the expert
+-    half's fp32 partial [rows, D]."""
++    half's fp32 partial [rows, D]. ``fp8`` (TF_GLM_WIRE_FP8, ``wire_fp8``): normed's section holds the rows as E4M3
++    codes [rows, D] then their UE8M0 scale bytes [rows, D / 32] (256-B aligned) instead."""
+ 
+-    def __init__(self, hidden: int, slots: int) -> None:
+-        self.d, self.s = int(hidden), int(slots)
++    def __init__(self, hidden: int, slots: int, *, fp8: bool = False) -> None:
++        self.d, self.s, self.fp8 = int(hidden), int(slots), bool(fp8)
+ 
+     def offsets(self, rows: int) -> tuple[int, int, int, int]:
+         normed = HDR_BYTES
+-        pick = normed + 2 * self.d * rows
++        rows_bytes = (self.d * rows + _align(self.d // 32 * rows)) if self.fp8 else 2 * self.d * rows
++        pick = normed + rows_bytes
+         wts = pick + _align(4 * self.s * rows)
+         return normed, pick, wts, wts + 4 * self.s * rows
+ 
+@@ -137,6 +139,11 @@ class Layout:
+     def pad(self, rows: int) -> int:
+         return _align(4 * self.s * rows) - 4 * self.s * rows
+ 
++    def scales_pad(self, rows: int) -> int:
++        """fp8: the zero bytes after the scale bytes, before pick."""
++
++        return _align(self.d // 32 * rows) - self.d // 32 * rows
++
+     def rep(self, rows: int) -> int:
+         return 4 * self.d * rows
+ 
+@@ -149,14 +156,19 @@ class Layout:
+         return up(self.req(rows)), up(self.rep(rows))
+ 
+     def views(self, land, rows: int):
+-        """(normed, pick, wts) over a device buffer holding a request's bytes from the header slot's end on."""
++        """(normed, pick, wts) over a device buffer holding a request's bytes from the header slot's end on; fp8:
++        (codes [rows, D], scale bytes [rows, D / 32], pick, wts)."""
+ 
+         import torch
+ 
+         normed, pick, wts, end = (o - HDR_BYTES for o in self.offsets(rows))
+-        return (land[normed:pick].view(torch.bfloat16).view(rows, self.d),
+-                land[pick:pick + 4 * self.s * rows].view(torch.int32).view(rows, self.s),
++        tail = (land[pick:pick + 4 * self.s * rows].view(torch.int32).view(rows, self.s),
+                 land[wts:end].view(torch.float32).view(rows, self.s))
++        if self.fp8:
++            codes = normed + self.d * rows
++            return (land[normed:codes].view(rows, self.d),
++                    land[codes:codes + self.d // 32 * rows].view(rows, self.d // 32), *tail)
++        return (land[normed:pick].view(torch.bfloat16).view(rows, self.d), *tail)
+ 
+ 
+ class Words:
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index 7023050..b743df1 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -465,14 +465,17 @@ class MultiDecoder:
+         self.unit = fill_unit(self.grid)
+         self.grouped = {"chunks": 0, "pieces": 0, "rows": 0}           # rank 0's multi-prompt chunks, for /health
+         # TF_GLM_PREFILL_PAIRS (``prefill_pairs``, ours): the AFD attention node (world 1) fills two prompt chunks as a
+-        # pair while no stream decodes
+-        self.pairs = (prefill_pairs.enabled() and self.world == 1 and getattr(self.w, "afd", None) is not None)
++        # pair while no stream decodes; TF_GLM_PREFILL_LANES=N up to N as lanes (``prefill_pairs.run_lanes``)
++        afd_node = self.world == 1 and getattr(self.w, "afd", None) is not None
++        self.n_lanes = prefill_pairs.lanes() if afd_node else 1
++        self.pairs = self.n_lanes >= 2
+         self.paired = {"pairs": 0, "rows": 0}
+         # TF_GLM_CACHE_ROOM (``cache_room``, ours): rank 0 makes room by moving extents before it evicts kept prompts,
+         # and evicts first what no waiting request resumes (``wanted``: the scheduler's waiting prompts, or None)
+         self.room = cache_room.enabled()
+         self.room_stats = cache_room.counters()
+         self.wanted: Callable[[], list] | None = None
++        self.laned = {"groups": 0, "chunks": 0, "rows": 0}               # groups of 3 or more lanes
+         self.mtp = self.w.mtp is not None                # MTP drafts: the head is loaded (engine.mtp_head)
+         self.drafts = drafts
+         if self.drafts is None and engine.drafter is not None:
+@@ -552,6 +555,7 @@ class MultiDecoder:
+                 **({"sliced_fill": dict(self.sliced)} if getattr(self, "fill_budget", 0) else {}),
+                 **({"prefill_pairs": dict(self.paired)} if getattr(self, "pairs", False) else {}),
+                 **({"cache_room": dict(self.room_stats)} if getattr(self, "room", False) else {}),
++                **({"prefill_lanes": dict(self.laned)} if getattr(self, "n_lanes", 1) >= 3 else {}),
+                 # how long rank 0's current iteration has run (0 between iterations): a stalled server keeps growing it
+                 "iteration_s": round(time.monotonic() - since, 1)
+                 if (since := getattr(self, "iteration_since", None)) is not None else 0.0}
+@@ -1180,7 +1184,7 @@ class MultiDecoder:
+             self.sliced["chunks"] += 1
+             return self._part_iteration()
+         pair = self._pair_plan(lane, group) if lane is not None and getattr(self, "pairs", False) else None
+-        if pair is not None:                  # TF_GLM_PREFILL_PAIRS: this chunk and the next one as a pair
++        if pair is not None:                  # TF_GLM_PREFILL_PAIRS / _LANES: this chunk and the next ones together
+             t = time.perf_counter()
+             done = self._fill_pair(*pair)
+             if prof is not None:
+@@ -1548,14 +1552,15 @@ class MultiDecoder:
+         return firsts
+ 
+     # -- TF_GLM_PREFILL_PAIRS: prompt chunk pairs on the AFD attention node (``prefill_pairs``; ours) --------------
+-    def _pair_plan(self, lane: Lane, group) -> tuple[list, list] | None:
++    def _pair_plan(self, lane: Lane, group) -> tuple[list, ...] | None:
+         """Rank 0 at world 1: this iteration's prompt chunk and the one the next iteration would fill, as
+         [(lane, stop)] each, when they can run as a pair, else None. Only while no stream decodes (a decode round
+         would come between them; the sliced fills and the decode rounds run as before), when the first chunk ends
+         no prompt (its stream would start decoding) and no stream in either drafts with the MTP head. Never while a
+         layer-sliced chunk (TF_GLM_FILL_BUDGET_MS) is suspended: that chunk goes on alone, slice by slice. The second
+         is what ``_iterate`` picks next (``_fill_turn``, ``_group``, ``_stop``) with the first's streams at their
+-        stops."""
++        stops. TF_GLM_PREFILL_LANES=N: up to N chunks, each the next as the second is to the first, the same rules
++        for each; a chunk that ends a prompt is the last (2 chunks run as a pair, 3 or more as lanes)."""
+ 
+         if getattr(self, "partial", None) is not None:
+             return None
+@@ -1564,70 +1569,89 @@ class MultiDecoder:
+         first = list(group) if group is not None else [(lane, self._stop(lane))]
+         if any(x.mtp or stop >= len(x.s.prompt) for x, stop in first):
+             return None
+-        saved = [(x.st, x.st.pos) for x, _ in first]
++        plans = [first]
++        saved: dict[int, tuple] = {}
+         try:
+-            for x, stop in first:                 # host positions only, for the plan: no state or cache moves
+-                x.st.pos = stop
+-            nxt = self._fill_turn()
+-            if nxt is None:
+-                return None
+-            second = self._group(nxt) if getattr(self, "group", False) else None
+-            second = list(second) if second is not None else [(nxt, self._stop(nxt))]
++            while len(plans) < max(2, getattr(self, "n_lanes", 2)):
++                for x, stop in plans[-1]:         # host positions only, for the plan: no state or cache moves
++                    saved.setdefault(id(x.st), (x.st, x.st.pos))
++                    x.st.pos = stop
++                nxt = self._fill_turn()
++                if nxt is None:
++                    break
++                more = self._group(nxt) if getattr(self, "group", False) else None
++                more = list(more) if more is not None else [(nxt, self._stop(nxt))]
++                if any(x.mtp or x.head is not None for x, _ in more):     # a replay (0042) has no rows to pair
++                    break
++                plans.append(more)
++                if any(stop >= len(x.s.prompt) for x, stop in more):      # it ends a prompt: the last chunk
++                    break
+         finally:
+-            for st, pos in saved:
++            for st, pos in saved.values():
+                 st.pos = pos
+-        if any(x.mtp or x.head is not None for x, _ in second):     # a replay (0042) has no rows to pair
+-            return None
+-        return first, second
++        return tuple(plans) if len(plans) >= 2 else None
+ 
+     @torch.no_grad()
+-    def _fill_pair(self, first: Sequence[tuple[Lane, int]], second: Sequence[tuple[Lane, int]]) -> list[Stream]:
++    def _fill_pair(self, *plans: Sequence[tuple[Lane, int]]) -> list[Stream]:
+         """Rank 0 at world 1, TF_GLM_PREFILL_PAIRS: two prompt chunks (``_pair_plan``) as a pair
+         (``prefill_pairs.run_pair``), each told as ``_iterate`` tells a chunk (FILL or MFILL); then each chunk's host
+         work in order, as ``_fill`` / ``_fill_many`` do it after their chunk: its taps and commits
+         (``prefill_pairs.finish``), its kept states (the first chunk's for a stream in both chunks as the pair held
+-        them at the first chunk's end), the second chunk's first tokens. Returns the streams that finished."""
++        them at the first chunk's end), the second chunk's first tokens. Returns the streams that finished.
++        TF_GLM_PREFILL_LANES: three or more chunks as lanes (``prefill_pairs.run_lanes``), the same host work for
++        each chunk in order (every chunk but the last as the first, the last as the second)."""
+ 
+         e = self.e
+-        for plan in (first, second):
++        for plan in plans:
+             if len(plan) > 1:
+                 self._emit(MFILL, [len(plan), *[v for x, stop in plan for v in (x.sid, stop)]])
+             else:
+                 self._emit(FILL, [plan[0][0].sid, plan[0][1]])
+             self._flush()
+-        ends = {id(x): stop for x, stop in first}
++        ends: dict[int, int] = {}
+         pieces = []
+-        for plan in (first, second):
++        for k, plan in enumerate(plans):
+             mine = []
+             for lane, stop in plan:
+                 n = len(lane.s.prompt)
+-                start = ends.get(id(lane), lane.st.pos) if plan is second else lane.st.pos
++                start = ends.get(id(lane), lane.st.pos) if k else lane.st.pos
+                 if lane.decoding or lane.mtp or not start < stop <= n or stop - start > e.prefill_rows:
+                     raise RuntimeError(f"stream {lane.sid}: a paired prompt chunk {start} .. {stop} of {n}")
+                 mine.append(multi_prefill.Piece(lane.st, list(lane.s.prompt[start:stop]),
+                                                 drafter=self._ctx(lane) if lane.dflash else None, head=stop == n))
+             pieces.append(mine)
+-        hold = [x.st for x, stop in first if stop in x.stops and any(y is x for y, _ in second)]
++            ends.update((id(lane), stop) for lane, stop in plan)
++        hold = [[x.st for x, stop in plan if stop in x.stops and any(y is x for later in plans[k + 1:] for y, _ in later)]
++                for k, plan in enumerate(plans[:-1])]
+         t = time.perf_counter()
+-        a, b = prefill_pairs.run_pair(e, pieces[0], pieces[1], hold=hold)
+-        prefill_pairs.finish(e, a)
+-        for x, stop in first:
+-            if stop in x.stops:
+-                self._keep(x, stop, held=a.held(x.st))
+-        prefill_pairs.finish(e, b)
+-        firsts = self._pair_firsts(second, b.heads)
++        if len(plans) == 2:
++            chunks = list(prefill_pairs.run_pair(e, pieces[0], pieces[1], hold=hold[0]))
++        else:
++            chunks = prefill_pairs.run_lanes(e, pieces, hold=hold)
++        for plan, ch in zip(plans[:-1], chunks[:-1]):
++            prefill_pairs.finish(e, ch)
++            for x, stop in plan:
++                if stop in x.stops:
++                    self._keep(x, stop, held=ch.held(x.st))
++        prefill_pairs.finish(e, chunks[-1])
++        firsts = self._pair_firsts(plans[-1], chunks[-1].heads)
+         dt = time.perf_counter() - t
+-        lanes = list(dict.fromkeys(x for plan in (first, second) for x, _ in plan))
++        lanes = list(dict.fromkeys(x for plan in plans for x, _ in plan))
+         for x in lanes:
+             x.s.prefill_s += dt
+-        for plan in (first, second):
++        for plan, mine in zip(plans, pieces):
+             if len(plan) > 1:                    # counted as _iterate counts a multi-prompt chunk
+                 self.grouped["chunks"] += 1
+                 self.grouped["pieces"] += len(plan)
+-                self.grouped["rows"] += sum(p.rows for p in (pieces[0] if plan is first else pieces[1]))
+-        self.paired["pairs"] += 1
+-        self.paired["rows"] += a.R + b.R
+-        for (x, _), tok in zip(second, firsts):
++                self.grouped["rows"] += sum(p.rows for p in mine)
++        if len(plans) == 2:
++            self.paired["pairs"] += 1
++            self.paired["rows"] += chunks[0].R + chunks[1].R
++        else:
++            self.laned["groups"] += 1
++            self.laned["chunks"] += len(plans)
++            self.laned["rows"] += sum(ch.R for ch in chunks)
++        for (x, _), tok in zip(plans[-1], firsts):
+             if tok is not None:
+                 x.s.take([tok], self._ends(x))
+         return [x.s for x in lanes if x.s.done]
+diff --git a/src/tensorfold/families/glm5_next/cuda/prefill_pairs.py b/src/tensorfold/families/glm5_next/cuda/prefill_pairs.py
+index 4274b1c..30de49f 100644
+--- a/src/tensorfold/families/glm5_next/cuda/prefill_pairs.py
++++ b/src/tensorfold/families/glm5_next/cuda/prefill_pairs.py
+@@ -27,10 +27,26 @@ same as the chunks' alone.
+   holds a stream drafting with the MTP head.
+ 
+ This tree's own design for the attention/expert split; not a MiaAI-Lab recipe patch.
++
++Prompt chunk lanes (``TF_GLM_PREFILL_LANES=N``, N = 1 .. 4; ``run_lanes``): N consecutive whole chunks through the
++layers together, the pair schedule generalized. The lanes go through each layer in lane order, each lane's exchange
++goes out in lane order and is collected at most ``depth`` exchanges later (``AfdWire.depth``: 1 on the MCDMA wire,
++whose links carry one request at a time), and a lane runs its attention whenever it needs no reply, after the lane
++before it ran that layer's. N = 2 is the pair (``run_pair``: the same schedule, messages and buffers); N >= 3 gives
++every lane its own routed rows (``lane_buffers``: a lane can stop before its exchange while later lanes run their
++attention). At depth 1, past the first layer each exchange window holds one lane's attention, as a pair's; more
++lanes keep the experts busier only on a wire that queues exchanges. The prefill lanes are Hugh Madden's
++(@dangerm00se, github.com/hughmadden): he authored the two-lane prefill of whole prompt chunks in mimo26f-afd (perf
++reset R4: hughmadden/mimo26f-afd @ bab9fa2, ``crates/mimo26-coordinator/src/dforward.rs`` ``forward``,
++``forward_group``) and the prefill in up to four lanes in glm53f-afd (four lanes of 2,048 rows by default, the
++exchanges in flight bounded by the expert backend's depth: hughmadden/glm53f-afd @ 91db3cc,
++``crates/glm53f-forward/src/forward.rs`` ``run_lanes``, ``src/experts.rs`` ``ExpertBackend::depth``); MIT. Written
++here for this tree's split of whole chunks over MCDMA; no code copied.
+ """
+ 
+ from __future__ import annotations
+ 
++import collections
+ import copy
+ import os
+ from collections.abc import Sequence
+@@ -40,6 +56,11 @@ from typing import Any
+ import torch
+ 
+ ENV = "TF_GLM_PREFILL_PAIRS"
++LANES_ENV = "TF_GLM_PREFILL_LANES"
++MAX_LANES = 4                              # glm53f-afd's (``MAX_LANES``); and its default prompt passes' lane count
++# what a lane of N >= 3 holds of its own beside SLOT_FIELDS: its routed rows, from ``layer_front`` / ``moe_route`` to
++# its ``moe_send`` (with three or more lanes, other lanes run their attention while a lane waits to send)
++ROUTED_FIELDS = ("normed", "xs", "pick", "wts")
+ 
+ # the second chunk's own buffers (``slot_buffers``); every other prompt buffer is shared, being scratch that one
+ # phase writes and reads before the other chunk's next phase (``_steps``): the KDA / DSA / indexer / dense-MLP / split-K
+@@ -62,6 +83,19 @@ def enabled(value: str | None = None) -> bool:
+     return value == "1"
+ 
+ 
++def lanes(value: str | None = None, *, pairs: bool | None = None) -> int:
++    """TF_GLM_PREFILL_LANES: how many consecutive prompt chunks go through the layers together on the AFD attention
++    node, 1 .. ``MAX_LANES`` (1: one chunk at a time; 2: the pairs). Unset or empty: 2 with TF_GLM_PREFILL_PAIRS=1, else
++    1, so with this switch unset everything is as before. ``pairs``: TF_GLM_PREFILL_PAIRS's value (default: read)."""
++
++    raw = (os.environ.get(LANES_ENV, "") if value is None else value).strip()
++    if not raw:
++        return 2 if (enabled() if pairs is None else pairs) else 1
++    if raw not in {str(n) for n in range(1, MAX_LANES + 1)}:
++        raise ValueError(f"{LANES_ENV}: 1 .. {MAX_LANES}, not {raw!r}")
++    return int(raw)
++
++
+ def slot_buffers(b):
+     """The second chunk's prompt buffers: ``b`` (forward.Buffers, prefill) with its own token ids, residual streams,
+     hyper-connection weights and DFlash2 taps (``SLOT_FIELDS``), the rest shared."""
+@@ -83,13 +117,52 @@ def slot_bytes(b) -> int:
+     return sum(t.numel() * t.element_size() for t in held)
+ 
+ 
+-def plan_bytes(text: dict, rows: int, *, taps: int) -> int:
++def lane_buffers(b):
++    """A lane's prompt buffers when three or more lanes run: ``slot_buffers`` plus its own routed rows
++    (``ROUTED_FIELDS``: the FFN input rows and their scales, each row's experts and weights)."""
++
++    lane = slot_buffers(b)
++    for name in ROUTED_FIELDS:
++        setattr(lane, name, torch.empty_like(getattr(b, name)))
++    return lane
++
++
++def lane_bytes(b) -> int:
++    """What ``lane_buffers`` adds on the device per lane."""
++
++    return slot_bytes(b) + sum(getattr(b, name).numel() * getattr(b, name).element_size() for name in ROUTED_FIELDS)
++
++
++def plan_bytes(text: dict, rows: int, *, taps: int, routed: bool = False) -> int:
+     """``slot_bytes`` before the buffers exist, for the capacity plan (``text``: the checkpoint's text config; ``rows``:
+     the prompt chunk's; ``taps``: DFlash2's tapped layers, 0 without a drafter): token ids, the residual streams
+-    and DFlash2 taps (bf16), the hyper-connection weights (fp32). 144 MiB for GLM-5.3-Flash at 2,048 rows."""
++    and DFlash2 taps (bf16), the hyper-connection weights (fp32). 144 MiB for GLM-5.3-Flash at 2,048 rows.
++    ``routed``: ``lane_bytes`` instead (a lane of three or more), adding the routed rows: bf16 FFN inputs, their fp32
++    scales per 64 values, each row's int32 experts and fp32 weights per slot (top-k + the shared): 16.6 MiB more."""
+ 
+     d, s = int(text["hidden_size"]), int(text.get("hc_mult", 4))
+-    return rows * (4 + 2 * s * d + 4 * s + 4 * s * s + 2 * taps * d)
++    per = 4 + 2 * s * d + 4 * s + 4 * s * s + 2 * taps * d
++    if routed:
++        slots = int(text.get("num_experts_per_tok", 8)) + 1
++        per += 2 * d + 4 * (d // 64) + 8 * slots
++    return rows * per
++
++
++def buffers_for(e, n: int) -> list:
++    """The prompt buffers of ``n`` lanes: the engine's own for the first lane; the pair's second chunk's
++    (``e.pbuf2``, ``slot_buffers``) for n = 2; each later lane's own (``e.pbuf_lanes``, ``lane_buffers``) for n >= 3,
++    and for a pair in a run of more lanes (the engine makes them at startup, before the caches fill the GPU)."""
++
++    more = list(getattr(e, "pbuf_lanes", None) or ())
++    if n == 2 and not more:
++        b2 = getattr(e, "pbuf2", None)
++        if b2 is None:
++            b2 = e.pbuf2 = slot_buffers(e.pbuf)
++        return [e.pbuf, b2]
++    while len(more) < n - 1:
++        more.append(lane_buffers(e.pbuf))
++    e.pbuf_lanes = more
++    return [e.pbuf, *more[:n - 1]]
+ 
+ 
+ class At:
+@@ -179,24 +252,38 @@ def run_pair(e, first: Sequence, second: Sequence, *, hold: Sequence = ()) -> tu
+     ``second`` start where ``first``'s end. ``hold``: states of ``first``'s streams to keep at its end (``Hold``).
+     Returns both chunks with their heads (a one-piece chunk's head logits copy, as ``decode.prefill_chunk`` returns
+     it; per piece ending its prompt, as ``multi_prefill.prefill_pieces``); their taps and commits are ``finish``'s,
+-    each chunk's in order. Positions are not committed here."""
++    each chunk's in order. Positions are not committed here. ``run_lanes`` of two chunks."""
++
++    a, b = run_lanes(e, [first, second], hold=[hold])
++    return a, b
++
++
++def run_lanes(e, chunks: Sequence[Sequence], *, hold: Sequence[Sequence] = ()) -> list[Chunk]:
++    """2 .. ``MAX_LANES`` consecutive prompt chunks' forwards as lanes (TF_GLM_PREFILL_LANES): each a list of
++    ``multi_prefill.Piece``; a stream in several has its rows in each later chunk start where its rows in the chunk
++    before end. ``hold[k]``: states of chunk k's streams to keep at chunk k's end (``Hold``; none at the last's).
++    Returns the chunks with their heads; their taps and commits are ``finish``'s, each chunk's in order. Two chunks
++    are the pair: ``AfdWire.begin_pair`` and ``_forward_pair``, the second chunk in ``e.pbuf2``."""
+ 
+     from . import latent, multi_prefill
+     from .forward import chunks_for
+ 
++    n = len(chunks)
++    if not 2 <= n <= MAX_LANES:
++        raise ValueError(f"prompt chunk lanes: 2 .. {MAX_LANES} chunks, not {n}")
+     w = e.w
+     afd = getattr(w, "afd", None)
+-    if afd is None or not hasattr(afd, "begin_pair"):
+-        raise RuntimeError("prompt chunk pairs run on the AFD attention node (--experts remote)")
+-    b2 = getattr(e, "pbuf2", None)
+-    if b2 is None:
+-        b2 = e.pbuf2 = slot_buffers(e.pbuf)
++    if afd is None or not hasattr(afd, "begin_pair" if n == 2 else "begin_lanes"):
++        raise RuntimeError("prompt chunk pairs run on the AFD attention node (--experts remote)" if n == 2 else
++                           "prompt chunk lanes run on the AFD attention node (--experts remote)")
++    bufs = buffers_for(e, n)
+     rows = min(e.pbuf.rows, e.prefill_rows)
+-    chunks = []
+-    ends: dict[int, tuple[Any, int]] = {}
+-    for slot, (pieces, b) in enumerate(((list(first), e.pbuf), (list(second), b2))):
++    out: list[Chunk] = []
++    ends: dict[int, tuple[Any, int]] = {}     # a stream's state -> where its rows in the chunks so far end
++    for slot, (pieces, b) in enumerate(zip(chunks, bufs)):
++        pieces = list(pieces)
+         if not pieces:
+-            raise ValueError("a prompt chunk pair needs two chunks")
++            raise ValueError("a prompt chunk pair needs two chunks" if n == 2 else "a prompt chunk lane has no rows")
+         ch = Chunk(pieces, slot, b)
+         mine = []
+         for p in pieces:
+@@ -204,7 +291,7 @@ def run_pair(e, first: Sequence, second: Sequence, *, hold: Sequence = ()) -> tu
+                 raise ValueError("a stream has one piece in a chunk")
+             mine.append(p)
+             seen = ends.get(id(p.st))
+-            if slot == 1 and seen is not None:   # the stream's next rows: from where its rows in the first chunk end
++            if slot >= 1 and seen is not None:   # the stream's next rows: from where its rows in earlier chunks end
+                 p.st = At(seen[0], seen[1], _pos_tensor(seen[0], seen[1]))
+         if not ch.single and not latent.ENABLED:
+             raise ValueError("multi-prompt chunks need the latent cache (TF_GLM_LATENT=1)")
+@@ -216,20 +303,29 @@ def run_pair(e, first: Sequence, second: Sequence, *, hold: Sequence = ()) -> tu
+             ch.nch, ch.host_pos = chunks_for(ch.st, ch.R), ch.st.pos
+         else:
+             ch.mixer = multi_prefill.PieceMixer(w, b, pieces, ch.R)
+-        if slot == 0:
++        if slot < n - 1:
+             for p in pieces:
+-                ends[id(p.st)] = (p.st, p.st.pos + p.rows)
+-        chunks.append(ch)
+-    a, b = chunks
+-    for st in hold:
+-        if not any(p.st is st for p in a.pieces):
+-            raise ValueError("a held state belongs to the pair's first chunk")
+-        a.holds.append(Hold(st))
+-    for ch in chunks:
++                st = p.st._st if isinstance(p.st, At) else p.st
++                ends[id(st)] = (st, p.st.pos + p.rows)
++        out.append(ch)
++    hold = list(hold)
++    if len(hold) > n - 1 or any(hold[n - 1:]):
++        raise ValueError("a held state belongs to a chunk before the last")
++    for ch, sts in zip(out, hold):
++        for st in sts:
++            if not any((p.st._st if isinstance(p.st, At) else p.st) is st for p in ch.pieces):
++                raise ValueError("a held state belongs to the pair's first chunk" if n == 2 else
++                                 f"a held state belongs to lane {ch.slot}'s chunk")
++            ch.holds.append(Hold(st))
++    for ch in out:
+         _stage_chunk(e, ch)
+-    afd.begin_pair((a.R, b.R))           # both windows' headers, before either's eager kernels
+-    _forward_pair(e, a, b)
+-    return a, b
++    if n == 2:
++        afd.begin_pair((out[0].R, out[1].R))   # both windows' headers, before either's eager kernels
++        _forward_pair(e, out[0], out[1])
++    else:
++        afd.begin_lanes(tuple(ch.R for ch in out))   # every lane's headers, before any lane's eager kernels
++        _forward_lanes(e, out)
++    return out
+ 
+ 
+ def _mark(slot: int) -> None:
+@@ -238,57 +334,83 @@ def _mark(slot: int) -> None:
+ 
+ def _forward_pair(e, a: Chunk, b: Chunk) -> None:
+     """Both chunks' layer loops, interleaved: a chunk runs until it would wait (to send while the other's request
+-    is in flight, or for its own reply while the other can work); the first chunk goes first."""
++    is in flight, or for its own reply while the other can work); the first chunk goes first. ``_forward_lanes`` of
++    two lanes."""
++
++    _forward_lanes(e, [a, b])
++
++
++def _depth(afd) -> int:
++    """Exchanges the wire takes in flight at once (``AfdWire.depth``; 1, MCDMA protocol 1's one request per link,
++    when the wire names none)."""
++
++    d = getattr(afd, "depth", 1)
++    return d if isinstance(d, int) and not isinstance(d, bool) and d >= 1 else 1
+ 
+-    gens = [_steps(e, a), _steps(e, b)]
+-    at: list[Any] = [None, None]          # where each loop stopped: None (not started), SEND, WAIT, DONE, or END
++
++def _forward_lanes(e, chunks: Sequence[Chunk], depth: int | None = None) -> None:
++    """The lanes' layer loops, interleaved (``_steps``; lane k = ``chunks[k]``). Three rules, in this order:
++
++    1. the next exchange goes out when its lane stopped before it and fewer than ``depth`` are in flight: lane order
++       within each MoE layer (lane 0's, lane 1's, ..., then lane 0's next layer), which the expert nodes follow;
++    2. else a lane runs its attention up to its next exchange (or its tail) when it needs no reply: not started, or
++       past its last collect, and the lane before it already ran that layer's attention (its latents, indexer keys
++       and KDA state are what this lane reads); the lanes are tried from the one whose exchange goes out next;
++    3. else the oldest exchange in flight is collected (the stream waits for its reply).
++
++    With two lanes this is the pair schedule: the first chunk's exchange of layer L, the second chunk's attention of
++    L inside it, the first's reply, the second's exchange, the first's attention of L + 1 inside it, and so on. More
++    lanes put every later lane's attention of L inside the first lane's exchange window. A lane's routed rows wait
++    in its own buffers (``lane_buffers``) while later lanes run their attention. Only depth 1 is built: the lanes
++    share the shared expert's output and the reply rows (``SLOT_FIELDS``' note), which hold one exchange in flight;
++    a deeper wire needs them per lane too."""
++
++    n = len(chunks)
++    if depth is None:
++        depth = _depth(e.w.afd)
++    if depth != 1:
++        raise ValueError(f"prompt chunk lanes over a wire of depth {depth}: the lanes share the shared expert's output "
++                         "and the reply rows, which hold one exchange in flight")
++    gens = [_steps(e, ch) for ch in chunks]
+     end = object()
+-    owner = None                          # the chunk whose request is on the wire
++    at: list[Any] = [None] * n            # where each lane stopped: None (not started), SEND, WAIT, DONE, or end
++    sent = [0] * n                        # each lane's SEND stops so far: its attention of that many MoE layers ran
++    flight: collections.deque[int] = collections.deque()   # lanes with an exchange on the wire, the oldest first
++    turn = 0                              # the lane whose exchange goes out next
+ 
+     def step(k: int):
+         _mark(k)
+         try:
+-            return next(gens[k])
++            got = next(gens[k])
+         except StopIteration:
+             return end
+-
+-    k = 0
+-    at[0] = step(0)
+-    while at[0] is not end or at[1] is not end:
+-        here, there = at[k], at[1 - k]
+-        if here is end:
+-            k = 1 - k
+-            if at[k] is None:
+-                at[k] = step(k)
+-            continue
+-        if here is SEND:
+-            if owner is None:             # the link is free: this chunk's exchange goes out now
+-                owner = k
+-                at[k] = step(k)
+-            else:
+-                k = 1 - k
+-                if at[k] is None:
+-                    at[k] = step(k)
++        if got is SEND:
++            sent[k] += 1
++        return got
++
++    def ready(k: int) -> bool:
++        """Lane k's next phase (its attention up to its next exchange, or its tail) may run: it needs no reply, and the
++        lane before it already ran that phase (it ran more MoE layers' attention, or ended)."""
++
++        if at[k] is not None and at[k] is not DONE:
++            return False
++        return k == 0 or at[k - 1] is end or sent[k - 1] > sent[k]
++
++    while any(a is not end for a in at):
++        if at[turn] is SEND and len(flight) < depth:
++            at[turn] = step(turn)         # moe_send: this lane's exchange out, its shared expert; then WAIT
++            flight.append(turn)
++            turn = (turn + 1) % n
+             continue
+-        if here is WAIT:
+-            if there is None or there is DONE:    # the other chunk works while this one's experts compute
+-                k = 1 - k
+-                at[k] = step(k)
+-            else:
+-                at[k] = step(k)           # collect
+-                if at[k] is DONE:
+-                    owner = None
++        k = next((j for j in ((turn + i) % n for i in range(n)) if ready(j)), None)
++        if k is not None:
++            at[k] = step(k)
+             continue
+-        if here is DONE:
+-            owner = None
+-            if there is SEND:             # the link is free: the other chunk's exchange first
+-                k = 1 - k
+-                owner = k
+-                at[k] = step(k)
+-            else:
+-                at[k] = step(k)
++        if flight:
++            k = flight.popleft()
++            at[k] = step(k)               # collect: DONE
+             continue
+-        raise AssertionError(f"a pair's chunk stopped at {here!r}")
++        raise AssertionError(f"prompt chunk lanes stopped at {at!r} with nothing in flight")
+ 
+ 
+ def _steps(e, ch: Chunk):
+diff --git a/src/tensorfold/families/glm5_next/cuda/wire_fp8.py b/src/tensorfold/families/glm5_next/cuda/wire_fp8.py
+new file mode 100644
+index 0000000..3ad4d3a
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/wire_fp8.py
+@@ -0,0 +1,229 @@
++"""FP8 wire rows for the AFD exchange (``TF_GLM_WIRE_FP8=1``): each MoE exchange's FFN input rows go to the expert
++nodes as FP8 E4M3 codes with one UE8M0 scale byte per 32 values, 4,224 bytes a row at hidden 4,096 instead of bf16's
++8,192; the expert nodes decode them back to bf16 before their experts. The rows' experts and weights, the replies, and
++every other byte of the exchange are unchanged.
++
++The codec is glm53f-afd's wire-out activation quantizer (``Fp8E4m3Ue8m0K32``), bit for bit as its device kernels
++compute it:
++
++- per 32 consecutive values of a row, ``amax`` of their magnitudes (NaN skipped) and the scale byte
++  ``s = 0 if amax == 0 else clamp(ceil(log2(amax / 448)) + 127, 0, 254)``: ``2^(s - 127)`` is the smallest power of two
++  that brings the block within E4M3's 448 (``quant_scales_kernel``);
++- each value times ``2^(127 - s)`` in fp32 (exact: a power of two), then the nearest E4M3 code, ties to the larger
++  magnitude, saturating at 448, the sign kept unless the product is a zero or NaN (``e4m3_encode``,
++  ``hidden_quantize_encode_kernel``);
++- the expert node decodes ``e4m3(code) * 2^(s - 127)``, exact in fp32, rounded once to bf16 (exact unless a block's
++  values fall below bf16's normal range).
++
++Hugh Madden (@dangerm00se, github.com/hughmadden) wrote these kernels in mimo26f-afd and carried them into
++glm53f-afd, where they quantize the hidden rows sent to the expert ranks: hughmadden/glm53f-afd @ 91db3cc
++(``crates/glm53f-coordinator/kernels/wire.cu`` ``quant_scales_kernel``, ``e4m3_encode``,
++``hidden_quantize_encode_kernel``; their host twins ``src/wire.rs`` ``quantize_hidden`` and ``src/fp8.rs``), from
++hughmadden/mimo26f-afd @ bab9fa2 (``crates/mimo26-coordinator/kernels/glue.cu``,
++``crates/mimo26-attn/kernels/include/mimo26_attn_device.cuh``, ``crates/mimo26-attn/kernels/kv_cache_fp8.cu``,
++``crates/mimo26-load/src/e4m3.rs``); MIT, Copyright (c) 2026 Turquoise Bay AI Pty Ltd. No code is copied: here the
++scale step is torch operations, the code step a table of the 32,768 bf16 magnitudes' codes made with the plain-Python
++``reference_code`` (the device encoder's arithmetic, line by line), and ``reference_*`` are the tests' oracle. A NaN
++encodes to 0, as glm53f-afd's host twin encodes it. The row's place in the MCDMA request is this tree's
++(``mcdma.Layout``). The wire row format itself (E4M3 codes, a UE8M0 scale per 32 values) is DS41RT's, by T.J. Purtell
++(@wrldsuksgo2mars; tpurtell/ds41rt, MIT), carried through mimo26f-afd (glm53f-afd's README credits it so).
++
++This changes the experts' inputs, so outputs change; the switch is off by default.
++"""
++
++from __future__ import annotations
++
++import math
++import os
++import struct
++
++import torch
++
++ENV = "TF_GLM_WIRE_FP8"
++BLOCK = 32                      # values per UE8M0 scale byte
++E4M3_MAX = 448.0                # the largest finite E4M3 magnitude (code 0x7E)
++_ROWS = 512                     # rows per pass of ``encode`` / ``decode``: bounds their temporaries (~40 MiB at 4,096)
++_TABLES: dict[str, torch.Tensor] = {}
++
++
++def enabled(value: str | None = None) -> bool:
++    """TF_GLM_WIRE_FP8: 1 sends the MoE exchanges' FFN input rows as FP8 E4M3 rows (one UE8M0 scale per 32 values);
++    unset or 0 (the default) as bf16."""
++
++    value = (os.environ.get(ENV, "") if value is None else value).strip() or "0"
++    if value not in ("0", "1"):
++        raise ValueError(f"{ENV}: 0 or 1, not {value!r}")
++    return value == "1"
++
++
++def row_bytes(d: int) -> int:
++    """One wire row's bytes: d E4M3 codes, then d / 32 scale bytes (4,224 at d = 4,096)."""
++
++    if d <= 0 or d % BLOCK:
++        raise ValueError(f"FP8 wire rows need a hidden size that is a multiple of {BLOCK}, not {d}")
++    return d + d // BLOCK
++
++
++def _pow2(e: torch.Tensor) -> torch.Tensor:
++    """2^e as fp32 for integer exponents e in -127 .. 127, from the bits (2^-127 is fp32's subnormal 0x00400000)."""
++
++    bits = torch.where(e >= -126, (e + 127) << 23, torch.full_like(e, 0x00400000))
++    return bits.to(torch.int32).view(torch.float32)
++
++
++def _scales(x32: torch.Tensor) -> torch.Tensor:
++    """Per 32 values of ``x32`` ([r, d] fp32): the UE8M0 scale bytes as int32 [r, d / 32]. ``amax = m 2^e`` with m in
++    [0.5, 1) and 448 = 0.875 2^9 give ``ceil(log2(amax / 448)) = e - 9 + (m > 0.875)`` exactly."""
++
++    r, d = x32.shape
++    mag = torch.nan_to_num(x32.abs(), nan=0.0, posinf=math.inf)      # the kernel's fmax skips NaN
++    amax = mag.view(r, d // BLOCK, BLOCK).amax(dim=-1)
++    m, e = torch.frexp(amax)
++    s = (e.to(torch.int32) - 9 + (m > 0.875).to(torch.int32) + 127).clamp(0, 254)
++    s = torch.where(amax > 0, s, torch.zeros_like(s))
++    return torch.where(torch.isinf(amax), torch.full_like(s, 254), s)
++
++
++def _table(device) -> torch.Tensor:
++    """The E4M3 code of each bf16 magnitude (index: the bf16 bits without the sign), uint8 [32768] on ``device``."""
++
++    key = str(device)
++    t = _TABLES.get(key)
++    if t is None:
++        codes = bytes(reference_code(struct.unpack("<f", struct.pack("<I", b << 16))[0]) for b in range(1 << 15))
++        t = _TABLES[key] = torch.frombuffer(bytearray(codes), dtype=torch.uint8).to(device)
++    return t
++
++
++def encode(x: torch.Tensor, payload: torch.Tensor, scales: torch.Tensor) -> None:
++    """``x`` ([r, d] bf16, the FFN input rows) as wire rows: ``payload`` [r, d] uint8 E4M3 codes and ``scales``
++    [r, d / 32] uint8 UE8M0 bytes, on ``x``'s device and stream, ``_ROWS`` rows at a time. A product of a bf16 value
++    and a power of two has at most bf16's 8 significant bits, so the table of bf16 magnitudes holds every code that
++    can arise; the sign is the fp32 product's, as the device kernel reads it."""
++
++    r, d = x.shape
++    row_bytes(d)
++    if payload.shape != (r, d) or scales.shape != (r, d // BLOCK):
++        raise ValueError(f"FP8 wire rows: payload {tuple(payload.shape)} and scales {tuple(scales.shape)} for rows "
++                         f"{(r, d)}")
++    table = _table(x.device)
++    for lo in range(0, r, _ROWS):
++        hi = min(r, lo + _ROWS)
++        n = hi - lo
++        x32 = x[lo:hi].to(torch.float32, copy=True)
++        s = _scales(x32)
++        p = x32.view(n, d // BLOCK, BLOCK).mul_(_pow2(127 - s).unsqueeze(-1)).view(n, d)
++        idx = p.abs().to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0x7FFF   # (a NaN's bf16 may set the sign)
++        code = table.index_select(0, idx.view(-1)).view(n, d)
++        code |= (p < 0).to(torch.uint8) << 7
++        payload[lo:hi].copy_(code)
++        scales[lo:hi].copy_(s.to(torch.uint8))
++
++
++def _values(codes: torch.Tensor) -> torch.Tensor:
++    """bf16 values of E4M3 codes (uint8), exact: torch's float8_e4m3fn where this torch has it, else a 256-entry table
++    of ``reference_decode``'s values."""
++
++    f8 = getattr(torch, "float8_e4m3fn", None)
++    if f8 is not None:
++        try:
++            return codes.view(f8).to(torch.bfloat16)
++        except (RuntimeError, TypeError):         # a build without float8 conversions on this device
++            pass
++    key = f"dec:{codes.device}"
++    lut = _TABLES.get(key)
++    if lut is None:
++        lut = _TABLES[key] = torch.tensor([reference_decode(c) for c in range(256)], dtype=torch.float32,
++                                          device=codes.device).to(torch.bfloat16)
++    return lut.index_select(0, codes.reshape(-1).to(torch.int32)).view(codes.shape)
++
++
++def decode(payload: torch.Tensor, scales: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
++    """Wire rows back to the bf16 values the expert nodes compute with: ``out[:r] = e4m3(payload) * 2^(scales -
++    127)`` ([r, d] bf16; torch multiplies bf16 in fp32 and rounds once, the exact product's rounding), ``_ROWS`` rows
++    at a time; returns ``out[:r]``."""
++
++    r, d = payload.shape
++    for lo in range(0, r, _ROWS):
++        hi = min(r, lo + _ROWS)
++        n = hi - lo
++        scale = _pow2(scales[lo:hi].to(torch.int32) - 127).to(torch.bfloat16).unsqueeze(-1)
++        torch.mul(_values(payload[lo:hi]).view(n, d // BLOCK, BLOCK), scale, out=out[lo:hi].view(n, d // BLOCK, BLOCK))
++    return out[:r]
++
++
++def roundtrip(x: torch.Tensor) -> torch.Tensor:
++    """``decode(encode(x))``: the bf16 rows an expert node computes with for FFN input rows ``x`` ([r, d] bf16)."""
++
++    r, d = x.shape
++    payload = torch.empty((r, d), dtype=torch.uint8, device=x.device)
++    scales = torch.empty((r, d // BLOCK), dtype=torch.uint8, device=x.device)
++    encode(x, payload, scales)
++    return decode(payload, scales, torch.empty_like(x))
++
++
++# -- plain-Python references (the tests' oracle; ``_table``'s source) -----------------------------------------------
++def reference_decode(code: int) -> float:
++    """One E4M3 code's value (glm53f-afd ``src/fp8.rs`` ``decode_e4m3``): NaN for 0x7F / 0xFF."""
++
++    if code in (0x7F, 0xFF):
++        return math.nan
++    s = -1.0 if code & 0x80 else 1.0
++    e, m = (code >> 3) & 0x0F, code & 0x07
++    return s * ((m / 8.0) * 2.0 ** -6 if e == 0 else (1.0 + m / 8.0) * 2.0 ** (e - 7))
++
++
++def reference_scale(block) -> int:
++    """A 32-value block's UE8M0 byte as glm53f-afd's quantizers compute it (``quant_scales_kernel``,
++    ``quantize_hidden``): amax in f64 (``fmax`` skips NaN), ``ceil(log2(amax / 448)) + 127`` clamped to 0 .. 254, 0 for
++    an all-zero block."""
++
++    amax = max((abs(float(v)) for v in block if not math.isnan(float(v))), default=0.0)
++    if amax == 0.0:
++        return 0
++    if math.isinf(amax):
++        return 254
++    return int(min(max(math.ceil(math.log2(amax / E4M3_MAX)) + 127.0, 0.0), 254.0))
++
++
++def _f32(v: float) -> float:
++    return struct.unpack("<f", struct.pack("<f", v))[0]
++
++
++def reference_code(v: float) -> int:
++    """glm53f-afd's device ``e4m3_encode`` of an fp32 value, step by step: the sign of ``v < 0``; the magnitude
++    clamped at 448; zero to the sign alone; ``ilogbf`` picks the band, the subnormal band rounds ``mag * 512``, a normal
++    band ``mag / 2^(E - 3)``, both half up (ties to the larger magnitude); a carry moves to the next band; at most 0x7E.
++    NaN encodes to 0 (the kernel's ``(int)floorf(NaN)`` is 0)."""
++
++    if math.isnan(v):
++        return 0
++    sign = 0x80 if v < 0.0 else 0x00
++    mag = min(abs(v), E4M3_MAX)
++    if mag == 0.0:
++        return sign
++    e = math.frexp(mag)[1] - 1                   # ilogbf
++    if e <= -7:
++        code = math.floor(mag * 512.0 + 0.5)
++    else:
++        q = math.floor(mag / 2.0 ** (e - 3) + 0.5)
++        ee = e + 7
++        if q >= 16:
++            q, ee = 8, ee + 1
++        code = min((ee << 3) | (q - 8), 0x7E)
++    return sign | code
++
++
++def reference_row(row) -> tuple[bytes, bytes]:
++    """One wire row of bf16-representable values: (E4M3 codes, UE8M0 bytes), each value times 2^(127 - s) in fp32 as
++    ``hidden_quantize_encode_kernel`` multiplies (exact: a power of two)."""
++
++    codes, scales = bytearray(), bytearray()
++    row = [float(v) for v in row]
++    for lo in range(0, len(row), BLOCK):
++        block = row[lo:lo + BLOCK]
++        s = reference_scale(block)
++        inv = 2.0 ** (127 - s)
++        scales.append(s)
++        codes.extend(reference_code(_f32(v * inv)) for v in block)
++    return bytes(codes), bytes(scales)
+diff --git a/tests/test_glm_multi_afd.py b/tests/test_glm_multi_afd.py
+index 6178487..d6f7364 100644
+--- a/tests/test_glm_multi_afd.py
++++ b/tests/test_glm_multi_afd.py
+@@ -67,6 +67,11 @@ class WireLog:
+ 
+         self.paired = getattr(self, "paired", []) + [(int(rows[0]), int(rows[1]))]
+ 
++    def begin_lanes(self, rows) -> None:
++        """TF_GLM_PREFILL_LANES (``prefill_pairs.run_lanes``): N >= 3 windows, as ``begin_pair``'s."""
++
++        self.laned = getattr(self, "laned", []) + [tuple(int(r) for r in rows)]
++
+     def use(self, slot: int) -> None:
+         pass
+ 
+@@ -184,7 +189,10 @@ def fake_pairs(torch, monkeypatch) -> None:
+             forward.check_room(e.w, p.st, p.rows)
+ 
+     def run(e, a, b):
+-        for ch in (a, b):
++        lanes(e, (a, b))
++
++    def lanes(e, chunks, depth=None):                    # TF_GLM_PREFILL_LANES: N chunks, the same way, in order
++        for ch in chunks:
+             e.w.afd.begin(ch.R, chunk=True)
+             e.w.afd.forward("chunk", ch.R)
+             if not ch.single:                            # as fake_pieces_compute records a multi-prompt chunk
+@@ -215,8 +223,10 @@ def fake_pairs(torch, monkeypatch) -> None:
+ 
+     monkeypatch.setattr(pp, "_stage_chunk", stage)
+     monkeypatch.setattr(pp, "_forward_pair", run)
++    monkeypatch.setattr(pp, "_forward_lanes", lanes)
+     monkeypatch.setattr(pp, "_pos_tensor", lambda st, pos: None)         # the fake states keep no device position
+     monkeypatch.setattr(pp, "slot_buffers", slot_buffers)
++    monkeypatch.setattr(pp, "lane_buffers", slot_buffers)
+ 
+ 
+ class World1:
+diff --git a/tests/test_glm_prefill_lanes.py b/tests/test_glm_prefill_lanes.py
+new file mode 100644
+index 0000000..2deaac0
+--- /dev/null
++++ b/tests/test_glm_prefill_lanes.py
+@@ -0,0 +1,746 @@
++"""TF_GLM_PREFILL_LANES (``prefill_pairs.run_lanes``) on CPU: up to four prompt chunks in flight on the AFD attention
++node, Hugh Madden's prefill lanes (hughmadden/glm53f-afd @ 91db3cc) in this tree's split, generalizing the prompt
++chunk pairs (TF_GLM_PREFILL_PAIRS).
++
++- The setting, the handshake and the capacity plan's bytes per lane.
++- The schedule (``_forward_lanes`` over stand-in layer loops): two lanes make exactly the pairs' schedule (the pairs'
++  own ``_forward_pair`` kept here as the oracle); for N lanes each layer's exchanges go in lane order, one at a time,
++  every lane's attention of a layer after the lane before it ran that layer's, and between a lane's collect and its
++  next phase no other reply lands (the shared reply rows are not overwritten); every later lane starts inside lane
++  0's first exchange window.
++- The forward seam (tests/test_glm_prefill_pairs.py's recorded kernels over the real forward): each lane's calls are
++  its solo chunk's, its own buffers (``lane_buffers``) named as the solo's; held states at earlier lanes' ends; the
++  wire saw one ``begin_lanes`` and per MoE layer each lane's exchange and collect in lane order; TF_GLM_MULTI_PREFILL's
++  chunks as lanes.
++- The wire: the real ``AfdWire`` + ``McdmaTransport`` and both expert loops over the fake mcdma-rpcd pair, CPU- and
++  GPU-driven: lanes of 3 and 4 windows (and a pair and a plain forward after them), every reply its own window's, the
++  experts' lane order; an expert link without ``lanes``, or with fewer, refuses MODE_LANES; lanes stopped early.
++- The engine (tests/test_glm_multi.py's fake model at world 1, tests/test_glm_multi_afd.py's ``afd_fake``): with 3
++  or 4 lanes, replies, cached counts, kept states and their pool rows equal the pairs' and the setting off, with
++  TF_GLM_MULTI_PREFILL and TF_GLM_SHARED_PREFIX; no lanes while a stream decodes or a sliced chunk is suspended.
++"""
++
++from __future__ import annotations
++
++import re
++from types import SimpleNamespace
++
++import pytest
++
++from tests import test_glm_multi as tm
++from tests import test_glm_multi_prefill as hp
++from tests import test_glm_prefill_pairs as tp
++from tests.glm_afd_fakes import (  # noqa: F401
++    LAYERS,
++    PREFILL,
++    D,
++    DictStore,
++    FakeDriver,
++    FakeNode,
++    S,
++    daemon_fixture,
++    env_fixture,
++    libpath_fixture,
++    master_fixture,
++    partial,
++    settings,
++    wait_attached,
++    words_fixture,
++)
++from tests.test_cuda_geometry import allocations  # noqa: F401
++from tests.test_glm_multi import fake  # noqa: F401
++
++pytestmark = pytest.mark.torch
++afd_fake = tp.afd_fake
++LANES = "TF_GLM_PREFILL_LANES"
++PAIRS = "TF_GLM_PREFILL_PAIRS"
++
++
++# -- the setting -----------------------------------------------------------------------------------------------------
++def test_the_setting_the_handshake_and_the_bytes(monkeypatch):
++    from tensorfold.families.glm5_next.cuda import afd
++    from tensorfold.families.glm5_next.cuda import prefill_pairs as pp
++
++    monkeypatch.delenv(LANES, raising=False)
++    monkeypatch.delenv(PAIRS, raising=False)
++    assert pp.lanes() == 1 and pp.lanes(pairs=True) == 2            # unset: as TF_GLM_PREFILL_PAIRS says
++    monkeypatch.setenv(PAIRS, "1")
++    assert pp.lanes() == 2 and pp.lanes("1") == 1 and pp.lanes("4") == 4 and pp.lanes(" 3 ") == 3
++    for bad in ("0", "5", "on", "2.0", "-1"):
++        with pytest.raises(ValueError, match=LANES):
++            pp.lanes(bad)
++    cfg = SimpleNamespace(mlp_kinds=["dense"] * 3 + ["moe"] * 4, quant="exl3", experts=16, top_k=8)
++    plain = afd.settings_for("/nonexistent", cfg, prefill_rows=2048, pairs=True)
++    four = afd.settings_for("/nonexistent", cfg, prefill_rows=2048, pairs=True, lanes=4)
++    assert afd.settings_for("/nonexistent", cfg, prefill_rows=2048, pairs=True, lanes=2) == plain     # 2: the pairs
++    assert four == dict(plain, lanes=4)
++    assert afd.settings_mismatch(plain, four) == "lanes: attention 4 != expert None"   # an older expert refuses
++    # the capacity plan at GLM-5.3-Flash's shapes (hidden 4,096, hc_mult 4, top-k 8 + the shared slot), DFlash2's taps:
++    # a pair's second chunk 144.2 MiB; each later lane of three or more also holds its routed rows, 16.6 MiB more
++    text = {"hidden_size": 4096, "hc_mult": 4, "num_experts_per_tok": 8}
++    assert pp.plan_bytes(text, 2048, taps=5) == 151_166_976
++    assert pp.plan_bytes(text, 2048, taps=5, routed=True) == 151_166_976 + 2048 * (2 * 4096 + 4 * 64 + 8 * 9)
++    assert pp.plan_bytes(text, 2048, taps=5, routed=True) == 168_615_936             # 160.8 MiB a lane
++
++
++def test_lane_buffers_own_the_routed_rows(allocations):  # noqa: F811
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import prefill_pairs as pp
++
++    rec = hp.Rec(torch)
++    _, b = hp.build_forward(torch, rec)
++    lane = pp.lane_buffers(b)
++    own = set(pp.SLOT_FIELDS) | set(pp.ROUTED_FIELDS) | {"ids_host", "taps"}
++    for name in vars(b):
++        x, y = getattr(b, name), getattr(lane, name)
++        if name in own:
++            assert x is not y, name
++        elif isinstance(x, torch.Tensor):
++            assert x is y, name                          # the scratch, the shared expert's output, the reply rows
++    for name in pp.ROUTED_FIELDS:
++        assert getattr(lane, name).shape == getattr(b, name).shape
++    assert pp.lane_bytes(b) == pp.slot_bytes(b) + sum(getattr(b, n).numel() * getattr(b, n).element_size()
++                                                      for n in pp.ROUTED_FIELDS)
++    e = SimpleNamespace(pbuf=b)
++    three = pp.buffers_for(e, 3)
++    assert three[0] is b and len(e.pbuf_lanes) == 2 and pp.buffers_for(e, 4)[1:3] == three[1:]
++    assert pp.buffers_for(e, 2) == [b, e.pbuf_lanes[0]] and not hasattr(e, "pbuf2")   # a pair in a lanes run
++
++
++# -- the schedule ----------------------------------------------------------------------------------------------------
++def _old_pair_schedule(gens, mark):
++    """The pairs' ``prefill_pairs._forward_pair`` as it was before the lanes, verbatim but for its arguments: the
++    pair oracle."""
++
++    from tensorfold.families.glm5_next.cuda.prefill_pairs import DONE, SEND, WAIT
++
++    at = [None, None]
++    end = object()
++    owner = None
++
++    def step(k):
++        mark(k)
++        try:
++            return next(gens[k])
++        except StopIteration:
++            return end
++
++    k = 0
++    at[0] = step(0)
++    while at[0] is not end or at[1] is not end:
++        here, there = at[k], at[1 - k]
++        if here is end:
++            k = 1 - k
++            if at[k] is None:
++                at[k] = step(k)
++            continue
++        if here is SEND:
++            if owner is None:
++                owner = k
++                at[k] = step(k)
++            else:
++                k = 1 - k
++                if at[k] is None:
++                    at[k] = step(k)
++            continue
++        if here is WAIT:
++            if there is None or there is DONE:
++                k = 1 - k
++                at[k] = step(k)
++            else:
++                at[k] = step(k)
++                if at[k] is DONE:
++                    owner = None
++            continue
++        if here is DONE:
++            owner = None
++            if there is SEND:
++                k = 1 - k
++                owner = k
++                at[k] = step(k)
++            else:
++                at[k] = step(k)
++            continue
++        raise AssertionError(here)
++
++
++def _stand_in(kinds, log):
++    """A chunk's layer loop as ``_steps`` stops it: per layer its attention ("a"), at a MoE layer its route, SEND,
++    the exchange ("x"), WAIT, the collect ("c"), DONE, then hc_post ("h"); then its tail ("t")."""
++
++    from tensorfold.families.glm5_next.cuda.prefill_pairs import DONE, SEND, WAIT
++
++    def steps(e, ch):
++        k = ch.slot
++        for i, kind in enumerate(kinds):
++            log.append(("a", k, i))
++            if kind == "moe":
++                yield SEND
++                log.append(("x", k, i))
++                yield WAIT
++                log.append(("c", k, i))
++                yield DONE
++            log.append(("h", k, i))
++        log.append(("t", k, None))
++    return steps
++
++
++KINDS = [["dense", "moe", "moe", "moe"], ["moe"], ["dense", "dense", "moe", "dense", "moe", "dense"],
++         ["moe", "moe", "moe", "moe", "moe", "dense"]]
++
++
++@pytest.mark.parametrize("kinds", KINDS, ids=["glm-like", "one-moe", "dense-between", "dense-tail"])
++def test_two_lanes_are_the_pair_schedule(monkeypatch, kinds):
++    from tensorfold.families.glm5_next.cuda import prefill_pairs as pp
++
++    marks, log = [], []
++    monkeypatch.setattr(pp, "_mark", marks.append)
++    monkeypatch.setattr(pp, "_steps", _stand_in(kinds, log))
++    e = SimpleNamespace(w=SimpleNamespace(afd=SimpleNamespace(depth=1)))
++    pp._forward_pair(e, *[pp.Chunk([None], k) for k in (0, 1)])
++    old_marks, old_log = [], []
++    steps = _stand_in(kinds, old_log)
++    _old_pair_schedule([steps(e, pp.Chunk([None], k)) for k in (0, 1)], old_marks.append)
++    assert marks == old_marks and log == old_log
++
++
++@pytest.mark.parametrize("n", [3, 4])
++@pytest.mark.parametrize("kinds", KINDS, ids=["glm-like", "one-moe", "dense-between", "dense-tail"])
++def test_the_lane_schedule(monkeypatch, n, kinds):
++    from tensorfold.families.glm5_next.cuda import prefill_pairs as pp
++
++    log = []
++    monkeypatch.setattr(pp, "_steps", _stand_in(kinds, log))
++    e = SimpleNamespace(w=SimpleNamespace(afd=SimpleNamespace(depth=1)))
++    pp._forward_lanes(e, [pp.Chunk([None], k) for k in range(n)])
++    moe = [i for i, kind in enumerate(kinds) if kind == "moe"]
++    xs = [(k, i) for ev, k, i in log if ev == "x"]
++    assert xs == [(k, i) for i in moe for k in range(n)]                    # lane order within each layer
++    flight = 0
++    for ev, _, _ in log:                                                     # one exchange on the wire at a time
++        flight += {"x": 1, "c": -1}.get(ev, 0)
++        assert 0 <= flight <= 1
++    for k in range(1, n):                                                    # the lane before ran each layer first
++        for i in range(len(kinds)):
++            assert log.index(("a", k - 1, i)) < log.index(("a", k, i)), (k, i)
++        assert log.index(("t", k - 1, None)) < log.index(("t", k, None))
++    for j, (ev, k, i) in enumerate(log):                                     # a collect's reply is used before the next
++        if ev == "c":
++            h = log.index(("h", k, i))
++            assert not [x for x in log[j + 1:h] if x[0] == "c"], (k, i, log[j:h + 1])
++    first = (log.index(("x", 0, moe[0])), log.index(("c", 0, moe[0])))
++    for k in range(1, n):                                                    # every later lane starts inside it
++        assert first[0] < log.index(("a", k, moe[0])) < first[1]
++    assert sum(1 for ev, _, _ in log if ev == "t") == n
++
++
++def test_a_deeper_wire_is_refused(monkeypatch):
++    from tensorfold.families.glm5_next.cuda import prefill_pairs as pp
++
++    e = SimpleNamespace(w=SimpleNamespace(afd=SimpleNamespace(depth=2)))
++    with pytest.raises(ValueError, match="depth 2"):
++        pp._forward_lanes(e, [pp.Chunk([None], k) for k in range(3)])
++    assert pp._depth(SimpleNamespace()) == 1 and pp._depth(SimpleNamespace(depth=True)) == 1
++
++
++# -- the forward seam: recorded kernels -----------------------------------------------------------------------------
++def _seam(monkeypatch, n):
++    """tests/test_glm_prefill_pairs.py's seam plus lanes 1 .. n - 1's own buffers (``lane_buffers``), named l<k>.*."""
++
++    from tensorfold.families.glm5_next.cuda import prefill_pairs as pp
++
++    s = tp._seam(monkeypatch)
++    rec = s.rec
++    s.w.afd.begin_lanes = rec.fn("afd.begin_lanes")
++    lanes = []
++    for k in range(1, n):
++        lb = pp.lane_buffers(s.b)
++        for name in pp.SLOT_FIELDS + pp.ROUTED_FIELDS:
++            rec.register(f"l{k}." + name, getattr(lb, name))
++        for i, t in enumerate(lb.taps):
++            rec.register(f"l{k}.tap{i}", t)
++        rec.aliases[id(lb)] = f"L{k}"
++        lanes.append(lb)
++    s.lanes = lanes
++    return s
++
++
++def _canon(x):
++    if isinstance(x, str):
++        x = re.sub(r"^l\d\.", "b.", x).replace(".pos_dev@", ".pos_dev")
++        return "B" if re.fullmatch(r"L\d", x) else x
++    if isinstance(x, tuple):
++        return tuple(_canon(v) for v in x)
++    return x
++
++
++def _engine(s, st=None):
++    torch = s.torch
++    return SimpleNamespace(w=s.w, st=st, pbuf=s.b, pbuf_lanes=list(s.lanes), prefill_rows=64, last_hidden=None,
++                           tap_rows=lambda k, bb: torch.cat([t[:k] for t in bb.taps], dim=1))
++
++
++def _by_lane(calls, n) -> list:
++    out, k = [[] for _ in range(n)], 0
++    for c in calls:
++        if c[0] == "slot":
++            k = c[1]
++        elif tp._kernel(c):
++            out[k].append(_canon(c))
++    return out
++
++
++@pytest.mark.parametrize("sizes,pos,holds", [((64, 64, 64), 0, (0, 1)), ((40, 1, 64, 23), 3, (1,)),
++                                             ((7, 64, 9), 90, ()), ((64, 30, 64, 64), 500, (0, 2))],
++                         ids=["3x64", "4-odd", "3-odd", "4-far"])
++def test_lanes_give_each_chunk_its_solo_calls(allocations, monkeypatch, sizes, pos, holds):  # noqa: F811
++    """One stream's 3 or 4 consecutive chunks as lanes (odd sizes, positions dense and past the dense limit, the last
++    ending the prompt): every kernel call of each lane is its solo prefill_chunk's (a later lane's l<k>.* buffers and
++    device position named as the solo's), taps and heads included; a state held at a lane's end equals the solo
++    chunk's end state; the wire saw one begin_lanes and per MoE layer each lane's exchange and collect in lane order."""
++
++    s = _seam(monkeypatch, len(sizes))
++    torch, rec, n = s.torch, s.rec, len(sizes)
++    starts = [pos + sum(sizes[:k]) for k in range(n)]
++    prompt = list(range(1, starts[-1] + sizes[-1] + 1))
++    st = hp.TraceState(torch, rec, 1, pos)
++    e = tp._engine(s, st)
++    solo, taps0, kept = [], [], {}
++    for k in range(n):
++        rec.calls = []
++        out_solo = s.decode.prefill_chunk(e, prompt, starts[k], sizes[k], drafter=tp._drafter(taps0, rec),
++                                          head=k == n - 1)
++        solo.append([tp._canon(c) for c in rec.calls if tp._kernel(c)])
++        kept[k] = (st.rec[st.cur[0]].clone(), st.conv.clone())
++    end_solo = (st.rec.clone(), st.conv.clone(), list(st.cur), st.pos)
++
++    st2 = hp.TraceState(torch, rec, 1, pos)
++    eng = _engine(s)
++    taps1 = []
++    rec.calls = []
++    chunks = s.pp.run_lanes(eng, [[tp._mp().Piece(st2, prompt[starts[k]:starts[k] + sizes[k]],
++                                                  drafter=tp._drafter(taps1, rec), head=k == n - 1)]
++                                  for k in range(n)], hold=[[st2] if k in holds else [] for k in range(n - 1)])
++    calls = list(rec.calls)
++    assert st2.pos == pos
++    for ch in chunks:
++        s.pp.finish(eng, ch)
++    assert _by_lane(calls, n) == solo
++    assert taps1 == taps0 and st2.pos == pos + sum(sizes)
++    assert st2.rec.tolist() == end_solo[0].tolist() and st2.conv.tolist() == end_solo[1].tolist()
++    assert list(st2.cur) == end_solo[2]
++    assert all(ch.heads == [None] for ch in chunks[:-1]) and chunks[-1].heads[0].shape == out_solo.shape
++    for k, ch in enumerate(chunks[:-1]):
++        if k in holds:
++            rec_h, conv_h = ch.held(st2)
++            assert torch.equal(rec_h, kept[k][0]) and torch.equal(conv_h, kept[k][1])
++        else:
++            assert ch.held(st2) is None
++    wire = [c for c in calls if c[0].startswith("afd.")]
++    assert wire[0] == ("afd.begin_lanes", (tuple(sizes),), ())
++    ops, slot = [], 0
++    for c in wire[1:]:
++        if c[0] == "afd.use":
++            slot = c[1][0]
++        else:
++            ops.append((c[0][4:], slot, c[1][1]))
++    assert ops == [(op, k, sizes[k]) for _ in range(3) for k in range(n) for op in ("exchange", "collect")]
++
++
++def test_grouped_chunks_as_lanes(allocations, monkeypatch):  # noqa: F811
++    """TF_GLM_MULTI_PREFILL's chunks as three lanes: two streams' pieces, then their next rows and a third stream's,
++    then all three again: each lane's calls are its solo prefill_pieces', the continuing streams' rows from where
++    their rows in the lanes before end, their kept states held."""
++
++    s = _seam(monkeypatch, 3)
++    torch, rec = s.torch, s.rec
++    plan = [(0, 30, (20, 9, 11)), (1, 4, (30, 12, 6)), (2, 7, (0, 21, 17))]      # (slot, position, rows per lane)
++
++    def run(laned):
++        sts = {k: hp.TraceState(torch, rec, k, pos) for k, pos, _ in plan}
++        prompts = {k: list(range(1, pos + sum(ns) + 1)) for k, pos, ns in plan}
++        lanes = []
++        for j in range(3):
++            lanes.append([tp._mp().Piece(sts[k], prompts[k][pos + sum(ns[:j]):pos + sum(ns[:j + 1])], head=j == 2)
++                          for k, pos, ns in plan if ns[j]])
++        e = _engine(s)
++        rec.calls = []
++        if laned:
++            chunks = s.pp.run_lanes(e, lanes, hold=[[sts[0], sts[1]], [sts[0], sts[1], sts[2]]])
++            calls = list(rec.calls)
++            for ch in chunks:
++                s.pp.finish(e, ch)
++            return _by_lane(calls, 3), {k: (st.rec.tolist(), st.conv.tolist(), st.pos) for k, st in sts.items()}, \
++                chunks
++        out, held = [], []
++        for j in range(3):
++            tp._mp().prefill_pieces(e, lanes[j])
++            out.append([tp._canon(c) for c in rec.calls if tp._kernel(c)])
++            held.append({k: (sts[k].rec[sts[k].cur[0]].clone(), sts[k].conv.clone()) for k in sts})
++            rec.calls = []
++        return out, {k: (st.rec.tolist(), st.conv.tolist(), st.pos) for k, st in sts.items()}, held
++
++    calls0, states0, held0 = run(False)
++    calls1, states1, chunks = run(True)
++    assert calls1 == calls0 and states1 == states0
++    from tensorfold.families.glm5_next.cuda.prefill_pairs import At
++
++    for j, ks in ((0, (0, 1)), (1, (0, 1, 2))):
++        for k in ks:
++            st = next((p.st._st if isinstance(p.st, At) else p.st) for p in chunks[j].pieces if p.st.slot == k)
++            assert all(torch.equal(x, y) for x, y in zip(chunks[j].held(st), held0[j][k])), (j, k)
++
++
++# -- the wire: the fake mcdma-rpcd pair --------------------------------------------------------------------------
++def _links(daemon, words, *, attn="cpu", experts=("cpu", "cpu"), timeout=10.0, pairs=True, lanes=4, fp8=False,
++           record=False, check=False, store=None):
++    import threading
++
++    from tensorfold.families.glm5_next.cuda import afd_mcdma, experts_node, mcdma
++
++    drv = FakeDriver(words)
++    links = mcdma.AttentionLinks(["a2", "a1"], words=words, driver=drv if attn == "gpu" else None, mode=attn,
++                                 stream=lambda: 0, timeout=timeout, shm_dir=str(daemon.shm), linkup_wait=2)
++    eps = []
++    for half, (name, mode) in enumerate(zip(["a2", "a1"], experts)):
++        link = mcdma.ExpertLink(name, words=words, driver=drv if mode == "gpu" else None, mode=mode,
++                                socket_path=daemon.sock(name), shm_dir=str(daemon.shm), stream=lambda: 0)
++        link.base = links.base[half]
++        end = afd_mcdma.McdmaExpertLink(link, D, S, len(LAYERS), PREFILL, device="cpu", pairs=pairs, lanes=lanes,
++                                        fp8=fp8)
++        ep = SimpleNamespace(link=end, node=FakeNode(LAYERS, half, record=record), error=None)
++
++        def run(ep=ep, half=half):
++            try:
++                experts_node.forwards(ep.node, ep.link, store if store is not None else DictStore(), half + 1,
++                                      check_on=check)
++            except BaseException as exc:  # noqa: BLE001
++                ep.error = exc
++
++        ep.t = threading.Thread(target=run, daemon=True)
++        ep.t.start()
++        eps.append(ep)
++    return links, eps
++
++
++def attention(links, port, *, fp8=False):
++    """``glm_afd_fakes.mcdma_attention`` with the handshake's ``wire_fp8`` when ``fp8``."""
++
++    from tensorfold.families.glm5_next.cuda import afd as afd_mod
++    from tensorfold.families.glm5_next.cuda import afd_mcdma
++
++    tr = afd_mcdma.McdmaTransport("127.0.0.1", port, links=links, comm=SimpleNamespace(abort=links.release),
++                                  device="cpu", hidden=D)
++    a = afd_mod.AfdWire("127.0.0.1", port, transport=tr)
++    a.announce(dict(settings(), **({"wire_fp8": 1} if fp8 else {})))
++    return a
++
++
++def _lanes_over(a, rows, gen, *, fp8=False, stop_after=None) -> None:
++    """N >= 3 lanes' exchanges in the schedule's wire order (lane 0's layer, lane 1's, ...), each reply checked against
++    the experts' function of the rows they decoded."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import wire_fp8
++
++    bufs = [tp._bufs() for _ in rows]
++    a.begin_lanes(rows)
++    for pos, layer in enumerate(LAYERS):
++        for k, r in enumerate(rows):
++            if stop_after is not None and (pos, k) == stop_after:
++                return
++            tp._fill(bufs[k], r, gen)
++            a.use(k)
++            a.exchange(bufs[k], r)
++            got = a.collect(bufs[k], r, D)
++            x = wire_fp8.roundtrip(bufs[k].normed[:r]) if fp8 else bufs[k].normed[:r]
++            for half in (0, 1):
++                assert torch.equal(got[half], partial(x, bufs[k].pick[:r], bufs[k].wts[:r], layer, half)), (layer, k)
++            assert torch.equal(got[2], bufs[k].sy[:r])
++
++
++MODES = [("cpu", ("cpu", "cpu")), ("gpu", ("gpu", "gpu")), ("gpu", ("cpu", "gpu"))]
++
++
++@pytest.mark.parametrize("modes", MODES, ids=["cpu", "gpu", "mixed"])
++def test_lanes_over_the_mcdma_wire(env, daemon, words, master, modes):
++    """Lanes of 4 (48, 7, 48, 1 rows) and 3 (5, 48, 30), then a pair and a plain chunk: every reply is the experts'
++    function of its own window's request; each expert served each layer's lanes in lane order; every later lane's
++    header was checked against the first's (``next_partner``); the forwards after the lanes carry no lane words."""
++
++    import torch
++
++    links, eps = _links(daemon, words, attn=modes[0], experts=modes[1])
++    wait_attached(daemon)
++    a = attention(links, master)
++    gen = torch.Generator().manual_seed(15)
++    groups = [(PREFILL, 7, PREFILL, 1), (5, PREFILL, 30)]
++    for rows in groups:
++        _lanes_over(a, rows, gen)
++    tp._pair(a, (9, PREFILL), gen)
++    tp._plain(a, 11, gen)
++    for ep in eps:
++        want = [(layer, r) for rows in groups + [(9, PREFILL)] for layer in LAYERS for r in rows]
++        assert ep.node.seen == want + [(layer, 11) for layer in LAYERS], ep.node.seen
++        assert ep.error is None
++    assert a.seq == 4 + 3 + 2 + 1 and a.dead is None
++    tp._close(daemon, eps)
++
++
++def test_an_expert_without_lanes_refuses(env, daemon, words, master):
++    """An expert link opened without the handshake's ``lanes`` refuses MODE_LANES (as an older tree refuses a mode
++    it does not know); the attention's next exchange then fails on the dead link."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import mcdma
++
++    links, eps = _links(daemon, words, lanes=0, timeout=2.0)
++    wait_attached(daemon)
++    a = attention(links, master)
++    gen = torch.Generator().manual_seed(2)
++    with pytest.raises(Exception):  # noqa: B017  the reply never comes: CapacityError after the link timeout
++        _lanes_over(a, (8, 8, 8), gen)
++    for ep in eps:
++        assert isinstance(ep.error, mcdma.LinkError) and "forward mode 9" in str(ep.error), repr(ep.error)
++
++
++def test_lanes_beyond_the_handshake_are_refused(env, daemon, words, master):
++    """An expert link that agreed to 3 lanes refuses a group of 4 at its first request."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import mcdma
++
++    links, eps = _links(daemon, words, lanes=3, timeout=2.0)
++    wait_attached(daemon)
++    a = attention(links, master)
++    gen = torch.Generator().manual_seed(3)
++    with pytest.raises(Exception):  # noqa: B017
++        _lanes_over(a, (8, 8, 8, 8), gen)
++    for ep in eps:
++        assert isinstance(ep.error, mcdma.LinkError) and "opens no prompt chunk lanes" in str(ep.error)
++
++
++def test_lanes_that_stop_early_are_refused(env, daemon, words, master):
++    """Lanes whose last lane stops before its last exchange: the next header refuses, naming the lane (the experts
++    are out of step), as a pair that stops early (tests/test_glm_prefill_pairs.py)."""
++
++    import torch
++
++    from tensorfold.server.errors import CapacityError
++
++    links, eps = _links(daemon, words, timeout=1.5)
++    wait_attached(daemon)
++    a = attention(links, master)
++    gen = torch.Generator().manual_seed(4)
++    _lanes_over(a, (8, 6, 4), gen, stop_after=(len(LAYERS) - 1, 2))
++    with pytest.raises(CapacityError, match=r"prompt chunk lane 2 \(seq 3\) stopped after 3 of 4"):
++        a.begin(5)
++    tp._close(daemon, eps)
++
++
++@pytest.mark.parametrize("modes", MODES[:2], ids=["cpu", "gpu"])
++def test_the_lane_scheduler_over_the_mcdma_wire(env, daemon, words, master, monkeypatch, modes):
++    """The real lane scheduler (``_forward_lanes``) over the real wire and the fake MCDMA pair, each lane's layer loop
++    a stand-in for ``_steps``: every reply is its own lane's; the experts saw each layer's lanes in lane order; never
++    more than one request on the wire."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import prefill_pairs as pp
++
++    links, eps = _links(daemon, words, attn=modes[0], experts=modes[1])
++    wait_attached(daemon)
++    a = attention(links, master)
++    gen = torch.Generator().manual_seed(19)
++    rows = (PREFILL, 13, 21, PREFILL)
++    bufs = [tp._bufs() for _ in rows]
++    flight = {"now": 0, "max": 0}
++
++    def steps(e, ch):
++        k, r, b = ch.slot, ch.R, bufs[ch.slot]
++        for pos, layer in enumerate(LAYERS):
++            tp._fill(b, r, gen)
++            yield pp.SEND
++            e.w.afd.use(k)
++            e.w.afd.exchange(b, r)
++            flight["now"] += 1
++            flight["max"] = max(flight["max"], flight["now"])
++            yield pp.WAIT
++            e.w.afd.use(k)
++            got = e.w.afd.collect(b, r, D)
++            flight["now"] -= 1
++            for half in (0, 1):
++                assert torch.equal(got[half], partial(b.normed[:r], b.pick[:r], b.wts[:r], layer, half)), (k, pos)
++            yield pp.DONE
++
++    monkeypatch.setattr(pp, "_steps", steps)
++    e = SimpleNamespace(w=SimpleNamespace(afd=a))
++    a.begin_lanes(rows)
++    pp._forward_lanes(e, [pp.Chunk([None], k, None, R=rows[k]) for k in range(len(rows))])
++    assert flight["max"] == 1 and a.dead is None
++    for ep in eps:
++        assert ep.node.seen == [(layer, r) for layer in LAYERS for r in rows] and ep.error is None
++    tp._plain(a, 9, gen)
++    assert all(ep.error is None for ep in eps)
++    tp._close(daemon, eps)
++
++
++def test_the_lane_timer_line(env, daemon, words, master, monkeypatch, capsys):
++    """TF_AFD_TIME=1 with lanes: sampled when the lanes close, one ``afd lane overlap`` line every 8 lane groups with
++    per N and R the window, wait and in-window work (2, 1 and 1 ms on the host clock), apart from the pairs' line."""
++
++    import torch
++
++    monkeypatch.setattr(torch.cuda, "Event", tp._HostEvent)
++    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
++    links, eps = _links(daemon, words)
++    wait_attached(daemon)
++    a = attention(links, master)
++    a.timing, a.ev = True, None
++    gen = torch.Generator().manual_seed(21)
++    rows, n = (PREFILL, 7, 7), len(LAYERS)
++    for _ in range(9):
++        _lanes_over(a, rows, gen)
++    out = capsys.readouterr().out
++    want = (f"[tensorfold] afd lane overlap: {24 * n} lane MoE exchanges over the last 8 lane groups (8 so far; "
++            f"in-window work: the shared expert + the other lanes' attention); "
++            f"N3 R7 n{16 * n} window p50 2.00 ms p90 2.00, wait for the reply p50 1.00 ms p90 1.00, in-window work "
++            f"p50 1.00 ms p90 1.00; N3 R{PREFILL} n{8 * n} window p50 2.00 ms p90 2.00, wait for the reply p50 1.00 ms "
++            f"p90 1.00, in-window work p50 1.00 ms p90 1.00")
++    assert out.count("afd lane overlap") == 1 and want in out and "afd pair overlap" not in out, out
++    assert a._lanes_timed == 8 and a._lane_overlap == {} and a._pairs_timed == 0
++    tp._plain(a, 5, gen)
++    assert a._lanes_timed == 9 and all(ep.error is None for ep in eps)
++    tp._close(daemon, eps)
++
++
++# -- the engine: the fake model at world 1 ---------------------------------------------------------------------------
++def _world1(env, monkeypatch, *, lanes, group=False, shared=False, prompts=(), streams=2):
++    """tests/test_glm_prefill_pairs.py's world 1 with TF_GLM_PREFILL_LANES (None: unset, the pairs off); every group
++    checked: no stream decoding, no sliced chunk suspended, at most ``lanes`` chunks, only the last ending prompts."""
++
++    from tests import test_glm_multi_afd as ta
++
++    monkeypatch.delenv(PAIRS, raising=False)
++    for name, on in (("TF_GLM_MULTI_PREFILL", group), ("TF_GLM_SHARED_PREFIX", shared)):
++        if on:
++            monkeypatch.setenv(name, "1")
++        else:
++            monkeypatch.delenv(name, raising=False)
++    if lanes is None:
++        monkeypatch.delenv(LANES, raising=False)
++    else:
++        monkeypatch.setenv(LANES, str(lanes))
++    n1 = ta.World1(env, streams=streams)
++    d = n1.d
++    assert d.n_lanes == (lanes or 1) and d.pairs == ((lanes or 1) >= 2)
++    groups, real = [], d._fill_pair
++
++    def checked(*plans):
++        assert d.partial is None and not any(x.decoding and not x.s.done for x in d.lanes.values())
++        assert 2 <= len(plans) <= d.n_lanes
++        assert all(stop < len(x.s.prompt) for plan in plans[:-1] for x, stop in plan)
++        groups.append([[(x.sid, stop) for x, stop in plan] for plan in plans])
++        return real(*plans)
++
++    d._fill_pair = checked
++    reqs = [(tm._prompt(n, seed), 12, tm._sampling(kind, seed)) for n, seed, kind in prompts]
++    out = [n1.submit(pr, cnt, sp) for pr, cnt, sp in reqs]
++    n1.run()
++    return n1, out, reqs, groups
++
++
++@pytest.mark.parametrize("prompts", tp.LENGTHS, ids=["1-chunk", "2-chunks", "3-chunks", "5-chunks", "64+1", "128+38"])
++def test_a_cold_prompt_alone_in_lanes(afd_fake, monkeypatch, prompts):
++    """A cold prompt alone with 3 and 4 lanes vs pairs vs the setting off (64-row chunks): the same reply (its solo
++    reply), cached count and kept states with their pool rows; lanes run where the prompt has three chunks before
++    its last chunk's start."""
++
++    n0, s0, reqs, _ = _world1(afd_fake, monkeypatch, lanes=None, prompts=prompts)
++    runs = {k: _world1(afd_fake, monkeypatch, lanes=k, prompts=prompts) for k in (2, 3, 4)}
++    chunks = len([c for c in n0.wire.calls if c[0] == "chunk"])
++    for k, (n1, s1, _, groups) in runs.items():
++        for s, (pr, cnt, sp) in zip(s1, reqs):
++            assert s.got == tm.solo(afd_fake.torch, pr, cnt, sp)
++        assert [s.got for s in s0] == [s.got for s in s1] and [s.cached for s in s0] == [s.cached for s in s1]
++        assert tp.hp.kept_view(n0.d) == tp.hp.kept_view(n1.d), k
++        assert n1.wire.pairs() == n0.wire.pairs()        # the same forwards (begin, then chunk) in the same order
++        big = [g for g in groups if len(g) >= 3]
++        assert n1.d.laned["groups"] == len(big) == len(getattr(n1.wire, "laned", ()))
++        assert n1.d.paired["pairs"] == len(groups) - len(big) == len(getattr(n1.wire, "paired", ()))
++        assert sum(len(g) for g in groups) <= chunks and (k < 3 or not big or max(len(g) for g in big) <= k)
++    assert runs[4][0].d.laned["groups"] > 0 if chunks >= 4 else True
++
++
++@pytest.mark.parametrize("group", [False, True], ids=["one-at-a-time", "multi-prefill"])
++@pytest.mark.parametrize("shared", [False, True], ids=["no-shared", "shared-prefix"])
++def test_several_prompts_filling_together_in_lanes(afd_fake, monkeypatch, group, shared):
++    """Three prompts admitted together (TF_GLM_MULTI_PREFILL and TF_GLM_SHARED_PREFIX off and on), 4 lanes vs the
++    setting off: the same replies, cached counts and kept states; lane groups ran (grouped chunks in them too)."""
++
++    prompts = ((150, 11, "greedy"), (90, 12, "topk"), (200, 13, "greedy"))
++    n0, s0, _, _ = _world1(afd_fake, monkeypatch, lanes=None, group=group, shared=shared, prompts=prompts, streams=4)
++    n1, s1, _, groups = _world1(afd_fake, monkeypatch, lanes=4, group=group, shared=shared, prompts=prompts,
++                                streams=4)
++    assert [s.got for s in s0] == [s.got for s in s1] and [s.cached for s in s0] == [s.cached for s in s1]
++    assert tp.hp.kept_view(n0.d) == tp.hp.kept_view(n1.d) and any(len(g) >= 3 for g in groups)
++    assert n1.d.grouped == n0.d.grouped
++
++
++def test_no_lanes_while_a_stream_decodes(afd_fake, monkeypatch):
++    """A short prompt decodes while a long one arrives: its chunks fill one at a time between decode rounds (no group
++    while anything decodes, which ``_world1`` asserts), the replies the same as with the setting off."""
++
++    prompts = ((20, 41, "greedy"), (300, 42, "greedy"))
++    n0, s0, _, _ = _world1(afd_fake, monkeypatch, lanes=None, prompts=prompts)
++    n1, s1, _, _ = _world1(afd_fake, monkeypatch, lanes=4, prompts=prompts)
++    assert [s.got for s in s0] == [s.got for s in s1] and tp.hp.kept_view(n0.d) == tp.hp.kept_view(n1.d)
++
++
++def test_sliced_fills_run_as_before_with_lanes_on(afd_fake, monkeypatch):
++    """tests/test_glm_prefill_pairs.py's sliced-fill check with 4 lanes: a 5-chunk prompt fills alone (as lanes), then
++    decodes while a 4-chunk
++    prompt arrives, whose chunks go in layer slices with decode rounds between them, as with the setting off (no
++    group while a stream decodes or a sliced chunk is suspended); the replies are the solo ones, the kept states
++    equal the setting off."""
++
++    from tensorfold.families.glm5_next.cuda.afd import MODE_SLICE
++    from tests import test_glm_sliced_fill as tsf
++
++    reqs = [(tm._prompt(300, 51), 40, tm._sampling("greedy", 51)), (tm._prompt(200, 52), 12, tm._sampling("topk", 52))]
++    runs = {}
++    for lanes in (None, 4):
++        monkeypatch.delenv(PAIRS, raising=False)
++        if lanes is None:
++            monkeypatch.delenv(LANES, raising=False)
++        else:
++            monkeypatch.setenv(LANES, str(lanes))
++        tsf.layered(monkeypatch, "2.5")
++        n1 = tsf.SlicedWorld1(afd_fake, streams=2)
++        d = n1.d
++        groups, real = [], d._fill_pair
++
++        def checked(*plans, d=d, groups=groups, real=real):
++            assert d.partial is None and not any(x.decoding and not x.s.done for x in d.lanes.values())
++            groups.append(len(plans))
++            return real(*plans)
++
++        d._fill_pair = checked
++        a = n1.submit(*reqs[0])
++        while not (a.sid in d.lanes and d.lanes[a.sid].decoding):
++            n1.step()
++        b = n1.submit(*reqs[1])
++        n1.run()
++        for s, (pr, cnt, sp) in zip((a, b), reqs):
++            assert s.got == tm.solo(afd_fake.torch, pr, cnt, sp)
++        runs[lanes] = (n1, d, groups, [a.got, b.got], tp._kept(d))
++    (n0, d0, g0, r0, k0), (n1, d1, g1, r1, k1) = runs[None], runs[4]
++    assert r0 == r1 and k0 == k1 and not g0 and g1 and 4 in g1
++    assert [e for e in n1.wire.events if e[0] == "lanes"] and not [e for e in n0.wire.events if e[0] == "lanes"]
++    assert d1.sliced["chunks"] > 0 and d1.sliced == d0.sliced and tsf._between(n1.begins())
++    assert [x for x in n1.begins() if x[2] == MODE_SLICE] == [x for x in n0.begins() if x[2] == MODE_SLICE]
++    assert d1.partial is None
+diff --git a/tests/test_glm_prefill_pairs.py b/tests/test_glm_prefill_pairs.py
+index 6829b45..4f1b846 100644
+--- a/tests/test_glm_prefill_pairs.py
++++ b/tests/test_glm_prefill_pairs.py
+@@ -764,6 +764,7 @@ def test_pairs_and_slices_share_the_wire(env, daemon, words, master, modes):
+ 
+ # -- the engine: the fake model at world 1 (test_glm_multi_afd.afd_fake's fake_pairs) ---------------------------------
+ def _world1(env, monkeypatch, *, pairs, group=False, shared=False, prompts=(), streams=2, cancel=None):
++    monkeypatch.delenv("TF_GLM_PREFILL_LANES", raising=False)      # pairs here, whatever the run's lanes setting
+     for name, on in ((ENV, pairs), ("TF_GLM_MULTI_PREFILL", group), ("TF_GLM_SHARED_PREFIX", shared)):
+         if on:
+             monkeypatch.setenv(name, "1")
+@@ -876,6 +877,7 @@ def _sliced(env, monkeypatch, *, pairs):
+ 
+     from tests import test_glm_sliced_fill as tsf
+ 
++    monkeypatch.delenv("TF_GLM_PREFILL_LANES", raising=False)      # pairs here, whatever the run's lanes setting
+     if pairs:
+         monkeypatch.setenv(ENV, "1")
+     else:
+diff --git a/tests/test_glm_sliced_fill.py b/tests/test_glm_sliced_fill.py
+index 7dfc751..dcad024 100644
+--- a/tests/test_glm_sliced_fill.py
++++ b/tests/test_glm_sliced_fill.py
+@@ -227,6 +227,12 @@ def slice_wire(layers: int = MOE, prefill: int = 64):
+             assert self.span is None or self.layer == self.end, ("a pair while a slice is open", self.span)
+             self.events.append(("pair", int(rows[0]), int(rows[1])))
+ 
++        def begin_lanes(self, rows) -> None:
++            """TF_GLM_PREFILL_LANES: N >= 3 lanes, as ``begin_pair``'s; logged as ("lanes", rows...)."""
++
++            assert self.span is None or self.layer == self.end, ("lanes while a slice is open", self.span)
++            self.events.append(("lanes", *(int(r) for r in rows)))
++
+         def use(self, slot: int) -> None:
+             pass
+ 
+diff --git a/tests/test_glm_wire_fp8.py b/tests/test_glm_wire_fp8.py
+new file mode 100644
+index 0000000..465cdbe
+--- /dev/null
++++ b/tests/test_glm_wire_fp8.py
+@@ -0,0 +1,314 @@
++"""TF_GLM_WIRE_FP8 (``wire_fp8``) on CPU: the MoE exchanges' FFN input rows as FP8 E4M3 wire rows with one UE8M0 scale
++per 32 values, glm53f-afd's wire-out quantizer (hughmadden/glm53f-afd @ 91db3cc, ``Fp8E4m3Ue8m0K32``).
++
++- The setting, the handshake, the row and request sizes (and the bytes saved per layer at 2,048 rows).
++- The codec against plain-Python references written from glm53f-afd's device kernels: every code's value and back,
++  the ties (to the larger magnitude), saturation, NaN and zeros; the scale bytes; whole rows of random, tied, tiny,
++  huge, zero, NaN and infinite values, bit for bit; the decode exact; the round trip's error bound; encoding the
++  decoded rows again changes nothing.
++- The wire: the real ``AfdWire`` + ``McdmaTransport`` and both expert loops over the fake mcdma-rpcd pair, CPU- and
++  GPU-driven: with the setting on, the experts compute with exactly the decoded rows (plain forwards, a pair and
++  lanes), each request carries the FP8 layout's bytes; TF_AFD_CHECK hashes the decoded rows on both sides (0
++  mismatches); an expert without ``wire_fp8`` refuses the settings.
++"""
++
++from __future__ import annotations
++
++import itertools
++import math
++import struct
++from types import SimpleNamespace
++
++import pytest
++
++from tests import test_glm_prefill_lanes as tl
++from tests import test_glm_prefill_pairs as tp
++from tests.glm_afd_fakes import (  # noqa: F401
++    LAYERS,
++    PREFILL,
++    D,
++    S,
++    daemon_fixture,
++    env_fixture,
++    libpath_fixture,
++    master_fixture,
++    partial,
++    wait_attached,
++    words_fixture,
++)
++
++pytestmark = pytest.mark.torch
++ENV = "TF_GLM_WIRE_FP8"
++
++
++def _w():
++    from tensorfold.families.glm5_next.cuda import wire_fp8
++
++    return wire_fp8
++
++
++def _bf16(v: float) -> float:
++    """The bf16 value nearest ``v`` (round to nearest even), as torch rounds."""
++
++    import torch
++
++    return float(torch.tensor([v], dtype=torch.float32).to(torch.bfloat16).float()[0])
++
++
++# -- the setting -----------------------------------------------------------------------------------------------------
++def test_the_setting_the_handshake_and_the_sizes(monkeypatch):
++    from tensorfold.families.glm5_next.cuda import afd, mcdma
++
++    w = _w()
++    monkeypatch.delenv(ENV, raising=False)
++    assert not w.enabled() and not w.enabled("0") and w.enabled("1") and w.enabled(" 1 ")
++    for bad in ("2", "on", "fp8", "true"):
++        with pytest.raises(ValueError, match=ENV):
++            w.enabled(bad)
++    cfg = SimpleNamespace(mlp_kinds=["dense"] * 3 + ["moe"] * 4, quant="exl3", experts=16, top_k=8)
++    plain = afd.settings_for("/nonexistent", cfg, prefill_rows=2048)
++    fp8 = afd.settings_for("/nonexistent", cfg, prefill_rows=2048, wire_fp8=True)
++    assert "wire_fp8" not in plain and fp8 == dict(plain, wire_fp8=1)
++    assert afd.settings_mismatch(plain, fp8) == "wire_fp8: attention 1 != expert None"   # an older expert refuses
++    assert w.row_bytes(4096) == 4224 and w.row_bytes(64) == 66
++    with pytest.raises(ValueError):
++        w.row_bytes(100)
++    # GLM-5.3-Flash at 2,048 rows: hidden 4,096, top-k 8 + the shared slot. Each request (one per expert link per MoE
++    # layer) carries 16 MiB of bf16 rows today, 8.25 MiB of FP8 rows and scales with the setting on
++    bf, f8 = mcdma.Layout(4096, 9), mcdma.Layout(4096, 9, fp8=True)
++    assert bf.req(2048) == 256 + 2048 * 4096 * 2 + 2048 * 36 + 2048 * 36 == 16_924_928
++    assert f8.req(2048) == 256 + 2048 * 4096 + 2048 * 128 + 2048 * 36 + 2048 * 36 == 8_798_464
++    assert bf.req(2048) - f8.req(2048) == 8_126_464                    # 7.75 MiB less per request, x2 links per layer
++    assert f8.rep(2048) == bf.rep(2048) == 2048 * 4096 * 4               # the replies are unchanged
++    for rows in (1, 7, 48, 2048):
++        n, p, wt, end = f8.offsets(rows)
++        assert n == mcdma.HDR_BYTES and p % 256 == 0 and wt % 256 == 0 and end == f8.req(rows)
++        assert p - n == rows * 4096 + rows * 128 + f8.scales_pad(rows) and (rows * 128 + f8.scales_pad(rows)) % 256 == 0
++
++
++# -- the codec -------------------------------------------------------------------------------------------------------
++def test_every_code_decodes_and_encodes_back():
++    w = _w()
++    for c in range(256):
++        v = w.reference_decode(c)
++        if c in (0x7F, 0xFF):
++            assert math.isnan(v)
++            continue
++        if c == 0x80:                                    # -0.0: the kernel's ``x < 0`` is false, code 0
++            assert v == 0.0 and w.reference_code(v) == 0
++            continue
++        assert w.reference_code(v) == c, (hex(c), v)
++    assert w.reference_decode(0x7E) == 448.0 and w.reference_decode(0x01) == 2.0 ** -9
++    assert w.reference_decode(0x08) == 2.0 ** -6 and w.reference_decode(0xFE) == -448.0
++
++
++def test_ties_go_to_the_larger_magnitude_and_saturation():
++    w = _w()
++    mags = sorted({w.reference_decode(c) for c in range(0x7F)})
++    for lo, hi in itertools.pairwise(mags):
++        mid = (lo + hi) / 2
++        assert w.reference_code(mid) == w.reference_code(hi), (lo, hi)                # a tie: the larger
++        assert w.reference_code(-mid) == 0x80 | w.reference_code(hi)
++        below = math.nextafter(mid, 0.0)
++        assert w.reference_code(below) == w.reference_code(lo) if lo else w.reference_code(below) in (0, 1)
++    assert w.reference_code(448.0) == w.reference_code(1e30) == w.reference_code(math.inf) == 0x7E
++    assert w.reference_code(-1e30) == 0xFE and w.reference_code(math.nan) == 0
++    assert w.reference_code(2.0 ** -11) == 0 and w.reference_code(-(2.0 ** -11)) == 0x80   # the sign kept on a zero code
++
++
++def test_the_scale_bytes():
++    w = _w()
++    assert w.reference_scale([0.0] * 32) == 0
++    assert w.reference_scale([448.0] + [0.0] * 31) == 127                          # 448 needs 2^0
++    assert w.reference_scale([448.5] + [0.0] * 31) == 128
++    assert w.reference_scale([1.0] * 32) == 127 - 8                                # 1 / 448 -> 2^-8
++    assert w.reference_scale([math.nan] * 31 + [3.0]) == w.reference_scale([0.0] * 31 + [3.0])   # NaN skipped
++    assert w.reference_scale([math.inf] + [0.0] * 31) == 254
++    assert w.reference_scale([1e-38] + [0.0] * 31) == 0                            # clamped
++
++
++def _rows(torch, gen, r, d):
++    """bf16 rows with every kind of block: gaussian at scales 2^-20 .. 2^20, all zeros, one value, NaN, +-inf, the
++    tiniest and the largest bf16 values, exact E4M3 ties after scaling, values spanning 2^40 inside one block."""
++
++    x = torch.randn((r, d), generator=gen) * torch.exp2(torch.randint(-20, 21, (r, d // 32, 1), generator=gen)
++                                                         .float()).repeat_interleave(32, dim=1).view(r, d)
++    x = x.to(torch.bfloat16)
++    x[0, :32] = 0.0
++    x[0, 32:64] = 0.0
++    x[0, 40] = -3.5
++    x[1, :32] = torch.tensor([math.nan, 1.0] * 16)
++    x[1, 32:64] = torch.tensor([math.inf, -math.inf] + [0.5] * 30)
++    x[2, :32] = 2.0 ** -133                               # bf16's smallest subnormal
++    x[2, 32:64] = torch.tensor([3.3895313892515355e38, -1.0] + [2.0 ** -100] * 30)
++    # ties: 448 and the midpoint between two codes, (1 + 1/16) and (1 + 3/16) at scale 2^0 after the block's 448
++    x[3, :32] = torch.tensor([448.0, 1.0625, 1.1875, -1.0625, 2.0 ** -10, -(2.0 ** -10), 3 * 2.0 ** -11, 0.0] * 4)
++    x[3, 32:64] = torch.tensor([2.0 ** 20, 2.0 ** -20] * 16)
++    return x
++
++
++def test_rows_encode_bit_for_bit_as_the_reference():
++    import torch
++
++    w = _w()
++    gen = torch.Generator().manual_seed(31)
++    r, d = 37, 128
++    x = _rows(torch, gen, r, d)
++    payload = torch.empty((r, d), dtype=torch.uint8)
++    scales = torch.empty((r, d // 32), dtype=torch.uint8)
++    w.encode(x, payload, scales)
++    for i in range(r):
++        codes, sc = w.reference_row(x[i].float().tolist())
++        assert bytes(payload[i].tolist()) == codes, i
++        assert bytes(scales[i].tolist()) == sc, i
++    w._ROWS, keep = 5, w._ROWS                           # several passes: the same bytes
++    try:
++        p2, s2 = torch.empty_like(payload), torch.empty_like(scales)
++        w.encode(x, p2, s2)
++    finally:
++        w._ROWS = keep
++    assert torch.equal(p2, payload) and torch.equal(s2, scales)
++    assert payload[3, :4].tolist() == [0x7E, 0x39, 0x3A, 0xB9]       # 448, 1.0625 -> 1.125, 1.1875 -> 1.25, -1.125
++
++
++def test_the_table_is_the_reference_on_every_bf16_magnitude():
++    import torch
++
++    w = _w()
++    t = w._table("cpu")
++    assert t.shape == (32768,) and t.dtype == torch.uint8
++    for b in list(range(0, 32768, 97)) + [0x0000, 0x3A80, 0x43E0, 0x43E1, 0x7F80, 0x7FC0]:
++        v = struct.unpack("<f", struct.pack("<I", b << 16))[0]
++        assert t[b] == w.reference_code(v), hex(b)
++
++
++def test_the_decode_is_exact_and_the_error_bound():
++    import torch
++
++    w = _w()
++    gen = torch.Generator().manual_seed(32)
++    r, d = 64, 256
++    x = (torch.randn((r, d), generator=gen) * torch.exp2(torch.randint(-12, 13, (r, 1), generator=gen).float()))
++    x = x.to(torch.bfloat16)
++    payload = torch.empty((r, d), dtype=torch.uint8)
++    scales = torch.empty((r, d // 32), dtype=torch.uint8)
++    w.encode(x, payload, scales)
++    y = w.decode(payload, scales, torch.empty_like(x))
++    want = torch.tensor([[_bf16(w.reference_decode(int(c)) * 2.0 ** (int(scales[i, j // 32]) - 127))
++                          for j, c in enumerate(payload[i].tolist())] for i in range(r)], dtype=torch.float32)
++    assert torch.equal(y.float(), want)                  # exact: e4m3 x 2^k, one rounding to bf16 at most
++    # the bound: half a step of E4M3's three mantissa bits (2^-4 relative), or half its smallest subnormal step
++    # (2^-10 at the block's scale) below 2^-6
++    s = torch.exp2(scales.float() - 127).repeat_interleave(32, dim=1)
++    err = (y.float() - x.float()).abs()
++    assert bool((err <= torch.maximum(x.float().abs() * 2.0 ** -4, s * 2.0 ** -10)).all())
++    rel = (err / x.float().abs().clamp_min(1e-30))[x.float().abs() >= s * 2.0 ** -6]
++    assert float(rel.max()) <= 2.0 ** -4 and float(rel.mean()) < 0.025
++    assert torch.equal(w.roundtrip(y), y)                # the decoded rows encode to themselves
++
++
++def test_the_bf16_decode_equals_the_fp32_path():
++    """``decode`` multiplies in bf16 (torch: fp32 math, one rounding); the same as the exact fp32 product rounded."""
++
++    import torch
++
++    w = _w()
++    gen = torch.Generator().manual_seed(33)
++    payload = torch.randint(0, 256, (16, 64), generator=gen, dtype=torch.int32)
++    payload[(payload == 0x7F) | (payload == 0xFF)] = 0x7E
++    payload = payload.to(torch.uint8)
++    scales = torch.randint(0, 255, (16, 2), generator=gen, dtype=torch.int32).to(torch.uint8)
++    y = w.decode(payload, scales, torch.empty((16, 64), dtype=torch.bfloat16))
++    lut = torch.tensor([w.reference_decode(c) if c not in (0x7F, 0xFF) else 0.0 for c in range(256)])
++    f32 = lut[payload.long()] * torch.exp2(scales.float() - 127).repeat_interleave(32, dim=1)
++    assert torch.equal(y, f32.to(torch.bfloat16))
++
++
++# -- the wire --------------------------------------------------------------------------------------------------------
++@pytest.mark.parametrize("modes", tl.MODES, ids=["cpu", "gpu", "mixed"])
++def test_fp8_rows_over_the_mcdma_wire(env, daemon, words, master, modes):
++    """With the setting on (the handshake's ``wire_fp8``): plain forwards, a pair and lanes of 3; every expert read
++    exactly the decoded rows (and the sent experts and weights), every reply is its function of them, and each request
++    was the FP8 layout's size."""
++
++    import torch
++
++    w = _w()
++    from tensorfold.families.glm5_next.cuda import mcdma
++
++    links, eps = tl._links(daemon, words, attn=modes[0], experts=modes[1], fp8=True, record=True)
++    wait_attached(daemon)
++    a = tl.attention(links, master, fp8=True)
++    assert a.tr.fp8 and a.tr.layout.req(PREFILL) < mcdma.Layout(D, S).req(PREFILL)
++    gen = torch.Generator().manual_seed(41)
++    sent = []
++    real = a.tr.send
++
++    def send(b, rows, layer):
++        sent.append((b.normed[:rows].clone(), b.pick[:rows].clone(), b.wts[:rows].clone()))
++        return real(b, rows, layer)
++
++    a.tr.send = send
++    b = tp._bufs()
++    a.begin(11, chunk=True)
++    for layer in LAYERS:
++        tp._fill(b, 11, gen)
++        a.exchange(b, 11)
++        got = a.collect(b, 11, D)
++        x = w.roundtrip(b.normed[:11])
++        assert not torch.equal(x, b.normed[:11])         # FP8 rows: not the bf16 rows
++        for half in (0, 1):
++            assert torch.equal(got[half], partial(x, b.pick[:11], b.wts[:11], layer, half))
++    tl._lanes_over(a, (PREFILL, 5, 9), gen, fp8=True)
++    for ep in eps:
++        assert ep.error is None and len(ep.node.inputs) == len(sent)
++        for (layer, rows, normed, pick, wts), (n0, p0, w0) in zip(ep.node.inputs, sent):
++            assert torch.equal(normed, w.roundtrip(n0)) and torch.equal(pick, p0) and torch.equal(wts, w0)
++    for ep in eps:
++        assert ep.link.lay.fp8 and ep.link.n_req == ep.link.lay.req(ep.link.rows)
++    tp._close(daemon, eps)
++
++
++def test_the_wire_check_hashes_the_decoded_rows(env, daemon, words, master, monkeypatch, capsys):
++    """TF_AFD_CHECK=1 with FP8 rows over a plain forward and a pair: the attention hashes the rows the experts decode
++    (``wire_rows``), the experts hash what they computed with; 0 mismatches."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import afd, experts_node
++
++    monkeypatch.setattr(afd, "CHECK_FORWARDS", 3)
++    monkeypatch.setattr(experts_node, "CHECK_FORWARDS", 3)
++    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
++    holder = {}
++    store = SimpleNamespace(set=lambda k, v: holder["s"].set(k, v))
++    links, eps = tl._links(daemon, words, fp8=True, check=True, store=store)
++    wait_attached(daemon)
++    a = tl.attention(links, master, fp8=True)
++    holder["s"] = a.store
++    a.check = True
++    gen = torch.Generator().manual_seed(42)
++    b = tp._bufs()
++    a.begin(6, chunk=True)
++    for layer in LAYERS:
++        tp._fill(b, 6, gen)
++        a.exchange(b, 6)
++        a.collect(b, 6, D)
++    _fp8_pair(a, (8, 5), gen)
++    a.begin(2)
++    a.layer = a.nlayers
++    out = capsys.readouterr().out
++    assert a.checked == 3 and a.mismatches == 0, out
++    assert "3 forwards (2 of them in prompt chunk pairs, seqs 2-3), 0 mismatches" in out
++    tp._close(daemon, eps)
++
++
++def _fp8_pair(a, rows, gen) -> None:
++    bufs = [tp._bufs(), tp._bufs()]
++    a.begin_pair(rows)
++    for _ in LAYERS:
++        for k in (0, 1):
++            tp._fill(bufs[k], rows[k], gen)
++            a.use(k)
++            a.exchange(bufs[k], rows[k])
++            a.collect(bufs[k], rows[k], D)

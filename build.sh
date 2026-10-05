@@ -1,39 +1,108 @@
 #!/bin/bash
-# build.sh — build glm53f-afd (pinned UPSTREAM_REF + patches/) from source, natively:
-#   coordinator: glm53f-serve for sm_120 on the x86 RTX host (CUDA 12.9 build image)
-#   ranks:       glm53f-rank  for sm_121 on each GB10 Spark  (CUDA 13.0 build image)
-# The build containers get no GPU. Binaries land in $GLM_HOME/bin on each host;
-# ./scripts/install.sh copies them to /opt/glm53f-afd/bin.
-#   ./build.sh [all|coord|ranks]
+# build.sh — the patched TensorFold tree, the serving images, MCDMA's link daemon and the CUDA extension caches.
+#   tree    on this controller: TensorFold at TF_TAG (checked against TF_COMMIT), then patches/ in order with
+#           `git am` (authors and messages kept) -> $BUILD_DIR/tensorfold
+#   sync    that tree to $AFD_HOME/tree on all three hosts (git archive; the containers mount it read-only)
+#   images  $IMAGE on each host from docker/Dockerfile (x86_64 on the attention host, arm64 on the Sparks)
+#   mcdma   MCDMA at MCDMA_COMMIT, built natively on each host -> $AFD_HOME/mcdma/{mcdma-rpcd,libmcdma-rpc.so}
+#   ext     the CUDA extensions prebuilt with NO model loaded, on all three hosts in parallel (refuses while
+#           the stack's containers run: two GPU tenants on a GB10 can hang it)
+# Needs git on this controller; docker, git, make, a C compiler and libibverbs-dev on the hosts.
+#   ./build.sh [all|tree|sync|images|mcdma|ext]      (all = every step, in that order)
 set -euo pipefail
 . "$(dirname "$0")/scripts/lib.sh"
 
-build_host() {  # host base-image image-tag cuda-arch cargo-package
-  local h=$1 base=$2 img=$3 arch=$4 pkg=$5
-  log "$h: fetching $UPSTREAM_REPO @ $UPSTREAM_REF"
-  rsh "$h" "set -e; mkdir -p $GLM_HOME/src $GLM_HOME/bin; cd $GLM_HOME/src
-    [ -d glm53f-afd/.git ] || git clone -q $UPSTREAM_REPO glm53f-afd
-    cd glm53f-afd; git fetch -q origin; git checkout -q -f $UPSTREAM_REF; git clean -qfdx -e 'target-*' -e .cargo"
-  rstage "$h"
-  rcp "$h" "$ROOT"/patches/*.patch "$ROOT/docker/Dockerfile.build"
-  log "$h: applying patches, building $pkg for $arch (first build ~10-20 min)"
-  RSH_TIMEOUT=3600 rsh "$h" "set -e; cd $GLM_HOME/src/glm53f-afd
-    for p in $STAGE_DIR/0*.patch; do git apply --whitespace=nowarn \"\$p\"; done
-    docker image inspect $img >/dev/null 2>&1 || docker build -q -t $img --build-arg BASE=$base -f $STAGE_DIR/Dockerfile.build $STAGE_DIR
-    docker run --rm -v \"\$PWD\":/src -w /src -e CARGO_HOME=/src/.cargo -e CARGO_TARGET_DIR=/src/target-$arch \
-      -e GLM53F_CUDA_ARCH=$arch $img \
-      bash -c 'set -e; cargo build --release -p $pkg --features cuda,rdma 2>&1 | tail -3; cargo test --release -p $pkg 2>&1 | grep -E \"^test result|FAILED\" | tail -5'
-    install -m755 target-$arch/release/$pkg $GLM_HOME/bin/$pkg
-    sha256sum $GLM_HOME/bin/$pkg"
+build_tree() {
+  local t=$BUILD_DIR/tensorfold p n=0
+  mkdir -p "$BUILD_DIR"
+  [ -d "$t/.git" ] || git clone -q "$TF_REPO_URL" "$t"
+  git -C "$t" am --abort >/dev/null 2>&1 || true
+  git -C "$t" fetch -q --tags origin
+  [ "$(git -C "$t" rev-parse "$TF_TAG^{commit}")" = "$TF_COMMIT" ] || die "$TF_TAG is not $TF_COMMIT upstream: check the pin"
+  git -C "$t" checkout -q -f --detach "$TF_COMMIT"
+  git -C "$t" clean -qfdx
+  for p in "$ROOT"/patches/*.patch; do
+    git -C "$t" apply --check "$p" || die "does not apply on $TF_TAG with the patches before it: $(basename "$p")"
+    git -C "$t" -c user.name=glm-afd-build -c user.email=build@localhost am -q "$p" || die "git am failed: $(basename "$p")"
+    n=$((n + 1))
+  done
+  log "tree: $TF_TAG + $n patches = $(git -C "$t" rev-parse --short HEAD) in $t (tree id $TREE_ID)"
+}
+
+sync_tree() {  # the tree by commit, as the containers will mount it
+  local t=$BUILD_DIR/tensorfold h sha
+  sha=$(git -C "$t" rev-parse HEAD 2>/dev/null) || die "no tree in $t: ./build.sh tree first"
+  for h in "${NODES[@]}"; do
+    git -C "$t" archive HEAD | RSH_TIMEOUT=600 rsh "$h" "rm -rf $AFD_HOME/tree && mkdir -p $AFD_HOME/tree $AFD_HOME/logs $AFD_HOME/mcdma && tar x -C $AFD_HOME/tree && echo $sha > $AFD_HOME/tree/.commit" \
+      || die "sync to $h"
+    log "sync: $h:$AFD_HOME/tree = ${sha:0:12}"
+  done
+}
+
+build_images() {
+  local h
+  for h in "${NODES[@]}"; do
+    rsh "$h" "test -f $AFD_HOME/tree/pyproject.toml && mkdir -p $AFD_HOME/docker" || die "$h: no tree at $AFD_HOME/tree (./build.sh sync)"
+    rcp "$h" "$AFD_HOME/docker" "$ROOT/docker/Dockerfile"
+    log "$h: building $IMAGE from $BASE_IMAGE (the first build pulls the base image)"
+    RSH_TIMEOUT=7200 rsh "$h" "docker build -q -t $IMAGE --build-arg BASE_IMAGE=$BASE_IMAGE -f $AFD_HOME/docker/Dockerfile $AFD_HOME/tree" >/dev/null \
+      || die "$h: image build failed"
+    log "$h: $IMAGE $(rsh "$h" "docker image inspect -f '{{.Id}}' $IMAGE" | cut -c1-19)"
+  done
+}
+
+build_mcdma() {  # rpc/'s Makefile has -Werror; GCC 11-13 stop on a false format-truncation warning at
+  local h        # rpcd_connect.c (ashhart/MCDMA#5 has the fix), so that one warning stays a warning here
+  for h in "${NODES[@]}"; do
+    RSH_TIMEOUT=1800 rsh "$h" "set -e; mkdir -p $AFD_HOME/src $AFD_HOME/mcdma; cd $AFD_HOME/src
+      [ -d MCDMA/.git ] || git clone -q $MCDMA_REPO_URL MCDMA
+      cd MCDMA; git fetch -q origin; git checkout -q -f --detach $MCDMA_COMMIT
+      make -s -C rpc CFLAGS='-std=c11 -O2 -Wall -Wextra -Werror -Wno-error=format-truncation' >/dev/null
+      install -m755 build/rpc/mcdma-rpcd $AFD_HOME/mcdma/
+      install -m644 build/rpc/libmcdma-rpc.so $AFD_HOME/mcdma/
+      cd $AFD_HOME/mcdma && sha256sum mcdma-rpcd libmcdma-rpc.so" | sed "s#^#$h #" || die "$h: MCDMA build failed"
+  done
+}
+
+prebuild_ext() {  # no-model prebuild into the tree's own extension dir, stale build locks removed first
+  local h st t rc=0 started=()
+  for h in "${NODES[@]}"; do
+    [ -z "$(rsh "$h" "docker ps -q --filter label=glm-afd=1")" ] || die "$h: the stack's containers are running: ./stop.sh first"
+  done
+  for h in "${NODES[@]}"; do
+    rsh "$h" "test -f $AFD_HOME/tree/src/tensorfold/families/glm5_next/cuda/afd.py" || { log "$h: tree not synced at $AFD_HOME/tree"; rc=1; continue; }
+    rsh "$h" "docker rm -f glm-afd-prep-$h >/dev/null 2>&1; mkdir -p $EXT_DIR $AFD_HOME/prep" && rcp "$h" "$AFD_HOME/prep" "$ROOT/scripts/prebuild_ext.py" \
+      || { log "$h: cannot stage prebuild_ext.py"; rc=1; continue; }
+    if drun "$h" "glm-afd-prep-$h" --gpus all --network none -v "$EXT_DIR:/ext" -e TORCH_EXTENSIONS_DIR=/ext \
+        -e TRITON_CACHE_DIR=/ext/triton -e MAX_JOBS=4 -v "$AFD_HOME/tree:/tf:ro" -e PYTHONPATH=/tf/src -v "$AFD_HOME/prep:/p:ro" \
+        "$IMAGE" bash -c "find /ext -maxdepth 2 \( -name lock -o -name .ninja_lock \) -print -delete; exec python /p/prebuild_ext.py"
+    then started+=("$h"); else log "$h: the prebuild container did not start"; rc=1; fi
+  done
+  for h in "${started[@]}"; do
+    t=0
+    while :; do
+      st=$(rsh "$h" "docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' glm-afd-prep-$h" 2>/dev/null || true)
+      case "$st" in
+        "exited 0") log "$h: prebuild OK ($EXT_DIR)"; break ;;
+        exited*|dead*|"") log "$h: prebuild FAILED (${st:-container gone})"; rc=1; break ;;
+      esac
+      [ $t -ge 1800 ] && { log "$h: prebuild still running after 1800 s"; rc=1; break; }
+      sleep 10; t=$((t + 10))
+    done
+    rsh "$h" "docker logs glm-afd-prep-$h 2>&1 | grep -E '^(OK|FAIL) |prebuild done' | cut -c1-200" || true
+  done
+  for h in "${NODES[@]}"; do rsh "$h" "docker rm -f glm-afd-prep-$h >/dev/null 2>&1" || true; done
+  return $rc
 }
 
 what=${1:-all}
 case $what in
-  all|coord|ranks) ;;
-  *) echo "usage: $0 [all|coord|ranks]"; exit 2 ;;
+  all) build_tree; sync_tree; build_images; build_mcdma; prebuild_ext ;;
+  tree) build_tree ;;
+  sync) sync_tree ;;
+  images) build_images ;;
+  mcdma) build_mcdma ;;
+  ext) prebuild_ext ;;
+  *) echo "usage: $0 [all|tree|sync|images|mcdma|ext]"; exit 2 ;;
 esac
-if [ "$what" != ranks ]; then build_host coord "$COORD_BUILD_BASE" "$COORD_IMAGE" sm_120 glm53f-serve; fi
-if [ "$what" != coord ]; then
-  for s in "${SPARKS[@]}"; do build_host "$s" "$RANK_BUILD_BASE" "$RANK_IMAGE" sm_121 glm53f-rank; done
-fi
-log "build done. Next: ./download.sh, then ./scripts/install.sh"
+log "build $what done.$([ "$what" = all ] && echo ' Next: ./download.sh, then ./start.sh up')"

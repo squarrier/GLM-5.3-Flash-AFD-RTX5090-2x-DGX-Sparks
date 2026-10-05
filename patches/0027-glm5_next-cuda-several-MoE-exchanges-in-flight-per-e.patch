@@ -1,0 +1,1881 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 18:12:50 -0400
+Subject: [PATCH] glm5_next/cuda: several MoE exchanges in flight per expert
+ node over MCDMA (TF_GLM_MCDMA_INFLIGHT), glm53f-afd's queued exchanges on the
+ AFD split
+
+Ash Hart (@ashxhart, github.com/ashhart) authored MCDMA (github.com/ashhart/MCDMA @ e672c14, Apache-2.0), whose link
+daemons carry the attention/expert exchange: its protocol 1 has one mailbox and one request per link and no queue
+mode, so exchanges in flight take more links. Hugh Madden (@dangerm00se, github.com/hughmadden) authored the exchanges
+kept in flight ahead of the expert ranks in glm53f-afd (@ 91db3cc, crates/glm53f-serve/src/lib.rs lines 74-75 and
+153-165: a prefill pass of N lanes keeps N exchanges in flight over RDMA, as many as the ranks queue, four by default
+with glm53f-rank serve --recv-slots), MIT, Copyright (c) 2026 Turquoise Bay AI Pty Ltd. Written here for MCDMA
+protocol 1 and this tree's prompt chunk lanes; no code is copied.
+
+TF_GLM_MCDMA_INFLIGHT=N (1 .. 4, the attention node only; unset or 1: one link to each expert node, every call,
+header, buffer and byte as before):
+- mcdma.py: inflight() reads the switch; link_names(N) gives each expert node N links (its TF_AFD_MCDMA_LINKS name,
+  then NAME-1 .. NAME-(N-1)) and socket_for puts link j's listen socket beside link 0's; AttentionLinks.issue and
+  collect take one exchange slot's links (one to each expert node); ExpertLink.stage_gpu takes a stream.
+- afd_mcdma.py: McdmaTransport keeps N link pairs (its depth): the run's k-th request goes on pair k mod N and replies
+  are collected in request order; each link's first sequence under its own store key; the handshake carries
+  "inflight": N, which an expert node of an older tree refuses. The expert node opens its N links (each its own base
+  and listen socket) and McdmaExpertLink takes the run's k-th request on link k mod N, landing and computing the
+  requests in that order on its one compute stream, so the kernels and bits are those of one link. GPU-driven on
+  CUDA, each link has its own routed rows (out): the reply is copied out and staged on a second stream after the
+  compute's event, and the compute waits for a link's last copy before writing its rows again.
+- experts_node.py: the compute writes into the link's rows when it has them (ExpertNode.compute's out); the expert
+  echoes "inflight" in its settings.
+- afd.py: AfdWire.depth is the transport's; a pair's or lanes' requests on the wire are a queue of at most depth
+  (window, layer) entries, replies in request order; windows that close with requests unanswered are refused, after
+  today's check of windows that stopped early (at depth 1 too: such a request would put the experts out of step).
+- prefill_pairs.py: the lanes run on a wire of depth N > 1 (refused before): a lane's exchange goes out as soon as its
+  attention ran while up to N - 1 earlier ones are unanswered, so the expert nodes find the next request waiting when
+  they reply. Every lane then holds its own shared expert output (FLIGHT_FIELDS: sy, which moe_send writes before the
+  lane's collect reads it; slot_buffers / lane_buffers with flight, buffers_for on a deeper wire), and lanes that share
+  it are refused. The reply rows stay shared at any depth: the scheduler collects only when no lane can run, and a
+  lane past its collect always can, so its hc_post reads them before the next collect.
+- engine.py: the later lanes' own shared expert output at startup and in the capacity plan (32 MiB a lane at 2,048
+  rows on GLM-5.3-Flash), named in the startup line.
+
+Each extra link needs its own mcdma-rpcd listen daemon on the expert node and a peer of the attention node's connect
+daemon (at most six per daemon); MCDMA itself is unchanged.
+
+Tests: tests/test_glm_mcdma_inflight.py, every case at N = 1, 2 and 4: the setting, link map, sockets and handshake
+(an older expert refuses); the lane schedule on four layer layouts and 2-4 lanes (lane order, replies in request
+order, at most N in flight and N reached, each reply used before the next collect, at N >= 2 each lane's exchange
+before the lane before it collects that layer); each lane's recorded kernel calls equal its solo chunk's over the real
+forward, with held states; the real AfdWire, McdmaTransport and both experts' loops over N link pairs of the fake
+MCDMA pair, CPU-, GPU-driven and mixed: lanes of 4, 3 and 2 through the real scheduler, plain forwards and a layer
+slice give every reply of the serial run, the experts the same requests in the same order at every N, the requests
+round-robin over the links; three MoE layers move the next forward to another link; lanes sharing the shared expert
+output are right at N = 1 and wrong at N = 2; with lane 0's replies held, lane 1's request goes out and is computed
+at N = 2 and waits at N = 1; windows that end with a request unanswered are refused at the next header (windows that
+stopped early: today's message), and lanes refuse a wire of depth 0; the switch off issues and collects every link at
+once; the expert's reply stream (faked streams and events); serve() over the store handshake with two links each.
+tests/test_glm_prefill_lanes.py: a deeper wire now needs each lane's own sy.
+
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+ THIRD_PARTY_NOTICES.md                        |  16 +
+ src/tensorfold/families/glm5_next/cuda/afd.py |  53 +-
+ .../families/glm5_next/cuda/afd_mcdma.py      | 214 ++++-
+ .../families/glm5_next/cuda/engine.py         |  19 +-
+ .../families/glm5_next/cuda/experts_node.py   |  45 +-
+ .../families/glm5_next/cuda/mcdma.py          |  89 +-
+ .../families/glm5_next/cuda/prefill_pairs.py  |  86 +-
+ tests/test_glm_mcdma_inflight.py              | 829 ++++++++++++++++++
+ tests/test_glm_prefill_lanes.py               |  12 +-
+ 9 files changed, 1242 insertions(+), 121 deletions(-)
+ create mode 100644 tests/test_glm_mcdma_inflight.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index 3397dfd..ae51ccf 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -390,3 +390,19 @@ exchange windows of the lanes before it); the codec is torch operations and a ta
+ computed with a plain-Python transcription of glm53f-afd's device encoder, and the tests check it byte for byte
+ against that transcription. Both are off unless set: `TF_GLM_PREFILL_LANES` (1 .. 4; unset follows
+ `TF_GLM_PREFILL_PAIRS`, 2 being this tree's pairs) and `TF_GLM_WIRE_FP8=1` (which changes the experts' inputs).
++
++## GLM exchanges in flight (TF_GLM_MCDMA_INFLIGHT)
++
++Hugh Madden ([@dangerm00se](https://x.com/dangerm00se), [hughmadden](https://github.com/hughmadden)) authored the
++exchanges kept in flight ahead of the expert ranks that `families/glm5_next/cuda/mcdma.py`, `afd_mcdma.py` and
++`prefill_pairs.py` bring to this tree's attention/expert split: in
++[glm53f-afd](https://github.com/hughmadden/glm53f-afd/tree/91db3cc6fe672e2724efa3464f63bd31493f63f6)
++(`crates/glm53f-serve/src/lib.rs` lines 74-75 and 153-165) a prefill pass of N lanes keeps N exchanges in flight over
++RDMA, as many as the ranks queue (four by default, `glm53f-rank serve --recv-slots`), so each lane's attention overlaps
++the other lanes' experts. MIT License, Copyright (c) 2026 Turquoise Bay AI Pty Ltd (the MIT text above). Ash Hart
++([@ashxhart](https://x.com/ashxhart), [ashhart](https://github.com/ashhart)) authored
++[MCDMA](https://github.com/ashhart/MCDMA/tree/e672c14ff9fc7b38994caf73025cf1588b4de74e), Apache-2.0, whose link
++daemons carry the exchanges; its protocol 1 has one mailbox and one request per link, so `TF_GLM_MCDMA_INFLIGHT=N`
++opens N links to each expert node (`NAME`, `NAME-1`, ...) and sends the run's k-th request on link k mod N, leaving
++MCDMA's protocol and daemons unchanged (installed separately, as above). No code is copied. Off unless set
++(`TF_GLM_MCDMA_INFLIGHT` 1 .. 4; unset or 1: one link to each expert node, as before).
+diff --git a/src/tensorfold/families/glm5_next/cuda/afd.py b/src/tensorfold/families/glm5_next/cuda/afd.py
+index f28b11a..f43f89b 100644
+--- a/src/tensorfold/families/glm5_next/cuda/afd.py
++++ b/src/tensorfold/families/glm5_next/cuda/afd.py
+@@ -24,6 +24,7 @@ TF_GLM_WIRE_FP8=1 sends each exchange's FFN input rows as FP8 E4M3 rows with one
+ 
+ from __future__ import annotations
+ 
++import collections
+ import hashlib
+ import json
+ import os
+@@ -233,17 +234,18 @@ class AfdWire:
+     start = end = 0                              # the current forward's MoE positions (set by ``begin``)
+     span: tuple[int, int] | None = None          # a MODE_SLICE forward's (a, n)
+     _sliced = 0
+-    depth = 1                                    # exchanges in flight at once: one request on each link (protocol 1)
++    depth = 1                                    # exchanges in flight at once: one request on each link (protocol 1);
++    # TF_GLM_MCDMA_INFLIGHT=N: the transport's N link pairs, one request on each (``afd_mcdma.McdmaTransport.depth``)
+     # TF_GLM_PREFILL_PAIRS (``begin_pair``): an open pair's two windows (the inactive one's fields saved there), the
+-    # active one, its offset among the check's forwards, the request on the wire (window, layer), the checked paired
+-    # forwards' seqs, TF_AFD_TIME's pair events (per window and MoE layer: send / collect / reply), the sampled pairs'
+-    # (window, wait) ms by window rows and how many pairs it sampled. Class defaults: no pair (replaced, never
+-    # appended to, here). TF_GLM_PREFILL_LANES (``begin_lanes``): the same fields for N windows; the checked lanes'
+-    # forwards' seqs and the lane groups timed apart from the pairs'.
++    # active one, its offset among the check's forwards, the requests on the wire ((window, layer), the oldest first,
++    # at most ``depth``), the checked paired forwards' seqs, TF_AFD_TIME's pair events (per window and MoE layer:
++    # send / collect / reply), the sampled pairs' (window, wait) ms by window rows and how many pairs it sampled. Class
++    # defaults: no pair (replaced, never appended to, here). TF_GLM_PREFILL_LANES (``begin_lanes``): the same fields
++    # for N windows; the checked lanes' forwards' seqs and the lane groups timed apart from the pairs'.
+     _pair: list[dict] | None = None
+     _slot = 0
+     _ahead = 0
+-    _busy: tuple[int, int] | None = None
++    _busy: collections.deque | tuple = ()
+     _paired: list[int] | tuple = ()
+     _laned: list[tuple[int, int]] | tuple = ()   # checked MODE_LANES forwards: (seq, the first lane's seq)
+     _pev: list | None = None
+@@ -262,6 +264,8 @@ class AfdWire:
+ 
+             transport = transport_for(master=master, port=port, model_dir=model_dir)
+         self.tr = transport
++        d = getattr(transport, "depth", 1)       # TF_GLM_MCDMA_INFLIGHT: exchanges the wire takes in flight at once
++        self.depth = d if isinstance(d, int) and not isinstance(d, bool) and d >= 1 else 1
+         self._cap = CapacityError
+         self.torch = torch
+         self.host, self.port = master, port
+@@ -432,7 +436,7 @@ class AfdWire:
+         mode = MODE_PAIR if n == 2 else MODE_LANES
+         win = {"seq": first, "rows": rows[0], "mode": mode, "layer": 0, "_chk": None, "_ahead": 0}
+         self._pair = [dict(win, seq=first + k, rows=r, _ahead=k) for k, r in enumerate(rows)]
+-        self._slot, self._busy = 0, None
++        self._slot, self._busy = 0, collections.deque()
+         self._load(self._pair[0])
+         seqs = tuple(first + k for k in range(n))
+         if n == 2:
+@@ -464,7 +468,7 @@ class AfdWire:
+ 
+         self._pair[self._slot] = {k: getattr(self, k) for k in self._WIN}
+         wins, self._pair = self._pair, None
+-        self._slot, self._busy = 0, None
++        left, self._slot, self._busy = list(self._busy), 0, ()
+         self.tr.close_pair()
+         lanes = len(wins) > 2
+         for k, win in enumerate(wins):
+@@ -474,6 +478,11 @@ class AfdWire:
+                        "experts are out of step")
+                 self.die(why)
+                 raise self._cap(f"the AFD expert nodes are gone ({why}); restart the serving stack")
++        if left:                                 # every request out was collected (the lanes' loop ends so)
++            why = (f"prompt chunk windows ended with requests {left} ((window, layer)) unanswered; the experts are "
++                   "out of step")
++            self.die(why)
++            raise self._cap(f"the AFD expert nodes are gone ({why}); restart the serving stack")
+         if self.check:
+             for win in wins:
+                 self._load(win)
+@@ -496,11 +505,17 @@ class AfdWire:
+         """The send half: ``normed/pick/wts`` to each expert; the layer's shared expert runs while it flies."""
+ 
+         if self._pair is not None:
+-            if self._busy is not None:
+-                self._fail(WireError("two requests on one link", f"a prompt chunk pair's window {self._slot} sent "
+-                                     f"layer {self.layer} while window {self._busy[0]}'s layer {self._busy[1]} is "
+-                                     "unanswered (one request on each link at a time)"))
+-            self._busy = (self._slot, self.layer)
++            if len(self._busy) >= self.depth:
++                if self.depth == 1:
++                    slot0, layer0 = self._busy[0]
++                    self._fail(WireError("two requests on one link", f"a prompt chunk pair's window {self._slot} sent "
++                                         f"layer {self.layer} while window {slot0}'s layer {layer0} is unanswered (one "
++                                         "request on each link at a time)"))
++                self._fail(WireError("too many requests in flight", f"a prompt chunk window {self._slot} sent layer "
++                                     f"{self.layer} while {list(self._busy)} ((window, layer)) are unanswered (one "
++                                     f"request on each of the {self.depth} link pairs at a time, "
++                                     "TF_GLM_MCDMA_INFLIGHT)"))
++            self._busy.append((self._slot, self.layer))
+             if self._pev is not None and self.layer < self.nlayers:
+                 self._pev[self._slot][self.layer][0].record()
+         elif self.timing and self.ev is not None and self.layer < len(self.ev):
+@@ -521,10 +536,12 @@ class AfdWire:
+ 
+         pev = None
+         if self._pair is not None:
+-            if self._busy != (self._slot, self.layer - 1):
++            head = self._busy[0] if self._busy else None
++            if head != (self._slot, self.layer - 1):
+                 self._fail(WireError("a reply out of order", f"a prompt chunk pair's window {self._slot} collected "
+-                                     f"layer {self.layer - 1} while the request on the wire is {self._busy} "
+-                                     "((window, layer); replies come in the order the requests went)"))
++                                     f"layer {self.layer - 1} while the {'oldest ' if self.depth > 1 else ''}request "
++                                     f"on the wire is {head} ((window, layer); replies come in the order the requests "
++                                     "went)"))
+             if self._pev is not None and 0 < self.layer <= self.nlayers:
+                 pev = self._pev[self._slot][self.layer - 1]
+                 pev[1].record()
+@@ -537,7 +554,7 @@ class AfdWire:
+         except WireError as exc:
+             self._fail(exc)
+         if self._pair is not None:
+-            self._busy = None
++            self._busy.popleft()
+             if pev is not None:
+                 pev[2].record()
+         flat[2 * n:3 * n].view(rows, d).copy_(b.sy[:rows])
+diff --git a/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py b/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py
+index cf2f694..6460bbc 100644
+--- a/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py
++++ b/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py
+@@ -6,10 +6,24 @@ operations where the probe passes (``mcdma_cuda``). Each expert node is the list
+ (``McdmaExpertLink``), opened before its weights load; the first request of a forward is its doorbell. The
+ three-rank TCPStore (``StoreComm``) is the rendezvous; the handshake, the heartbeats and error keys, and the wire
+ check and timer are ``afd.AfdWire``'s and ``experts_node.serve``'s.
++
++Exchanges in flight (``TF_GLM_MCDMA_INFLIGHT=N``, ``mcdma.inflight``; the handshake's ``"inflight"``): N links to
++each expert node, so N exchanges can be on the wire at once, each link still carrying one request at a time. The
++k-th request of the run (both ends count every request, in order) goes on link k mod N of both nodes and the replies
++are collected in request order, so the attention issues an exchange as soon as its rows are ready while up to N - 1
++earlier ones are unanswered (``AfdWire.depth``; ``prefill_pairs``' lanes use it). The expert node serves the requests
++in that order with the same kernels on its one compute stream, so every bit is as with one link; GPU-driven on CUDA
++it copies each reply out on a second stream (``McdmaExpertLink.out`` / ``reply``) while it computes the next request.
++Ash Hart (@ashxhart, github.com/ashhart) authored MCDMA (github.com/ashhart/MCDMA @ e672c14, Apache-2.0), its link
++daemons and protocol. Hugh Madden (@dangerm00se, github.com/hughmadden) authored the exchanges kept in flight ahead of
++the expert ranks in glm53f-afd (github.com/hughmadden/glm53f-afd @ 91db3cc, ``crates/glm53f-serve/src/lib.rs`` lines
++74-75 and 153-165: N prefill lanes' exchanges in flight, as many as the ranks queue, four by default with
++``--recv-slots``). Written here for MCDMA protocol 1; no code copied.
+ """
+ 
+ from __future__ import annotations
+ 
++import collections
+ import struct
+ 
+ from . import mcdma, mcdma_cuda
+@@ -64,23 +78,34 @@ class StoreComm:
+ 
+ class McdmaTransport:
+     """The attention node's end (``afd_transport.ExpertTransport``): one packed request per MoE layer to both expert
+-    links, two replies back. ``links``, ``comm``, ``device`` and ``hidden`` stand in for a GPU host in the tests."""
++    links, two replies back. ``links``, ``comm``, ``device`` and ``hidden`` stand in for a GPU host in the tests.
++    ``depth`` (TF_GLM_MCDMA_INFLIGHT): exchanges in flight at once, one link pair each; ``links``' names come in pairs
++    (rank 1's, rank 2's), one pair per exchange slot."""
+ 
+     name = "mcdma"
+     sliced: int | None = None                              # the header row whose word 6 holds a slice's count
++    depth = 1                                              # exchanges in flight: link pairs
+ 
+     def __init__(self, master: str, port: int, model_dir=None, *, links=None, comm=None, device: str = "cuda",
+                  hidden: int | None = None) -> None:
+         import torch
+ 
+         if links is None:
+-            names = mcdma.link_names()
++            names = mcdma.link_names(mcdma.inflight())     # TF_GLM_MCDMA_INFLIGHT: N link pairs, rank 1's and 2's
+             torch.cuda.init()                              # torch's runtime; the context the register needs is made
+             ordinal = torch.cuda.current_device()          # current by CudaDriver.ensure_ctx (choose_mode, register)
+             mode, driver = mcdma_cuda.choose_mode(torch, ordinal)
+             flags = mcdma_cuda.flush_flag(driver, ordinal) if mode == "gpu" else 0
+             links = mcdma.AttentionLinks(names, driver=driver, mode=mode, flags=flags)   # fail fast, before the store
+         self.mc = links
++        if len(links.names) % 2 or not links.names:
++            raise ValueError(f"the MCDMA wire needs its links in pairs (expert rank 1's, rank 2's), not {links.names}")
++        self.depth = len(links.names) // 2
++        # an exchange slot's links (rank 1's, rank 2's); one slot: every link, as before. The k-th request of the run
++        # goes on slot k mod depth; replies come back in request order (the slots in flight, oldest first)
++        self._slots = [None] if self.depth == 1 else [(2 * j, 2 * j + 1) for j in range(self.depth)]
++        self._next = 0
++        self._flight: collections.deque[int] = collections.deque()
+         self.torch = torch
+         self.device = device
+         self.hidden = hidden
+@@ -125,11 +150,13 @@ class McdmaTransport:
+             self.codes = torch.empty((rows, self.hidden), dtype=torch.uint8, device=dev)
+             self.scales = torch.empty((rows, self.hidden // wire_fp8.BLOCK), dtype=torch.uint8, device=dev)
+             self.wire_rows = wire_fp8.roundtrip  # the rows the experts decode (the wire check's)
+-        return {"transport": "mcdma", "mcdma_links": list(self.mc.names)}
++        return {"transport": "mcdma", "mcdma_links": list(self.mc.names),
++                **({"inflight": self.depth} if self.depth > 1 else {})}   # TF_GLM_MCDMA_INFLIGHT: the experts echo it
+ 
+     def start(self, store) -> None:
+-        for peer, base in zip((1, 2), self.mc.base):       # each expert counts its link's sequence from here
+-            store.set(f"afd_mcdma/base/{peer}", str(base).encode())
++        for k, base in enumerate(self.mc.base):            # each expert counts each of its links' sequences from here
++            peer, j = k % 2 + 1, k // 2                    # link pairs: rank 1's, rank 2's, per exchange slot j
++            store.set(f"afd_mcdma/base/{peer}" if j == 0 else f"afd_mcdma/base/{peer}/{j}", str(base).encode())
+ 
+     def header(self, seq: int, rows: int, mode: int, slice: tuple[int, int] | None = None) -> None:
+         """No doorbell of its own: the first layer's request carries the forward. One blocking copy of the
+@@ -219,18 +246,29 @@ class McdmaTransport:
+         parts.append(_bytes(b.wts[:rows]))
+         req = self.req_dev[:n]
+         torch.cat(parts, out=req)            # one kernel: the request contiguous for one copy per link
++        j = self._next                       # TF_GLM_MCDMA_INFLIGHT: this request's link pair (one slot: every link)
+         try:
+-            self.mc.issue(req, n, lay.rep(rows))
++            if self.depth == 1:
++                self.mc.issue(req, n, lay.rep(rows))
++            else:
++                self.mc.issue(req, n, lay.rep(rows), self._slots[j])
+         except mcdma.LinkError as exc:
+             raise WireError(str(exc), f"MCDMA {exc}") from exc
++        self._next = (j + 1) % self.depth
++        self._flight.append(j)
+ 
+     def recv(self, dst1, dst2, layer: int) -> None:
+-        """Rank 1's then rank 2's partial straight from the mailboxes."""
++        """Rank 1's then rank 2's partial straight from the mailboxes (TF_GLM_MCDMA_INFLIGHT: the oldest unanswered
++        request's link pair; replies are collected in request order)."""
+ 
+         if self.down:
+             return
++        j = self._flight.popleft() if self._flight else 0
+         try:
+-            self.mc.collect([_bytes(dst1), _bytes(dst2)], dst1.numel() * dst1.element_size())
++            if self.depth == 1:
++                self.mc.collect([_bytes(dst1), _bytes(dst2)], dst1.numel() * dst1.element_size())
++            else:
++                self.mc.collect([_bytes(dst1), _bytes(dst2)], dst1.numel() * dst1.element_size(), self._slots[j])
+         except mcdma.LinkError as exc:
+             raise WireError(str(exc), f"MCDMA {exc}") from exc
+ 
+@@ -247,23 +285,39 @@ class McdmaTransport:
+ 
+     def describe(self) -> str:
+         mc, box = self.mc, self.mc.boxes[0]
++        more = ""
++        if self.depth > 1:                       # TF_GLM_MCDMA_INFLIGHT: the later exchange slots' link pairs
++            more = (f"; {self.depth} exchanges in flight (TF_GLM_MCDMA_INFLIGHT), links "
++                    f"{', '.join(mc.names[2::2])} -> expert 1 and {', '.join(mc.names[3::2])} -> expert 2 too")
+         return (f"afd transport mcdma, {mc.mode}-driven{' +flush' if mc.flags else ''}: link {mc.names[0]} -> "
+-                f"expert 1, {mc.names[1]} -> expert 2; mailboxes {box.req >> 20}+{box.rep >> 20} MiB; first sequences "
+-                f"{mc.base}; generations {mc.gen}; no NCCL communicator")
++                f"expert 1, {mc.names[1]} -> expert 2{more}; mailboxes {box.req >> 20}+{box.rep >> 20} MiB; first "
++                f"sequences {mc.base}; generations {mc.gen}; no NCCL communicator")
+ 
+ 
+ # -- the expert node -----------------------------------------------------------------------------------------------
++def inflight_asked(theirs: dict) -> int:
++    """The attention's exchanges in flight per expert node (its handshake's ``inflight``, TF_GLM_MCDMA_INFLIGHT),
++    echoed in the expert's settings; 1 without it (out of range: 1, so the settings mismatch and the expert refuses)."""
++
++    n = theirs.get("inflight", 1)
++    return n if isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= mcdma.MAX_INFLIGHT else 1
++
++
+ def open_expert_link(theirs: dict, rank: int, cfg, store, device: str = "cuda", log=print) -> McdmaExpertLink:
+     """The expert's end of its link, before its weights load (a missing daemon fails in seconds, not after the load):
+-    the link the attention maps to this rank, room for the widest window, the daemon registration, the base."""
++    the link the attention maps to this rank, room for the widest window, the daemon registration, the base. With the
++    handshake's ``inflight`` N > 1 (TF_GLM_MCDMA_INFLIGHT): the N links it maps to this rank, link 0 the one
++    ``TF_AFD_MCDMA_LINK`` names and link j its ``NAME-j``, each with its own daemon (socket: ``mcdma.socket_for``)."""
+ 
+     import torch
+ 
+     name = mcdma.link_name()
+     names = list(theirs.get("mcdma_links") or [])
+-    if len(names) != 2 or names[rank - 1] != name:
++    n = inflight_asked(theirs)
++    if len(names) != 2 * n or names[rank - 1] != name:
+         raise SystemExit(f"[tensorfold] afd: expert {rank} serves MCDMA link {name!r} but the attention maps links "
+-                         f"{names} to ranks 1, 2 ({mcdma.LINK_ENV} vs {mcdma.LINKS_ENV})")
++                         f"{names} to ranks 1, 2 ({mcdma.LINK_ENV} vs {mcdma.LINKS_ENV})"
++                         + ("" if n == 1 else f" with {n} exchanges in flight ({2 * n} links)"))
+     cuda = str(device).startswith("cuda")
+     ordinal = 0
+     if cuda:
+@@ -271,20 +325,26 @@ def open_expert_link(theirs: dict, rank: int, cfg, store, device: str = "cuda",
+         ordinal = torch.cuda.current_device()
+     mode, driver = mcdma_cuda.choose_mode(torch, ordinal, log=log) if cuda else ("cpu", None)
+     flags = mcdma_cuda.flush_flag(driver, ordinal) if mode == "gpu" else 0
+-    link = mcdma.ExpertLink(name, driver=driver, mode=mode, flags=flags, log=log)
+     rows = int(theirs["prefill_rows"])
+     fp8 = theirs.get("wire_fp8") == 1
+-    link.check_room(mcdma.Layout(cfg.hidden, cfg.top_k + 1, fp8=fp8), max(rows, int(theirs["max_rows"])))
+-    raw = get_store(store, f"afd_mcdma/base/{rank}", 60.0)
+-    if raw is None:
+-        link.close()
+-        raise RuntimeError(f"the attention published no MCDMA base sequence for expert {rank}")
+-    link.base = int(bytes(raw).decode())
+-    log(f"[tensorfold] afd expert {rank}: MCDMA link {name}, {mode}-driven{' +flush' if flags else ''}, mailbox "
+-        f"{link.box.req >> 20}+{link.box.rep >> 20} MiB, socket {link.socket_path}, first sequence {link.base}",
+-        flush=True)
+-    return McdmaExpertLink(link, cfg.hidden, cfg.top_k + 1, len(theirs["layers"]), rows, device,
+-                           pairs=theirs.get("pairs") == 1, lanes=int(theirs.get("lanes", 0)), fp8=fp8)
++    links: list = []
++    for j, nm in enumerate(names[rank - 1::2]):    # this node's links: rank r's of every exchange slot, link 0 first
++        more: dict = {} if j == 0 else {"socket_path": mcdma.socket_for(nm, j)}   # link 0's socket: as one link's
++        link = mcdma.ExpertLink(nm, driver=driver, mode=mode, flags=flags, log=log, **more)
++        links.append(link)
++        link.check_room(mcdma.Layout(cfg.hidden, cfg.top_k + 1, fp8=fp8), max(rows, int(theirs["max_rows"])))
++        raw = get_store(store, f"afd_mcdma/base/{rank}" if j == 0 else f"afd_mcdma/base/{rank}/{j}", 60.0)
++        if raw is None:
++            for lk in links:
++                lk.close()
++            raise RuntimeError(f"the attention published no MCDMA base sequence for expert {rank}"
++                               + ("" if j == 0 else f"'s link {nm}"))
++        link.base = int(bytes(raw).decode())
++        log(f"[tensorfold] afd expert {rank}: MCDMA link {nm}, {mode}-driven{' +flush' if flags else ''}, mailbox "
++            f"{link.box.req >> 20}+{link.box.rep >> 20} MiB, socket {link.socket_path}, first sequence {link.base}"
++            + ("" if n == 1 else f" (exchange slot {j} of {n})"), flush=True)
++    return McdmaExpertLink(links[0] if n == 1 else links, cfg.hidden, cfg.top_k + 1, len(theirs["layers"]), rows,
++                           device, pairs=theirs.get("pairs") == 1, lanes=int(theirs.get("lanes", 0)), fp8=fp8)
+ 
+ 
+ class McdmaExpertLink:
+@@ -295,14 +355,24 @@ class McdmaExpertLink:
+     a time, their layers alternating (``next_partner``, ``use``); the link still carries one request at a time.
+     ``lanes`` (the handshake's, 3 or more): MODE_LANES forwards come N at a time (the header's word 10), their layers
+     in lane order, as a pair's. ``fp8`` (the handshake's ``wire_fp8``): the request's rows are FP8 wire rows, decoded
+-    to bf16 after each landing (``wire_fp8.decode``)."""
++    to bf16 after each landing (``wire_fp8.decode``).
++
++    ``link`` may be a list of N links (the handshake's ``inflight``, TF_GLM_MCDMA_INFLIGHT; link 0 first): the run's
++    k-th request comes on link k mod N, the order the attention issued them in, so the node lands and computes them in
++    that order on its one stream with the same calls as over one link (``link`` and ``seq`` are the current link's).
++    GPU-driven on CUDA, each reply goes out on a second stream (``out``, ``reply``) while the next request lands and
++    computes: the routed rows of the requests on link j are written to link j's own buffer, free again once its last
++    reply was copied out."""
+ 
+     def __init__(self, link, hidden: int, slots: int, layers: int, prefill_rows: int, device: str = "cuda", *,
+                  pairs: bool = False, lanes: int = 0, fp8: bool = False) -> None:
+-        self.link, self.lay = link, mcdma.Layout(hidden, slots, fp8=fp8)
++        self.links = list(link) if isinstance(link, (list, tuple)) else [link]
++        self.at = 0                              # the link the next request comes on (the run's k-th: k mod N)
++        self.seqs = [lk.base for lk in self.links]   # each link's next request's sequence
++        self.lay = mcdma.Layout(hidden, slots, fp8=fp8)
++        self.hidden = hidden
+         self.layers, self.prefill_rows, self.device = layers, prefill_rows, device
+-        self.gpu = link.mode == "gpu"
+-        self.seq = link.base                     # the next request's sequence
++        self.gpu = self.links[0].mode == "gpu"
+         self.landing = None                      # the widest request's bytes past the header slot, on the device
+         self.fseq = self.rows = self.n_req = self.n_rep = 0
+         self.first, self.count = 0, layers       # the forward's MoE positions: every layer, or a slice's (MODE_SLICE)
+@@ -315,6 +385,33 @@ class McdmaExpertLink:
+         self.wmode = MODE_PAIR                   # the open windows' mode (MODE_PAIR or MODE_LANES)
+         self.n_windows = 2                       # the open windows' count
+         self._wins: list = [None, None]
++        # TF_GLM_MCDMA_INFLIGHT, GPU-driven on CUDA: the reply stream, each link's routed rows and their events
++        self.side = self.outs = self._computed = self._sent = None
++        self._used: list = []                    # per link: a reply was copied out of its rows (``_sent`` recorded)
++        if self.gpu and len(self.links) > 1 and str(device).startswith("cuda"):
++            import torch
++
++            self.side = torch.cuda.Stream(device=device)
++            self.outs = [torch.empty((prefill_rows, hidden), dtype=torch.float32, device=device) for _ in self.links]
++            self._computed = [torch.cuda.Event() for _ in self.links]
++            self._sent = [torch.cuda.Event() for _ in self.links]
++            self._used = [False] * len(self.links)
++
++    @property
++    def link(self):
++        """The link the current request comes on."""
++
++        return self.links[self.at]
++
++    @property
++    def seq(self) -> int:
++        """The current link's next request's sequence."""
++
++        return self.seqs[self.at]
++
++    @seq.setter
++    def seq(self, value: int) -> None:
++        self.seqs[self.at] = value
+ 
+     def _words(self) -> tuple:
+         return struct.unpack_from(PAIR_WORDS, self.link.box.mm, mcdma.CTRL)
+@@ -437,7 +534,8 @@ class McdmaExpertLink:
+                     raise mcdma.LinkError(f"link {link.name}: request {self.seq} header {h[:6]} is not layer {layer} "
+                                           f"of forward {self.fseq} ({self.rows} rows, {self.n_req} bytes"
+                                           f"{'' if self.slot is None else f', pair window {self.slot}'})")
+-        self.dst.copy_(self.src, non_blocking=True)    # the request, header slot skipped: normed | pick | pad | wts
++        src = self.src if len(self.links) == 1 else link.box.req_bytes[mcdma.HDR_BYTES:self.n_req]
++        self.dst.copy_(src, non_blocking=True)         # the request, header slot skipped: normed | pick | pad | wts
+         if self.fp8:
+             from . import wire_fp8
+ 
+@@ -445,19 +543,63 @@ class McdmaExpertLink:
+             return wire_fp8.decode(codes, scales, views[0]), pick, wts
+         return self.x
+ 
++    def out(self, rows: int):
++        """Where the compute writes the current request's routed rows (``experts_node``): GPU-driven over N > 1 links
++        on CUDA, the current link's own buffer, once the reply stream copied that link's last reply out of it (the
++        compute stream waits for that copy); else None: the node's own ``routed``, as over one link."""
++
++        if self.side is None:
++            return None
++        import torch
++
++        j = self.at
++        if self._used[j]:
++            torch.cuda.current_stream().wait_event(self._sent[j])
++        return self.outs[j][:rows]
++
+     def reply(self, layer: int, routed) -> None:
+         if routed is not self._routed:
+             self._routed, self._out = routed, _bytes(routed)
++        link, multi = self.link, len(self.links) > 1
++        rep = self.rep if not multi else link.box.rep_bytes[:self.n_rep]
+         if self.gpu:
+-            self.rep.copy_(self._out, non_blocking=True)
+-            self.link.stage_gpu(self.seq, self.n_rep)       # write-value's fence: the partial lands before the word
++            if self.side is not None and routed.data_ptr() == self.outs[self.at].data_ptr():
++                self._reply_side(link, rep)                 # ``out``'s rows: copied out on the reply stream
++            else:
++                rep.copy_(self._out, non_blocking=True)
++                link.stage_gpu(self.seq, self.n_rep)        # write-value's fence: the partial lands before the word
+         else:
+-            self.rep.copy_(self._out)                       # blocking: the compute, then these bytes, before the word
+-            self.link.stage(self.seq, self.n_rep)
++            rep.copy_(self._out)                            # blocking: the compute, then these bytes, before the word
++            link.stage(self.seq, self.n_rep)
+         self.seq = mcdma.next_seq(self.seq)
++        if multi:                                           # the run's next request comes on the next link
++            self.at = (self.at + 1) % len(self.links)
++
++    def _reply_side(self, link, rep) -> None:
++        """The reply copied out and staged on the reply stream, after this request's compute (an event): the compute
++        stream goes on to the next request's landing and compute meanwhile. Each link's routed rows are its own
++        (``out``), so the next requests' compute never writes the rows being copied."""
++
++        import torch
++
++        j = self.at
++        self._computed[j].record(torch.cuda.current_stream())
++        self.side.wait_event(self._computed[j])
++        with torch.cuda.stream(self.side):
++            rep.copy_(self._out, non_blocking=True)
++        link.stage_gpu(self.seq, self.n_rep, stream=self.side.cuda_stream)   # fenced: the partial lands first
++        self._sent[j].record(self.side)
++        self._used[j] = True
+ 
+     def health(self) -> str | None:
+-        return self.link.alive() or None
++        if len(self.links) == 1:
++            return self.link.alive() or None
++        for lk in self.links:
++            why = lk.alive()
++            if why:
++                return f"link {lk.name}: {why}"
++        return None
+ 
+     def close(self) -> None:
+-        self.link.close()
++        for lk in self.links:
++            lk.close()
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 494c34d..b1a0032 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -470,11 +470,12 @@ class GlmEngine:
+                 from . import prefill_pairs
+ 
+                 lanes = prefill_pairs.lanes()
++                fly: dict = {"flight": True} if getattr(afd, "depth", 1) > 1 else {}   # TF_GLM_MCDMA_INFLIGHT: own sy
+                 if lanes == 2:
+-                    extra += prefill_pairs.plan_bytes(text, ring_rows, taps=5 if drafter is not None else 0)
++                    extra += prefill_pairs.plan_bytes(text, ring_rows, taps=5 if drafter is not None else 0, **fly)
+                 elif lanes >= 3:
+                     extra += (lanes - 1) * prefill_pairs.plan_bytes(text, ring_rows, taps=5 if drafter is not None
+-                                                                    else 0, routed=True)
++                                                                    else 0, routed=True, **fly)
+             per = 4 * MULTI_WINDOW // 4
+             return Geometry(lambda slots: g.bytes_at(slots) + extra + per * slots, g.reserve, g.minimum_slots)
+ 
+@@ -603,17 +604,21 @@ class GlmEngine:
+             from . import prefill_pairs
+ 
+             lanes = prefill_pairs.lanes()
++            deep = getattr(afd, "depth", 1) > 1  # TF_GLM_MCDMA_INFLIGHT: exchanges in flight, each lane's own sy
++            fly: dict = {"flight": True} if deep else {}
++            more = (f"; {afd.depth} exchanges in flight (TF_GLM_MCDMA_INFLIGHT): each later chunk's own shared expert "
++                    "output" if deep else "")
+             if lanes == 2:                       # the second chunk's prompt buffers now, before the caches fill the GPU
+-                self.e.pbuf2 = prefill_pairs.slot_buffers(self.e.pbuf)
++                self.e.pbuf2 = prefill_pairs.slot_buffers(self.e.pbuf, **fly)
+                 print(f"[tensorfold] TF_GLM_PREFILL_PAIRS=1: prompt chunks fill in pairs while no stream decodes (one "
+                       f"chunk's attention while the experts compute the other's); the second chunk's buffers "
+-                      f"{prefill_pairs.slot_bytes(self.e.pbuf) / 2 ** 20:.0f} MiB", flush=True)
++                      f"{prefill_pairs.slot_bytes(self.e.pbuf, **fly) / 2 ** 20:.0f} MiB{more}", flush=True)
+             elif lanes >= 3:                     # the later lanes' prompt buffers now, as the pair's
+-                self.e.pbuf_lanes = [prefill_pairs.lane_buffers(self.e.pbuf) for _ in range(lanes - 1)]
++                self.e.pbuf_lanes = [prefill_pairs.lane_buffers(self.e.pbuf, **fly) for _ in range(lanes - 1)]
+                 print(f"[tensorfold] TF_GLM_PREFILL_LANES={lanes}: up to {lanes} prompt chunks fill as lanes while no "
+                       f"stream decodes (the later lanes' attention while the experts compute an earlier lane's); the "
+-                      f"later lanes' buffers {lanes - 1} x {prefill_pairs.lane_bytes(self.e.pbuf) / 2 ** 20:.0f} MiB",
+-                      flush=True)
++                      f"later lanes' buffers {lanes - 1} x "
++                      f"{prefill_pairs.lane_bytes(self.e.pbuf, **fly) / 2 ** 20:.0f} MiB{more}", flush=True)
+         self.e.grid = self.grid                  # a resumed prompt starts on it (``decode.prefill``; recipe 0008)
+         if rank == 0 and kv != "bf16":
+             c = self.e.caches
+diff --git a/src/tensorfold/families/glm5_next/cuda/experts_node.py b/src/tensorfold/families/glm5_next/cuda/experts_node.py
+index c2f76a7..5d7c127 100644
+--- a/src/tensorfold/families/glm5_next/cuda/experts_node.py
++++ b/src/tensorfold/families/glm5_next/cuda/experts_node.py
+@@ -113,10 +113,12 @@ class ExpertNode:
+         self.by_layer = dict(zip(self.layers, self.experts))
+         self.buf = ExpertBuffers(self.cfg, rows=rows, prefill_rows=prefill_rows, device=device)
+ 
+-    def compute(self, layer_i: int, R: int, x: tuple | None = None) -> torch.Tensor:
++    def compute(self, layer_i: int, R: int, x: tuple | None = None, out: torch.Tensor | None = None) -> torch.Tensor:
+         """``routed_half[:R] = sum_k wts[:, k] * y_k`` in slot order, the shared slot zeroed, fp32.
+-        ``x``: (normed, pick, wts) to read instead of the wire slots (where the link landed them). A prompt chunk's
+-        window (``self.prompt``) takes the prompt kernel under TF_GLM_EXL3_PROMPT=1 (``exl3_generic.routed``)."""
++        ``x``: (normed, pick, wts) to read instead of the wire slots (where the link landed them). ``out``: the
++        ``[R, D]`` fp32 rows to write instead of the node's own ``routed`` (TF_GLM_MCDMA_INFLIGHT: the link's). A
++        prompt chunk's window (``self.prompt``) takes the prompt kernel under TF_GLM_EXL3_PROMPT=1
++        (``exl3_generic.routed``)."""
+ 
+         b = self.buf
+         if R > b.prefill_rows:
+@@ -124,8 +126,17 @@ class ExpertNode:
+         normed, pick, wts = x if x is not None else (b.normed[:R], b.pick[:R], b.wts[:R])
+         exl3_generic.routed(normed, pick, self.by_layer[layer_i], b.scratch(R), R, self.cfg.limit, prompt=self.prompt)
+         b.ey(R)[:, b.top_k].zero_()                          # the shared slot: attention adds its own sy
+-        glue.combine(b.ey(R), wts, b.routed[:R])
+-        return b.routed[:R]
++        dst = b.routed[:R] if out is None else out
++        glue.combine(b.ey(R), wts, dst)
++        return dst
++
++
++def _out(link, R: int):
++    """The link's own rows for this request's routed output (``McdmaExpertLink.out``: TF_GLM_MCDMA_INFLIGHT over
++    several links, GPU-driven, whose replies go out on a second stream), or None: the node's ``routed``."""
++
++    pick = getattr(link, "out", None)
++    return pick(R) if pick is not None else None
+ 
+ 
+ def _window(node: ExpertNode, link, R: int, collect: tuple[list, list] | None = None, first: int = 0,
+@@ -142,10 +153,15 @@ def _window(node: ExpertNode, link, R: int, collect: tuple[list, list] | None =
+         x = link.land(pos, slots)
+         if collect is not None:
+             collect[0].append([sha(x[0]), sha(x[1]), sha(x[2])])
+-        node.compute(i, R, x)
++        dst = _out(link, R)
++        if dst is None:
++            node.compute(i, R, x)
++            got = routed
++        else:
++            got = node.compute(i, R, x, out=dst)
+         if collect is not None:
+-            collect[1].append(sha(routed))
+-        link.reply(pos, routed)
++            collect[1].append(sha(got))
++        link.reply(pos, got)
+ 
+ 
+ def _pair(node: ExpertNode, link, collect: list) -> int:
+@@ -174,7 +190,8 @@ def _lanes(node: ExpertNode, link, collect: list) -> list[int]:
+             x = link.land(pos, (b.normed[:R], b.pick[:R], b.wts[:R]))
+             if collect[slot] is not None:
+                 collect[slot][0].append([sha(x[0]), sha(x[1]), sha(x[2])])
+-            routed = node.compute(i, R, x)
++            dst = _out(link, R)
++            routed = node.compute(i, R, x) if dst is None else node.compute(i, R, x, out=dst)
+             if collect[slot] is not None:
+                 collect[slot][1].append(sha(routed))
+             link.reply(pos, routed)
+@@ -253,10 +270,12 @@ def serve(model_dir, half: int, master: str, port: int, *, device: str = "cuda")
+             theirs = json.loads(bytes(raw).decode()) if raw else None
+         # the attention's wire must be this one; its link map is checked by open_expert_link; this tree serves
+         # prompt chunk pairs (MODE_PAIR), lanes (MODE_LANES) and FP8 wire rows when the attention asks for them
+-        mine = dict(settings_for(model_dir, cfg, prefill_rows=int(theirs["prefill_rows"]),
+-                                 pairs=theirs.get("pairs") == 1, lanes=_lanes_asked(theirs),
+-                                 wire_fp8=theirs.get("wire_fp8") == 1), transport="mcdma",
+-                    mcdma_links=theirs.get("mcdma_links"))
++        mine: dict = dict(settings_for(model_dir, cfg, prefill_rows=int(theirs["prefill_rows"]),
++                                       pairs=theirs.get("pairs") == 1, lanes=_lanes_asked(theirs),
++                                       wire_fp8=theirs.get("wire_fp8") == 1), transport="mcdma",
++                          mcdma_links=theirs.get("mcdma_links"))
++        if "inflight" in theirs:                         # TF_GLM_MCDMA_INFLIGHT: N links each way, echoed (1 .. 4)
++            mine["inflight"] = afd_mcdma.inflight_asked(theirs)
+         bad = settings_mismatch(mine, theirs)
+         if bad:
+             raise SystemExit(f"[tensorfold] afd: settings mismatch on expert {rank}: {bad}")
+diff --git a/src/tensorfold/families/glm5_next/cuda/mcdma.py b/src/tensorfold/families/glm5_next/cuda/mcdma.py
+index c70c79e..394f68c 100644
+--- a/src/tensorfold/families/glm5_next/cuda/mcdma.py
++++ b/src/tensorfold/families/glm5_next/cuda/mcdma.py
+@@ -9,6 +9,16 @@ listen end of its own (``mcdma-rpcd listen``, a registered ``MODE poll`` service
+ time: the next is issued only once the previous reply's done word has landed, so both ends count the same sequence
+ numbers (``next_seq`` from a base the attention publishes) and one mailbox per link is enough.
+ 
++Exchanges in flight (``TF_GLM_MCDMA_INFLIGHT=N``, 1 .. 4; unset: 1, as before): N links to each expert node, so up
++to N MoE exchanges are on the wire at once while each link still carries one request at a time (protocol 1, which
++has no queue of its own: one mailbox and one request per link, one listen daemon per link, a connect daemon serves up
++to six). Link 0 of a node is the one ``TF_AFD_MCDMA_LINKS`` / ``TF_AFD_MCDMA_LINK`` name, link j its ``NAME-j``
++(``more_link``), whose listen socket sits beside link 0's (``socket_for``). Ash Hart (@ashxhart, github.com/ashhart)
++authored MCDMA (github.com/ashhart/MCDMA @ e672c14, Apache-2.0), its link daemons and protocol 1. Hugh Madden
++(@dangerm00se, github.com/hughmadden) authored the exchanges kept in flight ahead of the expert ranks in glm53f-afd
++(github.com/hughmadden/glm53f-afd @ 91db3cc, ``crates/glm53f-serve/src/lib.rs`` lines 74-75 and 153-165: N prefill
++lanes' exchanges in flight, as many as the ranks queue, four by default). Written here for protocol 1; no code copied.
++
+ GPU-driven (``TF_AFD_MCDMA_MODE=gpu``): the copies into and out of the registered mailbox are stream-ordered, the
+ words are ``cuStreamWriteValue64``/``cuStreamWaitValue64`` on the torch stream; no host sync per layer.
+ CPU-driven (``cpu``): blocking copies, ``mcdma_rpc_store_word``/``mcdma_rpc_wait_word`` on the host. ``auto`` (the
+@@ -37,6 +47,8 @@ TIMEOUT_ENV = "TF_AFD_MCDMA_TIMEOUT"    # s a request may stay unanswered before
+ SPIN_ENV = "TF_AFD_MCDMA_SPIN_US"       # us a host wait spins before it sleeps in 20 us steps
+ FLUSH_ENV = "TF_AFD_MCDMA_FLUSH"        # auto | 0 | 1: CU_STREAM_WAIT_VALUE_FLUSH on the stream waits
+ SOCKET_ENV = "MCDMA_RPCD_SOCKET"        # the listen daemon's socket (the MCDMA tools' own variable)
++INFLIGHT_ENV = "TF_GLM_MCDMA_INFLIGHT"  # attention: MoE exchanges in flight per expert node, one link each (1 .. 4)
++MAX_INFLIGHT = 4                        # glm53f-afd's lanes and its ranks' default queue (--recv-slots 4)
+ 
+ CTRL = 4096                     # each half's control page
+ SEG = 4 << 20                   # mailbox halves are whole multiples of 4 MiB
+@@ -94,12 +106,46 @@ def _env(name: str, default: str = "") -> str:
+     return (os.environ.get(name) or default).strip()
+ 
+ 
+-def link_names() -> list[str]:
++def link_names(inflight: int = 1) -> list[str]:
++    """The attention's links: expert ranks 1's and 2's (``TF_AFD_MCDMA_LINKS``), then with ``inflight`` N > 1 each
++    node's links 1 .. N - 1 (``more_link``) in the same order: [r1, r2, r1-1, r2-1, ...], one pair per exchange slot."""
++
+     names = [n.strip() for n in _env(LINKS_ENV).split(",") if n.strip()]
+     if len(names) != 2 or len(set(names)) != 2:
+         raise ValueError(f"--experts remote needs {LINKS_ENV}=LINK_FOR_RANK1,LINK_FOR_RANK2 (two distinct "
+                          f"mcdma-rpcd link names, e.g. link1,link2); got {_env(LINKS_ENV)!r}")
+-    return names
++    return [more_link(n, j) for j in range(inflight) for n in names]
++
++
++def inflight(value: str | None = None) -> int:
++    """TF_GLM_MCDMA_INFLIGHT: MoE exchanges the attention keeps in flight to each expert node, 1 .. ``MAX_INFLIGHT``,
++    over that many links to each (the expert nodes take it from the settings handshake). Unset, empty or 1: one link
++    to each node, as before."""
++
++    raw = (os.environ.get(INFLIGHT_ENV, "") if value is None else value).strip()
++    if not raw:
++        return 1
++    if raw not in {str(n) for n in range(1, MAX_INFLIGHT + 1)}:
++        raise ValueError(f"{INFLIGHT_ENV}: 1 .. {MAX_INFLIGHT}, not {raw!r}")
++    return int(raw)
++
++
++def more_link(name: str, j: int) -> str:
++    """Link ``j`` of the expert node whose first link is ``name``: ``name`` itself for j = 0, else ``name-j`` (one
++    mcdma-rpcd link each: its own mailbox, listen daemon and socket)."""
++
++    return name if j == 0 else f"{name}-{j}"
++
++
++def socket_for(name: str, j: int) -> str | None:
++    """The listen daemon's socket for an expert node's link ``j`` (named ``name``): None for link 0 (``ExpertLink``'s
++    rule, as before: ``MCDMA_RPCD_SOCKET``, else the daemon's default); a later link's beside it, ``DIR/NAME.sock`` in
++    ``MCDMA_RPCD_SOCKET``'s directory, else the daemon's own default ``/tmp/mcdma-rpcd.NAME.sock``."""
++
++    if j == 0:
++        return None
++    base = _env(SOCKET_ENV)
++    return os.path.join(os.path.dirname(base), f"{name}.sock") if base else f"/tmp/mcdma-rpcd.{name}.sock"
+ 
+ 
+ def link_name() -> str:
+@@ -369,12 +415,15 @@ class AttentionLinks:
+         return torch.cuda.current_stream().cuda_stream
+ 
+     # -- the exchange --------------------------------------------------------------------------------------------
+-    def issue(self, req, n: int, rep_len: int) -> None:
+-        """``req``: the packed request (``n`` bytes, a device uint8 tensor) to every link, then its word."""
++    def issue(self, req, n: int, rep_len: int, links=None) -> None:
++        """``req``: the packed request (``n`` bytes, a device uint8 tensor) to every link, then its word. ``links``
++        (TF_GLM_MCDMA_INFLIGHT): only those links, one to each expert node (an exchange slot's)."""
+ 
++        ks = range(len(self.boxes)) if links is None else links
+         if self.mode == "gpu":
+             h = self._stream()
+-            for k, box in enumerate(self.boxes):
++            for k in ks:
++                box = self.boxes[k]
+                 box.req_bytes[:n].copy_(req, non_blocking=True)
+                 s = next_seq(self.seq[k])
+                 self.pending[k].append((s, rep_len))
+@@ -384,27 +433,30 @@ class AttentionLinks:
+             if self.failed is not None:                     # released while this was enqueued: release it too
+                 self.release()
+             return
+-        for box in self.boxes:
+-            box.req_bytes[:n].copy_(req)                    # blocking: the forward so far, then these bytes
+-        for k, box in enumerate(self.boxes):
++        for k in ks:
++            self.boxes[k].req_bytes[:n].copy_(req)          # blocking: the forward so far, then these bytes
++        for k in ks:
+             s = next_seq(self.seq[k])
+-            self.words.store(box.req_word, word(s, n))
++            self.words.store(self.boxes[k].req_word, word(s, n))
+             self.seq[k] = s
+             self.count[k] += 1
+ 
+-    def collect(self, outs, rep_len: int) -> None:
+-        """Each link's reply (``rep_len`` bytes) into ``outs[k]`` (device uint8 views), in link order."""
++    def collect(self, outs, rep_len: int, links=None) -> None:
++        """Each link's reply (``rep_len`` bytes) into ``outs[k]`` (device uint8 views), in link order; ``links`` (as
++        ``issue``'s): those links' replies only, in that order."""
+ 
++        ks = range(len(self.boxes)) if links is None else links
+         if self.mode == "gpu":
+             h = self._stream()
+-            for k, box in enumerate(self.boxes):
++            for out, k in zip(outs, ks):
++                box = self.boxes[k]
+                 self.driver.wait64(h, self.dptr[k] + box.req + DONE, word(self.seq[k], rep_len),
+                                    CU_STREAM_WAIT_VALUE_EQ | self.flags)
+-                outs[k].copy_(box.rep_bytes[:rep_len], non_blocking=True)
++                out.copy_(box.rep_bytes[:rep_len], non_blocking=True)
+             return
+-        for k, box in enumerate(self.boxes):
++        for out, k in zip(outs, ks):
+             self._wait(k, rep_len)
+-            outs[k].copy_(box.rep_bytes[:rep_len], non_blocking=True)   # ordered before the next issue's sync
++            out.copy_(self.boxes[k].rep_bytes[:rep_len], non_blocking=True)   # ordered before the next issue's sync
+ 
+     def _wait(self, k: int, rep_len: int) -> None:
+         box, want = self.boxes[k], self.seq[k]
+@@ -599,8 +651,11 @@ class ExpertLink:
+     def wait_gpu(self, seq: int, n: int) -> None:
+         self.driver.wait64(self._stream(), self.dptr + REQ_WORD, word(seq, n), CU_STREAM_WAIT_VALUE_EQ | self.flags)
+ 
+-    def stage_gpu(self, seq: int, n: int) -> None:
+-        self.driver.write64(self._stream(), self.dptr + self.box.req + STAGED, word(seq, n))
++    def stage_gpu(self, seq: int, n: int, stream: int | None = None) -> None:
++        """The staged word as a stream write on ``stream`` (a CUDA stream handle; default: this link's stream)."""
++
++        self.driver.write64(self._stream() if stream is None else stream, self.dptr + self.box.req + STAGED,
++                            word(seq, n))
+ 
+     def close(self) -> None:
+         try:
+diff --git a/src/tensorfold/families/glm5_next/cuda/prefill_pairs.py b/src/tensorfold/families/glm5_next/cuda/prefill_pairs.py
+index 30de49f..a2a5401 100644
+--- a/src/tensorfold/families/glm5_next/cuda/prefill_pairs.py
++++ b/src/tensorfold/families/glm5_next/cuda/prefill_pairs.py
+@@ -31,11 +31,13 @@ This tree's own design for the attention/expert split; not a MiaAI-Lab recipe pa
+ Prompt chunk lanes (``TF_GLM_PREFILL_LANES=N``, N = 1 .. 4; ``run_lanes``): N consecutive whole chunks through the
+ layers together, the pair schedule generalized. The lanes go through each layer in lane order, each lane's exchange
+ goes out in lane order and is collected at most ``depth`` exchanges later (``AfdWire.depth``: 1 on the MCDMA wire,
+-whose links carry one request at a time), and a lane runs its attention whenever it needs no reply, after the lane
+-before it ran that layer's. N = 2 is the pair (``run_pair``: the same schedule, messages and buffers); N >= 3 gives
+-every lane its own routed rows (``lane_buffers``: a lane can stop before its exchange while later lanes run their
+-attention). At depth 1, past the first layer each exchange window holds one lane's attention, as a pair's; more
+-lanes keep the experts busier only on a wire that queues exchanges. The prefill lanes are Hugh Madden's
++whose links carry one request at a time; ``TF_GLM_MCDMA_INFLIGHT=M``: M, over M link pairs), and a lane runs its
++attention whenever it needs no reply, after the lane before it ran that layer's. N = 2 is the pair (``run_pair``: the
++same schedule, messages and buffers); N >= 3 gives every lane its own routed rows (``lane_buffers``: a lane can stop
++before its exchange while later lanes run their attention). At depth 1, past the first layer each exchange window
++holds one lane's attention, as a pair's; more lanes keep the experts busier only on a wire that queues exchanges
++(depth M > 1: a lane's exchange goes out as soon as its attention ran, and each lane keeps its own shared expert's
++output, ``FLIGHT_FIELDS``). The prefill lanes are Hugh Madden's
+ (@dangerm00se, github.com/hughmadden): he authored the two-lane prefill of whole prompt chunks in mimo26f-afd (perf
+ reset R4: hughmadden/mimo26f-afd @ bab9fa2, ``crates/mimo26-coordinator/src/dforward.rs`` ``forward``,
+ ``forward_group``) and the prefill in up to four lanes in glm53f-afd (four lanes of 2,048 rows by default, the
+@@ -61,6 +63,11 @@ MAX_LANES = 4                              # glm53f-afd's (``MAX_LANES``); and i
+ # what a lane of N >= 3 holds of its own beside SLOT_FIELDS: its routed rows, from ``layer_front`` / ``moe_route`` to
+ # its ``moe_send`` (with three or more lanes, other lanes run their attention while a lane waits to send)
+ ROUTED_FIELDS = ("normed", "xs", "pick", "wts")
++# what every lane holds of its own when the wire keeps several exchanges in flight (TF_GLM_MCDMA_INFLIGHT=N,
++# ``AfdWire.depth`` > 1): its shared expert's output, from its ``moe_send`` to its collect (other lanes' ``moe_send``
++# run between). The reply rows (``afd_recv``) stay shared: a lane's collect is followed by its ``hc_post`` before any
++# other collect (``_forward_lanes``' rule 3 runs only when no lane can run, and a lane past its collect always can)
++FLIGHT_FIELDS = ("sy",)
+ 
+ # the second chunk's own buffers (``slot_buffers``); every other prompt buffer is shared, being scratch that one
+ # phase writes and reads before the other chunk's next phase (``_steps``): the KDA / DSA / indexer / dense-MLP / split-K
+@@ -96,12 +103,13 @@ def lanes(value: str | None = None, *, pairs: bool | None = None) -> int:
+     return int(raw)
+ 
+ 
+-def slot_buffers(b):
++def slot_buffers(b, *, flight: bool = False):
+     """The second chunk's prompt buffers: ``b`` (forward.Buffers, prefill) with its own token ids, residual streams,
+-    hyper-connection weights and DFlash2 taps (``SLOT_FIELDS``), the rest shared."""
++    hyper-connection weights and DFlash2 taps (``SLOT_FIELDS``), the rest shared. ``flight`` (a wire of depth > 1,
++    TF_GLM_MCDMA_INFLIGHT): its own shared expert's output too (``FLIGHT_FIELDS``)."""
+ 
+     two = copy.copy(b)
+-    for name in SLOT_FIELDS:
++    for name in SLOT_FIELDS + (FLIGHT_FIELDS if flight else ()):
+         setattr(two, name, torch.empty_like(getattr(b, name)))
+     two.ids_host = torch.zeros_like(b.ids_host, pin_memory=torch.cuda.is_available())
+     two.staged = torch.cuda.Event() if torch.cuda.is_available() else b.staged
+@@ -110,57 +118,73 @@ def slot_buffers(b):
+     return two
+ 
+ 
+-def slot_bytes(b) -> int:
++def slot_bytes(b, *, flight: bool = False) -> int:
+     """What ``slot_buffers`` adds on the device (the startup line's)."""
+ 
+-    held = [getattr(b, name) for name in SLOT_FIELDS] + list(b.taps)
++    held = [getattr(b, name) for name in SLOT_FIELDS + (FLIGHT_FIELDS if flight else ())] + list(b.taps)
+     return sum(t.numel() * t.element_size() for t in held)
+ 
+ 
+-def lane_buffers(b):
++def lane_buffers(b, *, flight: bool = False):
+     """A lane's prompt buffers when three or more lanes run: ``slot_buffers`` plus its own routed rows
+-    (``ROUTED_FIELDS``: the FFN input rows and their scales, each row's experts and weights)."""
++    (``ROUTED_FIELDS``: the FFN input rows and their scales, each row's experts and weights); ``flight``: as
++    ``slot_buffers``'."""
+ 
+-    lane = slot_buffers(b)
++    lane = slot_buffers(b, flight=flight)
+     for name in ROUTED_FIELDS:
+         setattr(lane, name, torch.empty_like(getattr(b, name)))
+     return lane
+ 
+ 
+-def lane_bytes(b) -> int:
++def lane_bytes(b, *, flight: bool = False) -> int:
+     """What ``lane_buffers`` adds on the device per lane."""
+ 
+-    return slot_bytes(b) + sum(getattr(b, name).numel() * getattr(b, name).element_size() for name in ROUTED_FIELDS)
++    return slot_bytes(b, flight=flight) + sum(getattr(b, name).numel() * getattr(b, name).element_size()
++                                              for name in ROUTED_FIELDS)
+ 
+ 
+-def plan_bytes(text: dict, rows: int, *, taps: int, routed: bool = False) -> int:
++def flies(lane, b) -> bool:
++    """Whether ``lane`` holds its own ``FLIGHT_FIELDS`` beside ``b``'s (``slot_buffers`` / ``lane_buffers`` with
++    ``flight``)."""
++
++    return all(getattr(lane, name) is not getattr(b, name) for name in FLIGHT_FIELDS)
++
++
++def plan_bytes(text: dict, rows: int, *, taps: int, routed: bool = False, flight: bool = False) -> int:
+     """``slot_bytes`` before the buffers exist, for the capacity plan (``text``: the checkpoint's text config; ``rows``:
+     the prompt chunk's; ``taps``: DFlash2's tapped layers, 0 without a drafter): token ids, the residual streams
+     and DFlash2 taps (bf16), the hyper-connection weights (fp32). 144 MiB for GLM-5.3-Flash at 2,048 rows.
+     ``routed``: ``lane_bytes`` instead (a lane of three or more), adding the routed rows: bf16 FFN inputs, their fp32
+-    scales per 64 values, each row's int32 experts and fp32 weights per slot (top-k + the shared): 16.6 MiB more."""
++    scales per 64 values, each row's int32 experts and fp32 weights per slot (top-k + the shared): 16.6 MiB more.
++    ``flight`` (a wire of depth > 1): the shared expert's fp32 output rows too, 32 MiB more."""
+ 
+     d, s = int(text["hidden_size"]), int(text.get("hc_mult", 4))
+     per = 4 + 2 * s * d + 4 * s + 4 * s * s + 2 * taps * d
+     if routed:
+         slots = int(text.get("num_experts_per_tok", 8)) + 1
+         per += 2 * d + 4 * (d // 64) + 8 * slots
++    if flight:
++        per += 4 * d
+     return rows * per
+ 
+ 
+ def buffers_for(e, n: int) -> list:
+     """The prompt buffers of ``n`` lanes: the engine's own for the first lane; the pair's second chunk's
+     (``e.pbuf2``, ``slot_buffers``) for n = 2; each later lane's own (``e.pbuf_lanes``, ``lane_buffers``) for n >= 3,
+-    and for a pair in a run of more lanes (the engine makes them at startup, before the caches fill the GPU)."""
++    and for a pair in a run of more lanes (the engine makes them at startup, before the caches fill the GPU). On a wire
++    of depth > 1 (TF_GLM_MCDMA_INFLIGHT) every later lane's with its own ``FLIGHT_FIELDS``."""
+ 
++    deep = _depth(getattr(getattr(e, "w", None), "afd", None)) > 1
+     more = list(getattr(e, "pbuf_lanes", None) or ())
+     if n == 2 and not more:
+         b2 = getattr(e, "pbuf2", None)
+-        if b2 is None:
+-            b2 = e.pbuf2 = slot_buffers(e.pbuf)
++        if b2 is None or (deep and not flies(b2, e.pbuf)):
++            b2 = e.pbuf2 = slot_buffers(e.pbuf, flight=True) if deep else slot_buffers(e.pbuf)
+         return [e.pbuf, b2]
++    if deep:
++        more = [m if flies(m, e.pbuf) else lane_buffers(e.pbuf, flight=True) for m in more]
+     while len(more) < n - 1:
+-        more.append(lane_buffers(e.pbuf))
++        more.append(lane_buffers(e.pbuf, flight=True) if deep else lane_buffers(e.pbuf))
+     e.pbuf_lanes = more
+     return [e.pbuf, *more[:n - 1]]
+ 
+@@ -361,16 +385,24 @@ def _forward_lanes(e, chunks: Sequence[Chunk], depth: int | None = None) -> None
+     With two lanes this is the pair schedule: the first chunk's exchange of layer L, the second chunk's attention of
+     L inside it, the first's reply, the second's exchange, the first's attention of L + 1 inside it, and so on. More
+     lanes put every later lane's attention of L inside the first lane's exchange window. A lane's routed rows wait
+-    in its own buffers (``lane_buffers``) while later lanes run their attention. Only depth 1 is built: the lanes
+-    share the shared expert's output and the reply rows (``SLOT_FIELDS``' note), which hold one exchange in flight;
+-    a deeper wire needs them per lane too."""
++    in its own buffers (``lane_buffers``) while later lanes run their attention. On a wire of depth N > 1
++    (TF_GLM_MCDMA_INFLIGHT=N: N exchanges in flight, one on each link pair) a lane's exchange goes out as soon as its
++    attention ran, while up to N - 1 earlier ones are unanswered, so the expert nodes find the next request waiting
++    when they reply; every lane then holds its own shared expert's output (``FLIGHT_FIELDS``: another lane's
++    ``moe_send`` runs before its collect). The reply rows stay shared at any depth: rule 3 runs only when no lane can
++    run, and a lane past its collect always can (the lowest such lane: the lane before it is past that layer's
++    attention, at its next exchange, or done), so its ``hc_post`` reads them before the next collect."""
+ 
+     n = len(chunks)
+     if depth is None:
+         depth = _depth(e.w.afd)
+-    if depth != 1:
+-        raise ValueError(f"prompt chunk lanes over a wire of depth {depth}: the lanes share the shared expert's output "
+-                         "and the reply rows, which hold one exchange in flight")
++    if depth < 1:
++        raise ValueError(f"prompt chunk lanes over a wire of depth {depth}: at least one exchange goes out at a time")
++    if depth > 1:
++        for name in FLIGHT_FIELDS:
++            if len({id(getattr(ch.b, name)) for ch in chunks}) != n:
++                raise ValueError(f"prompt chunk lanes over a wire of depth {depth} need each lane's own {name} "
++                                 "(``buffers_for`` on that wire: ``slot_buffers`` / ``lane_buffers`` with flight)")
+     gens = [_steps(e, ch) for ch in chunks]
+     end = object()
+     at: list[Any] = [None] * n            # where each lane stopped: None (not started), SEND, WAIT, DONE, or end
+diff --git a/tests/test_glm_mcdma_inflight.py b/tests/test_glm_mcdma_inflight.py
+new file mode 100644
+index 0000000..92e707b
+--- /dev/null
++++ b/tests/test_glm_mcdma_inflight.py
+@@ -0,0 +1,829 @@
++"""TF_GLM_MCDMA_INFLIGHT (several MoE exchanges in flight per expert node over N MCDMA link pairs) on CPU.
++
++MCDMA is Ash Hart's (@ashxhart, github.com/ashhart/MCDMA); keeping exchanges queued ahead of the expert ranks follows
++glm53f-afd by Hugh Madden (@dangerm00se, github.com/hughmadden/glm53f-afd @ 91db3cc). Every test runs N = 1 (the
++switch off: today's one link pair), 2 (the pairs') and 4 (TF_GLM_PREFILL_LANES=4's).
++
++- The setting, the link map (link j of a node is ``NAME-j``, its listen socket beside link 0's) and the handshake
++  (``inflight`` only when N > 1, echoed by the experts; an expert without it refuses).
++- The schedule (``prefill_pairs._forward_lanes`` over stand-in layer loops, 2-4 lanes): exchanges in lane order and
++  collected in that order, never more than N on the wire, a lane's reply used before any other collect (the reply
++  rows stay shared), and at N >= 2 each lane's exchange goes out before the lane before it collects that layer's reply.
++- The forward seam (tests/test_glm_prefill_pairs.py's recorded kernels over the real forward): at N = 1, 2 and 4 every
++  lane's kernel calls are its solo chunk's, its own shared expert output (``FLIGHT_FIELDS``) named as the solo's.
++- The wire: the real ``AfdWire`` + ``McdmaTransport`` and both experts' ``forwards`` over N link pairs of the fake
++  mcdma-rpcd pair, CPU-, GPU-driven and mixed: lanes of 4, 3 and 2 through the real scheduler, plain forwards and a
++  layer slice; every reply equals the serial run's, the experts saw the same requests in the same order at every N,
++  the requests went round-robin over the links; a forward of 3 MoE layers moves the next forward to another link.
++- B before A's reply: lane 0's replies held in the daemon; at N = 2 lane 1's request goes out and is computed while
++  lane 0's reply is held, at N = 1 it does not.
++- The switch off: N = 1 issues and collects every link at once (today's calls), publishes no ``inflight``.
++- The expert's reply stream (GPU-driven, faked streams and events): each link's own routed rows, the copy and the staged
++  word on the second stream after the compute's event, and the compute waits for a link's last copy before reusing
++  its rows.
++- serve(): the handshake with ``inflight`` 2, each expert opening its two links (bases per link) and serving.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import threading
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from tests import test_glm_prefill_lanes as tl
++from tests import test_glm_prefill_pairs as tp
++from tests.glm_afd_fakes import (  # noqa: F401
++    LAYERS,
++    PREFILL,
++    D,
++    DictStore,
++    FakeDaemon,
++    FakeDriver,
++    FakeNode,
++    S,
++    env_fixture,
++    fake_cfg,
++    free_port,
++    libpath_fixture,
++    master_fixture,
++    partial,
++    settings,
++    words_fixture,
++)
++from tests.test_cuda_geometry import allocations  # noqa: F401
++
++pytestmark = pytest.mark.torch
++ENV = "TF_GLM_MCDMA_INFLIGHT"
++DEPTHS = [1, 2, 4]
++MODES = [("cpu", ("cpu", "cpu")), ("gpu", ("gpu", "gpu")), ("gpu", ("cpu", "gpu"))]
++
++
++def _names(n: int) -> list[str]:
++    """The attention's links at N exchanges in flight: rank 1's and rank 2's, per exchange slot."""
++
++    from tensorfold.families.glm5_next.cuda import mcdma
++
++    return [mcdma.more_link(name, j) for j in range(n) for name in ("a2", "a1")]
++
++
++# -- the setting, the link map, the handshake ------------------------------------------------------------------------
++def test_the_setting_and_the_link_map(monkeypatch):
++    from tensorfold.families.glm5_next.cuda import afd_mcdma, mcdma
++
++    monkeypatch.delenv(ENV, raising=False)
++    assert mcdma.inflight() == 1 and mcdma.inflight("") == 1 and mcdma.inflight(" 2 ") == 2
++    assert [mcdma.inflight(str(n)) for n in (1, 2, 3, 4)] == [1, 2, 3, 4]
++    for bad in ("0", "5", "two", "2.0", "-1", "on"):
++        with pytest.raises(ValueError, match=ENV):
++            mcdma.inflight(bad)
++    monkeypatch.setenv(ENV, "4")
++    assert mcdma.inflight() == 4
++    monkeypatch.setenv(mcdma.LINKS_ENV, "a2,a1")
++    assert mcdma.link_names() == ["a2", "a1"] == mcdma.link_names(1)        # one pair: today's map
++    assert mcdma.link_names(2) == ["a2", "a1", "a2-1", "a1-1"] == _names(2)
++    assert mcdma.link_names(4) == ["a2", "a1", "a2-1", "a1-1", "a2-2", "a1-2", "a2-3", "a1-3"]
++    monkeypatch.delenv(mcdma.SOCKET_ENV, raising=False)
++    assert mcdma.socket_for("a2", 0) is None                                 # link 0: ExpertLink's own rule
++    assert mcdma.socket_for("a2-1", 1) == "/tmp/mcdma-rpcd.a2-1.sock"         # the daemon's default
++    monkeypatch.setenv(mcdma.SOCKET_ENV, "/mcdma/a2.sock")
++    assert mcdma.socket_for("a2-3", 3) == "/mcdma/a2-3.sock"                  # beside link 0's
++    for raw, want in (({"inflight": 2}, 2), ({"inflight": 4}, 4), ({}, 1), ({"inflight": 7}, 1),
++                      ({"inflight": True}, 1), ({"inflight": "2"}, 1)):
++        assert afd_mcdma.inflight_asked(raw) == want, raw
++
++
++@pytest.mark.parametrize("n", DEPTHS)
++def test_the_handshake(env, words, tmp_path, n):
++    """The attention publishes its 2N links and, only when N > 1, ``inflight``: N; an expert of this tree echoes it,
++    an expert of an older tree refuses (``inflight: attention N != expert None``)."""
++
++    from tensorfold.families.glm5_next.cuda import afd_mcdma, mcdma
++    from tensorfold.families.glm5_next.cuda.afd import settings_mismatch
++
++    daemon = FakeDaemon(tmp_path, _names(n))
++    try:
++        links = mcdma.AttentionLinks(_names(n), words=words, mode="cpu", timeout=5, shm_dir=str(daemon.shm),
++                                     linkup_wait=2)
++        tr = afd_mcdma.McdmaTransport("", 0, links=links, comm=object(), device="cpu", hidden=D)
++        assert tr.depth == n and len(tr._slots) == n
++        got = tr.publish(settings())
++        assert got["mcdma_links"] == _names(n) and ("inflight" in got) == (n > 1) and got.get("inflight", 1) == n
++        theirs = dict(settings(), **got)
++        mine = dict(settings(), transport="mcdma", mcdma_links=theirs["mcdma_links"])
++        old = dict(mine)
++        if "inflight" in theirs:                  # experts_node.serve's echo
++            mine["inflight"] = afd_mcdma.inflight_asked(theirs)
++        assert settings_mismatch(mine, theirs) == ""
++        assert settings_mismatch(old, theirs) == ("" if n == 1 else f"inflight: attention {n} != expert None")
++        assert ("exchanges in flight" in tr.describe()) == (n > 1)
++    finally:
++        daemon.close()
++
++
++def test_an_expert_on_a_short_link_map_refuses(env):
++    from tensorfold.families.glm5_next.cuda import afd_mcdma, mcdma
++
++    env.setenv(mcdma.LINK_ENV, "a2")
++    theirs = dict(settings(), transport="mcdma", mcdma_links=["a2", "a1"], inflight=2)
++    with pytest.raises(SystemExit, match=r"with 2 exchanges in flight \(4 links\)"):
++        afd_mcdma.open_expert_link(theirs, 1, fake_cfg(), None, device="cpu")
++
++
++def test_the_lanes_buffers_and_their_bytes(allocations):  # noqa: F811
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import prefill_pairs as pp
++
++    rec = tp.hp.Rec(torch)
++    _, b = tp.hp.build_forward(torch, rec)
++    for make in (pp.slot_buffers, pp.lane_buffers):
++        off, on = make(b), make(b, flight=True)
++        assert off.sy is b.sy and on.sy is not b.sy and on.sy.shape == b.sy.shape
++        assert not pp.flies(off, b) and pp.flies(on, b)
++    sy = b.sy.numel() * b.sy.element_size()
++    assert pp.slot_bytes(b, flight=True) == pp.slot_bytes(b) + sy
++    assert pp.lane_bytes(b, flight=True) == pp.lane_bytes(b) + sy
++    text = {"hidden_size": 4096, "hc_mult": 4, "num_experts_per_tok": 8}     # GLM-5.3-Flash: 32 MiB more a lane
++    assert pp.plan_bytes(text, 2048, taps=5, flight=True) - pp.plan_bytes(text, 2048, taps=5) == 32 << 20
++    assert pp.plan_bytes(text, 2048, taps=5, routed=True, flight=True) == 168_615_936 + (32 << 20)
++    # buffers_for on a deeper wire: every later lane's with its own shared expert output (a depth-1 pair's replaced)
++    e = SimpleNamespace(pbuf=b, pbuf2=pp.slot_buffers(b), w=SimpleNamespace(afd=SimpleNamespace(depth=2)))
++    two = pp.buffers_for(e, 2)
++    assert two[0] is b and pp.flies(two[1], b) and e.pbuf2 is two[1]
++    e = SimpleNamespace(pbuf=b, pbuf_lanes=[pp.lane_buffers(b)], w=SimpleNamespace(afd=SimpleNamespace(depth=4)))
++    four = pp.buffers_for(e, 4)
++    assert len(four) == 4 and all(pp.flies(x, b) for x in four[1:]) and len({id(x.sy) for x in four}) == 4
++    e = SimpleNamespace(pbuf=b, w=SimpleNamespace(afd=SimpleNamespace(depth=1)))
++    assert not any(pp.flies(x, b) for x in pp.buffers_for(e, 3)[1:])     # depth 1: as before
++
++
++# -- the schedule ----------------------------------------------------------------------------------------------------
++@pytest.mark.parametrize("depth", DEPTHS)
++@pytest.mark.parametrize("n", [2, 3, 4])
++@pytest.mark.parametrize("kinds", tl.KINDS, ids=["glm-like", "one-moe", "dense-between", "dense-tail"])
++def test_the_lane_schedule_at_depth(monkeypatch, n, depth, kinds):
++    from tensorfold.families.glm5_next.cuda import prefill_pairs as pp
++
++    log = []
++    monkeypatch.setattr(pp, "_steps", tl._stand_in(kinds, log))
++    e = SimpleNamespace(w=SimpleNamespace(afd=SimpleNamespace(depth=depth)))
++    pp._forward_lanes(e, [pp.Chunk([None], k, SimpleNamespace(sy=object())) for k in range(n)])
++    moe = [i for i, kind in enumerate(kinds) if kind == "moe"]
++    xs = [(k, i) for ev, k, i in log if ev == "x"]
++    assert xs == [(k, i) for i in moe for k in range(n)]                    # lane order within each layer
++    assert [(k, i) for ev, k, i in log if ev == "c"] == xs                  # replies in the order the requests went
++    flight = top = 0
++    for ev, _, _ in log:
++        flight += {"x": 1, "c": -1}.get(ev, 0)
++        assert 0 <= flight <= depth
++        top = max(top, flight)
++    assert top == min(depth, n)
++    for k in range(1, n):                                                    # the lane before ran each layer first
++        for i in range(len(kinds)):
++            assert log.index(("a", k - 1, i)) < log.index(("a", k, i)), (k, i)
++    for j, (ev, k, i) in enumerate(log):                                     # a reply is used before the next collect
++        if ev == "c":
++            h = log.index(("h", k, i))
++            assert not [x for x in log[j + 1:h] if x[0] == "c"], (k, i, log[j:h + 1])
++    for i in moe:                                  # depth >= 2: lane k's exchange before lane k - 1's reply of it
++        for k in range(1, n):
++            before = log.index(("x", k, i)) < log.index(("c", k - 1, i))
++            assert before == (depth >= 2), (k, i, depth)
++    assert sum(1 for ev, _, _ in log if ev == "t") == n
++
++
++# -- the forward seam: recorded kernels -----------------------------------------------------------------------------
++def _seam_at(monkeypatch, n: int, depth: int):
++    """tests/test_glm_prefill_lanes.py's seam on a wire of ``depth``: lanes 1 .. n - 1's own buffers with their own
++    shared expert output when depth > 1, named l<k>.*."""
++
++    from tensorfold.families.glm5_next.cuda import prefill_pairs as pp
++
++    s = tp._seam(monkeypatch)
++    rec = s.rec
++    s.w.afd.begin_lanes = rec.fn("afd.begin_lanes")
++    s.w.afd.depth = depth
++    lanes = []
++    own = pp.SLOT_FIELDS + pp.ROUTED_FIELDS + (pp.FLIGHT_FIELDS if depth > 1 else ())
++    for k in range(1, n):
++        lb = pp.lane_buffers(s.b, flight=True) if depth > 1 else pp.lane_buffers(s.b)
++        for name in own:
++            rec.register(f"l{k}." + name, getattr(lb, name))
++        for i, t in enumerate(lb.taps):
++            rec.register(f"l{k}.tap{i}", t)
++        rec.aliases[id(lb)] = f"L{k}"
++        lanes.append(lb)
++    s.lanes = lanes
++    return s
++
++
++def _wire_ops(calls) -> list:
++    ops, slot = [], 0
++    for c in calls:
++        if c[0] == "afd.use":
++            slot = c[1][0]
++        elif c[0] in ("afd.exchange", "afd.collect"):
++            ops.append((c[0][4], slot))
++    return ops
++
++
++@pytest.mark.parametrize("depth", DEPTHS)
++@pytest.mark.parametrize("sizes,pos,holds", [((64, 64), 0, (0,)), ((40, 1, 64, 23), 3, (1,)), ((7, 64, 9), 90, ()),
++                                             ((64, 30, 64, 64), 500, (0, 2))],
++                         ids=["2x64", "4-odd", "3-odd", "4-far"])
++def test_lanes_at_depth_make_each_chunks_solo_calls(allocations, monkeypatch, depth, sizes, pos, holds):  # noqa: F811
++    """One stream's 2-4 consecutive chunks as lanes on a wire of depth 1, 2 and 4: every kernel call of each lane is
++    its solo prefill_chunk's (later lanes' l<k>.* buffers, their own shared expert output included, named as the
++    solo's), taps, end states and held states as the solo chunks'; on the wire each layer's exchanges go in lane
++    order, are collected in that order, at most ``depth`` in flight, and at depth >= 2 lane k's exchange of a layer
++    goes out before lane k - 1 collects that layer's reply."""
++
++    s = _seam_at(monkeypatch, len(sizes), depth)
++    torch, rec, n = s.torch, s.rec, len(sizes)
++    starts = [pos + sum(sizes[:k]) for k in range(n)]
++    prompt = list(range(1, starts[-1] + sizes[-1] + 1))
++    st = tp.hp.TraceState(torch, rec, 1, pos)
++    e = tp._engine(s, st)
++    solo, taps0, kept = [], [], {}
++    for k in range(n):
++        rec.calls = []
++        out_solo = s.decode.prefill_chunk(e, prompt, starts[k], sizes[k], drafter=tp._drafter(taps0, rec),
++                                          head=k == n - 1)
++        solo.append([tp._canon(c) for c in rec.calls if tp._kernel(c)])
++        kept[k] = (st.rec[st.cur[0]].clone(), st.conv.clone())
++    end_solo = (st.rec.clone(), st.conv.clone(), list(st.cur), st.pos)
++
++    st2 = tp.hp.TraceState(torch, rec, 1, pos)
++    eng = tl._engine(s)
++    taps1 = []
++    rec.calls = []
++    chunks = s.pp.run_lanes(eng, [[tp._mp().Piece(st2, prompt[starts[k]:starts[k] + sizes[k]],
++                                                  drafter=tp._drafter(taps1, rec), head=k == n - 1)]
++                                  for k in range(n)], hold=[[st2] if k in holds else [] for k in range(n - 1)])
++    calls = list(rec.calls)
++    for ch in chunks:
++        s.pp.finish(eng, ch)
++    assert tl._by_lane(calls, n) == solo
++    assert taps1 == taps0 and st2.pos == pos + sum(sizes)
++    assert st2.rec.tolist() == end_solo[0].tolist() and st2.conv.tolist() == end_solo[1].tolist()
++    assert list(st2.cur) == end_solo[2]
++    assert all(ch.heads == [None] for ch in chunks[:-1]) and chunks[-1].heads[0].shape == out_solo.shape
++    for k, ch in enumerate(chunks[:-1]):
++        if k in holds:
++            rec_h, conv_h = ch.held(st2)
++            assert torch.equal(rec_h, kept[k][0]) and torch.equal(conv_h, kept[k][1])
++    ops, moe = _wire_ops(calls), 3                    # build_forward: layers 1, 2, 3 are MoE
++    xs = [k for op, k in ops if op == "e"]
++    assert xs == [k for _ in range(moe) for k in range(n)] and [k for op, k in ops if op == "c"] == xs
++    flight = top = 0
++    for op, _ in ops:
++        flight += 1 if op == "e" else -1
++        assert 0 <= flight <= depth
++        top = max(top, flight)
++    assert top == min(depth, n)
++    for layer in range(moe):                          # the j-th exchange / collect of lane k is its layer j's
++        for k in range(1, n):
++            x = [i for i, (op, kk) in enumerate(ops) if op == "e" and kk == k][layer]
++            c = [i for i, (op, kk) in enumerate(ops) if op == "c" and kk == k - 1][layer]
++            assert (x < c) == (depth >= 2), (layer, k, depth)
++
++
++# -- the wire: N link pairs of the fake mcdma-rpcd pair ----------------------------------------------------------
++class Wire:
++    """N link pairs of the fake mcdma-rpcd pair: the attention's ``AfdWire`` over ``McdmaTransport``, both experts'
++    ``experts_node.forwards`` over their N links (``McdmaExpertLink`` of a list, as ``open_expert_link`` makes it)."""
++
++    def __init__(self, root, words, port, n, *, attn="cpu", experts=("cpu", "cpu"), layers=LAYERS, timeout=10.0,
++                 lanes=4) -> None:
++        from tensorfold.families.glm5_next.cuda import afd as afd_mod
++        from tensorfold.families.glm5_next.cuda import afd_mcdma, experts_node, mcdma
++
++        root.mkdir(parents=True, exist_ok=True)
++        self.n, self.names, self.layers = n, _names(n), list(layers)
++        self.daemon = FakeDaemon(root, self.names)
++        self.drv = FakeDriver(words)
++        self.links = mcdma.AttentionLinks(self.names, words=words, driver=self.drv if attn == "gpu" else None,
++                                          mode=attn, stream=lambda: 0, timeout=timeout, shm_dir=str(self.daemon.shm),
++                                          linkup_wait=2)
++        self.eps = []
++        for half, mode in enumerate(experts):
++            mine = []
++            for j in range(n):
++                name = self.names[2 * j + half]
++                link = mcdma.ExpertLink(name, words=words, driver=self.drv if mode == "gpu" else None, mode=mode,
++                                        socket_path=self.daemon.sock(name), shm_dir=str(self.daemon.shm),
++                                        stream=lambda: 0)
++                link.base = self.links.base[2 * j + half]
++                mine.append(link)
++            end = afd_mcdma.McdmaExpertLink(mine[0] if n == 1 else mine, D, S, len(self.layers), PREFILL,
++                                            device="cpu", pairs=True, lanes=lanes)
++            ep = SimpleNamespace(link=end, node=FakeNode(self.layers, half, record=True), error=None)
++
++            def run(ep=ep, half=half):
++                try:
++                    experts_node.forwards(ep.node, ep.link, DictStore(), half + 1)
++                except BaseException as exc:  # noqa: BLE001
++                    ep.error = exc
++
++            ep.t = threading.Thread(target=run, daemon=True)
++            ep.t.start()
++            self.eps.append(ep)
++        end = time.monotonic() + 5
++        while any(self.daemon.svc[x] is None for x in self.names):
++            assert time.monotonic() < end, "services never attached"
++            time.sleep(0.01)
++        self.tr = afd_mcdma.McdmaTransport("127.0.0.1", port, links=self.links,
++                                           comm=SimpleNamespace(abort=self.links.release), device="cpu", hidden=D)
++        self.a = afd_mod.AfdWire("127.0.0.1", port, transport=self.tr)
++        self.a.announce(settings(layers=self.layers))
++        assert self.a.depth == n
++
++    def close(self) -> None:
++        for x in self.names:
++            self.daemon.bye(x)
++        for ep in self.eps:
++            ep.t.join(5)
++            assert not ep.t.is_alive()
++        self.daemon.close()
++
++
++def _gen(seed: int):
++    import torch
++
++    return torch.Generator().manual_seed(seed)
++
++
++def _rows(b, rows, seed: int):
++    """``tp._fill``'s rows from a seed (normed, pick and wts written, as ``layer_front`` / ``moe_route`` write them);
++    returns the shared expert output, which the caller writes after the exchange, as ``forward.moe_send`` does."""
++
++    import torch
++
++    gen = _gen(seed)
++    b.normed[:rows] = torch.randn((rows, D), generator=gen).to(torch.bfloat16)
++    b.pick[:rows] = torch.randint(0, 16, (rows, S), generator=gen, dtype=torch.int32)
++    b.wts[:rows] = torch.rand((rows, S), generator=gen)
++    return torch.randn((rows, D), generator=gen)
++
++
++def _check(got, b, rows, layer, sy) -> None:
++    import torch
++
++    for half in (0, 1):
++        assert torch.equal(got[half], partial(b.normed[:rows], b.pick[:rows], b.wts[:rows], layer, half)), (layer, half)
++    assert torch.equal(got[2], sy), ("the shared expert output", layer)
++
++
++def _lanes_run(monkeypatch, w: Wire, rows, seed: int, out: dict, flight: dict, *, share_sy: bool = False) -> None:
++    """``rows``' chunks as lanes through the real scheduler (``_forward_lanes``, each lane's layer loop a stand-in for
++    ``_steps``) over the real wire; lane k's layer rows are seeded by (seed, k, layer), so every N sends the same
++    rows; the shared expert output is written after the exchange (``moe_send``'s order); each reply is checked and
++    kept in ``out``. ``share_sy``: every lane's buffers hold lane 0's ``sy`` (today's pair buffers)."""
++
++    from tensorfold.families.glm5_next.cuda import prefill_pairs as pp
++
++    a = w.a
++    bufs = [tp._bufs() for _ in rows]
++    if share_sy:
++        for b in bufs[1:]:
++            b.sy = bufs[0].sy
++
++    def steps(e, ch):
++        k, r, b = ch.slot, ch.R, bufs[ch.slot]
++        for pos, layer in enumerate(w.layers):
++            sy = _rows(b, r, seed + 100 * k + pos)
++            yield pp.SEND
++            e.w.afd.use(k)
++            e.w.afd.exchange(b, r)
++            b.sy[:r] = sy                          # the shared expert, while the exchange flies
++            flight["now"] += 1
++            flight["max"] = max(flight["max"], flight["now"])
++            yield pp.WAIT
++            e.w.afd.use(k)
++            got = e.w.afd.collect(b, r, D)
++            flight["now"] -= 1
++            _check(got, b, r, layer, sy)
++            out[(seed, k, pos)] = got.clone()
++            yield pp.DONE
++
++    monkeypatch.setattr(pp, "_steps", steps)
++    e = SimpleNamespace(w=SimpleNamespace(afd=a))
++    if len(rows) == 2:
++        a.begin_pair(rows)
++    else:
++        a.begin_lanes(rows)
++    pp._forward_lanes(e, [pp.Chunk([None], k, bufs[k], R=rows[k]) for k in range(len(rows))])
++
++
++def _plain_run(w: Wire, rows, seed: int, out: dict, *, k: int = 0, slice=None) -> None:
++    """One forward (or a layer slice ``(first, count)``) with the same seeding as ``_lanes_run``'s lane ``k``."""
++
++    b = tp._bufs()
++    first, count = slice if slice is not None else (0, len(w.layers))
++    if slice is None:
++        w.a.begin(rows, chunk=rows > 8)
++    else:
++        w.a.begin(rows, chunk=True, slice=slice)
++    for pos in range(first, first + count):
++        sy = _rows(b, rows, seed + 100 * k + pos)
++        w.a.exchange(b, rows)
++        b.sy[:rows] = sy
++        got = w.a.collect(b, rows, D)
++        _check(got, b, rows, w.layers[pos], sy)
++        out[(seed, k, pos)] = got.clone()
++
++
++GROUPS = [(PREFILL, 13, 21, PREFILL), (5, PREFILL, 30), (9, PREFILL)]     # lanes of 4, 3 and a pair
++
++
++def _session(monkeypatch, w: Wire) -> tuple[dict, list]:
++    """The groups as lanes, then plain forwards (a prompt chunk, decode windows) and a layer slice."""
++
++    out, tops = {}, []
++    for g, rows in enumerate(GROUPS):
++        flight = {"now": 0, "max": 0}
++        _lanes_run(monkeypatch, w, rows, 1000 * (g + 1), out, flight)
++        tops.append(flight["max"])
++    _plain_run(w, 11, 9000, out)
++    _plain_run(w, 1, 9100, out)
++    _plain_run(w, PREFILL, 9200, out, slice=(1, 2))
++    _plain_run(w, 3, 9300, out)
++    return out, tops
++
++
++def _serial(monkeypatch, w: Wire) -> dict:
++    """Every lane of every group alone, as a plain prompt-chunk forward (the serial reference), then the same tail."""
++
++    out = {}
++    for g, rows in enumerate(GROUPS):
++        for k, r in enumerate(rows):
++            _plain_run(w, r, 1000 * (g + 1), out, k=k)
++    _plain_run(w, 11, 9000, out)
++    _plain_run(w, 1, 9100, out)
++    _plain_run(w, PREFILL, 9200, out, slice=(1, 2))
++    _plain_run(w, 3, 9300, out)
++    return out
++
++
++def _same(x: dict, y: dict) -> bool:
++    import torch
++
++    return x.keys() == y.keys() and all(torch.equal(x[k], y[k]) for k in x)
++
++
++@pytest.mark.parametrize("modes", MODES, ids=["cpu", "gpu", "mixed"])
++def test_lanes_over_n_link_pairs_equal_the_serial_run(env, words, master, tmp_path, monkeypatch, modes):
++    """N = 1, 2, 4 over the fake MCDMA pair: lanes of 4, 3 and 2 through the real scheduler, then plain forwards and a
++    layer slice. Every reply equals the serial run's (each lane alone, one link pair); both experts saw the same
++    requests (rows and bytes) in the same order at every N; at most N exchanges were in flight, and N of them were
++    (up to the lane count); the requests went round-robin over each node's links; the transport ends with nothing in
++    flight."""
++
++    import torch
++
++    ref = Wire(tmp_path / "serial", words, master, 1, attn=modes[0], experts=modes[1])
++    serial = _serial(monkeypatch, ref)
++    ref.close()
++    seen = {}
++    for n in DEPTHS:
++        w = Wire(tmp_path / f"n{n}", words, master, n, attn=modes[0], experts=modes[1])
++        out, tops = _session(monkeypatch, w)
++        assert _same(out, serial), n
++        assert tops == [min(n, len(rows)) for rows in GROUPS], (n, tops)
++        assert not w.tr._flight and not w.a._busy and w.a.dead is None
++        counts = w.links.count
++        for half in (0, 1):                       # round-robin: each node's links within one request of each other
++            mine = counts[half::2]
++            assert max(mine) - min(mine) <= 1 and sum(mine) == len(w.eps[half].node.seen), (n, counts)
++        for ep in w.eps:
++            assert ep.error is None
++        seen[n] = [(ep.node.seen, ep.node.inputs) for ep in w.eps]
++        w.close()
++    for n in DEPTHS[1:]:                          # the experts' work identical to the switch off's, call for call
++        for (s1, i1), (sn, i_n) in zip(seen[1], seen[n]):
++            assert sn == s1
++            assert all(a[:2] == b[:2] and all(torch.equal(x, y) for x, y in zip(a[2:], b[2:])) for a, b in zip(i1, i_n))
++
++
++@pytest.mark.parametrize("n", [2, 4])
++def test_a_forward_of_three_moe_layers_moves_the_next_to_another_link(env, words, master, tmp_path, monkeypatch, n):
++    """Three MoE layers: a plain forward ends on another link than it began (3 requests over N links), so the next
++    forward's first request comes on link 3 mod N; a pair and lanes after it; every reply as the serial run's."""
++
++    layers = [3, 4, 5]
++    ref = Wire(tmp_path / "serial", words, master, 1, layers=layers)
++    want = {}
++    for seed, rows in ((10, 7), (20, PREFILL), (30, 2)):
++        _plain_run(ref, rows, seed, want)
++    for k, r in enumerate((9, PREFILL)):
++        _plain_run(ref, r, 40, want, k=k)
++    for k, r in enumerate((5, 7, PREFILL)):
++        _plain_run(ref, r, 50, want, k=k)
++    ref.close()
++    w = Wire(tmp_path / f"n{n}", words, master, n, layers=layers)
++    out = {}
++    _plain_run(w, 7, 10, out)
++    end = time.monotonic() + 5                       # each expert moved on after its last reply
++    while [ep.link.at for ep in w.eps] != [3 % n, 3 % n]:
++        assert time.monotonic() < end, [ep.link.at for ep in w.eps]
++        time.sleep(0.005)
++    _plain_run(w, PREFILL, 20, out)
++    _plain_run(w, 2, 30, out)
++    flight = {"now": 0, "max": 0}
++    _lanes_run(monkeypatch, w, (9, PREFILL), 40, out, flight)
++    _lanes_run(monkeypatch, w, (5, 7, PREFILL), 50, out, flight)
++    assert _same(out, want) and flight["max"] == min(n, 3)
++    assert all(ep.error is None for ep in w.eps)
++    w.close()
++
++
++# -- each lane's own shared expert output ----------------------------------------------------------------------------
++@pytest.mark.parametrize("n", [1, 2])
++def test_a_shared_shared_expert_output_needs_depth_one(env, words, master, tmp_path, monkeypatch, n):
++    """Why each lane holds its own ``sy`` on a deeper wire: lanes sharing it (the pairs' buffers, the check in
++    ``_forward_lanes`` switched off) are right at N = 1, where a lane's shared expert output is collected before the
++    next lane's exchange writes it, and wrong at N = 2, where the next lane's ``moe_send`` overwrites it first."""
++
++    from tensorfold.families.glm5_next.cuda import prefill_pairs as pp
++
++    monkeypatch.setattr(pp, "FLIGHT_FIELDS", ())
++    w = Wire(tmp_path, words, master, n)
++    out = {}
++    if n == 1:
++        _lanes_run(monkeypatch, w, (PREFILL, 13), 5, out, {"now": 0, "max": 0}, share_sy=True)
++        assert len(out) == 2 * len(LAYERS)
++    else:
++        with pytest.raises(AssertionError, match="the shared expert output"):
++            _lanes_run(monkeypatch, w, (PREFILL, 13), 5, out, {"now": 0, "max": 0}, share_sy=True)
++        assert not out                            # lane 0's first reply already carried lane 1's sy
++    for x in w.names:                             # the wire was left mid-pair at N = 2: the experts end on BYE
++        w.daemon.bye(x)
++    for ep in w.eps:
++        ep.t.join(5)
++    w.daemon.close()
++
++
++@pytest.mark.parametrize("case", ["unanswered", "stopped"])
++@pytest.mark.parametrize("n", [1, 2])
++def test_windows_that_end_with_a_request_unanswered_are_refused(env, words, master, tmp_path, n, case):
++    """A pair whose windows both sent every MoE layer but whose last request was never collected: the next header
++    refuses it (the experts are out of step), at N = 1 as at N = 2. Windows that stopped early (here also with a
++    request unanswered) get today's message: that check comes first."""
++
++    from tensorfold.server.errors import CapacityError
++
++    w = Wire(tmp_path, words, master, n)
++    a, bufs, rows, nl = w.a, [tp._bufs(), tp._bufs()], (PREFILL, 13), len(w.layers)
++    last = nl - 1 if case == "unanswered" else nl - 2      # the layer whose window-1 request stays unanswered
++    a.begin_pair(rows)
++    for pos in range(last + 1):
++        for k in (0, 1):
++            a.use(k)
++            _rows(bufs[k], rows[k], 10 * k + pos)
++            a.exchange(bufs[k], rows[k])
++            if not (k == 1 and pos == last):
++                a.collect(bufs[k], rows[k], D)
++    want = (rf"requests \[\(1, {last}\)\] \(\(window, layer\)\) unanswered" if case == "unanswered" else
++            rf"pair's window 0 \(seq \d+\) stopped after {last + 1} of {nl} MoE exchanges")
++    with pytest.raises(CapacityError, match=want):
++        a.begin(1)
++    for x in w.names:
++        w.daemon.bye(x)
++    for ep in w.eps:
++        ep.t.join(5)
++    w.daemon.close()
++
++
++def test_lanes_need_a_wire_of_depth_one_or_more():
++    from tensorfold.families.glm5_next.cuda import prefill_pairs as pp
++
++    with pytest.raises(ValueError, match="depth 0: at least one exchange"):
++        pp._forward_lanes(SimpleNamespace(), [pp.Chunk([None], k, tp._bufs(), R=8) for k in range(2)], depth=0)
++
++
++# -- B issued before A's reply ---------------------------------------------------------------------------------------
++@pytest.mark.parametrize("n", [1, 2])
++def test_the_next_lane_goes_out_before_the_reply(env, words, master, tmp_path, monkeypatch, n):
++    """Lane 0's replies held in the daemon (its link pair stalls): at N = 2 lane 1's request goes out, and both experts
++    compute it, while lane 0's first reply is still held; at N = 1 lane 1's request waits for that reply. The wire's
++    send / reply times (host clock) show the same: at N = 2 lane 1's send precedes lane 0's reply."""
++
++    from tensorfold.families.glm5_next.cuda import afd_mcdma
++
++    w = Wire(tmp_path, words, master, n)
++    events = []
++    send, recv = afd_mcdma.McdmaTransport.send, afd_mcdma.McdmaTransport.recv
++
++    def timed_send(self, b, rows, layer):
++        send(self, b, rows, layer)
++        events.append(("send", rows, layer, time.monotonic()))
++
++    def timed_recv(self, d1, d2, layer):
++        recv(self, d1, d2, layer)
++        events.append(("reply", d1.shape[0], layer, time.monotonic()))
++
++    monkeypatch.setattr(afd_mcdma.McdmaTransport, "send", timed_send)
++    monkeypatch.setattr(afd_mcdma.McdmaTransport, "recv", timed_recv)
++    w.daemon.stalled |= {"a2", "a1"}                 # lane 0's link pair (the k-th request: pair k mod N)
++    rows, out, failed = (PREFILL, 13), {}, []
++
++    def attention():
++        try:
++            _lanes_run(monkeypatch, w, rows, 77, out, {"now": 0, "max": 0})
++        except BaseException as exc:  # noqa: BLE001
++            failed.append(exc)
++
++    t = threading.Thread(target=attention, daemon=True)
++    t.start()
++    end = time.monotonic() + 5
++    while not all(ep.node.seen for ep in w.eps):
++        assert time.monotonic() < end, "lane 0's first request never computed"
++        time.sleep(0.005)
++    if n == 2:                                       # lane 1's request computed while lane 0's reply is held
++        while not all(len(ep.node.seen) >= 2 for ep in w.eps):
++            assert time.monotonic() < end, "lane 1's request did not go out while lane 0's reply was held"
++            time.sleep(0.005)
++        assert [ep.node.seen[:2] for ep in w.eps] == [[(LAYERS[0], PREFILL), (LAYERS[0], 13)]] * 2
++    else:                                            # one link pair: lane 1 waits for lane 0's reply
++        time.sleep(0.5)
++        assert [ep.node.seen for ep in w.eps] == [[(LAYERS[0], PREFILL)]] * 2
++    assert not [e for e in events if e[0] == "reply"]
++    w.daemon.stalled.clear()
++    t.join(10)
++    assert not t.is_alive() and not failed, failed
++    first_reply = next(e[3] for e in events if e[0] == "reply" and e[1] == PREFILL)
++    lane1_send = next(e[3] for e in events if e[0] == "send" and e[1] == 13)
++    assert (lane1_send < first_reply) == (n == 2), events[:6]
++    assert len(out) == 2 * len(LAYERS) and all(ep.error is None for ep in w.eps)
++    w.close()
++
++
++# -- the switch off --------------------------------------------------------------------------------------------------
++def test_the_switch_off_is_todays_path(env, words, master, tmp_path, monkeypatch):
++    """N = 1 (TF_GLM_MCDMA_INFLIGHT unset): every issue and collect goes to every link at once (today's calls, no link
++    subset), the transport and the wire have depth 1 and the handshake no ``inflight``; the expert ends keep one
++    link and no reply stream."""
++
++    from tensorfold.families.glm5_next.cuda import mcdma
++
++    monkeypatch.delenv(ENV, raising=False)
++    calls = []
++    issue, collect = mcdma.AttentionLinks.issue, mcdma.AttentionLinks.collect
++
++    def rec_issue(self, req, n, rep_len, *a, **k):
++        calls.append(("issue", a, k))
++        return issue(self, req, n, rep_len, *a, **k)
++
++    def rec_collect(self, outs, rep_len, *a, **k):
++        calls.append(("collect", a, k))
++        return collect(self, outs, rep_len, *a, **k)
++
++    monkeypatch.setattr(mcdma.AttentionLinks, "issue", rec_issue)
++    monkeypatch.setattr(mcdma.AttentionLinks, "collect", rec_collect)
++    w = Wire(tmp_path, words, master, mcdma.inflight(), attn="gpu", experts=("gpu", "cpu"))
++    assert w.tr.depth == w.a.depth == 1 and w.tr._slots == [None]
++    assert "inflight" not in w.tr.publish(settings())
++    _session(monkeypatch, w)
++    assert calls and all(a == () and k == {} for _, a, k in calls)
++    assert all(len(ep.link.links) == 1 and ep.link.side is None and ep.link.at == 0 for ep in w.eps)
++    w.close()
++
++
++# -- the expert's reply stream (GPU-driven; streams and events faked) -------------------------------------------------
++class _Ev:
++    def __init__(self, log, name) -> None:
++        self.log, self.name = log, name
++
++    def record(self, stream=None) -> None:
++        self.log.append(("record", self.name, stream.name))
++
++
++class _Stream:
++    def __init__(self, log, name, handle) -> None:
++        self.log, self.name, self.cuda_stream = log, name, handle
++
++    def wait_event(self, ev) -> None:
++        self.log.append(("wait", self.name, ev.name))
++
++
++def test_the_reply_stream(monkeypatch):
++    """Two links, GPU-driven: ``out`` gives each request its link's own rows; ``reply`` records the compute's event,
++    the reply stream waits for it, copies the rows into the link's reply mailbox and stages the word there, then
++    records the link's sent event; the third request (link 0 again) makes the compute stream wait for link 0's last
++    copy before its rows are reused. The replies' bytes are the rows computed."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import afd_mcdma
++
++    log = []
++    comp, side = _Stream(log, "compute", 11), _Stream(log, "reply", 22)
++    monkeypatch.setattr(torch.cuda, "current_stream", lambda *a, **k: comp)
++
++    @contextlib.contextmanager
++    def on(stream):
++        log.append(("enter", stream.name))
++        yield
++        log.append(("exit", stream.name))
++
++    monkeypatch.setattr(torch.cuda, "stream", on)
++    rows = 4
++
++    def fake_link(j):
++        box = SimpleNamespace(rep_bytes=torch.zeros(rows * D * 4, dtype=torch.uint8))
++        return SimpleNamespace(name=f"a2-{j}" if j else "a2", mode="gpu", base=1, box=box,
++                               stage_gpu=lambda seq, n, stream=None, j=j: log.append(("stage", j, seq, n, stream)))
++
++    links = [fake_link(0), fake_link(1)]
++    end = afd_mcdma.McdmaExpertLink(links, D, S, len(LAYERS), PREFILL, device="cpu")
++    assert end.side is None and end.out(rows) is None           # no CUDA device: no reply stream
++    end.side = side                                             # as on CUDA (__init__'s branch)
++    end.outs = [torch.zeros((PREFILL, D)) for _ in links]
++    end._computed = [_Ev(log, f"computed{j}") for j in range(2)]
++    end._sent = [_Ev(log, f"sent{j}") for j in range(2)]
++    end._used = [False, False]
++    end.n_rep = rows * D * 4
++    for k in range(3):
++        log.clear()
++        j = k % 2
++        dst = end.out(rows)
++        assert dst.data_ptr() == end.outs[j].data_ptr() and dst.shape == (rows, D)
++        dst.copy_(torch.full((rows, D), float(k + 1)))           # the compute's rows
++        end.reply(0, dst)
++        want = ([("wait", "compute", "sent0")] if k == 2 else []) + [
++            ("record", f"computed{j}", "compute"), ("wait", "reply", f"computed{j}"), ("enter", "reply"),
++            ("exit", "reply"), ("stage", j, 1 + k // 2, rows * D * 4, 22), ("record", f"sent{j}", "reply")]
++        assert log == want, (k, log)
++        assert torch.equal(links[j].box.rep_bytes.view(torch.float32).view(rows, D), torch.full((rows, D), k + 1.0))
++        assert end.at == (k + 1) % 2 and end.seqs[j] == 2 + k // 2
++    log.clear()
++    other = torch.full((rows, D), 9.0)                          # not ``out``'s rows: the compute stream's copy (today)
++    end.reply(0, other)
++    assert log == [("stage", 1, 2, rows * D * 4, None)]
++    assert torch.equal(links[1].box.rep_bytes.view(torch.float32).view(rows, D), other)
++
++
++# -- serve(): the handshake and the expert's links --------------------------------------------------------------------
++def test_serve_with_two_exchanges_in_flight(env, words, tmp_path):
++    """The expert nodes' ``serve`` over the store handshake with ``inflight`` 2: each opens its two links (link 1's
++    socket from ``socket_for``, each link's base from its own store key), echoes ``inflight``, and serves plain
++    forwards and a pair over both link pairs; the attention's watchdog keys see the BYE."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import afd as afd_mod
++    from tensorfold.families.glm5_next.cuda import afd_mcdma, experts_node, mcdma
++    from tests.glm_afd_fakes import buffers, forward
++
++    names = _names(2)
++    daemon = FakeDaemon(tmp_path, names)
++    env.setattr(afd_mod, "WATCH_EVERY", 3600)
++    env.setattr(experts_node, "ALIVE_EVERY", 3600)
++    env.setattr(experts_node.Config, "read", staticmethod(lambda _d: fake_cfg()))
++    env.setattr(experts_node, "ExpertNode", lambda _d, half, layers, **_: FakeNode(layers, half))
++    by_thread = {"x0": "a2", "x1": "a1"}
++    env.setattr(mcdma, "link_name", lambda: by_thread[threading.current_thread().name])
++    env.setattr(mcdma, "socket_for", lambda name, j: None if j == 0 else daemon.sock(name))
++    init = mcdma.ExpertLink.__init__
++    opened = []
++
++    def link_init(self, name, **kw):
++        kw.setdefault("socket_path", daemon.sock(name))
++        opened.append((threading.current_thread().name, name, kw["socket_path"] == daemon.sock(name)))
++        init(self, name, **kw)
++
++    env.setattr(mcdma.ExpertLink, "__init__", link_init)
++    port, errors = free_port(), {}
++
++    def run(half):
++        try:
++            experts_node.serve(tmp_path, half, "127.0.0.1", port, device="cpu")
++        except BaseException as exc:  # noqa: BLE001
++            errors[half] = exc
++
++    threads = [threading.Thread(target=run, args=(h,), name=f"x{h}", daemon=True) for h in (0, 1)]
++    for t in threads:
++        t.start()
++    links = mcdma.AttentionLinks(names, words=words, mode="cpu", timeout=10, shm_dir=str(daemon.shm), linkup_wait=2)
++    tr = afd_mcdma.McdmaTransport("127.0.0.1", port, links=links, device="cpu", hidden=D)
++    a = afd_mod.AfdWire("127.0.0.1", port, transport=tr)
++    a.announce(afd_mod.settings_for(tmp_path, fake_cfg(), prefill_rows=PREFILL, pairs=True))
++    a.wait_loaded(30)
++    assert sorted(opened) == [("x0", "a2", True), ("x0", "a2-1", True), ("x1", "a1", True), ("x1", "a1-1", True)]
++    b, gen = buffers(), torch.Generator().manual_seed(11)
++    for rows in (1, 4, PREFILL, 1):
++        forward(a, b, rows, gen, chunk=rows > 8)
++    tp._pair(a, (9, PREFILL), gen)
++    assert links.count == [len(LAYERS) * 3] * 4                 # 12 requests per node, alternating its two links
++    for x in names:
++        daemon.bye(x)
++    for t in threads:
++        t.join(10)
++        assert not t.is_alive()
++    assert all(isinstance(errors[h], mcdma.LinkError) for h in (0, 1)), errors
++    for r in (1, 2):
++        assert b"BYE" in bytes(a.store.get(f"afd_error/{r}"))
++    daemon.close()
+diff --git a/tests/test_glm_prefill_lanes.py b/tests/test_glm_prefill_lanes.py
+index 2deaac0..fe7f5c1 100644
+--- a/tests/test_glm_prefill_lanes.py
++++ b/tests/test_glm_prefill_lanes.py
+@@ -235,12 +235,18 @@ def test_the_lane_schedule(monkeypatch, n, kinds):
+     assert sum(1 for ev, _, _ in log if ev == "t") == n
+ 
+ 
+-def test_a_deeper_wire_is_refused(monkeypatch):
++def test_a_deeper_wire_needs_each_lanes_own_shared_output(monkeypatch):
++    """A wire of depth 2 (TF_GLM_MCDMA_INFLIGHT=2, tests/test_glm_mcdma_inflight.py) runs the lanes only when each
++    lane holds its own shared expert output (``FLIGHT_FIELDS``); lanes that share it are refused."""
++
++    import torch
++
+     from tensorfold.families.glm5_next.cuda import prefill_pairs as pp
+ 
+     e = SimpleNamespace(w=SimpleNamespace(afd=SimpleNamespace(depth=2)))
+-    with pytest.raises(ValueError, match="depth 2"):
+-        pp._forward_lanes(e, [pp.Chunk([None], k) for k in range(3)])
++    shared = SimpleNamespace(sy=torch.zeros(1))
++    with pytest.raises(ValueError, match="depth 2 need each lane's own sy"):
++        pp._forward_lanes(e, [pp.Chunk([None], k, shared) for k in range(3)])
+     assert pp._depth(SimpleNamespace()) == 1 and pp._depth(SimpleNamespace(depth=True)) == 1
+ 
+ 

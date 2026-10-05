@@ -1,0 +1,886 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 13:55:47 +0300
+Subject: [PATCH] feat(glm cuda): DFlash2 for several streams: batched block
+ passes and context updates (each stream's solo bits)
+
+dflash2_multi.MultiDrafter drafts up to 4 streams from one Drafter's weights, each from its own context ring
+(DraftContext, which stands in for a solo drafter in prefill, snapshots and restores):
+
+- block passes of several streams in one launch sequence: every kernel of a pass is row-independent except the
+  block attention, which reads each stream's own ring (a segmented kernel), and the selector projection and top-k,
+  which run per stream on its rows alone
+- context updates stack every stream's kept rows, each row with its own position and ring destination
+- CUDA graphs for 1..streams block passes and for update row buckets (padding rows go to trash rows)
+
+dflash2.py: merge_candidates (the solo candidates' merge, shared), a SEG flag on the dynamic convolution (blocks side
+by side), and Drafter.chain(confs=...) to walk a chain whole and report each pick's confidence (the picks unchanged).
+
+Tests (GPU): tests/cuda/test_glm_draft_multi.py: 1-4 streams at different lengths (ring wrapped, flat buffers),
+eager and graphs, two ranks as threads, against one solo Drafter per stream, bit for bit; 4-bit matmul rows
+independent of the row count at the real drafter's shapes.
+
+From the GLM-5.3-Flash EXL3 2x DGX Sparks recipe (MiaAI-Lab), patch 0027.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+---
+Credit: MiaAI-Lab's pull request ashhart/TensorFold#243, her commit 6a848caa01001eb4c5e39ea5ae63f8b67341307b,
+  https://github.com/ashhart/TensorFold/pull/243 (Apache-2.0, as TensorFold). Her authorship is kept.
+
+ .../families/glm5_next/cuda/dflash2.py        |  53 ++-
+ .../families/glm5_next/cuda/dflash2_multi.py  | 424 ++++++++++++++++++
+ tests/cuda/test_glm_draft_multi.py            | 308 +++++++++++++
+ 3 files changed, 767 insertions(+), 18 deletions(-)
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/dflash2_multi.py
+ create mode 100644 tests/cuda/test_glm_draft_multi.py
+
+diff --git a/src/tensorfold/families/glm5_next/cuda/dflash2.py b/src/tensorfold/families/glm5_next/cuda/dflash2.py
+index 309104e..29eb5c2 100644
+--- a/src/tensorfold/families/glm5_next/cuda/dflash2.py
++++ b/src/tensorfold/families/glm5_next/cuda/dflash2.py
+@@ -25,14 +25,19 @@ NO_LIMIT = 1e30
+ 
+ @triton.jit
+ def _dconv_kernel(X, DYN, BASE, RES, OUT, D: tl.constexpr, G: tl.constexpr, GS: tl.constexpr,
+-                  BRANCH: tl.constexpr, HAS_RES: tl.constexpr, BLOCK: tl.constexpr):
+-    """Two-tap grouped dynamic convolution over the block (row r mixes rows r and r - 1), plus the residual."""
++                  BRANCH: tl.constexpr, HAS_RES: tl.constexpr, BLOCK: tl.constexpr, SEG: tl.constexpr = 0):
++    """Two-tap grouped dynamic convolution over the block (row r mixes rows r and r - 1), plus the residual; SEG > 0:
++    the rows are blocks of SEG rows side by side (``dflash2_multi``), each block's first row mixing no row before."""
+ 
+     row = tl.program_id(0)
+     c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+     ok = c < D
+     x = tl.load(X + row * D + c, mask=ok, other=0.0).to(tl.float32)
+-    prev = tl.load(X + (row - 1) * D + c, mask=ok & (row > 0), other=0.0).to(tl.float32)
++    if SEG > 0:
++        has_prev = row % SEG != 0
++    else:
++        has_prev = row > 0
++    prev = tl.load(X + (row - 1) * D + c, mask=ok & has_prev, other=0.0).to(tl.float32)
+     grp = c // GS
+     d0 = tl.load(DYN + ((row * 2 + BRANCH) * 2) * G + grp, mask=ok, other=0.0).to(tl.float32)
+     d1 = tl.load(DYN + ((row * 2 + BRANCH) * 2 + 1) * G + grp, mask=ok, other=0.0).to(tl.float32)
+@@ -132,14 +137,14 @@ def _dattn_kernel(Q, K, V, OUT, POS, window, scale, N: tl.constexpr, G: tl.const
+ 
+ 
+ def _dconv(x: torch.Tensor, dyn: torch.Tensor, base: torch.Tensor, branch: int, group_size: int,
+-           residual: torch.Tensor | None = None) -> torch.Tensor:
++           residual: torch.Tensor | None = None, seg: int = 0) -> torch.Tensor:
+     rows, d = x.shape
+     x = x.contiguous()
+     out = torch.empty_like(x)
+     block = 1024
+     _dconv_kernel[(rows, triton.cdiv(d, block))](x, dyn.contiguous(), base, residual if residual is not None else x,
+                                                  out, D=d, G=d // group_size, GS=group_size, BRANCH=branch,
+-                                                 HAS_RES=residual is not None, BLOCK=block, num_warps=4)
++                                                 HAS_RES=residual is not None, BLOCK=block, SEG=seg, num_warps=4)
+     return out
+ 
+ 
+@@ -153,6 +158,20 @@ def _mm(x: torch.Tensor, w: qmm.Q4, xs: torch.Tensor | None = None, *, f32: bool
+     return qmm.matmul(x, w, xs, f32=f32)
+ 
+ 
++def merge_candidates(g: torch.Tensor, proj: torch.Tensor, k: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
++    """A block pass's host rows -> (ids [depth, k], logits, projected rows): ``g`` [ranks, depth, 2 * k] (each rank's
++    top-k values, then ids as fp32 bits), merged by value then id over the ranks; ``proj`` [depth, selector rank]."""
++
++    values = torch.cat([g[r, :, :k] for r in range(g.shape[0])], dim=1).numpy().astype(np.float64)
++    tokens = torch.cat([g[r, :, k:].contiguous().view(torch.int32) for r in range(g.shape[0])],
++                       dim=1).numpy().astype(np.int64)
++    if g.shape[0] > 1:
++        order = np.lexsort((tokens, -values), axis=-1)[:, :k]
++        values = np.take_along_axis(values, order, axis=1)
++        tokens = np.take_along_axis(tokens, order, axis=1)
++    return tokens, values, proj.numpy().astype(np.float64)          # astype copies: nothing keeps the host buffer
++
++
+ @dataclass
+ class DraftLayer:
+     in_norm: torch.Tensor
+@@ -434,20 +453,15 @@ class Drafter:
+             self.block_graph.replay()
+         else:
+             self._block_compute()
+-        g = self.packed[:, :depth].cpu()
+-        k = self.top_k
+-        values = torch.cat([g[r, :, :k] for r in range(g.shape[0])], dim=1).numpy().astype(np.float64)
+-        tokens = torch.cat([g[r, :, k:].contiguous().view(torch.int32) for r in range(g.shape[0])],
+-                           dim=1).numpy().astype(np.int64)
+-        if g.shape[0] > 1:
+-            order = np.lexsort((tokens, -values), axis=-1)[:, :k]
+-            values = np.take_along_axis(values, order, axis=1)
+-            tokens = np.take_along_axis(tokens, order, axis=1)
+-        return tokens, values, self.proj[:depth].cpu().numpy().astype(np.float64)
++        return merge_candidates(self.packed[:, :depth].cpu(), self.proj[:depth].cpu(), self.top_k)
+ 
+     def chain(self, tokens: np.ndarray, values: np.ndarray, proj: np.ndarray, anchor: int, first: int,
+-              sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
+-        """Choose candidates with selector edges and target keyed noise; stop below cumulative confidence, always keeping the first draft."""
++              sampling: Sampling | None, confidence: float = 0.0, *, confs: list | None = None) -> list[int]:
++        """Choose candidates with selector edges and target keyed noise; stop below cumulative confidence, always keeping the first draft.
++
++        ``confs`` (a list): the chain is walked whole and each pick's confidence (the softmax share of its score)
++        appended to it, for a caller that cuts the chains itself (``multi``'s joint allocation). Only where the chain
++        stops changes: the picks are the same."""
+ 
+         depth = tokens.shape[0]
+         sampled = sampling is not None and sampling.temperature > 0
+@@ -462,7 +476,10 @@ class Drafter:
+             score = (values[d] + EDGE * edge) / temp
+             pick = score + NOISE * noise[d] if noise is not None else score
+             j = int(np.argmax(pick))
+-            if confidence > 0:
++            if confs is not None:
++                p = np.exp(score - score.max())
++                confs.append(float(p[j] / p.sum()))
++            elif confidence > 0:
+                 p = np.exp(score - score.max())
+                 chain *= float(p[j] / p.sum())
+                 if d > 0 and chain < confidence:
+diff --git a/src/tensorfold/families/glm5_next/cuda/dflash2_multi.py b/src/tensorfold/families/glm5_next/cuda/dflash2_multi.py
+new file mode 100644
+index 0000000..f1c576f
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/dflash2_multi.py
+@@ -0,0 +1,424 @@
++"""DFlash2 for several streams at once: one drafter's weights, a context ring per stream, block passes and context
++updates of several streams in one launch sequence, each stream's candidates the bits of its own solo ``Drafter``.
++
++Every kernel of a block pass is row-independent (the 4-bit matmuls run the same groups and K slices at any row
++count, ``qmm``; norms, rotary, the dynamic convolutions per block, ``_prep``) except the block attention, which reads
++each stream's own ring (a per-segment slot and position table), and the two ops whose kernels could depend on the row
++count (cuBLAS's selector projection and ``torch.topk``), which run per stream on that stream's rows alone. Context
++updates stack every stream's kept rows; each row carries its own position and ring destination.
++
++API (both ranks call it identically, the same streams in the same order):
++
++    md = MultiDrafter(drafter, streams=4)          # drafter: a dflash2.Drafter (its weights are shared)
++    ctx = md.contexts[i]                            # stream i's DraftContext (duck-types a Drafter's context for
++                                                    # decode.prefill / take_snapshot / restore: add_taps, reset,
++                                                    # context_end, pos_dev, kc, vc, ring, window)
++    chains = md.propose([DraftRequest(ctx, pending, depth, sampling, confidence), ...])
++    md.commit([(ctx, taps), ...])                   # each stream's kept rows' taps [n, 5 * D], after verify
++    md.capture()                                    # CUDA graphs: block passes of 1..streams, updates by row bucket
++"""
++
++from __future__ import annotations
++
++from collections.abc import Sequence
++from dataclasses import dataclass
++
++import numpy as np
++import torch
++import torch.nn.functional as F
++import triton
++import triton.language as tl
++
++from tensorfold.engine.exact_sampling import Sampling
++
++from . import glue
++from .dflash2 import NO_LIMIT, Drafter, _dconv, _mm, merge_candidates
++
++
++@triton.jit
++def _dattn_seg_kernel(Q, K, V, OUT, POS, SLOT, window, scale, L, SLOT_ROWS,
++                      N: tl.constexpr, G: tl.constexpr, NH: tl.constexpr, HD: tl.constexpr, CAP: tl.constexpr,
++                      BK: tl.constexpr, CAUSAL: tl.constexpr, RING: tl.constexpr):
++    """``dflash2._dattn_kernel`` for block ``seg`` (program 1) of L rows side by side: its queries at rows seg * N of
++    Q [heads, L, HD], its context in slot SLOT[seg] (rows slot * CAP .. of K / V [kv heads, SLOT_ROWS, HD]) at
++    position POS[seg]. The same loop and arithmetic as the solo kernel, so each block gets its solo bits."""
++
++    kvh = tl.program_id(0)
++    seg = tl.program_id(1)
++    M: tl.constexpr = G * N
++    m = tl.arange(0, M)
++    qh = kvh * G + m // N
++    qr = m % N
++    d = tl.arange(0, HD)
++    q = tl.load(Q + (qh[:, None] * L + seg * N + qr[:, None]) * HD + d[None, :])
++    s = tl.load(POS + seg).to(tl.int32)
++    base = kvh.to(tl.int64) * SLOT_ROWS + tl.load(SLOT + seg).to(tl.int64) * CAP
++    klen = s + N
++    qpos = s + qr
++    m_i = tl.full([M], -1e30, tl.float32)
++    l_i = tl.zeros([M], tl.float32)
++    acc = tl.zeros([M, HD], tl.float32)
++    lo = 0
++    if RING:
++        lo = tl.maximum(s - window, 0) // BK * BK
++    for start in range(lo, klen, BK):
++        kk = start + tl.arange(0, BK)
++        kin = kk < klen
++        if RING:
++            row = kk % CAP
++        else:
++            row = kk
++        k = tl.load(K + (base + row[:, None]) * HD + d[None, :], mask=kin[:, None], other=0.0)
++        v = tl.load(V + (base + row[:, None]) * HD + d[None, :], mask=kin[:, None], other=0.0)
++        sc = tl.dot(q, tl.trans(k)) * scale
++        ok = kin[None, :] & (((kk[None, :] < s) & (qpos[:, None] - kk[None, :] <= window)) | (kk[None, :] >= s))
++        if CAUSAL:
++            ok = ok & (kk[None, :] <= qpos[:, None])
++        sc = tl.where(ok, sc, float("-inf"))
++        m_new = tl.maximum(m_i, tl.max(sc, axis=1))
++        alpha = tl.exp(m_i - m_new)
++        p = tl.exp(sc - m_new[:, None])
++        l_i = l_i * alpha + tl.sum(p, axis=1)
++        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
++        m_i = m_new
++    out = acc / l_i[:, None]
++    tl.store(OUT + (seg * N + qr[:, None]) * (NH * HD) + qh[:, None] * HD + d[None, :], out.to(tl.bfloat16))
++
++
++class DraftContext:
++    """One stream's DFlash2 context: its slot of the shared ring pool (``kc`` / ``vc`` per layer are views
++    [kv heads, ring rows, head_dim]) and where its committed rows end. Stands in for a solo ``Drafter`` wherever one
++    stream's context is handled on its own (``decode.prefill``, ``take_snapshot``, ``restore``)."""
++
++    def __init__(self, owner: MultiDrafter, slot: int) -> None:
++        d = owner.d
++        self.owner, self.slot = owner, slot
++        self.ring, self.window, self.block, self.capacity = d.ring, d.window, d.block, d.capacity
++        self.tap_layers = d.tap_layers
++        cap = owner.cap
++        self.kc = [c[:, slot * cap:(slot + 1) * cap] for c in owner.kc]
++        self.vc = [c[:, slot * cap:(slot + 1) * cap] for c in owner.vc]
++        self.pos_dev = owner.pos[slot:slot + 1]          # the device mirror of context_end (restore fills it)
++        self.context_end = 0
++
++    def reset(self) -> None:
++        self.context_end = 0
++        self.pos_dev.zero_()
++
++    def add_taps(self, taps: torch.Tensor) -> None:
++        """This stream's committed rows' taps alone (a prompt's chunks): ``MultiDrafter.commit`` of one stream."""
++        self.owner.commit([(self, taps)])
++
++    def propose(self, pending: int, depth: int, sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
++        return self.owner.propose([DraftRequest(self, pending, depth, sampling, confidence)])[0]
++
++
++@dataclass
++class DraftRequest:
++    """One stream's draft for a round: ``Drafter.propose``'s arguments with the stream's context."""
++
++    ctx: DraftContext
++    pending: int
++    depth: int
++    sampling: Sampling | None = None
++    confidence: float = 0.0
++
++
++class MultiDrafter:
++    """Up to ``streams`` DFlash2 streams over one ``Drafter``'s weights (its own context buffers stay unused).
++
++    The ring pool per layer is [kv heads, streams * cap + trash, head_dim]: stream i's rows at i * cap .. (the
++    drafter's ring, or a flat capacity + block when it has none), then ``trash`` rows that padded context updates
++    (a captured row bucket larger than the rows kept) write to."""
++
++    def __init__(self, drafter: Drafter, streams: int = 4, *, tap_rows: int = 8) -> None:
++        """``tap_rows``: the most rows a stream commits in a round (its verify window, ``engine.MAX_ROWS``)."""
++
++        d = self.d = drafter
++        if streams < 1:
++            raise ValueError("a multi-stream drafter needs at least one stream")
++        self.streams = streams
++        self.dev = d.dev
++        self.block = d.block
++        self.cap = d.cap
++        # ranks whose candidates a block pass gathers (the solo drafter's all-gather of its vocabulary shards)
++        self.gathered = d.world if d.world > 1 and d.w.comm is not None else 1
++        n = self.block
++        # context updates: rows per launch (every stream's kept rows stacked), padded to a multiple of the block
++        rows = max(64, streams * tap_rows)
++        self.t_max = -(-rows // n) * n
++        self.trash = self.t_max
++        self.slot_rows = streams * self.cap + self.trash
++        KV, hd = d.kvh, d.hd
++        self.kc = [torch.zeros((KV, self.slot_rows, hd), dtype=torch.bfloat16, device=self.dev) for _ in d.layers]
++        self.vc = [torch.zeros((KV, self.slot_rows, hd), dtype=torch.bfloat16, device=self.dev) for _ in d.layers]
++        self.pos = torch.zeros((streams + 1,), dtype=torch.int64, device=self.dev)   # + the trash entry
++        self.contexts = [DraftContext(self, i) for i in range(streams)]
++        pinned = torch.cuda.is_available()
++        # block passes: [pending x streams | slot x streams | position x streams]
++        self.b_meta = torch.zeros((3 * streams,), dtype=torch.int64, device=self.dev)
++        self.b_host = torch.zeros((3 * streams,), dtype=torch.int64, pin_memory=pinned)
++        self.ids = torch.full((streams * n,), d.mask_id, dtype=torch.int32, device=self.dev)
++        self.ar = torch.arange(max(64, n), device=self.dev)
++        # context updates: [position x t_max | destination row x t_max | slot x streams | end x streams]
++        T = self.t_max
++        self.t_meta = torch.zeros((2 * T + 2 * streams,), dtype=torch.int64, device=self.dev)
++        self.t_host = torch.zeros((2 * T + 2 * streams,), dtype=torch.int64, pin_memory=pinned)
++        self.t_ready = torch.cuda.Event() if pinned else None
++        self.tap_in = torch.zeros((T, d.tap_in.shape[1]), dtype=torch.bfloat16, device=self.dev)
++        m = n - 1
++        self.cand_n = self.gathered * streams * m * 2 * d.top_k
++        self.cand = torch.zeros((self.cand_n + streams * m * d.hproj.shape[0],), dtype=torch.float32,
++                                device=self.dev)
++        self.cand_host = torch.zeros(self.cand.shape, dtype=torch.float32, pin_memory=pinned)
++        self.cand_ready = torch.cuda.Event() if pinned else None
++        self.proj = self.cand[self.cand_n:].view(streams * m, d.hproj.shape[0])
++        self.pool = None
++        self.block_graphs: dict[int, torch.cuda.CUDAGraph] = {}
++        self.tap_graphs: dict[int, torch.cuda.CUDAGraph] = {}
++        self.buckets = list(range(n, T + 1, n))
++
++    def nbytes(self) -> int:
++        """The pool's context rows (the weights are the drafter's)."""
++        return 2 * sum(t.numel() * 2 for t in self.kc)
++
++    def reset(self) -> None:
++        for c in self.contexts:
++            c.reset()
++
++    # -- pieces -------------------------------------------------------------------------------------------------
++    def _rotary(self, pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        phase = pos.to(torch.float32)[:, None] * self.d.inv_freq[None, :]
++        return phase.cos().contiguous(), phase.sin().contiguous()
++
++    def _local(self, pos: torch.Tensor) -> torch.Tensor:
++        return pos % self.d.ring if self.d.ring else pos
++
++    def _layer(self, i: int, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, idx: torch.Tensor, S: int,
++               pos: torch.Tensor, slot: torch.Tensor) -> torch.Tensor:
++        """``Drafter._layer`` over S blocks side by side; the attention reads each block's own slot."""
++
++        d = self.d
++        L = d.layers[i]
++        n = self.block
++        rows = x.shape[0]
++        normed, xs = d._norm(x, L.in_norm)
++        dyn = _mm(normed, L.a_kp, xs)
++        q, k, v = d._prep(_mm(_dconv(normed, dyn, L.a_base, 0, d.gs, seg=n), L.qkv), L, cos, sin, d.heads)
++        self.kc[i].index_copy_(1, idx, k)
++        self.vc[i].index_copy_(1, idx, v)
++        out = torch.empty((rows, d.heads * d.hd), dtype=torch.bfloat16, device=self.dev)
++        _dattn_seg_kernel[(d.kvh, S)](q, self.kc[i], self.vc[i], out, pos, slot, d.window, d.hd ** -0.5, rows,
++                                      self.slot_rows, N=n, G=d.heads // d.kvh, NH=d.heads, HD=d.hd, CAP=self.cap,
++                                      BK=64, CAUSAL=d.causal, RING=bool(d.ring), num_warps=4)
++        x = _dconv(d._row(out, L.o), dyn, L.a_base, 1, d.gs, x, seg=n)
++        normed, xs = d._norm(x, L.post_norm)
++        dyn = _mm(normed, L.m_kp, xs)
++        gu = _mm(_dconv(normed, dyn, L.m_base, 0, d.gs, seg=n), L.gu)
++        act = torch.empty((rows, d.inter), dtype=torch.bfloat16, device=self.dev)
++        axs = torch.empty((rows, d.inter // 64), dtype=torch.float32, device=self.dev)
++        glue.swiglu(gu, act, axs, NO_LIMIT)
++        return _dconv(d._row(act, L.down, axs), dyn, L.m_base, 1, d.gs, x, seg=n)
++
++    def _block_compute(self, S: int) -> None:
++        """S streams' blocks [pending, mask x (block - 1)] at their committed lengths (``b_meta``), then each
++        stream's candidates and projected rows as its solo pass leaves them, stream s at rows s * (block - 1)."""
++
++        d, w = self.d, self.d.w
++        n, St = self.block, self.streams
++        pend, slot, pos = self.b_meta[:S], self.b_meta[St:St + S], self.b_meta[2 * St:2 * St + S]
++        self.ids.view(St, n)[:S, 0].copy_(pend)
++        rowpos = (pos[:, None] + self.ar[:n][None, :]).reshape(-1)
++        idx = (slot[:, None] * self.cap + self._local(rowpos).view(S, n)).reshape(-1)
++        R = S * n
++        x = torch.empty((R, d.D), dtype=torch.bfloat16, device=self.dev)
++        glue.embed(self.ids[:R], w.embed, d.D, 1, x)
++        cos, sin = self._rotary(rowpos)
++        for i in range(len(d.layers)):
++            x = self._layer(i, x, cos, sin, idx, S, pos, slot)
++        m, k = n - 1, d.top_k
++        h, hs = d._norm(x.view(S, n, d.D)[:, 1:].reshape(S * m, d.D), d.norm)
++        logits = _mm(h, w.draft_head if w.draft_head is not None else w.head, hs).float()
++        packed = torch.empty((S * m, 2 * k), dtype=torch.float32, device=self.dev)
++        for s in range(S):                  # torch.topk and cuBLAS may pick kernels by row count: one stream each
++            rows = slice(s * m, (s + 1) * m)
++            vals, local = torch.topk(logits[rows], k, dim=-1)
++            gids = (local + w.vocab_offset).to(torch.int32)
++            packed[rows] = torch.cat([vals, gids.view(torch.float32)], dim=1)
++            self.proj[rows].copy_(F.linear(h[rows], d.hproj).float())
++        size = self.gathered * S * m * 2 * k
++        if self.gathered > 1:
++            w.comm.all_gather(packed.view(-1), self.cand[:size])
++        else:
++            self.cand[:size].copy_(packed.view(-1))
++
++    def _taps_compute(self, T: int) -> None:
++        """Context updates of T stacked rows (``t_meta``: each row's position and destination), then each updated
++        stream's device end."""
++
++        d, St, Tm = self.d, self.streams, self.t_max
++        pos, idx = self.t_meta[:T], self.t_meta[Tm:Tm + T]
++        ctx, _ = d._norm(_mm(self.tap_in[:T], d.fc), d.hidden_norm)
++        cos, sin = self._rotary(pos)
++        for i, L in enumerate(d.layers):
++            _, k, v = d._prep(_mm(ctx, L.kv), L, cos, sin, 0)
++            self.kc[i].index_copy_(1, idx, k)
++            self.vc[i].index_copy_(1, idx, v)
++        self.pos.index_copy_(0, self.t_meta[2 * Tm:2 * Tm + St], self.t_meta[2 * Tm + St:2 * Tm + 2 * St])
++
++    # -- graphs -------------------------------------------------------------------------------------------------
++    def _trash_tables(self) -> None:
++        """Tables that send every row to the trash rows (captures and their warm-ups touch no stream)."""
++
++        St, Tm = self.streams, self.t_max
++        self.b_meta.zero_()
++        self.b_meta[St:2 * St].fill_(St)                 # slot St: rows St * cap .., the trash (block < trash)
++        self.t_meta.zero_()
++        self.t_meta[Tm:2 * Tm].copy_(St * self.cap + torch.arange(Tm, device=self.dev))
++        self.t_meta[2 * Tm:2 * Tm + St].fill_(St)       # the trash end
++
++    @torch.no_grad()
++    def capture(self) -> None:
++        """CUDA graphs for block passes of 1..streams streams and context updates of each row bucket (a multiple of
++        the block up to ``t_max``), both ranks together. Stream contexts are left as they were."""
++
++        ends = [c.context_end for c in self.contexts]
++        saved = self.pos.clone()
++        self.pool = torch.cuda.graph_pool_handle()
++        self._trash_tables()
++        for T in self.buckets:
++            for _ in range(2):
++                self._taps_compute(T)
++            torch.cuda.synchronize()
++            g = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(g, pool=self.pool):
++                self._taps_compute(T)
++            self.tap_graphs[T] = g
++        for S in range(1, self.streams + 1):
++            for _ in range(2):
++                self._block_compute(S)
++            torch.cuda.synchronize()
++            g = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(g, pool=self.pool):
++                self._block_compute(S)
++            self.block_graphs[S] = g
++        torch.cuda.synchronize()
++        self.pos.copy_(saved)
++        for c, e in zip(self.contexts, ends):
++            c.context_end = e
++
++    def drop_graphs(self) -> None:
++        self.block_graphs, self.tap_graphs = {}, {}
++
++    # -- the context ---------------------------------------------------------------------------------------------
++    def _launch_taps(self, pieces: list[tuple[DraftContext, torch.Tensor, int]]) -> None:
++        St, Tm = self.streams, self.t_max
++        if self.t_ready is not None:
++            self.t_ready.synchronize()                   # the last update's table has left t_host
++        h = self.t_host
++        h[2 * Tm:2 * Tm + St].fill_(St)
++        h[2 * Tm + St:].zero_()
++        off = 0
++        for j, (c, part, p0) in enumerate(pieces):
++            r = part.shape[0]
++            self.tap_in[off:off + r].copy_(part)
++            p = torch.arange(p0, p0 + r, dtype=torch.int64)
++            h[off:off + r] = p
++            h[Tm + off:Tm + off + r] = c.slot * self.cap + (p % self.d.ring if self.d.ring else p)
++            h[2 * Tm + j], h[2 * Tm + St + j] = c.slot, p0 + r
++            off += r
++        T = off
++        g = None
++        if self.tap_graphs:
++            T = next(b for b in self.buckets if b >= off)
++            g = self.tap_graphs[T]
++        if T > off:                                      # padded rows: the trash
++            h[off:T] = 0
++            h[Tm + off:Tm + T] = St * self.cap + torch.arange(off, T, dtype=torch.int64)
++        self.t_meta.copy_(h, non_blocking=True)
++        if self.t_ready is not None:
++            self.t_ready.record()
++        if g is not None:
++            g.replay()
++        else:
++            self._taps_compute(T)
++        for c, part, p0 in pieces:
++            c.context_end = p0 + part.shape[0]
++
++    @torch.no_grad()
++    def commit(self, items: Sequence[tuple[DraftContext, torch.Tensor]]) -> None:
++        """Each stream's committed rows' taps [n, 5 * D] (bf16) at its positions context_end, context_end + 1, ...:
++        every stream's rows stacked into launches of up to ``t_max`` rows."""
++
++        seen: set[int] = set()
++        for c, taps in items:
++            if c.owner is not self or c.slot in seen:
++                raise ValueError("commit takes each of this drafter's streams at most once")
++            seen.add(c.slot)
++            if c.context_end + taps.shape[0] > c.capacity:
++                raise ValueError("drafter context past its capacity")
++        pieces: list[tuple[DraftContext, torch.Tensor, int]] = []
++        used = 0
++        for c, taps in items:
++            start, end = 0, c.context_end
++            while start < taps.shape[0]:
++                take = min(taps.shape[0] - start, self.t_max - used)
++                pieces.append((c, taps[start:start + take], end))
++                start, end, used = start + take, end + take, used + take
++                if used == self.t_max:
++                    self._launch_taps(pieces)
++                    pieces, used = [], 0
++        if pieces:
++            self._launch_taps(pieces)
++
++    # -- drafts -------------------------------------------------------------------------------------------------
++    @torch.no_grad()
++    def candidates(self, reqs: Sequence[tuple[DraftContext, int, int]]) -> list[tuple[np.ndarray, ...]]:
++        """(stream, pending, depth) -> each stream's ``Drafter.candidates(pending, depth)``: one batched pass."""
++
++        S, St = len(reqs), self.streams
++        if not 1 <= S <= St:
++            raise ValueError(f"a block pass takes 1..{St} streams, got {S}")
++        if len({c.slot for c, _, _ in reqs}) != S or any(c.owner is not self for c, _, _ in reqs):
++            raise ValueError("a block pass takes each of this drafter's streams at most once")
++        h = self.b_host
++        for s, (c, pending, _) in enumerate(reqs):
++            h[s], h[St + s], h[2 * St + s] = int(pending), c.slot, c.context_end
++        self.b_meta.copy_(h, non_blocking=True)
++        g = self.block_graphs.get(S)
++        if g is not None:
++            g.replay()
++        else:
++            self._block_compute(S)
++        if self.cand_ready is not None:
++            self.cand_host.copy_(self.cand, non_blocking=True)
++            self.cand_ready.record()
++            self.cand_ready.synchronize()
++        else:
++            self.cand_host.copy_(self.cand)
++        d = self.d
++        m, k = self.block - 1, d.top_k
++        g_all = self.cand_host[:self.gathered * S * m * 2 * k].view(self.gathered, S * m, 2 * k)
++        p_all = self.cand_host[self.cand_n:].view(St * m, -1)
++        out = []
++        for s, (_, _, depth) in enumerate(reqs):
++            out.append(merge_candidates(g_all[:, s * m:s * m + depth], p_all[s * m:s * m + depth], k))
++        return out
++
++    def propose(self, reqs: Sequence[DraftRequest]) -> list[list[int]]:
++        """Each stream's ``Drafter.propose``: streams with a depth and a context share one block pass; the others
++        get [] (as a solo drafter runs none for them)."""
++
++        out: list[list[int]] = [[] for _ in reqs]
++        live = []
++        for i, r in enumerate(reqs):
++            depth = min(r.depth, self.block - 1)
++            if depth >= 1 and r.ctx.context_end > 0:
++                live.append((i, depth))
++        if not live:
++            return out
++        got = self.candidates([(reqs[i].ctx, reqs[i].pending, depth) for i, depth in live])
++        for (i, _), (tokens, values, proj) in zip(live, got):
++            r = reqs[i]
++            out[i] = self.d.chain(tokens, values, proj, r.pending, r.ctx.context_end + 1, r.sampling, r.confidence)
++        return out
+diff --git a/tests/cuda/test_glm_draft_multi.py b/tests/cuda/test_glm_draft_multi.py
+new file mode 100644
+index 0000000..7613167
+--- /dev/null
++++ b/tests/cuda/test_glm_draft_multi.py
+@@ -0,0 +1,308 @@
++"""DFlash2 for several streams (dflash2_multi) against one solo Drafter per stream, bit for bit: 1-4 streams at
++different context lengths (the ring wrapped, flat buffers too) in batched block passes and batched context updates,
++eager and in CUDA graphs, and two ranks (threads) eager; the 4-bit matmuls' rows independent of the row count at the
++synthetic and the real drafter's shapes; batched vs sequential timings (printed with -s).
++
++Small: the one-layer synthetic drafter of test_glm_engine, a few MiB of caches; the real-shape matmuls use random
++weights, one matrix at a time."""
++
++from __future__ import annotations
++
++import json
++import time
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++
++if not torch.cuda.is_available():
++    pytest.skip("CUDA only", allow_module_level=True)
++
++from test_glm_engine import DRAFT, D, V, _drafter  # noqa: E402
++
++# per-rank (N, K) of the real drafter (hidden 4096, 32 / 8 heads of 128, MLP 12,288, 5 taps; two ranks, then one)
++# and of a vocabulary head's slice, plus the synthetic drafter's
++REAL = [(1024, 4096), (3072, 4096), (1024, 4096), (4096, 2048), (12288, 4096), (4096, 6144), (4096, 20480),
++        (16384, 4096), (6144, 4096), (2048, 4096), (4096, 4096), (24576, 4096), (4096, 12288)]
++SYNTH = [(128, 512), (1536, 512), (512, 512), (512, 1024), (512, 256), (1024, 512), (V, 512)]
++
++
++@pytest.mark.parametrize("n,k", REAL + SYNTH)
++def test_q4_rows_do_not_depend_on_the_row_count(n, k):
++    """A block pass's matmuls take 8 rows alone, S x 8 batched (to 32); updates up to 64 stacked rows; the head 7
++    rows alone, S x 7 batched: every row's bits (bf16 and fp32 outputs) are the same at every row count."""
++
++    from tensorfold.families.glm5_next.cuda import qmm
++
++    g = torch.Generator(device="cuda").manual_seed(n * 7 + k)
++    q = qmm.quantize4((torch.randn((n, k), generator=g, device="cuda") * 0.03).bfloat16())
++    x = torch.randn((64, k), generator=g, device="cuda").bfloat16()
++    for f32 in (False, True):
++        full = qmm.matmul(x, q, f32=f32)
++        for r in (1, 7, 8, 9, 14, 16, 17, 21, 24, 28, 32, 33, 40, 48, 56, 63):
++            assert torch.equal(qmm.matmul(x[:r], q, f32=f32), full[:r]), (r, f32)
++        for a, b in ((8, 16), (16, 24), (24, 32), (7, 14), (21, 28)):   # a later block alone
++            assert torch.equal(qmm.matmul(x[a:b].clone(), q, f32=f32), full[a:b]), (a, b, f32)
++    del q, x
++    torch.cuda.empty_cache()
++
++
++def _weights():
++    from tensorfold.families.glm5_next.cuda import qmm
++
++    g = torch.Generator(device="cuda").manual_seed(5)
++    embed = (torch.randn((V, D), generator=g, device="cuda") * 0.05).bfloat16()
++    head = qmm.quantize4((torch.randn((V, D), generator=g, device="cuda") * 0.03).bfloat16())
++    return SimpleNamespace(device=torch.device("cuda"), rank=0, world=1, comm=None, embed=embed, head=head,
++                           draft_head=None, vocab_offset=0)
++
++
++STREAMS = 4
++
++
++@pytest.fixture(scope="module", params=[(2048, True), (49, True), (2048, False)],
++                ids=["window2047-ring", "window48-ring", "window2047-flat"])
++def rig(request, tmp_path_factory):
++    from tensorfold.families.glm5_next.cuda.dflash2 import Drafter
++    from tensorfold.families.glm5_next.cuda.dflash2_multi import MultiDrafter
++
++    window, ring = request.param
++    path = tmp_path_factory.mktemp(f"dmulti{window}{ring}")
++    _drafter(path)
++    (path / "config.json").write_text(json.dumps(dict(DRAFT, sliding_window=window)))
++    w = _weights()
++    solos = [Drafter(path, w, capacity=9000, ring=ring) for _ in range(STREAMS)]
++    base = Drafter(path, w, capacity=9000, ring=ring)
++    for s in solos:                          # the same weights (quantized alike): the drafts' only other input
++        assert torch.equal(s.fc.weight, base.fc.weight) and torch.equal(s.layers[0].gu.weight, base.layers[0].gu.weight)
++    multi = MultiDrafter(base, streams=STREAMS)
++    assert multi.t_max == 64 and multi.cap == base.cap
++    yield solos, multi
++    del solos, multi, base
++    torch.cuda.empty_cache()
++
++
++def _drive(rig, seed: int, rounds: int = 60) -> int:
++    """Four streams prompted to different lengths (one past the ring several times, one short, one alone in a batch
++    commit of every prompt), then rounds of random stream subsets in random order: each stream's candidates, logits
++    and selector rows, and its sampled / greedy chains, equal to its solo drafter's; kept rows committed batched on
++    one side, one stream at a time on the other. A kept state taken, run past and restored on the way."""
++
++    from tensorfold.engine.exact_sampling import Sampling
++    from tensorfold.families.glm5_next.cuda import decode
++    from tensorfold.families.glm5_next.cuda.dflash2_multi import DraftRequest
++
++    solos, multi = rig
++    ctxs = multi.contexts
++    rng = np.random.default_rng(seed)
++    width = solos[0].tap_in.shape[1]
++    gen = torch.Generator(device="cuda").manual_seed(seed)
++    compared = 0
++
++    def taps(n: int) -> torch.Tensor:
++        return (torch.randn((n, width), generator=gen, device="cuda") * 0.5).bfloat16()
++
++    def check_ends() -> None:
++        for s, c in zip(solos, ctxs):
++            assert s.context_end == c.context_end
++            assert int(c.pos_dev.item()) == c.context_end == int(s.pos_dev.item())
++
++    for s in solos:
++        s.reset()
++    multi.reset()
++    # prompts: stream 0 3,481 rows in chunks, stream 1 5,300 (the ring wraps twice), stream 2 17, stream 3 700;
++    # streams 0 and 1 one at a time (ctx.add_taps), then all four in one batched commit
++    for i, chunks in ((0, (300, 64, 1000, 17, 2100)), (1, (2048, 2048, 1204))):
++        for n in chunks:
++            t = taps(n)
++            solos[i].add_taps(t)
++            ctxs[i].add_taps(t)
++    items = [(ctxs[i], taps(n)) for i, n in ((2, 17), (3, 700), (0, 5), (1, 90))]
++    for c, t in items:
++        solos[c.slot].add_taps(t)
++    multi.commit(items)
++    check_ends()
++
++    def one_round() -> None:
++        nonlocal compared
++        S = int(rng.integers(1, STREAMS + 1))
++        pick = [int(i) for i in rng.permutation(STREAMS)[:S]]
++        pend = [int(rng.integers(0, 1000)) for _ in pick]
++        depth = [int(rng.integers(1, solos[0].block)) for _ in pick]
++        got = multi.candidates([(ctxs[i], p, d) for i, p, d in zip(pick, pend, depth)])
++        for i, p, d, g in zip(pick, pend, depth, got):
++            want = solos[i].candidates(p, d)
++            assert all(np.array_equal(a, b) for a, b in zip(want, g)), (i, solos[i].context_end, compared)
++            compared += 1
++        # chains through propose: sampled (keyed noise) or greedy, with or without a stop rule
++        reqs, want = [], []
++        for i, p in zip(pick, pend):
++            samp = Sampling(seed=int(rng.integers(1 << 30)), temperature=1.0) if rng.random() < 0.7 else None
++            conf = float(rng.choice([0.0, 0.05, 0.3]))
++            reqs.append(DraftRequest(ctxs[i], p, 7, samp, conf))
++            want.append(solos[i].propose(p, 7, samp, conf))
++        assert multi.propose(reqs) == want
++        # kept rows: the drafted streams and sometimes another, 1..8 rows each
++        keep = pick + [int(i) for i in range(STREAMS) if i not in pick and rng.random() < 0.3]
++        items = [(ctxs[i], taps(int(rng.integers(1, 9)))) for i in keep]
++        for c, t in items:
++            solos[c.slot].add_taps(t)
++        multi.commit(items)
++        check_ends()
++
++    for _ in range(rounds):
++        one_round()
++    # a kept state of stream 1 (ring: its window copied), the stream run on past its ring, then restored
++    e = SimpleNamespace(st=SimpleNamespace(cur=[], rec=[torch.zeros(1, device="cuda")],
++                                           conv=torch.zeros(1, device="cuda"), mtp_len=0, mtp_drafted=0,
++                                           set_pos=lambda n: None, set_mtp_len=lambda n: None))
++    n1 = solos[1].context_end
++    snaps = [decode.take_snapshot(e, list(range(n1)), None, mtp=False, drafter=d) for d in (solos[1], ctxs[1])]
++    t = taps(2500)
++    solos[1].add_taps(t)
++    multi.commit([(ctxs[1], t)])
++    for _ in range(rounds // 3):
++        one_round()
++    extra = ctxs[1].context_end - n1
++    for d, s in zip((solos[1], ctxs[1]), snaps):
++        decode.restore(e, s, d)
++    check_ends()
++    assert extra > 2500
++    for _ in range(rounds):
++        one_round()
++    return compared
++
++
++def test_streams_draft_their_solo_bits_eager(rig):
++    assert _drive(rig, 1) > 200
++
++
++def test_streams_draft_their_solo_bits_in_cuda_graphs(rig):
++    solos, multi = rig
++    for s in solos:
++        s.capture()
++    multi.capture()
++    assert sorted(multi.block_graphs) == [1, 2, 3, 4] and sorted(multi.tap_graphs) == list(range(8, 65, 8))
++    try:
++        assert _drive(rig, 2) > 200
++    finally:
++        for s in solos:
++            s.block_graph, s.tap_graphs = None, {}
++        multi.drop_graphs()
++
++
++def test_batched_vs_sequential_timing(rig):
++    """Timings only (printed): one batched block pass of S streams vs S solo passes, eager and graphs."""
++
++    solos, multi = rig
++    for s in solos:
++        s.reset()
++    multi.reset()
++    t = (torch.randn((3000, solos[0].tap_in.shape[1]), device="cuda") * 0.5).bfloat16()
++    for s, c in zip(solos, multi.contexts):
++        s.add_taps(t)
++        c.add_taps(t)
++
++    def clock(fn, reps=30) -> float:
++        for _ in range(3):
++            fn()
++        torch.cuda.synchronize()
++        t0 = time.perf_counter()
++        for _ in range(reps):
++            fn()
++        torch.cuda.synchronize()
++        return (time.perf_counter() - t0) / reps * 1e3
++
++    rows = []
++    for graphs in (False, True):
++        if graphs:
++            for s in solos:
++                s.capture()
++            multi.capture()
++        for S in range(1, STREAMS + 1):
++            seq = clock(lambda: [solos[i].candidates(5, 7) for i in range(S)])
++            bat = clock(lambda: multi.candidates([(multi.contexts[i], 5, 7) for i in range(S)]))
++            rows.append(("graphs" if graphs else "eager", S, seq, bat))
++    for s in solos:
++        s.block_graph, s.tap_graphs = None, {}
++    multi.drop_graphs()
++    print("\nblock pass ms (synthetic drafter): mode S sequential batched")
++    for r in rows:
++        print(f"  {r[0]:6s} {r[1]} {r[2]:7.3f} {r[3]:7.3f}")
++
++
++def test_two_ranks_draft_their_solo_bits(tmp_path):
++    """Two ranks as threads of one process (test_flashnext_tp's thread all-gather), eager: the heads, MLP and
++    vocabulary split over the ranks, row-parallel partials and candidates all-gathered in batched passes; each rank's
++    merged candidates equal its solo drafters', and the two ranks' equal each other."""
++
++    import threading
++
++    from test_flashnext_tp import _Hub, _ThreadComm
++
++    from tensorfold.families.glm5_next.cuda import qmm
++    from tensorfold.families.glm5_next.cuda.dflash2 import Drafter
++    from tensorfold.families.glm5_next.cuda.dflash2_multi import MultiDrafter
++
++    _drafter(tmp_path)
++    (tmp_path / "config.json").write_text(json.dumps(DRAFT))
++    g = torch.Generator(device="cuda").manual_seed(5)
++    embed = (torch.randn((V, D), generator=g, device="cuda") * 0.05).bfloat16()
++    head = (torch.randn((V, D), generator=g, device="cuda") * 0.03).bfloat16()
++    hub = _Hub(2)
++    ranks = []
++    for r in range(2):
++        w = SimpleNamespace(device=torch.device("cuda"), rank=r, world=2, comm=_ThreadComm(hub, r), embed=embed,
++                            head=qmm.quantize4(head[r * V // 2:(r + 1) * V // 2].contiguous()), draft_head=None,
++                            vocab_offset=r * V // 2)
++        solos = [Drafter(tmp_path, w, capacity=6000, ring=True) for _ in range(3)]
++        multi = MultiDrafter(Drafter(tmp_path, w, capacity=6000, ring=True), streams=3)
++        assert multi.gathered == 2 and multi.d.heads == 4
++        ranks.append((solos, multi))
++    results: list = [None, None]
++    errors: list = []
++
++    def body(r: int) -> None:
++        try:
++            with torch.no_grad():
++                solos, multi = ranks[r]
++                rng = np.random.default_rng(7)             # the same draws on both ranks
++                gen = torch.Generator(device="cuda").manual_seed(7)
++                width = solos[0].tap_in.shape[1]
++                seen = []
++                for i, n in enumerate((2500, 300, 40)):
++                    t = (torch.randn((n, width), generator=gen, device="cuda") * 0.5).bfloat16()
++                    solos[i].add_taps(t)
++                    multi.contexts[i].add_taps(t)
++                for _ in range(25):
++                    S = int(rng.integers(1, 4))
++                    pick = [int(i) for i in rng.permutation(3)[:S]]
++                    pend = [int(rng.integers(0, V)) for _ in pick]
++                    got = multi.candidates([(multi.contexts[i], p, 7) for i, p in zip(pick, pend)])
++                    for i, p, c in zip(pick, pend, got):
++                        want = solos[i].candidates(p, 7)
++                        assert all(np.array_equal(a, b) for a, b in zip(want, c)), (r, i)
++                        seen.append(c)
++                    items = []
++                    for i in pick:
++                        t = (torch.randn((int(rng.integers(1, 9)), width), generator=gen, device="cuda") * 0.5
++                             ).bfloat16()
++                        solos[i].add_taps(t)
++                        items.append((multi.contexts[i], t))
++                    multi.commit(items)
++                results[r] = seen
++        except BaseException as exc:        # noqa: BLE001
++            errors.append(exc)
++            hub.barrier.abort()
++
++    threads = [threading.Thread(target=body, args=(r,)) for r in range(2)]
++    for th in threads:
++        th.start()
++    for th in threads:
++        th.join()
++    if errors:
++        raise errors[0]
++    assert len(results[0]) > 40
++    for a, b in zip(*results):
++        assert all(np.array_equal(x, y) for x, y in zip(a, b))

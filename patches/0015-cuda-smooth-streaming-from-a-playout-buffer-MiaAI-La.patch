@@ -1,0 +1,1004 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 22:09:38 -0400
+Subject: [PATCH] cuda: smooth streaming from a playout buffer (MiaAI-Lab
+ recipe patch 0061)
+
+TF_GLM_STREAM_SMOOTH=1 sends a streamed reply's tokens one event each at a steady pace from a short playout buffer
+(TF_GLM_STREAM_SMOOTH_MS, default 400 ms), so a drafted round's burst and a pause while the engine fills another
+request's prompt are spread over the tokens already queued instead of showing as a freeze. Off unless set: unset or
+0, the server writes exactly the events it wrote before (checked byte for byte on fixed fake engines).
+
+- cuda/stream_pacing.py: the recipe's file whole (Playout, smooth_streaming, hold_seconds), two lines changed for
+  lint (Callable from collections.abc, sorted __slots__), with the credit header.
+- cuda/server.py App.run: send() through the playout, text_delta(), a multi-token round split into one event per
+  token unless the round ends the reply (then the queue is flushed and the end is never later), the playout closed
+  (or aborted when the client left) after generate. Written against this tree's server: #285's ToolCallStreamer
+  call deltas follow their round's text unpaced, so a tool call keeps its place in the stream. Differences from the
+  recipe: the playout and its writer thread are made just before the engine runs (a refused or cancelled request
+  leaves no writer behind), and an engine failure sends the text still queued before the error, as unsmoothed (the
+  recipe drops it).
+
+Tests: tests/test_cuda_stream_smooth.py (the settings; Playout's pacing, hold bound, unpaced items in order, flush,
+close, abort, a failed or raising write, a client gone; the server's SSE byte-identical with the setting unset for
+text, thinking and tool-call engines, and with it on the same text token by token, the end not delayed, a tool call
+in its place). With TF_GLM_STREAM_SMOOTH=1 the server, tool and stream test files pass as unset except
+test_cuda_server_disconnect's timed-out write, which expects the engine to stop in the round whose write failed (the
+writer thread finds the failure a few rounds later).
+
+Credit: THIRD_PARTY_NOTICES.md ("Smooth streaming") and the ported code's comments name MiaAI-Lab and the patch.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patch 0061,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 1576746a04983b6eded0551dbf22512ee9e95654 (v1.5); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md               |  16 +
+ src/tensorfold/cuda/server.py        |  77 +++-
+ src/tensorfold/cuda/stream_pacing.py | 150 +++++++
+ tests/data/stream_smooth_sse.json    |   6 +
+ tests/test_cuda_stream_smooth.py     | 633 +++++++++++++++++++++++++++
+ 5 files changed, 869 insertions(+), 13 deletions(-)
+ create mode 100644 src/tensorfold/cuda/stream_pacing.py
+ create mode 100644 tests/data/stream_smooth_sse.json
+ create mode 100644 tests/test_cuda_stream_smooth.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index 2ce3cd2..a441135 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -209,3 +209,19 @@ pieces end at a stream's kept points (or its end) and cut in multiples of 64 row
+ fill alone; on the attention/expert split's attention node a multi-prompt chunk is one prompt-chunk forward of at
+ most the expert nodes' `prefill_rows` rows (no wire change). `TF_GLM_MULTI_PREFILL` is off unless set (the recipe's
+ `config.sh` turns it on).
++
++## Smooth streaming (TF_GLM_STREAM_SMOOTH)
++
++`cuda/stream_pacing.py` (`smooth_streaming`, `hold_seconds`, `Playout`) and the `TF_GLM_STREAM_SMOOTH` paths of
++`cuda/server.py` (`App.run`'s `send`, `text_delta`, the token-by-token rounds of `on_tokens`, and the playout's close
++or abort after `generate`) are ported from MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/1576746)
++patch 0061-server-smooth-stream, Apache License 2.0, Copyright 2026 MiaAI-Lab (see
++[the license text](LICENSES/Apache-2.0.txt)). `stream_pacing.py` is the recipe's file with two lines changed for this
++tree's lint (`Callable` imported from `collections.abc`, `_Item.__slots__` sorted). Changes in the port: this tree
++streams calls with `ToolCallStreamer` (the recipe's GLM call streamer and its keep-alive deltas are not here), so a
++round's call deltas follow all of the round's text, unpaced, as they did before; the playout and its writer thread are
++made just before the engine runs (the recipe makes them with the request's helpers, which leaves a writer waiting for
++good when a request is refused or cancelled before it runs); an engine failure sends the text still queued before the
++error, as unsmoothed (the recipe drops it). `TF_GLM_STREAM_SMOOTH` is off unless set, and unset or 0
++the server writes the events it wrote before.
+diff --git a/src/tensorfold/cuda/server.py b/src/tensorfold/cuda/server.py
+index 8f2a97c..e474b6e 100644
+--- a/src/tensorfold/cuda/server.py
++++ b/src/tensorfold/cuda/server.py
+@@ -28,6 +28,7 @@ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
+ from tensorfold.cuda import health
+ from tensorfold.cuda.chat_template import ChatTemplate
+ from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, close_glm_call, hide_tool_calls, parse_tool_calls
++from tensorfold.cuda.stream_pacing import Playout, hold_seconds, smooth_streaming  # MiaAI-Lab recipe patch 0061
+ from tensorfold.cuda.turns import Turns, Yield
+ from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
+ from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
+@@ -407,7 +408,7 @@ class App:
+         out: list[int] = []
+         sent = {"reasoning": 0, "content": 0}
+         stopped = {"client": False, "stop": False}
+-        failed: list[Exception] = []
++        failed: list[BaseException] = []    # MiaAI-Lab recipe patch 0061: a playout write's error too (any BaseException)
+         stream = StreamDecoder(self.tok, ends)
+         # calls stream as argument deltas while written (as on the Mac); one-call requests keep the end parser
+         calls_stream = ToolCallStreamer(tools) if tools and not policy.single else None
+@@ -431,8 +432,40 @@ class App:
+ 
+         serving: list[Any] = [None]
+ 
++        # MiaAI-Lab recipe patch 0061: TF_GLM_STREAM_SMOOTH=1 sends a streamed reply's tokens one event each at a steady
++        # pace from a short playout buffer (``stream_pacing.Playout``), so drafted bursts and other requests' prompt
++        # fills do not show; unset or 0, every event is written as before. The settings are read here, the playout
++        # (and its writer thread) is made just before the engine runs, so a request that never runs leaves none behind.
++        smooth = bool(body.get("stream")) and smooth_streaming()
++        hold = hold_seconds() if smooth else None
++        playout: Playout | None = None
++
++        def send(delta: dict[str, Any], paced: bool) -> bool:
++            """Write an event (through the playout queue when smoothing): False once the client has gone."""
++
++            if playout is None:
++                return emit(delta)
++            playout.put(delta, paced)
++            return not playout.gone
++
++        def text_delta(tokens: list[int]) -> dict[str, Any]:
++            """The reasoning and answer text these tokens add (the part not sent yet)."""
++
++            stream.add(tokens)
++            reasoning, answer = visible(False)
++            delta: dict[str, Any] = {}
++            if len(reasoning) > sent["reasoning"]:
++                delta["reasoning_content"] = reasoning[sent["reasoning"]:]
++                sent["reasoning"] = len(reasoning)
++            if len(answer) > sent["content"]:
++                delta["content"] = answer[sent["content"]:]
++                sent["content"] = len(answer)
++            return delta
++
+         def on_tokens(new: list[int]) -> bool:
+             # True stops the engine after this round (two-rank GLM: the next one); a running engine keeps getting True
++            if playout is not None and playout.gone:      # MiaAI-Lab recipe patch 0061: the writer found the client gone
++                stopped["client"] = True
+             if stopped["client"] or stopped["stop"] or failed:
+                 return True
+             try:
+@@ -447,20 +480,22 @@ class App:
+                     new = kept
+                 else:
+                     out.extend(new)
+-                stream.add(new)
+-                reasoning, answer = visible(False)
+-                delta: dict[str, Any] = {}
+-                if len(reasoning) > sent["reasoning"]:
+-                    delta["reasoning_content"] = reasoning[sent["reasoning"]:]
+-                    sent["reasoning"] = len(reasoning)
+-                if len(answer) > sent["content"]:
+-                    delta["content"] = answer[sent["content"]:]
+-                    sent["content"] = len(answer)
+-                if delta and not emit(delta):
+-                    stopped["client"] = True
++                # MiaAI-Lab recipe patch 0061, smooth streaming: token by token into the playout queue, unless the reply
++                # ends in this round (then the queue is flushed and the round goes as one event: the end is never later)
++                ending = stopped["stop"] or (bool(new) and (new[-1] in ends or len(out) >= max_tokens))
++                if playout is not None and ending:
++                    playout.flush()
++                pieces = [[t] for t in new] if playout is not None and not ending and len(new) > 1 else [new]
++                for piece in pieces:
++                    delta = text_delta(piece)
++                    if delta and not send(delta, True):
++                        stopped["client"] = True
++                        break
+                 if calls_stream is not None and not stopped["client"]:
++                    # MiaAI-Lab recipe patch 0061: the round's call deltas follow all of its text, as unsmoothed, and are
++                    # not paced (they keep their place in the queue)
+                     for call_delta in calls_stream.feed(answer_raw[0]):   # never the reasoning
+-                        if not emit(call_delta):
++                        if not send(call_delta, False):
+                             stopped["client"] = True
+                             break
+                 if not stopped["client"] and cancelled is not None and cancelled():   # every round, text or not
+@@ -528,10 +563,26 @@ class App:
+                 raise RequestCancelled("the client left before the request started")
+             with health.of(self).running(len(prompt), out, arrived) as request:  # /health reads ``out``; rounds never call in
+                 serving[0] = request
++                playout = Playout(emit, hold, cancelled=cancelled) if smooth else None   # MiaAI-Lab recipe patch 0061
+                 try:
+                     stats = request.stats = generate_gated(generate, prompt, max_tokens, gates, on_tokens)
++                except BaseException as exc:
++                    if playout is not None:         # MiaAI-Lab recipe patch 0061: queued events are dropped when the
++                        # client left; an engine failure first sends the text it made, then the error event as unsmoothed
++                        # (this tree's choice: the recipe drops them on any failure)
++                        left = stopped["client"] or isinstance(exc, RequestCancelled) or not isinstance(exc, Exception)
++                        (playout.abort if left else playout.close)()
++                    raise
+                 finally:
+                     serving[0] = None
++                # MiaAI-Lab recipe patch 0061: what is still queued goes out now, before the reply's end (dropped when the
++                # client has gone or the reply failed); a write that raised fails the request, one that failed ends it
++                if playout is not None:
++                    (playout.abort if stopped["client"] or failed else playout.close)()
++                    if playout.error is not None:
++                        failed.append(playout.error)
++                    elif playout.gone:
++                        stopped["client"] = True
+         finally:
+             if turns is not None:
+                 turns.give()
+diff --git a/src/tensorfold/cuda/stream_pacing.py b/src/tensorfold/cuda/stream_pacing.py
+new file mode 100644
+index 0000000..59b3ca0
+--- /dev/null
++++ b/src/tensorfold/cuda/stream_pacing.py
+@@ -0,0 +1,150 @@
++# Ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe @ 1576746, patch 0061-server-smooth-stream
++# (Apache-2.0, Copyright 2026 MiaAI-Lab; THIRD_PARTY_NOTICES.md "Smooth streaming").
++"""Smooth streaming (``TF_GLM_STREAM_SMOOTH=1``): a streamed reply's text goes out token by token at a steady pace
++from a short playout buffer, instead of a burst of drafted tokens every round and a pause whenever the engine fills
++another request's prompt.
++
++The engine's rounds come in bursts: a round accepts ~3 drafted tokens, a round takes longer while other requests
++decode, and while a new prompt fills the rounds wait for its layer slices. The request's tokens enter a queue as they
++arrive and a writer thread sends them one event each: the next goes out ``hold / queued`` after the previous one
++(never before it arrived), so the queue settles at about ``hold`` seconds of tokens and a pause in the rounds shorter
++than that is spread over the tokens already queued instead of showing as a freeze. No token is held longer than
++``LONGEST_HOLD`` times ``hold``.
++
++The text, its order and the reply's end are unchanged: only when events go out. Events that are not text (tool-call
++deltas, keep-alives) keep their place in the queue and are not paced; the round that ends the reply flushes the queue
++at once, so the reply ends when it did. The engine never waits: the request thread only queues."""
++
++from __future__ import annotations
++
++import collections
++import os
++import threading
++import time
++from collections.abc import Callable
++from typing import Any
++
++HOLD_MS = 400               # the default playout buffer: about this much text is held, so shorter pauses never show
++LONGEST_HOLD = 2.5          # no token is held longer than this many times the buffer
++
++
++def smooth_streaming(value: str | None = None) -> bool:
++    """``TF_GLM_STREAM_SMOOTH``: 1 paces a streamed reply's tokens, 0 (the default) sends each round as one event."""
++
++    raw = (os.environ.get("TF_GLM_STREAM_SMOOTH", "0") if value is None else value).strip() or "0"
++    if raw not in ("0", "1"):
++        raise ValueError(f"TF_GLM_STREAM_SMOOTH={raw!r}: expected 0 or 1")
++    return raw == "1"
++
++
++def hold_seconds(value: str | None = None) -> float:
++    """``TF_GLM_STREAM_SMOOTH_MS``: the playout buffer in milliseconds (default ``HOLD_MS``)."""
++
++    raw = (os.environ.get("TF_GLM_STREAM_SMOOTH_MS", "") if value is None else value).strip() or str(HOLD_MS)
++    try:
++        ms = int(raw)
++    except ValueError:
++        raise ValueError(f"TF_GLM_STREAM_SMOOTH_MS={raw!r}: expected whole milliseconds") from None
++    if not 1 <= ms <= 5000:
++        raise ValueError(f"TF_GLM_STREAM_SMOOTH_MS={ms}: expected 1-5000")
++    return ms / 1000.0
++
++
++class _Item:
++    __slots__ = ("arrived", "delta", "paced")
++
++    def __init__(self, delta: dict[str, Any], paced: bool, arrived: float) -> None:
++        self.delta, self.paced, self.arrived = delta, paced, arrived
++
++
++class Playout:
++    """One streamed reply's playout queue, and the writer thread that empties it through ``emit``.
++
++    ``put`` queues an event (``paced``: a text delta; else it goes out as soon as it reaches the front); ``flush``
++    sends everything queued at once from then on; ``close`` flushes, waits for the queue to empty and stops the writer;
++    ``abort`` drops what is queued and stops it. ``gone`` holds once ``emit`` failed or ``cancelled()`` said the
++    client left (checked before each held event)."""
++
++    def __init__(self, emit: Callable[[dict[str, Any]], bool], hold: float | None = None,
++                 cancelled: Callable[[], bool] | None = None, clock: Callable[[], float] = time.monotonic) -> None:
++        self.emit, self.cancelled, self.clock = emit, cancelled, clock
++        self.hold = hold_seconds() if hold is None else hold
++        self.queue: collections.deque[_Item] = collections.deque()
++        self.paced = 0                       # paced items queued
++        self.last: float | None = None       # when the previous event went out
++        self.flushing = self.closed = self.gone = False
++        self.error: BaseException | None = None
++        self.cond = threading.Condition()
++        self.thread = threading.Thread(target=self._run, name="tf-playout", daemon=True)
++        self.thread.start()
++
++    # -- the request thread -------------------------------------------------------------------------------------------
++
++    def put(self, delta: dict[str, Any], paced: bool = True) -> None:
++        with self.cond:
++            if self.closed or self.gone:
++                return
++            self.queue.append(_Item(delta, paced, self.clock()))
++            self.paced += paced
++            self.cond.notify()
++
++    def flush(self) -> None:
++        with self.cond:
++            self.flushing = True
++            self.cond.notify()
++
++    def close(self) -> None:
++        """Send everything still queued at once and stop the writer (the reply's end follows)."""
++
++        with self.cond:
++            self.flushing = self.closed = True
++            self.cond.notify()
++        self.thread.join()
++
++    def abort(self) -> None:
++        with self.cond:
++            self.queue.clear()
++            self.paced = 0
++            self.closed = True
++            self.cond.notify()
++        self.thread.join()
++
++    # -- the writer ---------------------------------------------------------------------------------------------------
++
++    def due(self, now: float) -> float:
++        """When the front of the queue goes out (the queue is not empty)."""
++
++        item = self.queue[0]
++        if self.flushing or not item.paced or self.last is None:
++            return now
++        at = max(item.arrived, self.last + self.hold / max(self.paced, 1))
++        return min(at, item.arrived + LONGEST_HOLD * self.hold)
++
++    def _run(self) -> None:
++        while True:
++            with self.cond:
++                while True:
++                    if not self.queue:
++                        if self.closed:
++                            return
++                        self.cond.wait()
++                        continue
++                    now = self.clock()
++                    at = self.due(now)
++                    if at <= now:
++                        break
++                    self.cond.wait(at - now)          # a new token shortens the wait; a flush ends it
++                item = self.queue.popleft()
++                self.paced -= item.paced
++                held = item.paced and not self.flushing and now > item.arrived
++            try:
++                ok = not (held and self.cancelled is not None and self.cancelled()) and self.emit(item.delta)
++            except BaseException as exc:              # noqa: BLE001  re-raised by the request after generate
++                self.error, ok = exc, False
++            with self.cond:
++                self.last = self.clock()
++                if not ok:
++                    self.gone = True
++                    self.queue.clear()
++                    self.paced = 0
++                    return
+diff --git a/tests/data/stream_smooth_sse.json b/tests/data/stream_smooth_sse.json
+new file mode 100644
+index 0000000..ad375a4
+--- /dev/null
++++ b/tests/data/stream_smooth_sse.json
+@@ -0,0 +1,6 @@
++{
++ "about": "tests/test_cuda_stream_smooth.py's references: the SSE bodies the CUDA server wrote for its SCENARIOS (FixedIds: uuid4 counting from 1, created fixed) before MiaAI-Lab recipe patch 0061's port (TensorFold c0c7351, TF_GLM_STREAM_SMOOTH unset), captured by running the same test module's scenarios against that tree.",
++ "text": "data: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"Smo\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"oth\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" st\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"rea\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"ms \"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"are\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" ca\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"lm.\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"stop\"}], \"tensorfold\": {\"rounds\": 8, \"decode_s\": 0.5, \"token_sha\": \"544c352390c3\"}, \"usage\": {\"prompt_tokens\": 26, \"completion_tokens\": 25, \"total_tokens\": 51, \"prompt_tokens_details\": {\"cached_tokens\": 0}, \"completion_tokens_details\": {\"reasoning_tokens\": 0}}}\n\ndata: [DONE]\n\n",
++ "thinking": "data: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \"the\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \" us\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \"er \"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \"wan\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \"ts \"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \"hi\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"H\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"i t\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"her\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"e, \"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"fri\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"e\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"nd!\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"stop\"}], \"tensorfold\": {\"rounds\": 13, \"decode_s\": 0.5, \"token_sha\": \"e8f22f6ecc5e\"}, \"usage\": {\"prompt_tokens\": 26, \"completion_tokens\": 38, \"total_tokens\": 64, \"prompt_tokens_details\": {\"cached_tokens\": 0}, \"completion_tokens_details\": {\"reasoning_tokens\": 18}}}\n\ndata: [DONE]\n\n",
++ "tool": "data: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"Let\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" me\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" lo\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"ok.\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"tool_calls\": [{\"index\": 0, \"id\": \"call_000000020000000000000000\", \"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"arguments\": \"\"}}]}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"tool_calls\": [{\"index\": 0, \"function\": {\"arguments\": \"{\\\"city\\\":\\\"\"}}]}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"tool_calls\": [{\"index\": 0, \"function\": {\"arguments\": \"Osl\"}}]}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"tool_calls\": [{\"index\": 0, \"function\": {\"arguments\": \"o\"}}]}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"tool_calls\": [{\"index\": 0, \"function\": {\"arguments\": \"\\\"\"}}]}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"Do\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"tool_calls\": [{\"index\": 0, \"function\": {\"arguments\": \"}\"}}]}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"ne.\"}, \"finish_reason\": null}]}\n\ndata: {\"id\": \"chatcmpl-000000010000000000000000\", \"object\": \"chat.completion.chunk\", \"created\": 1767225600, \"model\": \"fake-cuda\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"tool_calls\"}], \"tensorfold\": {\"rounds\": 29, \"decode_s\": 0.5, \"token_sha\": \"c72e8f615598\"}, \"usage\": {\"prompt_tokens\": 26, \"completion_tokens\": 91, \"total_tokens\": 117, \"prompt_tokens_details\": {\"cached_tokens\": 0}, \"completion_tokens_details\": {\"reasoning_tokens\": 0}}}\n\ndata: [DONE]\n\n"
++}
+diff --git a/tests/test_cuda_stream_smooth.py b/tests/test_cuda_stream_smooth.py
+new file mode 100644
+index 0000000..380166d
+--- /dev/null
++++ b/tests/test_cuda_stream_smooth.py
+@@ -0,0 +1,633 @@
++"""Smooth streaming (``TF_GLM_STREAM_SMOOTH=1``, MiaAI-Lab recipe patch 0061): ``stream_pacing.Playout`` paces a
++streamed reply's text from a short playout buffer, and the CUDA server sends a reply through it token by token, its tool
++calls in their places and its end on time; unset or 0, the server writes the event stream it wrote before."""
++
++from __future__ import annotations
++
++import json
++import re
++import threading
++import time
++import types
++import uuid
++from itertools import pairwise
++from pathlib import Path
++from typing import Any
++
++import pytest
++
++from tensorfold.cuda import http as cuda_http
++from tensorfold.cuda import stream_pacing
++from tensorfold.cuda.stream_pacing import HOLD_MS, LONGEST_HOLD, Playout, hold_seconds, smooth_streaming
++from tensorfold.server.cancellation import RequestCancelled
++from tests.test_cuda_server_disconnect import app_for, post, serving
++
++SMOOTH, SMOOTH_MS = "TF_GLM_STREAM_SMOOTH", "TF_GLM_STREAM_SMOOTH_MS"
++# the SSE bodies the server wrote before the port (TensorFold c0c7351) for SCENARIOS, with ``FixedIds``
++GOLDEN = Path(__file__).parent / "data" / "stream_smooth_sse.json"
++
++
++# -- the playout buffer ------------------------------------------------------------------------------------------------
++
++@pytest.mark.parametrize(("value", "on"), [(None, False), ("", False), ("0", False), ("1", True), (" 1 ", True)])
++def test_smooth_streaming_reads_0_or_1_and_is_off_unset(monkeypatch, value, on):
++    if value is None:
++        monkeypatch.delenv(SMOOTH, raising=False)
++    else:
++        monkeypatch.setenv(SMOOTH, value)
++        assert smooth_streaming(value) is on
++    assert smooth_streaming() is on
++
++
++@pytest.mark.parametrize("value", ["2", "yes", "true", "on", "-1", "1.0"])
++def test_smooth_streaming_refuses_other_values(monkeypatch, value):
++    monkeypatch.setenv(SMOOTH, value)
++    with pytest.raises(ValueError, match="TF_GLM_STREAM_SMOOTH"):
++        smooth_streaming()
++    with pytest.raises(ValueError, match="expected 0 or 1"):
++        smooth_streaming(value)
++
++
++@pytest.mark.parametrize(("value", "seconds"), [(None, 0.4), ("", 0.4), ("1", 0.001), ("250", 0.25), (" 400 ", 0.4),
++                                                ("5000", 5.0)])
++def test_hold_seconds_reads_whole_milliseconds_400_by_default(monkeypatch, value, seconds):
++    if value is None:
++        monkeypatch.delenv(SMOOTH_MS, raising=False)
++    else:
++        monkeypatch.setenv(SMOOTH_MS, value)
++        assert hold_seconds(value) == pytest.approx(seconds)
++    assert HOLD_MS == 400
++    assert hold_seconds() == pytest.approx(seconds)
++
++
++@pytest.mark.parametrize("value", ["0", "5001", "-5", "abc", "1.5", "4e2"])
++def test_hold_seconds_refuses_values_outside_1_to_5000(monkeypatch, value):
++    monkeypatch.setenv(SMOOTH_MS, value)
++    with pytest.raises(ValueError, match="TF_GLM_STREAM_SMOOTH_MS"):
++        hold_seconds()
++    with pytest.raises(ValueError, match="TF_GLM_STREAM_SMOOTH_MS"):
++        Playout(lambda delta: True)                   # read when made, before its writer starts
++
++
++def test_a_playout_takes_its_buffer_from_the_setting(monkeypatch):
++    for value, hold in ((None, 0.4), ("250", 0.25)):
++        if value is None:
++            monkeypatch.delenv(SMOOTH_MS, raising=False)
++        else:
++            monkeypatch.setenv(SMOOTH_MS, value)
++        playout = Playout(lambda delta: True)
++        playout.close()
++        assert playout.hold == pytest.approx(hold) and not playout.thread.is_alive()
++    playout = Playout(lambda delta: True, 0.05)       # given, the buffer is not read from the setting
++    playout.close()
++    assert playout.hold == 0.05
++
++
++class Clock:
++    """Virtual time for the next Playout made: the playout reads it as its clock, and its Condition makes the writer's
++    timed waits pass at once, the clock jumping to the wait's end, or to the next scheduled arrival (queued then) when
++    that comes first; an untimed wait (the queue empty) jumps to the next arrival, or else waits for real. The
++    writer's schedule so plays out exactly and without real waiting."""
++
++    def __init__(self, monkeypatch, arrivals) -> None:
++        self.now = 0.0
++        self.arrivals = sorted(arrivals, key=lambda arrival: arrival[0])      # (time, delta, paced)
++        self.playout: Playout | None = None
++        clock = self
++
++        class Condition(threading.Condition):
++            def wait(self, timeout=None):
++                due = clock.arrivals[0][0] if clock.arrivals and clock.playout is not None else None
++                if due is not None and (timeout is None or due <= clock.now + timeout):
++                    clock.now = max(clock.now, due)
++                    while clock.arrivals and clock.arrivals[0][0] <= clock.now:
++                        _, delta, paced = clock.arrivals.pop(0)
++                        clock.playout.put(delta, paced)
++                    return True
++                if timeout is None:
++                    return super().wait()
++                clock.now += timeout
++                return False
++
++        monkeypatch.setattr(stream_pacing, "threading", types.SimpleNamespace(Condition=Condition,
++                                                                              Thread=threading.Thread))
++
++    def __call__(self) -> float:
++        return self.now
++
++
++def play(monkeypatch, arrivals, *, hold=0.4, cancelled=None, on_sent=None):
++    """``arrivals`` ((time, delta, paced)) through a Playout in virtual time (``Clock``), until all went out or the
++    writer stopped: [(time sent, delta)], and the playout (closed). ``on_sent(playout, delta)`` is what emit returns."""
++
++    clock = Clock(monkeypatch, arrivals)
++    sent: list[tuple[float, dict[str, Any]]] = []
++    made: list[Playout] = []
++
++    def emit(delta):
++        sent.append((clock.now, delta))
++        return True if on_sent is None else on_sent(made[0], delta)
++
++    playout = Playout(emit, hold, cancelled=cancelled, clock=clock)
++    made.append(playout)
++    with playout.cond:
++        clock.playout = playout
++        playout.cond.notify()
++    deadline = time.monotonic() + 30
++    while (clock.arrivals or playout.queue) and playout.thread.is_alive():
++        assert time.monotonic() < deadline, "the playout never played its arrivals out"
++        time.sleep(0.001)
++    playout.close()
++    assert not playout.thread.is_alive()
++    return sent, playout
++
++
++def burst(count, at=0.0, paced=True):
++    return [(at, {"content": str(i)}, paced) for i in range(count)]
++
++
++def burst_times(count, hold):
++    """When a burst of ``count`` paced events queued at 0 goes out: the first at once, each next ``hold / queued``
++    after the one before, none later than ``LONGEST_HOLD * hold`` after it arrived."""
++
++    times = [0.0]
++    for k in range(1, count):
++        times.append(min(times[-1] + hold / (count - k), LONGEST_HOLD * hold))
++    return times
++
++
++@pytest.mark.parametrize(("count", "hold"), [(2, 0.4), (4, 0.4), (5, 0.25), (7, 1.0)])
++def test_a_burst_is_spread_over_the_buffer_in_order(monkeypatch, count, hold):
++    # (bursts small enough that LONGEST_HOLD does not cut them short: see the next test)
++    sent, playout = play(monkeypatch, burst(count), hold=hold)
++    assert [delta for _, delta in sent] == [delta for _, delta, _ in burst(count)]
++    times = [t for t, _ in sent]
++    assert times == pytest.approx(burst_times(count, hold), abs=1e-9)
++    gaps = [b - a for a, b in pairwise(times)]
++    assert times[0] == 0.0 and all(gap > 0 for gap in gaps)       # the first at once, then never two together
++    assert gaps == sorted(gaps)                                   # the queue drains at hold / (what is left)
++    assert hold <= times[-1] <= LONGEST_HOLD * hold + 1e-9        # about the buffer: from one to 2.5 holds
++    assert not playout.gone and playout.error is None
++
++
++def test_nothing_goes_out_before_it_arrived(monkeypatch):
++    # a token now and then: each goes out when it arrives, however recently the one before went
++    arrivals = [(t, {"content": str(i)}, True) for i, t in enumerate((0.0, 0.05, 0.9, 0.95, 3.0))]
++    sent, _ = play(monkeypatch, arrivals)
++    for (arrived, delta, _), (went, got) in zip(arrivals, sent):
++        assert got == delta and went >= arrived
++    times = [t for t, _ in sent]
++    # alone in the queue, a token is held to ``hold`` after the event before, never past its arrival when later
++    assert times == pytest.approx([0.0, 0.4, 0.9, 1.3, 3.0], abs=1e-9)
++
++
++def test_no_token_is_held_longer_than_longest_hold(monkeypatch):
++    hold = 0.4
++    sent, _ = play(monkeypatch, burst(50), hold=hold)
++    times = [t for t, _ in sent]
++    assert max(times) == pytest.approx(LONGEST_HOLD * hold)       # paced alone, the burst would take 4.48 holds
++    assert times == pytest.approx(burst_times(50, hold), abs=1e-9)
++    assert sum(t == pytest.approx(LONGEST_HOLD * hold) for t in times) >= 2     # the bound held several at once
++
++
++def test_steady_rounds_go_out_evenly_through_a_pause(monkeypatch):
++    # three tokens a round every 0.1 s (30 tokens/s), and a 0.4 s gap after 1 s (another request's prompt fill)
++    starts = [round(0.1 * i, 6) for i in range(11)] + [round(1.4 + 0.1 * i, 6) for i in range(7)]
++    arrivals = [(t, {"content": f"{t}:{k}"}, True) for t in starts for k in range(3)]
++    sent, _ = play(monkeypatch, arrivals, hold=0.4)
++    assert [delta for _, delta in sent] == [delta for _, delta, _ in arrivals]
++    times = [t for t, _ in sent]
++    gaps = [b - a for a, b in pairwise(times)]
++    steady = [gap for t, gap in zip(times[1:], gaps) if 0.5 <= t <= 2.0]
++    # unpaced the reply freezes 0.4 s in the gap and comes three tokens at once; paced no event waits even 0.15 s,
++    # and none goes out together with the one before
++    assert max(steady) < 0.15 and min(steady) > 0
++    held = [went - arrived for (arrived, _, _), (went, _) in zip(arrivals, sent)]
++    assert max(held) <= LONGEST_HOLD * 0.4 + 1e-9
++    assert 0.2 <= sum(held[9:33]) / 24 <= 0.6                     # settled: about the buffer (0.4 s) of text queued
++
++
++def test_events_that_are_not_paced_keep_their_place(monkeypatch):
++    call = {"tool_calls": [{"index": 0, "function": {"arguments": "{}"}}]}
++    arrivals = [(0.0, {"content": "a"}, True), (0.0, {"content": "b"}, True), (0.0, call, False),
++                (0.0, {"content": "c"}, True), (0.0, {}, False), (0.0, {"content": "d"}, True)]
++    sent, _ = play(monkeypatch, arrivals, hold=0.4)
++    assert [delta for _, delta in sent] == [delta for _, delta, _ in arrivals]
++    times = [t for t, _ in sent]
++    # an unpaced event goes out as soon as it reaches the front: with the text event before it, never ahead of it
++    assert times[2] == times[1] and times[4] == times[3]
++    assert times[0] < times[1] < times[3] < times[5]
++
++
++def test_flush_sends_everything_queued_at_once(monkeypatch):
++    def flush_after_two(playout, delta):
++        if delta == {"content": "1"}:
++            playout.flush()
++        return True
++
++    sent, _ = play(monkeypatch, burst(6), hold=0.4, on_sent=flush_after_two)
++    times = [t for t, _ in sent]
++    assert [delta for _, delta in sent] == [delta for _, delta, _ in burst(6)]
++    assert times[:2] == pytest.approx([0.0, 0.4 / 5]) and times[2:] == pytest.approx([0.4 / 5] * 4)
++
++
++def test_close_drains_the_queue_at_once_then_stops_the_writer():
++    sent, first = [], threading.Event()
++
++    def emit(delta):
++        sent.append(delta)
++        first.set()
++        return True
++
++    playout = Playout(emit, 30.0)                     # paced, the four after the first would take over 7 s each
++    playout.put({"content": "0"})
++    assert first.wait(10)
++    for i in range(1, 5):
++        playout.put({"content": str(i)})
++    began = time.monotonic()
++    playout.close()
++    assert time.monotonic() - began < 5
++    assert sent == [{"content": str(i)} for i in range(5)] and not playout.thread.is_alive()
++    playout.put({"content": "late"})                  # closed: nothing more is queued
++    assert not playout.queue and not playout.gone and playout.error is None
++
++
++def test_abort_drops_what_is_queued():
++    sent, first = [], threading.Event()
++
++    def emit(delta):
++        sent.append(delta)
++        first.set()
++        return True
++
++    playout = Playout(emit, 30.0)
++    playout.put({"content": "0"})
++    assert first.wait(10)
++    for i in range(1, 5):
++        playout.put({"content": str(i)}, paced=i != 2)
++    began = time.monotonic()
++    playout.abort()
++    assert time.monotonic() - began < 5
++    assert sent == [{"content": "0"}] and not playout.queue and not playout.thread.is_alive()
++    assert not playout.gone and playout.error is None
++
++
++def test_a_failed_write_marks_the_client_gone_and_drops_the_rest(monkeypatch):
++    sent, playout = play(monkeypatch, burst(5), on_sent=lambda playout, delta: delta != {"content": "1"})
++    assert [delta for _, delta in sent] == [{"content": "0"}, {"content": "1"}]
++    assert playout.gone and playout.error is None and not playout.queue and playout.paced == 0
++    playout.put({"content": "late"})
++    assert not playout.queue
++
++
++def test_a_client_gone_while_a_token_was_held_is_not_written_to(monkeypatch):
++    asked = []
++
++    def cancelled():
++        asked.append(True)
++        return len(asked) >= 2
++
++    sent, playout = play(monkeypatch, burst(4), cancelled=cancelled)
++    # the first went at once (not held: not asked); the second and third were held, and the client left at the third
++    assert [delta for _, delta in sent] == [{"content": "0"}, {"content": "1"}] and len(asked) == 2
++    assert playout.gone and playout.error is None and not playout.queue
++
++
++def test_flushed_events_are_not_held_so_cancelled_is_not_asked(monkeypatch):
++    asked = []
++
++    def cancelled():
++        asked.append(True)
++        return True
++
++    def flush_first(playout, delta):
++        playout.flush()
++        return True
++
++    sent, playout = play(monkeypatch, burst(4), cancelled=cancelled, on_sent=flush_first)
++    assert len(sent) == 4 and not asked and not playout.gone
++
++
++def test_a_write_that_raises_is_kept_for_the_request(monkeypatch):
++    def refuse(playout, delta):
++        if delta == {"content": "2"}:
++            raise RuntimeError("the translator broke")
++        return True
++
++    sent, playout = play(monkeypatch, burst(5), on_sent=refuse)
++    assert len(sent) == 3 and isinstance(playout.error, RuntimeError) and str(playout.error) == "the translator broke"
++    assert playout.gone and not playout.queue
++
++
++# -- through the server ------------------------------------------------------------------------------------------------
++# (tests/test_cuda_server_disconnect.py's harness: a real HTTP server over an App with a character tokenizer, which
++# needs no tokenizers package; ``Tokens`` makes the call and think markup one token each, as real tokenizers do)
++
++EOS, OPEN, CLOSE, END = 0, 1000, 1001, 1003
++SPECIAL = {"<tool_call>": OPEN, "</tool_call>": CLOSE, "</think>": END}
++TOOLS = [{"type": "function", "function": {"name": "get_weather", "parameters": {
++    "type": "object", "properties": {"city": {"type": "string"}}}}}]
++CALL = "\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n"
++
++
++class Tokens:
++    """Characters as their code points, the markup in ``SPECIAL`` one token each; the end token decodes to nothing."""
++
++    def encode(self, text, **kwargs):
++        ids: list[int] = []
++        for part in re.split("(" + "|".join(re.escape(mark) for mark in SPECIAL) + ")", text):
++            ids += [SPECIAL[part]] if part in SPECIAL else [ord(c) for c in part]
++        return types.SimpleNamespace(ids=ids)
++
++    def decode(self, ids, **kwargs):
++        names = {token: mark for mark, token in SPECIAL.items()}
++        return "".join(names.get(token, "" if token == EOS else chr(token)) for token in ids)
++
++    def token_to_id(self, text):
++        return SPECIAL.get(text)
++
++
++def ids(text: str) -> list[int]:
++    return Tokens().encode(text).ids
++
++
++def rounds(reply: list[int], width: int = 3, tail: tuple[int, ...] = (4,)) -> list[list[int]]:
++    """``reply`` as a drafting engine writes it: rounds of ``width`` tokens, then rounds as wide as ``tail``'s."""
++
++    cut = len(reply) - sum(tail)
++    written = [reply[at:min(at + width, cut)] for at in range(0, cut, width)]
++    for size in tail:
++        written.append(reply[cut:cut + size])
++        cut += size
++    return written
++
++
++SCENARIOS = {
++    # text, three tokens a round, the end token in a last round of four
++    "text": ({}, rounds([*ids("Smooth streams are calm."), EOS])),
++    # reasoning then the answer (a round ends with </think>, the next holds the answer's two newlines and first letter)
++    "thinking": ({"chat_template_kwargs": {"enable_thinking": True}},
++                 rounds([*ids("the user wants hi"), END, *ids("\n\nHi there, friend!"), EOS])),
++    # text, a call streamed as argument deltas, then text after it: the round that ends the call ("n>\n", </tool_call>)
++    # also writes "Do", which goes out before the call's last delta, as every round's text goes before its calls
++    "tool": ({"tools": TOOLS}, rounds([*ids("Let me look."), OPEN, *ids(CALL), CLOSE, *ids("Done."), EOS],
++                                      tail=(6, 4))),
++}
++
++
++class Rounds:
++    """An engine writing fixed rounds (each a drafted burst); ``pause(at)`` runs before round ``at``, and ``tail``
++    seconds pass after the last one before ``generate`` returns (a two-rank engine finishing its round)."""
++
++    eos = (EOS,)
++
++    def __init__(self, written, pause=None, tail=0.0) -> None:
++        self.written, self.pause, self.tail = written, pause, tail
++        self.taken: list[float] = []              # when each round was handed over
++        self.returned: float | None = None
++
++    def generate(self, prompt, max_tokens, sampling, on_tokens, draft=True):
++        for at, piece in enumerate(self.written):
++            if self.pause is not None:
++                self.pause(at)
++            self.taken.append(time.monotonic())
++            if on_tokens(list(piece)):
++                break
++        time.sleep(self.tail)
++        self.returned = time.monotonic()
++        return {"rounds": len(self.taken), "decode_s": 0.5}
++
++
++class FixedIds:
++    """``uuid.uuid4`` counting from 1 and the chunks' ``created`` fixed, so two streams compare byte for byte."""
++
++    def __init__(self, monkeypatch) -> None:
++        self.count = 0
++        monkeypatch.setattr(uuid, "uuid4", self.next)
++        monkeypatch.setattr(cuda_http, "time", types.SimpleNamespace(time=lambda: 1767225600.0))
++
++    def next(self) -> uuid.UUID:
++        self.count += 1
++        return uuid.UUID(int=self.count << 96)
++
++    def reset(self) -> None:
++        self.count = 0
++
++
++def smoothing(monkeypatch, value: str | None, ms: str | None = None) -> None:
++    for name, setting in ((SMOOTH, value), (SMOOTH_MS, ms)):
++        if setting is None:
++            monkeypatch.delenv(name, raising=False)
++        else:
++            monkeypatch.setenv(name, setting)
++
++
++def app(tmp_path, engine):
++    made = app_for(tmp_path, engine)
++    made.tok = Tokens()
++    return made
++
++
++def stream(tmp_path, scenario: str) -> str:
++    """The SSE body of the scenario's streamed chat reply through the HTTP server."""
++
++    fields, written = SCENARIOS[scenario]
++    body = {"messages": [{"role": "user", "content": "Say hello."}], "stream": True, **fields}
++    with serving(app(tmp_path, Rounds(written))) as port:
++        status, reply = post(port, body)
++    assert status == 200, reply
++    return reply
++
++
++def events(body: str) -> list[dict[str, Any]]:
++    return [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: {")]
++
++
++def kinds(chunks: list[dict[str, Any]]) -> list[str]:
++    """What each event carries, in order (a delta may carry reasoning and content), a run of one text kind as one."""
++
++    seen: list[str] = []
++    for chunk in chunks:
++        choice = chunk["choices"][0]
++        here = [kind for kind in ("role", "reasoning_content", "content", "tool_calls") if kind in choice["delta"]]
++        for kind in [*here, *(["finish"] if choice["finish_reason"] is not None else [])]:
++            if not (seen and seen[-1] == kind and kind in ("reasoning_content", "content")):
++                seen.append(kind)
++    return seen
++
++
++def texts(chunks: list[dict[str, Any]]) -> list[str]:
++    return [choice["delta"][kind] for chunk in chunks for choice in chunk["choices"]
++            for kind in ("reasoning_content", "content") if kind in choice["delta"]]
++
++
++def joined(chunks: list[dict[str, Any]], kind: str) -> str:
++    return "".join(chunk["choices"][0]["delta"].get(kind, "") for chunk in chunks)
++
++
++@pytest.mark.parametrize("setting", [None, "0"])
++@pytest.mark.parametrize("scenario", sorted(SCENARIOS))
++def test_unset_or_0_streams_the_bytes_the_server_wrote_before(tmp_path, monkeypatch, scenario, setting):
++    FixedIds(monkeypatch)
++    smoothing(monkeypatch, setting, "250")            # the buffer's setting alone changes nothing
++    assert stream(tmp_path, scenario) == json.loads(GOLDEN.read_text())[scenario]
++
++
++@pytest.mark.parametrize("scenario", sorted(SCENARIOS))
++def test_smoothing_sends_a_token_an_event_and_the_same_reply(tmp_path, monkeypatch, scenario):
++    fixed = FixedIds(monkeypatch)
++    smoothing(monkeypatch, None)
++    plain = events(stream(tmp_path, scenario))
++    fixed.reset()
++    smoothing(monkeypatch, "1")
++    smooth = events(stream(tmp_path, scenario))
++    # the same text, calls and end (finish, usage and token sha)...
++    for kind in ("reasoning_content", "content"):
++        assert joined(smooth, kind) == joined(plain, kind)
++    calls = [[chunk["choices"][0]["delta"]["tool_calls"] for chunk in chunks
++              if "tool_calls" in chunk["choices"][0]["delta"]] for chunks in (plain, smooth)]
++    assert calls[1] == calls[0] and (scenario != "tool" or len(calls[0]) > 2)
++    assert smooth[-1] == plain[-1] and smooth[0] == plain[0] == events(json.loads(GOLDEN.read_text())[scenario])[0]
++    # ...in the same order: text, calls and the end keep their places, the text split into more events...
++    assert kinds(smooth) == kinds(plain)
++    if scenario == "tool":                            # the call between the text before and after it, its "}" after "Do"
++        assert kinds(smooth) == ["role", "content", *["tool_calls"] * 5, "content", "tool_calls", "content", "finish"]
++    # ...one token's text an event, but the round that ends the reply (one event, as before)
++    final = Tokens().decode(SCENARIOS[scenario][1][-1])
++    assert all(len(text) == 1 for text in texts(smooth)[:-1]) and texts(smooth)[-1] == final
++    assert texts(plain)[-1] == final and len(texts(smooth)) > len(texts(plain))
++
++
++def test_text_rounds_arrive_token_by_token(tmp_path, monkeypatch):
++    smoothing(monkeypatch, None)
++    assert texts(events(stream(tmp_path, "text"))) == ["Smo", "oth", " st", "rea", "ms ", "are", " ca", "lm."]
++    smoothing(monkeypatch, "1")
++    assert texts(events(stream(tmp_path, "text"))) == [*"Smooth streams are ca", "lm."]
++
++
++def direct(tmp_path, engine, emit=None, cancelled=None, **fields):
++    """App.run's events (when each was written, and the delta) for a streamed chat request, and its result."""
++
++    sent: list[tuple[float, dict[str, Any]]] = []
++
++    def record(delta):
++        sent.append((time.monotonic(), delta))
++        return True if emit is None else emit(delta)
++
++    body = {"messages": [{"role": "user", "content": "Say hello."}], "stream": True, **fields}
++    result = app(tmp_path, engine).run(body, True, record, cancelled=cancelled)
++    return sent, result
++
++
++def writers() -> set[threading.Thread]:
++    return {thread for thread in threading.enumerate() if thread.name == "tf-playout"}
++
++
++def test_the_round_that_ends_the_reply_goes_out_at_once(tmp_path, monkeypatch):
++    smoothing(monkeypatch, "1", "5000")               # a 5 s buffer: paced, the queued tokens would take seconds
++    written = SCENARIOS["text"][1]
++    last = len(written) - 1
++    engine = Rounds(written, pause=lambda at: time.sleep(0.3 if at == last else 0), tail=1.5)
++    sent, result = direct(tmp_path, engine)
++    content = [(t, delta["content"]) for t, delta in sent if "content" in delta]
++    assert [text for _, text in content] == [*"Smooth streams are ca", "lm."]
++    # the playout was holding tokens when the last round came...
++    assert sum(t < engine.taken[last] for t, _ in content) < len(content) - 1
++    # ...and it all went out then, the last round as one event, before the engine even returned
++    assert all(t < engine.returned for t, _ in content)
++    assert result["finish"] == "stop" and result["content"] == "Smooth streams are calm." and not result["final"]
++
++
++def test_unset_writes_each_round_from_the_request_thread(tmp_path, monkeypatch):
++    smoothing(monkeypatch, None)
++    threads = set()
++
++    def emit(delta):
++        threads.add(threading.current_thread())
++        return True
++
++    sent, _ = direct(tmp_path, Rounds(SCENARIOS["text"][1]), emit=emit)
++    assert threads == {threading.current_thread()} and len(sent) == len(SCENARIOS["text"][1])
++
++
++def test_a_client_gone_at_the_playout_stops_the_engine(tmp_path, monkeypatch):
++    smoothing(monkeypatch, "1", "1")
++    before = writers()
++    refused = threading.Event()
++
++    def emit(delta):
++        if delta == {"content": "S"}:                 # the reply's first write fails
++            refused.set()
++            return False
++        return True
++
++    def pause(at):
++        if at == 1:                                   # the writer has failed its write, and stopped
++            assert refused.wait(10)
++            deadline = time.monotonic() + 10
++            while writers() - before:
++                assert time.monotonic() < deadline
++                time.sleep(0.001)
++
++    engine = Rounds(SCENARIOS["text"][1], pause=pause)
++    with pytest.raises(RequestCancelled):
++        direct(tmp_path, engine, emit=emit)
++    assert len(engine.taken) == 2                     # the round after the failed write was the engine's last
++    assert writers() == before
++
++
++def test_a_write_that_raises_fails_the_request(tmp_path, monkeypatch):
++    smoothing(monkeypatch, "1", "1")
++
++    def emit(delta):
++        if delta == {"content": "o"}:
++            raise RuntimeError("the translator broke")
++        return True
++
++    with pytest.raises(RuntimeError, match="the translator broke"):
++        direct(tmp_path, Rounds(SCENARIOS["text"][1]), emit=emit)
++
++
++class Failing(Rounds):
++    """Writes its rounds, then fails as an engine can (out of memory, say)."""
++
++    def generate(self, prompt, max_tokens, sampling, on_tokens, draft=True):
++        super().generate(prompt, max_tokens, sampling, on_tokens, draft)
++        raise RuntimeError("CUDA out of memory (stand-in)")
++
++
++def test_an_engine_failure_sends_what_the_playout_still_holds(tmp_path, monkeypatch):
++    # this tree's rule (the recipe drops the queue on any failure): an engine failure first sends the text it made, at
++    # once, as unsmoothed (each round written before the failure); the request fails with the engine's error and leaves
++    # no writer behind
++    written, sent = SCENARIOS["text"][1][:2], []
++    smoothing(monkeypatch, None)
++    with pytest.raises(RuntimeError, match="out of memory"):
++        direct(tmp_path, Failing(written), emit=lambda delta: sent.append(delta) or True)
++    assert sent == [{"content": "Smo"}, {"content": "oth"}]
++    smoothing(monkeypatch, "1", "5000")               # held: the second token would go out a second after the first
++    before, sent = writers(), []
++    with pytest.raises(RuntimeError, match="out of memory"):
++        direct(tmp_path, Failing(written), emit=lambda delta: sent.append(delta) or True)
++    assert "".join(d["content"] for d in sent) == "Smooth" and writers() == before
++
++
++def test_no_writer_is_left_behind(tmp_path, monkeypatch):
++    smoothing(monkeypatch, "1", "1")
++    before = writers()
++    sent, _ = direct(tmp_path, Rounds(SCENARIOS["tool"][1]))
++    assert sent and writers() == before
++    engine = Rounds(SCENARIOS["text"][1])
++    with pytest.raises(RequestCancelled):             # the client left while the request waited: it never ran
++        direct(tmp_path, engine, cancelled=lambda: True)
++    assert not engine.taken and writers() == before
++
++
++def test_a_bad_setting_refuses_streamed_requests_before_they_run(tmp_path, monkeypatch):
++    smoothing(monkeypatch, "yes")
++    engine = Rounds(SCENARIOS["text"][1])
++    with pytest.raises(ValueError, match="TF_GLM_STREAM_SMOOTH"):
++        direct(tmp_path, engine)
++    assert not engine.taken
++    _, result = direct(tmp_path, engine, stream=False)          # unstreamed, the setting is never read
++    assert result["content"] == "Smooth streams are calm."

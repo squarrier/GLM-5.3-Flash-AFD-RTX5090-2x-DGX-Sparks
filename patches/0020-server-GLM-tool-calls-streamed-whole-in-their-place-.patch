@@ -1,0 +1,1879 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 23:19:41 -0400
+Subject: [PATCH] server: GLM tool calls streamed whole in their place, calls
+ at the end of the think block, agent histories that render, TF_GLM_TOOL_CALLS
+ (MiaAI-Lab recipe patches 0036, 0051, 0056)
+
+MiaAI-Lab's recipe (github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold @ 1576746) serves GLM-5.3-Flash
+to agent clients with tool-call fixes that TensorFold 0.6.5 lacks. This ports, behind TF_GLM_TOOL_CALLS=1 (off
+unless set; the recipe has no switch for them), the end state of recipe patches 0036-glm-tool-calls (with 0053's and
+0055's changes to its streamer), 0051-glm-tool-history-recovery and the text part of 0056-glm-tool-result-media
+(Apache License 2.0, Copyright 2026 MiaAI-Lab; parts of 0036 adapted from jayleaton/glm53-tensorfold-spark patch
+0620, Apache License 2.0, Copyright 2026 Jay Leaton), and 0036's kept reasoning behind its own TF_GLM_KEEP_REASONING
+(default 0 here, 1024 in the recipe):
+
+- cuda/reply_text.py: GlmCallStreamer follows each GLM call while it is written and sends it whole, header and
+  arguments in one delta, in its place in the stream once its </tool_call> arrives (0.6.5 sends GLM's calls after
+  the reply ends, and nothing while a long call such as a file write is written). ThinkSplit: calls written inside
+  the think block are the reply's calls when they end it, else reasoning (0.6.5 reads a call in an unclosed block as
+  the answer, text after it included). Both copied from the recipe's end state.
+- cuda/server.py App.run: the streamer for GLM's streamed replies (other families keep ToolCallStreamer), an empty
+  delta every CALL_KEEPALIVE_S (2 s) while a call is held, a call the reply ends inside (its token limit, a stop
+  string) never sent nor its markup as content, finish "length"/"stop" for such a reply; #285's closing of a call
+  the end token left open is unchanged. cuda/http.py sends the calls the reply's end closed.
+- families/glm5_next/prompts.py agent_history (the CUDA and Mac servers): a call's arguments sent as "" or null are
+  no arguments (0.6.5 renders them as an _invalid_arguments argument the model never wrote); a call whose
+  arguments are not a JSON object is left out with its result and logged (0051; 0.6.5 renders it under
+  _invalid_arguments); results whose ids match none of their calls' render in the order sent (the checkpoint's
+  template drops them). server/messages.py: a step's `reasoning` field is its reasoning_content.
+- App._prepare + server/prompts.py tool_media_parts: without --vision, a GLM tool result's pictures render as the
+  checkpoint template's own "unable to process this image" reminder instead of HTTP 400 on every later turn of the
+  agent session (0056's text part; its image path needs GLM vision, which this tree does not have).
+- tool_parameters.py (every parser and both streamers, as in the recipe): a parameter schema's type list, anyOf /
+  oneOf, enum or const types its value, and a nullable string's null is None; engine/tool_draft.py streams it.
+- families/glm5_next/cuda/kept_reasoning.py (new) + GlmApp: a tool-calling reply's reasoning is kept and put back
+  into a later request whose client dropped it, found by the server's call ids or a signature of the whole
+  conversation before the calls (TF_GLM_KEEP_REASONING replies, TF_GLM_KEEP_REASONING_MB of text).
+
+Unset, every path is TensorFold 0.6.5's (+ #285): the shared decoder reads a single type name only, and the server's
+replies and prompts are byte-identical.
+
+Tests: tests/test_glm_tool_fixes.py (CPU, through GlmApp and the HTTP handler: streamed calls in their place, drafted
+rounds, keepalive deltas, cut calls, think-block calls, tool_choice none / named / required / auto,
+parallel_tool_calls false, func_probe's exact case, empty and malformed arguments and null content in the history,
+renumbered result ids, the reasoning field, a tool result's picture without --vision, kept reasoning, schema types;
+with the checkpoint's own template when TF_GLM5_TR3_MODEL points at it; with smooth streaming once
+tensorfold.cuda.stream_pacing is in the tree). tests/test_glm_tool_call_end.py: #285's two cut-call cases read the
+switch (with it, the cut markup is not content).
+
+Credit: THIRD_PARTY_NOTICES.md ("GLM tool calls") and the ported units' docstrings name MiaAI-Lab, the patches and
+Jay Leaton's project.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patches 0036, 0051, 0056,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 1576746a04983b6eded0551dbf22512ee9e95654 (v1.5); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |  26 +
+ src/tensorfold/cuda/http.py                   |   2 +
+ src/tensorfold/cuda/reply_text.py             | 244 ++++++-
+ src/tensorfold/cuda/server.py                 | 117 +++-
+ src/tensorfold/engine/tool_draft.py           |  15 +-
+ src/tensorfold/families/glm5_next/cuda/app.py |  31 +-
+ .../families/glm5_next/cuda/kept_reasoning.py | 155 +++++
+ src/tensorfold/families/glm5_next/prompts.py  |  72 ++
+ src/tensorfold/server/messages.py             |   7 +
+ src/tensorfold/server/prompts.py              |  24 +
+ src/tensorfold/tool_parameters.py             | 104 ++-
+ tests/test_glm_tool_call_end.py               |   8 +-
+ tests/test_glm_tool_calls.py                  |   7 +-
+ tests/test_glm_tool_fixes.py                  | 617 ++++++++++++++++++
+ 14 files changed, 1369 insertions(+), 60 deletions(-)
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/kept_reasoning.py
+ create mode 100644 tests/test_glm_tool_fixes.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index 9329db2..71ce11a 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -291,3 +291,29 @@ times here (1 to 8 rows, so N up to 7, as in the recipe, whose bound is its capt
+ split's attention node checks `TF_GLM_DFLASH_POLICY` before the wire opens; the joint allocation passes `beta` only
+ when a policy has one. Unset, `TF_GLM_DFLASH_POLICY` is `fc5:0.3`, the policy before (the recipe's `config.sh` sets
+ `fnc7:0.3`).
++
++## GLM tool calls (TF_GLM_TOOL_CALLS, TF_GLM_KEEP_REASONING)
++
++`cuda/reply_text.py` (`ThinkSplit`, `_call_run`, `GlmCallStreamer`), `families/glm5_next/cuda/kept_reasoning.py`,
++`families/glm5_next/prompts.py` (`agent_history`), `server/prompts.py` (`tool_media_parts`), `tool_parameters.py`
++(`schema_types`, `typed_parameter`, `nullable_text`, `decode_parameter`), `engine/tool_draft.py`
++(`ToolCallStreamer`'s nullable values) and the `TF_GLM_TOOL_CALLS` paths of `cuda/server.py`, `cuda/http.py`,
++`server/messages.py` and `families/glm5_next/cuda/app.py` are ported from MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/1576746)
++patches 0036-glm-tool-calls, 0051-glm-tool-history-recovery and the text part of 0056-glm-tool-result-media, as they
++stand at the end of the recipe's patch chain (with 0053-glm-whole-tool-calls' and 0055-glm-open-tool-calls' changes
++to 0036's streamer), Apache License 2.0, Copyright 2026 MiaAI-Lab (see [the license text](LICENSES/Apache-2.0.txt)).
++Parts of patch 0036 are adapted from
++[jayleaton/glm53-tensorfold-spark](https://github.com/jayleaton/glm53-tensorfold-spark) patch 0620, Apache License
++2.0, Copyright 2026 Jay Leaton (https://x.com/jayleaton): the rule that tool calls written inside the think block are
++the reply's calls when they end it (its `trailing_calls`, in `ThinkSplit`); the reasoning store (its `ReasoningMemory`
++LRU, keyed by the server's call ids and by a signature of the calls; MiaAI-Lab's signature covers the whole
++conversation before the calls); and `const` schemas and `null` read as None for a nullable string (its
++`typed_value`), in the shared decoder. Changes in the port: every one of these paths except the reasoning store is
++off unless `TF_GLM_TOOL_CALLS=1` (the recipe has no switch for them); the reasoning store keeps its own switch,
++`TF_GLM_KEEP_REASONING`, which defaults to 0 (off) here (the recipe's default is 1024); the cut-call rule of 0053
++applies to GLM's replies only; #285's `close_glm_call` and the shared `repair_glm_keys`, already in this tree, are
++used in place of the recipe's copies; 0056's image path (GLM vision) is not taken. With `TF_GLM_TOOL_CALLS=1` the
++recipe's GLM call streamer is in this tree after all (the smooth-streaming section above predates it): with
++`TF_GLM_STREAM_SMOOTH=1` too, a round's whole calls and keep-alive deltas go into the playout queue after the
++round's text, unpaced, as in the recipe's end state.
+diff --git a/src/tensorfold/cuda/http.py b/src/tensorfold/cuda/http.py
+index 1a1dc30..6cde8e2 100644
+--- a/src/tensorfold/cuda/http.py
++++ b/src/tensorfold/cuda/http.py
+@@ -184,6 +184,8 @@ def make_handler(app: App):
+                     return self._stream_error({"message": _error_message(exc), "type": "server_error"})
+                 if result["final"]:
+                     emit(result["final"])
++                for delta in result.get("call_deltas") or ():      # calls the reply's end closed (TF_GLM_TOOL_CALLS)
++                    emit(delta)
+                 if result["calls"]:
+                     for i, call in enumerate(result["calls"]):
+                         if i < result.get("calls_streamed", 0):      # sent as deltas already
+diff --git a/src/tensorfold/cuda/reply_text.py b/src/tensorfold/cuda/reply_text.py
+index 9f68859..58994bd 100644
+--- a/src/tensorfold/cuda/reply_text.py
++++ b/src/tensorfold/cuda/reply_text.py
+@@ -1,4 +1,10 @@
+-"""The CUDA server's reply text: streamed decoding, think blocks and tool-call parsing (the Mac lane server's rules)."""
++"""The CUDA server's reply text: streamed decoding, think blocks and tool-call parsing (the Mac lane server's rules).
++
++``ThinkSplit`` and ``GlmCallStreamer`` are MiaAI-Lab's GLM tool-call handling (recipe patches 0036, 0053, 0055),
++used by the server only with ``TF_GLM_TOOL_CALLS=1``. Parts adapted from jayleaton/glm53-tensorfold-spark patch
++0620 (Apache-2.0): the rule that calls written inside the think block are the reply's calls when they end it (its
++``trailing_calls``), in ``ThinkSplit``.
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -8,8 +14,9 @@ import uuid
+ from typing import Any
+ 
+ from tensorfold.server.stopping import StopPolicy
++from tensorfold.server.tools import _GLM_NAME_RE as _GLM_NAME
+ from tensorfold.server.tools import parse_glm_tool_call_block
+-from tensorfold.tool_parameters import decode_parameter, parameter_schemas
++from tensorfold.tool_parameters import decode_parameter, nullable_text, parameter_schemas, typed_parameter
+ 
+ _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
+ _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
+@@ -171,4 +178,237 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
+     return "".join(residue).strip(), calls or None
+ 
+ 
++_THINK_CLOSE = "</think>"
++_CALL_BLOCK = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
++THINK_CALL_HOLD = 1024      # characters of a call written inside the think block held before it streams as a call
++
++
++def _call_run(text: str, start: int, finished: bool) -> tuple[int, str]:
++    """(where the run of complete ``<tool_call>`` blocks from ``start`` ends, what it is): ``"calls"`` when the reply
++    ended on it (nothing after it but whitespace and a closing ``</think>``), ``"pending"`` while that may still
++    come true, ``"reasoning"`` once text follows it (more reasoning, or an answer after the think block)."""
++
++    end = pos = start
++    while (block := _CALL_BLOCK.match(text, pos)) is not None:
++        end = block.end()
++        pos = len(text) - len(text[end:].lstrip())
++    after = text[end:].lstrip()
++    if after.startswith(_THINK_CLOSE) and not after[len(_THINK_CLOSE):].strip():
++        after = ""
++    if not after:
++        return end, "calls" if finished and end > start else "pending"
++    if not finished and (after.startswith(_CALL_OPEN) or _CALL_OPEN.startswith(after)
++                         or _THINK_CLOSE.startswith(after)):
++        return end, "pending"                   # a block, or the think block's close, being written
++    return end, "reasoning"
++
++
++class ThinkSplit:
++    """(reasoning, answer) of a thinking GLM reply with tools, streamed or whole: the think block ends at its
++    ``</think>``, and calls the model wrote inside it are its calls only when they end the reply (nothing after them
++    but whitespace and the block's close; theirs is the trailing-calls rule of jayleaton/glm53-tensorfold-spark patch
++    0620, and upstream's split read any call in an unclosed block as the answer). A call in the think block is held:
++    its text stays out of the reasoning until the reply ends on it (a call) or text follows it (reasoning after all).
++    With ``hold``, a held call longer than ``hold`` characters is taken as a call at once (``committed``) so a long
++    file write streams while it is written; nothing after it can make it reasoning again.
++
++    ``stream_from`` is where the text a call streamer reads begins once known (the answer, or a committed call); a
++    reply whose calls it never reaches has them from the end parser."""
++
++    def __init__(self, hold: int | None = None) -> None:
++        self.hold = hold
++        self.floor = 0                  # calls before this are reasoning
++        self.committed: int | None = None
++        self.stream_from: int | None = None
++
++    def __call__(self, text: str, finished: bool) -> tuple[str, str]:
++        if self.committed is not None:
++            at = self.committed
++            return text[:at], text[at:].replace(_THINK_CLOSE, "", 1).lstrip()
++        close = text.find(_THINK_CLOSE)
++        while True:
++            call = text.find(_CALL_OPEN, self.floor)
++            if close >= 0 and (call < 0 or close < call):
++                self.stream_from = close + len(_THINK_CLOSE)
++                return text[:close], text[self.stream_from:].lstrip("\n")
++            if call < 0:
++                held = 0 if finished else max(_partial_tag(text, tag) for tag in (_THINK_CLOSE, _CALL_OPEN))
++                return text[:len(text) - held], ""
++            end, kind = _call_run(text, call, finished)
++            if kind == "calls":
++                return text[:call], text[call:end]
++            if kind == "reasoning":
++                self.floor = max(end, call + len(_CALL_OPEN))
++                continue
++            if self.hold is not None and len(text) - call > self.hold and close < 0:
++                self.committed = self.stream_from = call
++                return self(text, finished)
++            return text[:call], ""
++
++
++_KEY, _KEY_END, _VALUE, _VALUE_END = "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>"
++_VALUE_OPENS = re.compile(r"\s*<arg_value>")
++
++
++def _json(value: Any) -> str:
++    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
++
++
++class GlmCallStreamer:
++    """GLM's ``<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>`` calls as OpenAI tool-call
++    deltas: each call is followed while it is written (its arguments' JSON built a string value as it arrives and a
++    typed one when whole, joining to what ``parse_tool_calls`` gives) and sent whole, header and arguments in one delta,
++    once its ``</tool_call>`` arrives. A call the reply ends inside (its token limit) is never sent: a client could
++    store or run its cut arguments.
++
++    ``feed`` takes the reply's answer so far (text that only grows) and returns the new deltas; ``sent`` counts the
++    calls sent. A block it cannot follow (not GLM's markup, a tool the request did not offer) is skipped and stays
++    with the end parser."""
++
++    def __init__(self, tools: list[dict[str, Any]]) -> None:
++        self.tools = tools
++        self.known = {_tool_name(t).lower(): _tool_name(t) for t in tools}
++        self.schemas = parameter_schemas(tools)
++        self.calls: list[dict[str, Any]] = []          # every call whose header was sent, its arguments as sent
++        self.skipped: list[str] = []                    # whole blocks it did not follow, for the end parser
++        self.pos, self.state, self.start = 0, "outside", 0
++        self.open = False                               # the last call's header went out, its </tool_call> has not
++        self.schema: dict[str, Any] = {}               # the current call's parameter schemas
++        self.value_schema: dict[str, Any] | None = None     # the current typed value's schema, None for text
++        self.maybe_null = False                         # a nullable text value that may still be ``null``: held
++        self.sent = 0                                   # calls sent whole (the last one may still be open)
++
++    def _args(self, out: list[dict[str, Any]], piece: str) -> None:
++        index = len(self.calls) - 1
++        self.calls[index]["function"]["arguments"] += piece
++        last = out[-1]["tool_calls"][0] if out else None
++        if last is not None and last["index"] == index and "id" not in last:      # one delta a call a feed
++            last["function"]["arguments"] += piece
++        else:
++            out.append({"tool_calls": [{"index": index, "function": {"arguments": piece}}]})
++
++    def feed(self, text: str) -> list[dict[str, Any]]:
++        self._follow(text)
++        whole = len(self.calls) - (1 if self.open else 0)
++        out = [{"tool_calls": [{"index": i, "id": c["id"], "type": "function",
++                                "function": {"name": c["function"]["name"], "arguments": c["function"]["arguments"]}}]}
++               for i, c in enumerate(self.calls[self.sent:whole], self.sent)]
++        self.sent = whole
++        return out
++
++    def _follow(self, text: str) -> list[dict[str, Any]]:
++        out: list[dict[str, Any]] = []
++        while True:
++            rest = text[self.pos:]
++            if self.state == "outside":
++                at = rest.find(_CALL_OPEN)
++                if at < 0:
++                    return out
++                self.start = self.pos + at
++                self.pos, self.state = self.start + len(_CALL_OPEN), "name"
++            elif self.state == "name":                  # the end parser's name: the text before <arg_key> or the end
++                ends = [at for at in (rest.find(_KEY), rest.find(_CALL_CLOSE)) if at >= 0]
++                if not ends:
++                    if len(rest) > 256:
++                        self.state = "skip"
++                        continue
++                    return out
++                name = rest[:min(ends)].strip()
++                if not self._callable(name):
++                    self.state = "skip"
++                    continue
++                name, id_ = self.known[name.lower()], f"call_{uuid.uuid4().hex[:24]}"
++                self.calls.append({"id": id_, "type": "function", "function": {"name": name, "arguments": ""}})
++                self.open = True
++                out.append({"tool_calls": [{"index": len(self.calls) - 1, "id": id_, "type": "function",
++                                            "function": {"name": name, "arguments": ""}}]})
++                self.schema = self.schemas.get(name.lower(), {})
++                self.pos, self.state = self.pos + min(ends), "arguments"
++            elif self.state == "skip":                  # a block the end parser decides: to its end
++                at = rest.find(_CALL_CLOSE)
++                if at < 0:
++                    return out
++                self.pos, self.state = self.pos + at + len(_CALL_CLOSE), "outside"
++                self.skipped.append(text[self.start:self.pos])
++            elif self.state == "arguments":             # text between arguments is ignored, as the end parser does
++                key, close = rest.find(_KEY), rest.find(_CALL_CLOSE)
++                if close >= 0 and (key < 0 or close < key):
++                    self._args(out, "}" if self.calls[-1]["function"]["arguments"] else "{}")
++                    self.pos, self.state, self.open = self.pos + close + len(_CALL_CLOSE), "outside", False
++                    self._repaired(text[self.start:self.pos])
++                elif key >= 0:
++                    self.pos, self.state = self.pos + key + len(_KEY), "key"
++                else:
++                    return out
++            elif self.state == "key":
++                end = rest.find(_KEY_END)
++                opens = _VALUE_OPENS.match(rest, end + len(_KEY_END)) if end >= 0 else None
++                if opens is None:
++                    after = rest[end + len(_KEY_END):] if end >= 0 else ""
++                    cut = _CALL_CLOSE in (rest if end < 0 else after)
++                    if not cut and (end < 0 or not after.strip() or _VALUE.startswith(after.lstrip())):
++                        return out                      # the key or its value's opener is still being written
++                    self.state = "arguments"            # not an argument the end parser reads the same way
++                    continue
++                key = rest[:end].strip()
++                schema = self.schema.get(key, {})
++                self.value_schema = schema if typed_parameter(schema) else None
++                self.maybe_null = self.value_schema is None and nullable_text(schema)
++                opened = "{" if not self.calls[-1]["function"]["arguments"] else ","
++                quote = "" if self.value_schema is not None or self.maybe_null else '"'
++                self._args(out, opened + _json(key) + ":" + quote)
++                self.pos, self.state = self.pos + opens.end(), "value"
++            elif self.state == "value":
++                end = rest.find(_VALUE_END)
++                if self.value_schema is not None:       # typed: decoded whole, as the end parser does
++                    if end < 0:
++                        return out
++                    self._args(out, _json(decode_parameter(rest[:end], self.value_schema, python=False)))
++                elif self.maybe_null:                   # text or null: held while it may still be ``null``
++                    written = rest[:end] if end >= 0 else rest[:len(rest) - _partial_tag(rest, _VALUE_END)]
++                    if end >= 0 and written == "null":
++                        self._args(out, "null")
++                    elif end < 0 and "null".startswith(written):
++                        return out
++                    else:
++                        self._args(out, '"')
++                        self.maybe_null = False
++                        continue
++                else:                                   # text: as it arrives, less a tail that may begin the closer
++                    written = rest[:end] if end >= 0 else rest[:len(rest) - _partial_tag(rest, _VALUE_END)]
++                    piece = _json(written)[1:-1] + ('"' if end >= 0 else "")
++                    if piece:
++                        self._args(out, piece)
++                    if end < 0:
++                        self.pos += len(written)
++                        return out
++                self.pos, self.state = self.pos + end + len(_VALUE_END), "arguments"
++
++    def _repaired(self, block: str) -> None:
++        """A whole call whose markup lost an ``<arg_key>`` (``repair_glm_keys``): its arguments as the end parser reads
++        it repaired (the streamer skipped the argument it could not see); it has not been sent yet."""
++
++        if block.count(_KEY_END) <= block.count(_KEY):
++            return
++        calls = parse_tool_calls(block, self.tools)[1] or []
++        if len(calls) == 1 and calls[0]["function"]["name"] == self.calls[-1]["function"]["name"]:
++            self.calls[-1]["function"]["arguments"] = calls[0]["function"]["arguments"]
++
++    def _callable(self, name: str) -> bool:
++        """Whether the end parser reads a block beginning ``name`` as a GLM call to an offered tool."""
++
++        if _GLM_NAME.fullmatch(name) is None or name.lower() not in self.known:
++            return False
++        try:
++            json.loads(name)                            # a name that is JSON (``true``, ``1``) is read as JSON
++        except ValueError:
++            return True
++        return False
++
++    def rest(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
++        """The calls the end parser reads in the blocks this streamer skipped (JSON or Qwen markup): sent at the end."""
++
++        return [call for block in self.skipped for call in parse_tool_calls(block, tools)[1] or []]
++
++
+ # -- chat template -------------------------------------------------------------------------
+diff --git a/src/tensorfold/cuda/server.py b/src/tensorfold/cuda/server.py
+index af23265..c2fd05c 100644
+--- a/src/tensorfold/cuda/server.py
++++ b/src/tensorfold/cuda/server.py
+@@ -27,12 +27,19 @@ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
+ 
+ from tensorfold.cuda import health
+ from tensorfold.cuda.chat_template import ChatTemplate
+-from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, close_glm_call, hide_tool_calls, parse_tool_calls
++from tensorfold.cuda.reply_text import (THINK_CALL_HOLD, GlmCallStreamer, StopStrings, StreamDecoder, ThinkSplit,
++                                        close_glm_call, hide_tool_calls, parse_tool_calls)
+ from tensorfold.cuda.stream_pacing import Playout, hold_seconds, smooth_streaming  # MiaAI-Lab recipe patch 0061
+ from tensorfold.cuda.turns import Turns, Yield
+ from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
++from tensorfold.tool_parameters import tool_calls_on
+ from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
+ 
++# TF_GLM_TOOL_CALLS=1: while a GLM tool call is written it is held until whole (a call the reply ends inside is never
++# sent); an idle client (upstream #114: one that drops a reply sending nothing) gets an empty delta this often
++# meanwhile (MiaAI-Lab recipe patch 0053)
++CALL_KEEPALIVE_S = 2.0
++
+ 
+ # -- requests --------------------------------------------------------------------------------
+ 
+@@ -259,7 +266,7 @@ class App:
+         if chat:
+             if not isinstance(body.get("messages"), list):
+                 raise RequestError("messages must be a list")
+-            from tensorfold.server.prompts import has_images, prepare_images
++            from tensorfold.server.prompts import has_images, prepare_images, tool_media_parts
+ 
+             def render(messages: list[dict[str, Any]], **images: bool) -> str:   # text renders as it always has
+                 try:
+@@ -268,7 +275,11 @@ class App:
+                 except TemplateError as exc:     # the checkpoint's template refuses the request (``raise_exception``)
+                     raise RequestError(f"the chat template rejected the request: {exc}") from exc
+ 
+-            if has_images(body["messages"]):
++            # no --vision: a tool result's pictures as the template's own "unable to process" reminder (GLM with
++            # TF_GLM_TOOL_CALLS=1, MiaAI-Lab recipe patch 0056's text part); a user's still need --vision
++            reminded = (tool_media_parts(body["messages"]) if getattr(self, "tool_media_reminders", False)
++                        and getattr(self, "vision", None) is None and tool_calls_on() else None)
++            if reminded is None and has_images(body["messages"]):
+                 rendered = prepare_images(self.vision, body["messages"],
+                                           lambda messages: render(messages, allow_images=True),
+                                           context_limit=self._context_limit(),
+@@ -276,7 +287,7 @@ class App:
+                 return PreparedRequest(rendered.tokens, max_tokens, tools, thinking,
+                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
+                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
+-            text = render(body["messages"])
++            text = render(reminded, allow_images=True) if reminded is not None else render(body["messages"])
+             prompt = self.tok.encode(text, add_special_tokens=False).ids
+         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
+             prompt = self.token_ids(body["prompt"])
+@@ -410,25 +421,43 @@ class App:
+         stopped = {"client": False, "stop": False}
+         failed: list[BaseException] = []    # MiaAI-Lab recipe patch 0061: a playout write's error too (any BaseException)
+         stream = StreamDecoder(self.tok, ends)
+-        # calls stream as argument deltas while written (as on the Mac); one-call requests keep the end parser
+-        calls_stream = ToolCallStreamer(tools) if tools and not policy.single else None
++        # TF_GLM_TOOL_CALLS=1 (MiaAI-Lab recipe patches 0036, 0053, 0055): a streamed reply's GLM calls go out while
++        # they are written, each whole once its </tool_call> arrives (a long file write would otherwise send nothing
++        # for minutes, past the idle cut of clients such as LiteLLM and Node's fetch); one call a reply waits
++        glm_calls = bool(tools) and self._glm_calls() and tool_calls_on()
++        calls_stream = GlmCallStreamer(tools) if glm_calls and body.get("stream") and not policy.single else None
++        quiet_since = [time.monotonic()]     # the last delta sent while a call is held (CALL_KEEPALIVE_S)
++        # other calls stream as argument deltas while written (as on the Mac); one-call requests keep the end parser
++        xml_stream = ToolCallStreamer(tools) if tools and not glm_calls and not policy.single else None
+         answer_raw = [""]
+         closing = [""]                      # what closes a GLM call the model's end token left open (``run``'s end)
++        # GLM's calls written inside the think block: calls when the reply ends on them (``ThinkSplit``)
++        think = (ThinkSplit(THINK_CALL_HOLD if calls_stream is not None else None) if glm_calls and chat and thinking
++                 else None)
++
++        def split(raw: str, finished: bool) -> tuple[str, str]:
++            if not (chat and thinking):
++                return "", raw
++            return think(raw, finished) if think is not None else split_thinking(raw, finished=finished)
++
++        def call_text(raw: str) -> str:
++            """The text the call streamer reads: the answer, or a long call taken from the think block; "" before."""
+ 
+-        def visible(finished: bool) -> tuple[str, str]:
++            if think is None:
++                return raw
++            return raw[think.stream_from:] if think.stream_from is not None else ""
++
++        def visible(finished: bool) -> tuple[str, str, str]:
+             raw = stream.final() if finished else stream.text
+             # stop strings match the generated text, reasoning included, before it is split (as on the Mac)
+             raw = stops.visible(raw, partial=not finished) if stops.strings else raw
+             raw = raw + closing[0] if finished else raw
+-            if chat and thinking:
+-                reasoning, answer = split_thinking(raw, finished=finished)
+-            else:
+-                reasoning, answer = "", raw
++            reasoning, answer = split(raw, finished)
+             answer_raw[0] = answer
+             if tools:
+                 answer = (policy.content(answer, finished=finished) if policy.single
+                           else hide_tool_calls(answer, finished=finished))
+-            return reasoning, answer
++            return reasoning, answer, raw
+ 
+         serving: list[Any] = [None]
+ 
+@@ -448,11 +477,11 @@ class App:
+             playout.put(delta, paced)
+             return not playout.gone
+ 
+-        def text_delta(tokens: list[int]) -> dict[str, Any]:
+-            """The reasoning and answer text these tokens add (the part not sent yet)."""
++        def text_delta(tokens: list[int]) -> tuple[dict[str, Any], str]:
++            """The reasoning and answer text these tokens add (the part not sent yet), and the raw text so far."""
+ 
+             stream.add(tokens)
+-            reasoning, answer = visible(False)
++            reasoning, answer, raw = visible(False)
+             delta: dict[str, Any] = {}
+             if len(reasoning) > sent["reasoning"]:
+                 delta["reasoning_content"] = reasoning[sent["reasoning"]:]
+@@ -460,7 +489,7 @@ class App:
+             if len(answer) > sent["content"]:
+                 delta["content"] = answer[sent["content"]:]
+                 sent["content"] = len(answer)
+-            return delta
++            return delta, raw
+ 
+         def on_tokens(new: list[int]) -> bool:
+             # True stops the engine after this round (two-rank GLM: the next one); a running engine keeps getting True
+@@ -486,15 +515,29 @@ class App:
+                 if playout is not None and ending:
+                     playout.flush()
+                 pieces = [[t] for t in new] if playout is not None and not ending and len(new) > 1 else [new]
++                raw, wrote = "", False
+                 for piece in pieces:
+-                    delta = text_delta(piece)
+-                    if delta and not send(delta, True):
++                    delta, raw = text_delta(piece)
++                    if not delta:
++                        continue
++                    if not send(delta, True):
+                         stopped["client"] = True
+                         break
++                    wrote = True
++                # the round's call deltas follow all of its text, as unsmoothed, and are not paced (they keep their place
++                # in the queue: MiaAI-Lab recipe patch 0061); GLM's whole calls with TF_GLM_TOOL_CALLS=1 (0036, 0053)
++                parts: list[dict[str, Any]] = []
+                 if calls_stream is not None and not stopped["client"]:
+-                    # MiaAI-Lab recipe patch 0061: the round's call deltas follow all of its text, as unsmoothed, and are
+-                    # not paced (they keep their place in the queue)
+-                    for call_delta in calls_stream.feed(answer_raw[0]):   # never the reasoning
++                    parts += calls_stream.feed(call_text(raw))
++                    if parts or wrote:
++                        quiet_since[0] = time.monotonic()
++                    elif calls_stream.open and time.monotonic() - quiet_since[0] >= CALL_KEEPALIVE_S:
++                        parts.append({})          # a call held until whole: an empty delta keeps idle clients waiting
++                        quiet_since[0] = time.monotonic()
++                if not all(send(part, False) for part in parts):
++                    stopped["client"] = True
++                if xml_stream is not None and not stopped["client"]:
++                    for call_delta in xml_stream.feed(answer_raw[0]):     # never the reasoning
+                         if not send(call_delta, False):
+                             stopped["client"] = True
+                             break
+@@ -596,21 +639,39 @@ class App:
+         stats = {**(stats or {}), "token_sha": token_sha(out)}
+         # GLM: the model's end token (not a stop string or the token limit) ended the reply inside a call, before its
+         # </tool_call>: the call is closed and sent when it then parses whole; otherwise its markup stays the text
+-        if tools and out and out[-1] in ends and not stopped["stop"] and self._glm_calls():
++        ended = bool(out) and out[-1] in ends and not stopped["stop"]
++        if tools and ended and self._glm_calls():
+             closing[0] = close_glm_call(stops.visible(stream.final()) if stops.strings else stream.final(), tools)
+-        reasoning, answer = visible(True)
++        reasoning, answer, raw = visible(True)
+         final: dict[str, Any] = {}
+         if len(reasoning) > sent["reasoning"]:
+             final["reasoning_content"] = reasoning[sent["reasoning"]:]
+         raw_text = self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False)
+         text = stops.visible(raw_text) + closing[0]
+-        raw_answer = split_thinking(text, finished=True)[1] if chat and thinking else text
++        raw_answer = split(text, True)[1]
+         content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
+         content = policy.content(content) if tools else content
++        call_deltas: list[dict[str, Any]] = []
++        streamed, cut = 0, False
++        if glm_calls:                       # TF_GLM_TOOL_CALLS=1 (MiaAI-Lab recipe patches 0036, 0053, 0055)
++            # the calls streamed as sent, then any the streamer did not follow; calls held in the think block to the
++            # end (never streamed) are the end parser's, sent whole
++            if calls_stream is not None and (think is None or think.stream_from is not None):
++                call_deltas = calls_stream.feed(call_text(raw))
++                streamed = calls_stream.sent
++                calls = [*calls_stream.calls[:streamed], *calls_stream.rest(tools)] or None
++            # a call the token limit or a stop string cut (the reply ended inside it): never sent, nor its markup as
++            # content; one the model's end token left open that would not parse, its markup as text (``closing``)
++            cut = calls_stream is not None and calls_stream.open and not ended
++            if cut:
++                content = answer.strip()
++            elif not ended and (at := content.rfind("<tool_call>")) >= 0 and "</tool_call>" not in content[at:]:
++                content, cut = content[:at].rstrip(), True     # the same for the end parser: an unclosed call is cut
+         tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
+         if tail:
+             final["content"] = tail
+-        finish = "tool_calls" if calls else ("stop" if stopped["stop"] or (out and out[-1] in ends) else "length")
++        finish = "tool_calls" if calls and not cut else ("stop" if stopped["stop"] or (out and out[-1] in ends)
++                                                         else "length")
+         warning = unanswered(finish, chat and thinking, content, calls)
+         if warning:
+             print(warning, flush=True)
+@@ -620,8 +681,10 @@ class App:
+         logprobs = (self._probability_decoder.format(probabilities.emitted(out), ends)
+                     if probabilities is not None else None)
+         # the calls already sent as deltas; the handler sends the rest (a call the streamer could not follow)
+-        streamed = calls_stream.index + 1 if calls_stream is not None and calls_stream.streamed else 0
+-        return {"final": final, "calls": calls, "finish": finish, "content": content, "reasoning": reasoning,
++        if xml_stream is not None and xml_stream.streamed:
++            streamed = xml_stream.index + 1
++        return {"final": final, "calls": calls, "call_deltas": call_deltas, "finish": finish, "content": content,
++                "reasoning": reasoning,
+                 "stop_sequence": matched_stop(raw_text, stops.strings),
+                 **({"logprobs": logprobs} if logprobs is not None else {}),
+                 "prompt_tokens": len(prompt), "completion_tokens": len(out), "cached_tokens": (cached or [0])[0],
+diff --git a/src/tensorfold/engine/tool_draft.py b/src/tensorfold/engine/tool_draft.py
+index bd64ae6..83497ba 100644
+--- a/src/tensorfold/engine/tool_draft.py
++++ b/src/tensorfold/engine/tool_draft.py
+@@ -5,7 +5,7 @@ from __future__ import annotations
+ import re
+ from typing import Any, Sequence
+ 
+-from tensorfold.tool_parameters import decode_parameter, parameter_schemas, typed_parameter
++from tensorfold.tool_parameters import decode_parameter, nullable_text, parameter_schemas, typed_parameter
+ 
+ _OPEN = "<tool_call>"
+ _END = "\x00end"  # placeholder: after a closed call the draft is the end-of-turn token
+@@ -252,6 +252,7 @@ class ToolCallStreamer:
+         self.schemas = parameter_schemas(tools)
+         self.current_schema = {}
+         self.typed = False
++        self.maybe_null = False     # a nullable text value that may still be ``null``: held in value_buffer
+         self.value_buffer = ""
+         self.known = {name.lower(): name for name in tool_schema(tools)}
+         self.pos = 0
+@@ -307,9 +308,10 @@ class ToolCallStreamer:
+                 if m is not None:
+                     self.value_schema = self.current_schema.get(m.group(1).strip(), {})
+                     self.typed = typed_parameter(self.value_schema)
++                    self.maybe_null = not self.typed and nullable_text(self.value_schema)
+                     self.value_buffer = ""
+-                    out.append(self._args(("," if self.args_open else "{")
+-                                          + self._esc_key(m.group(1).strip()) + (':' if self.typed else ':"')))
++                    out.append(self._args(("," if self.args_open else "{") + self._esc_key(m.group(1).strip())
++                                          + (':' if self.typed or self.maybe_null else ':"')))
+                     self.args_open = True
+                     self.pos += m.end()
+                     self.state = "value"
+@@ -339,11 +341,16 @@ class ToolCallStreamer:
+                     self.held = piece[len(keep):]
+                 if self.typed:
+                     self.value_buffer += keep
++                elif self.maybe_null:
++                    self.value_buffer += keep
++                    if not "null".startswith(self.value_buffer):    # text after all: the held part first
++                        out.append(self._args('"' + self._esc(self.value_buffer)))
++                        self.value_buffer, self.maybe_null = "", False
+                 elif keep:
+                     out.append(self._args(self._esc(keep)))
+                 if end < 0:
+                     break
+-                if self.typed:
++                if self.typed or self.maybe_null:
+                     import json
+                     out.append(self._args(json.dumps(decode_parameter(self.value_buffer, self.value_schema), ensure_ascii=False)))
+                 else:
+diff --git a/src/tensorfold/families/glm5_next/cuda/app.py b/src/tensorfold/families/glm5_next/cuda/app.py
+index 3d21cac..e986b22 100644
+--- a/src/tensorfold/families/glm5_next/cuda/app.py
++++ b/src/tensorfold/families/glm5_next/cuda/app.py
+@@ -5,32 +5,44 @@ from __future__ import annotations
+ from typing import Any, Callable
+ 
+ from tensorfold.cuda.server import App, PreparedRequest, RequestError
+-from tensorfold.families.glm5_next.prompts import clear_thinking, thinking_off
++from tensorfold.families.glm5_next.cuda.kept_reasoning import KeptReasoning
++from tensorfold.families.glm5_next.prompts import agent_history, clear_thinking, thinking_off
+ from tensorfold.server.errors import CONTEXT_LIMIT
++from tensorfold.tool_parameters import tool_calls_on
+ 
+ 
+ class ThinkingOffTemplate:
+     """The checkpoint template as GLM-5.3's thinking-off template renders it (``prompts.thinking_off``), with earlier
+     turns' reasoning kept unless the request's ``chat_template_kwargs.clear_thinking`` says otherwise
+-    (``prompts.clear_thinking``)."""
++    (``prompts.clear_thinking``). With ``TF_GLM_TOOL_CALLS=1`` an agent's history is made renderable first
++    (``prompts.agent_history``), and with ``TF_GLM_KEEP_REASONING`` the reasoning of tool-calling steps the client
++    dropped is put back (``kept``, ``kept_reasoning.KeptReasoning``; None: off). MiaAI-Lab recipe patch 0036."""
+ 
+-    def __init__(self, inner, clear: bool | None = None) -> None:
++    def __init__(self, inner, clear: bool | None = None, kept: KeptReasoning | None = None) -> None:
+         self.inner = inner
+         self.efforts = getattr(inner, "efforts", frozenset())
+         self.clear = clear_thinking() if clear is None else clear
++        self.kept = kept
+ 
+-    def render(self, messages, *, tools, enable_thinking, extra=None) -> str:
++    def render(self, messages, *, tools, enable_thinking, extra=None, allow_images: bool = False) -> str:
+         extra = {"clear_thinking": self.clear, **(extra or {})}       # a request's own value wins
+-        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra)
++        if self.kept is not None:
++            messages = self.kept.restore(messages)
++        text = self.inner.render(agent_history(messages), tools=tools, enable_thinking=enable_thinking, extra=extra,
++                                 **({"allow_images": True} if allow_images else {}))
+         return text if enable_thinking else thinking_off(text)
+ 
+ 
+ class GlmApp(App):
+     reads_ignore_eos = True             # ``run`` hands it to the engine's request
++    # without --vision, a tool result's pictures render as the template's own reminder (MiaAI-Lab recipe patch 0056,
++    # issue #28; with TF_GLM_TOOL_CALLS=1): a user's are refused
++    tool_media_reminders = True
+ 
+     def __init__(self, engine, model_dir, served: str, **kwargs: Any) -> None:
+         super().__init__(engine, model_dir, served, **kwargs)
+-        self.template = ThinkingOffTemplate(self.template)
++        tool_calls_on()                 # a malformed TF_GLM_TOOL_CALLS is refused at startup, not per request
++        self.template = ThinkingOffTemplate(self.template, kept=KeptReasoning.from_env())
+ 
+     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
+         """Validate the rendered prompt plus max_tokens against the engine context limit before streaming."""
+@@ -60,4 +72,9 @@ class GlmApp(App):
+         model = str(body.get("model") or "")
+         self.engine.request.policy = body.get("tf_policy") or (model.split("@", 1)[1] if "@" in model else None)
+         self.engine.request.stop_eos = not bool(body.get("ignore_eos", False))
+-        return super().run(body, chat, emit, prepared=prepared, cancelled=cancelled)
++        result = super().run(body, chat, emit, prepared=prepared, cancelled=cancelled)
++        kept = getattr(self.template, "kept", None)
++        if chat and kept is not None and result.get("calls") and result.get("finish") == "tool_calls":
++            # the calls' reasoning, for a client that will not send it back (TF_GLM_KEEP_REASONING)
++            kept.remember(body.get("messages"), result["calls"], result.get("reasoning"))
++        return result
+diff --git a/src/tensorfold/families/glm5_next/cuda/kept_reasoning.py b/src/tensorfold/families/glm5_next/cuda/kept_reasoning.py
+new file mode 100644
+index 0000000..0ae81dc
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/kept_reasoning.py
+@@ -0,0 +1,155 @@
++"""The reasoning of GLM's tool-calling replies, put back into later requests whose client dropped it.
++
++Parts adapted from jayleaton/glm53-tensorfold-spark patch 0620 (Apache-2.0): its ``reasoning`` fix (the
++``ReasoningMemory`` LRU, keyed by the server's call ids and by a signature of the calls for clients that renumber
++ids). Here the signature covers the whole conversation before the calls, not only the last user message, so a reply
++is only ever put back into the conversation it was written for.
++
++GLM-5.3's template renders the reasoning of every assistant step after the last user message (interleaved thinking
++inside one tool loop). A client that does not send a step's reasoning back (spark-bench, many agent frameworks) gets
++``<think></think>`` for it: a context the model never wrote, and a prompt that stops matching the previous one at
++that step, so the prefix cache re-reads the rest. With the reasoning kept here, each prompt of a chain continues the
++last one as it was generated. A step that carries its own reasoning (``reasoning_content`` or ``reasoning``, or a
++``<think>`` block in its content) is never changed; an empty one (clients that send ``""`` for every step) is none.
++
++``TF_GLM_KEEP_REASONING``: replies kept (default 0: off on this branch; MiaAI-Lab's recipe keeps 1024 by default);
++``TF_GLM_KEEP_REASONING_MB``: their text at most (default 32 MiB); the oldest go first. (MiaAI-Lab recipe patch 0036.)
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import re
++import threading
++from collections import OrderedDict
++from typing import Any
++
++_OUR_ID = re.compile(r"^call_[0-9a-f]{24}$")      # the ids ``parse_tool_calls`` / ``GlmCallStreamer`` make
++
++
++def _env_int(name: str, default: int) -> int:
++    raw = os.environ.get(name, "").strip()
++    if not raw:
++        return default
++    try:
++        value = int(raw)
++    except ValueError:
++        raise ValueError(f"{name}={raw!r}: expected a whole number") from None
++    if value < 0:
++        raise ValueError(f"{name}={raw!r}: expected 0 or more")
++    return value
++
++
++def _text(content: Any) -> str:
++    if isinstance(content, str):
++        return content
++    if isinstance(content, list):
++        return "".join(p["text"] for p in content if isinstance(p, dict) and isinstance(p.get("text"), str))
++    return ""
++
++
++def _arguments(value: Any) -> Any:
++    if isinstance(value, str):
++        try:
++            return json.loads(value) if value.strip() else {}
++        except ValueError:
++            return value
++    return {} if value is None else value
++
++
++def _calls(calls: Any) -> list[list[Any]]:
++    """Calls as [name, arguments]: ids dropped (clients renumber them), arguments parsed (clients re-serialise)."""
++
++    out = []
++    for call in calls if isinstance(calls, list) else []:
++        fn = call.get("function") if isinstance(call, dict) and isinstance(call.get("function"), dict) else {}
++        out.append([str(fn.get("name") or ""), _arguments(fn.get("arguments"))])
++    return out
++
++
++def signature(history: list[Any], calls: Any) -> str:
++    """The key of ``calls`` written after ``history``: each message's role, text (stripped, as the template renders
++    it) and calls, without ids or reasoning, then the calls."""
++
++    shape = []
++    for m in history:
++        if not isinstance(m, dict):
++            continue
++        entry = [str(m.get("role") or ""), _text(m.get("content")).strip()]
++        if m.get("role") == "assistant" and m.get("tool_calls"):
++            entry.append(_calls(m.get("tool_calls")))
++        shape.append(entry)
++    text = json.dumps([shape, _calls(calls)], ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
++    return "sig:" + hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
++
++
++def _keys(history: list[Any], calls: Any) -> list[str]:
++    ids = [c.get("id") for c in calls if isinstance(c, dict)] if isinstance(calls, list) else []
++    return [i for i in ids if isinstance(i, str) and _OUR_ID.match(i)] + [signature(history, calls)]
++
++
++class KeptReasoning:
++    """Recent tool-calling replies' reasoning (LRU, bounded in replies and characters), found by any of its keys."""
++
++    def __init__(self, entries: int = 1024, chars: int = 32 << 20) -> None:
++        self.entries, self.chars = int(entries), int(chars)
++        self.items: OrderedDict[int, tuple[str, tuple[str, ...]]] = OrderedDict()
++        self.by_key: dict[str, int] = {}
++        self.size = self.next = 0
++        self.lock = threading.Lock()
++
++    @classmethod
++    def from_env(cls) -> KeptReasoning | None:
++        entries = _env_int("TF_GLM_KEEP_REASONING", 0)      # the recipe's default is 1024; off unless set here
++        return cls(entries, _env_int("TF_GLM_KEEP_REASONING_MB", 32) << 20) if entries else None
++
++    def __len__(self) -> int:
++        return len(self.items)
++
++    def remember(self, messages: Any, calls: Any, reasoning: Any) -> None:
++        """Keep the ``reasoning`` of a reply that made ``calls`` after the request's ``messages``."""
++
++        if not calls or not isinstance(reasoning, str) or not reasoning.strip() or len(reasoning) > self.chars:
++            return
++        keys = tuple(_keys(messages if isinstance(messages, list) else [], calls))
++        with self.lock:
++            n, self.next = self.next, self.next + 1
++            self.items[n] = (reasoning, keys)
++            self.size += len(reasoning)
++            for key in keys:                    # a key kept again points at the newer reply
++                self.by_key[key] = n
++            while len(self.items) > self.entries or self.size > self.chars:
++                old, (text, old_keys) = self.items.popitem(last=False)
++                self.size -= len(text)
++                for key in old_keys:
++                    if self.by_key.get(key) == old:
++                        del self.by_key[key]
++
++    def _find(self, keys: list[str]) -> str | None:
++        with self.lock:
++            for key in keys:
++                n = self.by_key.get(key)
++                if n is not None:
++                    self.items.move_to_end(n)
++                    return self.items[n][0]
++        return None
++
++    def restore(self, messages: Any) -> Any:
++        """``messages`` with the kept reasoning of each assistant step that calls tools and carries none (a copy;
++        the caller's list and messages are left alone)."""
++
++        if not isinstance(messages, list) or not self.items:
++            return messages
++        out = None
++        for i, m in enumerate(messages):
++            if not (isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
++                    and not _text(m.get("reasoning_content")).strip() and not _text(m.get("reasoning")).strip()
++                    and "</think>" not in _text(m.get("content"))):
++                continue
++            kept = self._find(_keys(messages[:i], m["tool_calls"]))
++            if kept is not None:
++                out = out if out is not None else list(messages)
++                out[i] = {**m, "reasoning_content": kept}
++        return messages if out is None else out
+diff --git a/src/tensorfold/families/glm5_next/prompts.py b/src/tensorfold/families/glm5_next/prompts.py
+index 60b3d5f..65a920e 100644
+--- a/src/tensorfold/families/glm5_next/prompts.py
++++ b/src/tensorfold/families/glm5_next/prompts.py
+@@ -3,9 +3,13 @@ line and no opened think block."""
+ 
+ from __future__ import annotations
+ 
++import json
+ import os
++import sys
+ from typing import Any
+ 
++from tensorfold.tool_parameters import tool_calls_on
++
+ EFFORT_LINE = "<|system|>Reasoning Effort: Max"
+ OPENED = "<|assistant|><think>"
+ CLEAR_THINKING = "TF_GLM_CLEAR_THINKING"
+@@ -27,6 +31,73 @@ def clear_thinking() -> bool:
+     return value == "1"
+ 
+ 
++def _call_id(message: Any) -> Any:
++    """The id GLM's template matches a tool result or call by (its ``id_of``)."""
++
++    return message.get("tool_call_id") or message.get("id") if isinstance(message, dict) else None
++
++
++def agent_history(messages: Any) -> Any:
++    """A chat as GLM-5.3's template can render every part of it: a call's arguments sent as "" or null are no
++    arguments (the template reads them as a mapping), and results whose ids match none of their calls' ids are
++    rendered in the order sent (the template sorts results by id and silently drops one it cannot place).
++
++    A call whose arguments are not a JSON object (a truncated or garbled string from a model, client or proxy) is
++    left out with its result, logged, rather than refused: an agent replays its history on every later turn, so a
++    refusal would end the conversation. Its message keeps its other calls, content and reasoning; its result is the
++    one with the call's id, else (no ids) the one in the call's place.
++
++    MiaAI-Lab recipe patches 0036 and 0051, with ``TF_GLM_TOOL_CALLS=1``; otherwise the messages as sent (TensorFold
++    v0.6.5 renders arguments that are not a JSON object under ``_invalid_arguments``)."""
++
++    if not isinstance(messages, list) or not tool_calls_on():       # TensorFold v0.6.5: as sent
++        return messages
++    out = list(messages)
++    for i, message in enumerate(out):
++        calls = message.get("tool_calls") if isinstance(message, dict) and message.get("role") == "assistant" else None
++        if not isinstance(calls, list) or not calls:
++            continue
++        fixed, bad = [], []
++        for j, call in enumerate(calls):
++            function = call.get("function") if isinstance(call, dict) else None
++            arguments = function.get("arguments") if isinstance(function, dict) else {}
++            if arguments is None or (isinstance(arguments, str) and not arguments.strip()):
++                call = {**call, "function": {**function, "arguments": {}}}
++            elif isinstance(arguments, str):
++                try:
++                    parsed = json.loads(arguments)
++                except ValueError:
++                    parsed = None
++                if not isinstance(parsed, dict):
++                    print(f"[tensorfold] messages[{i}].tool_calls[{j}] ({_call_id(call)!r}): arguments are not a JSON "
++                          f"object ({arguments[:80]!r}); the call and its result are left out of the prompt",
++                          file=sys.stderr, flush=True)
++                    bad.append(j)
++                    continue
++            fixed.append(call)
++        end = i + 1
++        while end < len(out) and isinstance(out[end], dict) and out[end].get("role") == "tool":
++            end += 1
++        if bad:
++            ids = {_call_id(calls[j]) for j in bad} - {None}
++            by_place = not ids and end - i - 1 == len(calls)      # no ids: results in their calls' order
++            out[i + 1:end] = [r for k, r in enumerate(out[i + 1:end])
++                              if not (_call_id(r) in ids or (by_place and k in bad))]
++            end = i + 1
++            while end < len(out) and isinstance(out[end], dict) and out[end].get("role") == "tool":
++                end += 1
++        if fixed:
++            out[i] = {**message, "tool_calls": fixed}
++        else:
++            out[i] = {k: v for k, v in message.items() if k != "tool_calls"}
++            continue
++        known = {_call_id(call) for call in fixed}
++        if any(_call_id(result) and _call_id(result) not in known for result in out[i + 1:end]):
++            out[i + 1:end] = [{k: v for k, v in result.items() if k not in ("tool_call_id", "id")}
++                              for result in out[i + 1:end]]
++    return out
++
++
+ def thinking_off(text: str) -> str:
+     """The checkpoint text as the thinking-off template renders it: no effort line, an empty think block."""
+ 
+@@ -47,6 +118,7 @@ class GlmTokenizer:
+ 
+     def apply_chat_template(self, messages: Any, *args: Any, tokenize: bool = True, **kwargs: Any) -> Any:
+         kwargs.setdefault("clear_thinking", self._clear)
++        messages = agent_history(messages)
+         if kwargs.get("enable_thinking", True) is not False:
+             return self._inner.apply_chat_template(messages, *args, tokenize=tokenize, **kwargs)
+         text = thinking_off(self._inner.apply_chat_template(messages, *args, tokenize=False, **kwargs))
+diff --git a/src/tensorfold/server/messages.py b/src/tensorfold/server/messages.py
+index 3e9255c..a71f8a5 100644
+--- a/src/tensorfold/server/messages.py
++++ b/src/tensorfold/server/messages.py
+@@ -4,6 +4,7 @@ import json
+ from typing import Any, Callable
+ 
+ from tensorfold.server.errors import RequestError
++from tensorfold.tool_parameters import tool_calls_on
+ 
+ _MEDIA = ("image", "images", "image_url", "input_image", "audio", "input_audio", "video", "video_url")
+ _IMAGE_ROLES = ("user", "tool")    # a tool result may carry images (an agent's screenshots): templates render them
+@@ -74,6 +75,12 @@ def normalize_messages(messages: list[dict[str, Any]], *, late_system: str = "sy
+         elif not isinstance(content, str):
+             raise RequestError("message content must be text or an array of text parts")
+         item = message if content is message.get("content") else {**message, "content": content}
++        if (role == "assistant" and not isinstance(message.get("reasoning_content"), str)
++                and isinstance(message.get("reasoning"), str) and tool_calls_on()):
++            # vLLM's newer replies and OpenRouter's name a step's reasoning ``reasoning``; templates read
++            # ``reasoning_content``, and without it a tool step's reasoning is dropped from the resent history
++            # (MiaAI-Lab recipe patch 0036, with TF_GLM_TOOL_CALLS=1)
++            item = {**item, "reasoning_content": message["reasoning"]}
+         if role in ("system", "developer"):
+             if not out:
+                 instructions.append(item)
+diff --git a/src/tensorfold/server/prompts.py b/src/tensorfold/server/prompts.py
+index 37fbe24..d545c8f 100644
+--- a/src/tensorfold/server/prompts.py
++++ b/src/tensorfold/server/prompts.py
+@@ -23,6 +23,30 @@ def has_images(messages):
+                for m in messages or [])
+ 
+ 
++def tool_media_parts(messages):
++    """For a server without a vision frontend whose template answers media with its own reminder (GLM-5.3's "You are
++    unable to process this image ..."): messages whose only pictures and clips are in tool results, those parts as the
++    template's bare media parts (never fetched or decoded), so an agent session that keeps a screenshot in its history
++    goes on (issue #28); None when there are none, or a user (or other) message has some. (MiaAI-Lab recipe patch
++    0056's text part; the CUDA server calls it with TF_GLM_TOOL_CALLS=1.)"""
++
++    if not has_images(messages):
++        return None
++    out = []
++    for m in messages:
++        content = m.get('content') if isinstance(m, dict) else None
++        if not (isinstance(content, list)
++                and any(isinstance(p, dict) and p.get('type') in ('image_url', 'video_url') for p in content)):
++            out.append(m)
++            continue
++        if m.get('role') != 'tool':
++            return None
++        out.append({**m, 'content': [{'type': p['type'][:-len('_url')]}
++                                     if isinstance(p, dict) and p.get('type') in ('image_url', 'video_url') else p
++                                     for p in content]})
++    return out
++
++
+ IMAGE_SLOTS = threading.BoundedSemaphore(16)      # requests decoding and processing images at once (host memory)
+ IMAGE_WAITERS = threading.BoundedSemaphore(128)   # requests waiting for a slot; past that, refused at once
+ IMAGE_WAIT_S = 60.0
+diff --git a/src/tensorfold/tool_parameters.py b/src/tensorfold/tool_parameters.py
+index d722004..d14bd27 100644
+--- a/src/tensorfold/tool_parameters.py
++++ b/src/tensorfold/tool_parameters.py
+@@ -1,12 +1,33 @@
+-"""Schema-aware decoding of Qwen XML parameter text."""
++"""Schema-aware decoding of Qwen XML parameter text.
++
++Parts adapted from jayleaton/glm53-tensorfold-spark patch 0620 (Apache-2.0): ``const`` schemas, and ``null`` read as
++None for a nullable string (its ``typed_value``), here in the shared decoder that every parser and both streamers use.
++Its coercions that change what a resent history renders (quoted scalars, Python literals, integral floats) are not.
++"""
+ 
+ from __future__ import annotations
+ 
+ import ast
+ import json
++import os
+ from collections.abc import Sequence
+ from typing import Any
+ 
++TOOL_CALLS = "TF_GLM_TOOL_CALLS"
++
++
++def tool_calls_on() -> bool:
++    """``TF_GLM_TOOL_CALLS=1``: MiaAI-Lab's tool-call fixes (recipe patches 0036, 0051 and 0056's text part; GLM's
++    calls streamed whole in their place, calls at the end of the think block, a dropped step's reasoning field, an
++    agent's history made renderable, tool results' pictures without --vision) and, in this shared decoder, the types a
++    parameter schema admits through a type list, ``anyOf`` / ``oneOf``, ``enum`` or ``const``. Unset or 0: TensorFold
++    v0.6.5's behaviour, unchanged."""
++
++    value = os.environ.get(TOOL_CALLS, "0").strip() or "0"
++    if value not in ("0", "1"):
++        raise ValueError(f"{TOOL_CALLS}={value!r}: expected 0 or 1")
++    return value == "1"
++
+ 
+ def parameter_schemas(tools: Sequence[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
+     """Each offered tool's parameter schemas by lowercase name; a spec that is not an object reads as untyped."""
+@@ -24,9 +45,41 @@ def parameter_schemas(tools: Sequence[dict[str, Any]] | None) -> dict[str, dict[
+     return result
+ 
+ 
+-def typed_parameter(schema: dict[str, Any]) -> bool:
++_TYPED = frozenset({"array", "object", "boolean", "integer", "number", "null"})
++_KINDS = {bool: "boolean", int: "integer", float: "number", str: "string", type(None): "null", list: "array",
++          dict: "object"}
++
++
++def schema_types(schema: dict[str, Any]) -> frozenset[str]:
++    """The JSON types a parameter schema admits: its ``type`` (a name or a list of names), else those of its
++    ``anyOf`` / ``oneOf`` members (none if a member is untyped), else those of its ``enum`` values or ``const``."""
++
+     kind = schema.get("type")
+-    return isinstance(kind, str) and kind in {"array", "object", "boolean", "integer", "number", "null"}
++    if isinstance(kind, str):
++        return frozenset({kind})
++    if not tool_calls_on():         # TensorFold v0.6.5 reads a single type name only (TF_GLM_TOOL_CALLS unset)
++        return frozenset()
++    if isinstance(kind, list):
++        return frozenset(k for k in kind if isinstance(k, str))
++    for key in ("anyOf", "oneOf"):
++        members = schema.get(key)
++        if isinstance(members, list) and members:
++            found = [schema_types(m) if isinstance(m, dict) else frozenset() for m in members]
++            return frozenset().union(*found) if all(found) else frozenset()
++    enum = schema.get("enum")
++    if isinstance(enum, list) and enum:
++        return frozenset(_KINDS.get(type(v), "string") for v in enum)
++    if "const" in schema:
++        return frozenset({_KINDS.get(type(schema["const"]), "string")})
++    return frozenset()
++
++
++def typed_parameter(schema: dict[str, Any]) -> bool:
++    """Whether a value is read as JSON: every type the schema admits is a JSON one other than string (a union with
++    string, such as ``["string", "null"]``, keeps the text as written)."""
++
++    kinds = schema_types(schema)
++    return bool(kinds) and kinds <= _TYPED
+ 
+ 
+ def closed_json(text: str) -> str | None:
+@@ -68,22 +121,39 @@ def _python_literal(text: str) -> Any:
+         raise ValueError(str(exc)) from None
+ 
+ 
++def nullable_text(schema: dict[str, Any]) -> bool:
++    """Whether a text value may also be null (``["string", "null"]``, pydantic's ``Optional[str]``): its value
++    ``null`` is None, as vLLM's GLM and Qwen parsers read it and as the templates render a None argument."""
++
++    kinds = schema_types(schema)
++    return "string" in kinds and "null" in kinds
++
++
+ def decode_parameter(value: str, schema: dict[str, Any], *, python: bool = True) -> Any:
+-    """``value`` as the schema's type when it spells one, else the text; ``python`` also reads Python's spelling."""
++    """A parameter's text read by its schema: a string schema keeps the text (a nullable one reads ``null`` as None,
++    which the template renders back as ``null``); a typed one reads JSON of an admitted type, or the value closed
++    (#87), and with ``python`` (Qwen's parsers) Python's spelling of one (``True``, ``None``, ``['a']``). Anything
++    else stays as written, so a resent history renders the tokens the model wrote: GLM's parsers pass python=False
++    (a quoted ``"5"``, Python's ``True`` or ``2.0`` for an integer are not coerced: their JSON would render
++    differently)."""
+ 
+     if not typed_parameter(schema):
+-        return value
+-    kind = schema["type"]
+-    valid = {
+-        "array": lambda v: isinstance(v, list),
+-        "object": lambda v: isinstance(v, dict),
+-        "boolean": lambda v: isinstance(v, bool),
+-        "integer": lambda v: type(v) is int,
+-        "number": lambda v: type(v) in (int, float),
+-        "null": lambda v: v is None,
+-    }[kind]
++        return None if nullable_text(schema) and value == "null" else value
++    kinds = schema_types(schema)
++
++    def admitted(parsed: Any) -> bool:
++        valid = {
++            "array": isinstance(parsed, list),
++            "object": isinstance(parsed, dict),
++            "boolean": isinstance(parsed, bool),
++            "integer": type(parsed) is int,
++            "number": type(parsed) in (int, float),
++            "null": parsed is None,
++        }
++        return any(valid[kind] for kind in kinds)
++
+     # a model can end an object or array value one closer short (#87): the value closed is what it meant
+-    for text in (value, closed_json(value) if kind in ("array", "object") else None):
++    for text in (value, closed_json(value) if kinds & {"array", "object"} else None):
+         if text is None:
+             continue
+         try:
+@@ -91,7 +161,7 @@ def decode_parameter(value: str, schema: dict[str, Any], *, python: bool = True)
+             json.dumps(parsed, allow_nan=False)
+         except (ValueError, TypeError):
+             continue
+-        return parsed if valid(parsed) else value
++        return parsed if admitted(parsed) else value
+     # not JSON: Python's spelling (True, None, single-quoted strings), as vLLM's Qwen parsers also accept
+     if not python:
+         return value
+@@ -100,4 +170,4 @@ def decode_parameter(value: str, schema: dict[str, Any], *, python: bool = True)
+         json.dumps(parsed, allow_nan=False)
+     except (ValueError, TypeError):
+         return value
+-    return parsed if valid(parsed) else value
++    return parsed if admitted(parsed) else value
+diff --git a/tests/test_glm_tool_call_end.py b/tests/test_glm_tool_call_end.py
+index 9b23cae..22f16ed 100644
+--- a/tests/test_glm_tool_call_end.py
++++ b/tests/test_glm_tool_call_end.py
+@@ -11,6 +11,7 @@ import pytest
+ 
+ from tensorfold.cuda.reply_text import close_glm_call, parse_tool_calls
+ from tensorfold.server.tools import parse_tool_calls_from_content, repair_glm_keys
++from tensorfold.tool_parameters import tool_calls_on
+ 
+ TOOLS = [
+     {"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {
+@@ -222,14 +223,17 @@ def test_a_call_the_token_limit_cut_is_not_closed(tmp_path, streamed):
+     written = "Removing it. <tool_call>run<arg_key>command</arg_key><arg_value>rm -rf build"
+     content, _, calls, finish = _reply(tmp_path, written, streamed, ended=False,
+                                        max_tokens=len(TOK.encode(written, add_special_tokens=False).ids))
+-    assert (content, calls, finish) == (written, [], "length")
++    # with TF_GLM_TOOL_CALLS=1 (MiaAI-Lab recipe patch 0053's rule) the cut call's markup is not sent as content either
++    want = written[:written.find(" <tool_call>")] if tool_calls_on() else written
++    assert (content.strip() if tool_calls_on() else content, calls, finish) == (want, [], "length")
+ 
+ 
+ @pytest.mark.parametrize("streamed", [False, True])
+ def test_a_call_a_stop_string_cut_is_not_closed(tmp_path, streamed):
+     written = "Removing it. <tool_call>run<arg_key>command</arg_key><arg_value>rm -rf build STOP and more"
+     content, _, calls, finish = _reply(tmp_path, written, streamed, stop=" STOP")
+-    assert (content, calls, finish) == (written[:written.find(" STOP")], [], "stop")
++    want = written[:written.find(" <tool_call>" if tool_calls_on() else " STOP")]       # as for the token limit
++    assert (content.strip() if tool_calls_on() else content, calls, finish) == (want, [], "stop")
+ 
+ 
+ @pytest.mark.parametrize("streamed", [False, True])
+diff --git a/tests/test_glm_tool_calls.py b/tests/test_glm_tool_calls.py
+index a26324a..dd67c66 100644
+--- a/tests/test_glm_tool_calls.py
++++ b/tests/test_glm_tool_calls.py
+@@ -53,9 +53,14 @@ def test_string_arguments_keep_their_exact_text(parser):
+ 
+ @PARSERS
+ def test_string_typed_values_that_look_like_json_stay_text(parser):
++    from tensorfold.tool_parameters import tool_calls_on
++
+     text = ("<tool_call>get_weather<arg_key>units</arg_key><arg_value>null</arg_value>"
+             "<arg_key>zip</arg_key><arg_value>02134</arg_value></tool_call>")
+-    assert _parse(parser, text)[1] == [("get_weather", {"units": "null", "zip": "02134"})]
++    # with TF_GLM_TOOL_CALLS=1 a nullable string's null is None (MiaAI-Lab recipe patch 0036, after jayleaton's
++    # typed_value); a string-only value stays text either way (tests/test_glm_tool_fixes.py)
++    units = None if tool_calls_on() else "null"
++    assert _parse(parser, text)[1] == [("get_weather", {"units": units, "zip": "02134"})]
+ 
+ 
+ @PARSERS
+diff --git a/tests/test_glm_tool_fixes.py b/tests/test_glm_tool_fixes.py
+new file mode 100644
+index 0000000..8c3e561
+--- /dev/null
++++ b/tests/test_glm_tool_fixes.py
+@@ -0,0 +1,617 @@
++"""MiaAI-Lab's GLM tool-call fixes behind ``TF_GLM_TOOL_CALLS`` (recipe patches 0036, 0051 and 0056's text part) and
++her kept reasoning behind ``TF_GLM_KEEP_REASONING`` (0036), through the CUDA server's request path: GlmApp and the
++HTTP handler, on CPU.
++
++Unset (the default), every case gives what TensorFold v0.6.5 gives. With ``TF_GLM_TOOL_CALLS=1``:
++- a streamed reply's GLM calls go out whole, each in its place in the stream once its ``</tool_call>`` arrives, with
++  an empty delta every ``CALL_KEEPALIVE_S`` while one is written; a call the reply ends inside (its token limit, a
++  stop string) is never sent, nor its markup as content (0053's rules, which 0036's streamer carries);
++- calls written inside the think block are the reply's calls when they end it, else reasoning (0036's ``ThinkSplit``,
++  after jayleaton/glm53-tensorfold-spark's trailing-calls rule);
++- an agent's history renders as GLM's template can render it: arguments sent as "" or null are no arguments, a call
++  whose arguments are not a JSON object is left out with its result (0051), results whose ids match none of their
++  calls' ids render in the order sent, a step's ``reasoning`` field is its ``reasoning_content``;
++- a tool result's pictures without ``--vision`` render as the template's own reminder instead of HTTP 400 (0056);
++- a parameter schema's type list, ``anyOf`` / ``oneOf``, ``enum`` or ``const`` types its value (0036).
++The real-checkpoint case needs Mia-AiLab's first-revision template (``TF_GLM5_TR3_MODEL``) and skips without it; the
++smooth-streaming case needs ``tensorfold.cuda.stream_pacing`` (recipe patch 0061).
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import json
++import os
++import threading
++from pathlib import Path
++
++import pytest
++
++from tensorfold.cuda import server
++from tensorfold.cuda.chat_template import ChatTemplate
++from tensorfold.cuda.reply_text import GlmCallStreamer, ThinkSplit
++from tensorfold.families.glm5_next.cuda.app import GlmApp, ThinkingOffTemplate
++from tensorfold.families.glm5_next.cuda.kept_reasoning import KeptReasoning
++from tensorfold.families.glm5_next.prompts import agent_history
++from tensorfold.tool_parameters import TOOL_CALLS, decode_parameter, tool_calls_on
++from tests.test_cuda_admission import http_server, post
++from tests.test_cuda_stop_strings import events
++from tests.test_glm_tool_call_end import END_ID, TOK, Engine  # skips this module without `tokenizers`
++
++pytest.importorskip("jinja2")
++
++TOOLS = [
++    {"type": "function", "function": {"name": "read_file", "parameters": {"type": "object", "properties": {
++        "path": {"type": "string"}, "limit": {"type": ["integer", "null"]},
++        "note": {"type": ["string", "null"]}}}}},
++    {"type": "function", "function": {"name": "now", "parameters": {"type": "object", "properties": {}}}},
++    {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {
++        "city": {"type": "string"}}, "required": ["city"]}}},
++]
++
++# GLM-5.3's template, cut down to the parts these fixes touch (as its first revision, sha256 41cff9af, renders them):
++# a step's reasoning_content, its calls' arguments as a mapping, results sorted by their calls' ids when every one has
++# an id (one matching no call is dropped), and the no-media reminder for pictures
++TEMPLATE = (
++    "{%- macro visible(content) -%}{%- if content is string -%}{{ content }}"
++    "{%- elif content is iterable and content is not mapping -%}{%- for item in content -%}"
++    "{%- if item is mapping and item.type == 'text' -%}{{ item.text }}"
++    "{%- elif item is mapping and item.type in ['image', 'image_url', 'video', 'video_url'] -%}"
++    "<reminder>You are unable to process this {{ item.type | replace('_url', '') }}.</reminder>"
++    "{%- endif -%}{%- endfor -%}{%- elif content is not none -%}{{ content }}{%- endif -%}{%- endmacro -%}"
++    "{%- if tools -%}<|system|>tools:{% for t in tools %}{{ (t.function or t).name }};{% endfor %}{%- endif -%}"
++    "{%- for m in messages -%}"
++    "{%- if m.role == 'user' -%}<|user|>{{ visible(m.content) }}"
++    "{%- elif m.role == 'assistant' -%}<|assistant|>"
++    "{%- if m.reasoning_content is string -%}<think>{{ m.reasoning_content }}</think>"
++    "{%- else -%}<think></think>{%- endif -%}{{ visible(m.content) }}"
++    "{%- for tc in m.tool_calls or [] -%}{%- set f = tc.function if tc.function else tc -%}<tool_call>{{ f.name }}"
++    "{%- for k, v in f.arguments.items() -%}<arg_key>{{ k }}</arg_key>"
++    "<arg_value>{{ v | tojson if v is not string else v }}</arg_value>{%- endfor -%}</tool_call>{%- endfor -%}"
++    "{%- elif m.role == 'tool' -%}{%- if loop.first or messages[loop.index0 - 1].role != 'tool' -%}"
++    "<|observation|>{%- set start = loop.index0 -%}{%- set ns = namespace(end=start, calls=[], sort=true) -%}"
++    "{%- for j in range(start, messages | length) -%}{%- if messages[j].role == 'tool' -%}{%- set ns.end = j -%}"
++    "{%- else -%}{%- break -%}{%- endif -%}{%- endfor -%}"
++    "{%- if start > 0 and messages[start - 1].role == 'assistant' and messages[start - 1].tool_calls -%}"
++    "{%- set ns.calls = messages[start - 1].tool_calls -%}{%- else -%}{%- set ns.sort = false -%}{%- endif -%}"
++    "{%- for k in range(start, ns.end + 1) -%}{%- if not (messages[k].tool_call_id or messages[k].id) -%}"
++    "{%- set ns.sort = false -%}{%- endif -%}{%- endfor -%}"
++    "{%- for tc in ns.calls -%}{%- if not tc.id -%}{%- set ns.sort = false -%}{%- endif -%}{%- endfor -%}"
++    "{%- if ns.sort -%}{%- for tc in ns.calls -%}{%- for k in range(start, ns.end + 1) -%}"
++    "{%- if (messages[k].tool_call_id or messages[k].id) == tc.id -%}"
++    "<tool_response>{{ visible(messages[k].content) }}</tool_response>{%- endif -%}{%- endfor -%}{%- endfor -%}"
++    "{%- else -%}{%- for k in range(start, ns.end + 1) -%}"
++    "<tool_response>{{ visible(messages[k].content) }}</tool_response>{%- endfor -%}{%- endif -%}"
++    "{%- endif -%}"
++    "{%- endif -%}{%- endfor -%}"
++    "{%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}")
++
++
++class Recording(Engine):
++    """#285's fake GLM engine (a fixed reply in rounds of varying width), keeping each prompt it was given."""
++
++    def __init__(self, reply):
++        super().__init__(reply)
++        self.prompts: list[list[int]] = []
++
++    def generate(self, prompt, max_tokens, sampling, on_tokens, draft=True):
++        self.prompts.append(list(prompt))
++        return super().generate(prompt, max_tokens, sampling, on_tokens, draft=draft)
++
++
++def ids(text: str, *, ended: bool = True) -> list[int]:
++    return TOK.encode(text, add_special_tokens=False).ids + ([END_ID] if ended else [])
++
++
++def make_app(tmp_path, reply, *, thinking=False, kept=None):
++    (tmp_path / "tokenizer_config.json").write_text(json.dumps({"chat_template": TEMPLATE}))
++    app = GlmApp.__new__(GlmApp)
++    app.engine = Recording(reply)
++    app.served = "fake-glm"
++    app.tok = TOK
++    app.vision = None
++    app.template = ThinkingOffTemplate(server.ChatTemplate(tmp_path), kept=kept)
++    app.default_thinking = thinking
++    app.sampling = {"temperature": 0.0}
++    app.max_tokens = 4096
++    app.native_context_window = app.context_window = 0
++    app.lock = threading.Lock()
++    return app
++
++
++def ask(app, body):
++    with http_server(app) as port:
++        return post(port, {"temperature": 0, **body}, True)
++
++
++def stream_parts(text):
++    """The SSE events as (kind, value) in order: content, reasoning, a call (index, name, arguments), an empty delta,
++    the finish reason."""
++
++    out = []
++    for chunk in events(text):
++        for choice in chunk.get("choices") or []:
++            delta = choice.get("delta") or {}
++            if delta == {} and choice.get("finish_reason") is None:
++                out.append(("empty", None))
++            if delta.get("reasoning_content"):
++                out.append(("reasoning", delta["reasoning_content"]))
++            if delta.get("content"):
++                out.append(("content", delta["content"]))
++            for call in delta.get("tool_calls") or []:
++                out.append(("call", (call["index"], call["function"].get("name"),
++                                     call["function"].get("arguments"))))
++            if choice.get("finish_reason"):
++                out.append(("finish", choice["finish_reason"]))
++    return out
++
++
++def merged(parts):
++    """Adjacent text deltas joined (rounds and pacing split them differently); calls and finish as they came."""
++
++    out = []
++    for kind, value in parts:
++        if kind in ("content", "reasoning") and out and out[-1][0] == kind:
++            out[-1] = (kind, out[-1][1] + value)
++        elif kind != "empty":
++            out.append((kind, value))
++    return out
++
++
++def reply_of(text):
++    choice = json.loads(text)["choices"][0]
++    message = choice["message"]
++    calls = [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in message.get("tool_calls") or []]
++    return message.get("content"), message.get("reasoning_content"), calls, choice["finish_reason"]
++
++
++def prompt_text(app):
++    return TOK.decode(app.engine.prompts[-1], skip_special_tokens=False)
++
++
++@pytest.fixture
++def on(monkeypatch):
++    monkeypatch.setenv(TOOL_CALLS, "1")
++
++
++@pytest.fixture(autouse=True)
++def _clean(monkeypatch):
++    for name in (TOOL_CALLS, "TF_GLM_KEEP_REASONING", "TF_GLM_KEEP_REASONING_MB"):
++        monkeypatch.delenv(name, raising=False)
++
++
++SWITCH = pytest.mark.parametrize("switch", ["0", "1"], ids=["unset", "on"])
++USER = [{"role": "user", "content": "x"}]
++
++# -- the setting ------------------------------------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("value, want", [(None, False), ("", False), ("0", False), ("1", True), (" 1 ", True)])
++def test_the_setting(monkeypatch, value, want):
++    if value is not None:
++        monkeypatch.setenv(TOOL_CALLS, value)
++    assert tool_calls_on() is want
++
++
++@pytest.mark.parametrize("value", ["2", "yes", "on"])
++def test_a_bad_setting_stops_the_start(monkeypatch, value):
++    monkeypatch.setenv(TOOL_CALLS, value)
++    with pytest.raises(ValueError, match=TOOL_CALLS):
++        tool_calls_on()
++
++
++def test_kept_reasoning_is_off_unless_set(monkeypatch):
++    assert KeptReasoning.from_env() is None
++    monkeypatch.setenv("TF_GLM_KEEP_REASONING", "0")
++    assert KeptReasoning.from_env() is None
++    monkeypatch.setenv("TF_GLM_KEEP_REASONING", "1024")
++    assert KeptReasoning.from_env().entries == 1024
++
++
++# -- streamed calls keep their place ----------------------------------------------------------------------------------
++
++TWO_CALLS = ("Let me look.<tool_call>read_file<arg_key>path</arg_key><arg_value>a.txt</arg_value></tool_call>"
++             "Then the time.<tool_call>now</tool_call>")
++IN_PLACE = [("content", "Let me look."), ("call", (0, "read_file", '{"path":"a.txt"}')),
++            ("content", "Then the time."), ("call", (1, "now", "{}")), ("finish", "tool_calls")]
++
++
++def test_streamed_calls_go_out_whole_in_their_place(tmp_path, on):
++    # one token a round ("draft": false): each call goes out in the round its </tool_call> arrives
++    status, text = ask(make_app(tmp_path, ids(TWO_CALLS)), {"messages": USER, "tools": TOOLS, "stream": True,
++                                                           "draft": False})
++    assert status == 200, text
++    assert merged(stream_parts(text)) == IN_PLACE
++
++
++def test_a_drafted_rounds_call_goes_out_with_its_round(tmp_path, on):
++    # drafted rounds (1, 3, 5, 2, 7, 4 tokens): a round's text, then the calls it closed; never held to the end
++    status, text = ask(make_app(tmp_path, ids(TWO_CALLS)), {"messages": USER, "tools": TOOLS, "stream": True})
++    assert status == 200, text
++    parts = merged(stream_parts(text))
++    first = next(i for i, (kind, _) in enumerate(parts) if kind == "call")
++    assert parts[first] == ("call", (0, "read_file", '{"path":"a.txt"}'))
++    assert "time." in "".join(v for k, v in parts[first + 1:] if k == "content")
++    assert "".join(v for k, v in parts if k == "content") == "Let me look.Then the time."
++    assert parts[-2:] == [("call", (1, "now", "{}")), ("finish", "tool_calls")]
++
++
++def test_without_the_setting_calls_come_after_the_text_as_before(tmp_path):
++    status, text = ask(make_app(tmp_path, ids(TWO_CALLS)), {"messages": USER, "tools": TOOLS, "stream": True,
++                                                           "draft": False})
++    assert status == 200, text
++    assert merged(stream_parts(text)) == [("content", "Let me look.Then the time."),
++                                          ("call", (0, "read_file", '{"path":"a.txt"}')), ("call", (1, "now", "{}")),
++                                          ("finish", "tool_calls")]
++
++
++@pytest.mark.skipif(importlib.util.find_spec("tensorfold.cuda.stream_pacing") is None,
++                    reason="needs smooth streaming (tensorfold.cuda.stream_pacing, recipe patch 0061)")
++def test_calls_keep_their_place_with_smooth_streaming(tmp_path, on, monkeypatch):
++    monkeypatch.setenv("TF_GLM_STREAM_SMOOTH", "1")
++    monkeypatch.setenv("TF_GLM_STREAM_SMOOTH_MS", "20")
++    status, text = ask(make_app(tmp_path, ids(TWO_CALLS)), {"messages": USER, "tools": TOOLS, "stream": True,
++                                                           "draft": False})
++    assert status == 200, text
++    assert merged(stream_parts(text)) == IN_PLACE
++
++
++@pytest.mark.skipif(importlib.util.find_spec("tensorfold.cuda.stream_pacing") is None,
++                    reason="needs smooth streaming (tensorfold.cuda.stream_pacing, recipe patch 0061)")
++def test_drafted_rounds_keep_their_calls_in_place_with_smooth_streaming(tmp_path, on, monkeypatch):
++    # smoothed, a drafted round's text goes out token by token, paced; the calls it closed still follow it, unpaced
++    body = {"messages": USER, "tools": TOOLS, "stream": True}
++    status, text = ask(make_app(tmp_path, ids(TWO_CALLS)), body)
++    assert status == 200, text
++    plain = merged(stream_parts(text))
++    monkeypatch.setenv("TF_GLM_STREAM_SMOOTH", "1")
++    monkeypatch.setenv("TF_GLM_STREAM_SMOOTH_MS", "20")
++    status, text = ask(make_app(tmp_path, ids(TWO_CALLS)), body)
++    assert status == 200, text
++    smooth = stream_parts(text)
++    assert merged(smooth) == plain
++    first = next(i for i, (kind, _) in enumerate(plain) if kind == "call")
++    assert plain[first] == ("call", (0, "read_file", '{"path":"a.txt"}'))
++    assert "time." in "".join(v for k, v in plain[first + 1:] if k == "content")
++    assert sum(kind == "content" for kind, _ in smooth) > sum(kind == "content" for kind, _ in plain)
++
++
++@SWITCH
++def test_streamed_and_whole_replies_agree(tmp_path, monkeypatch, switch):
++    monkeypatch.setenv(TOOL_CALLS, switch)
++    whole = reply_of(ask(make_app(tmp_path, ids(TWO_CALLS)), {"messages": USER, "tools": TOOLS})[1])
++    assert whole == ("Let me look.Then the time.", None, [("read_file", {"path": "a.txt"}), ("now", {})], "tool_calls")
++    status, text = ask(make_app(tmp_path, ids(TWO_CALLS)), {"messages": USER, "tools": TOOLS, "stream": True})
++    assert status == 200, text
++    calls: dict[int, list[str]] = {}
++    for kind, value in stream_parts(text):
++        if kind == "call":
++            entry = calls.setdefault(value[0], ["", ""])
++            entry[0] += value[1] or ""
++            entry[1] += value[2] or ""
++    assert [(n, json.loads(a)) for n, a in (calls[i] for i in sorted(calls))] == whole[2]
++
++
++def test_an_idle_client_gets_empty_deltas_while_a_call_is_written(tmp_path, on, monkeypatch):
++    monkeypatch.setattr(server, "CALL_KEEPALIVE_S", 0.0)
++    value = "x" * 40
++    app = make_app(tmp_path, ids(f"<tool_call>read_file<arg_key>path</arg_key><arg_value>{value}</arg_value>"
++                                 "</tool_call>"))
++    status, text = ask(app, {"messages": USER, "tools": TOOLS, "stream": True})
++    kinds = [k for k, _ in stream_parts(text)]
++    assert status == 200 and "empty" in kinds and kinds.index("empty") < kinds.index("call")
++    assert merged(stream_parts(text)) == [("call", (0, "read_file", json.dumps({"path": value}, separators=(",", ":")))),
++                                          ("finish", "tool_calls")]
++
++
++@pytest.mark.parametrize("streamed", [False, True])
++@pytest.mark.parametrize("cut_by", ["max_tokens", "stop"])
++def test_a_cut_call_is_never_sent(tmp_path, on, streamed, cut_by):
++    written = "Removing it. <tool_call>now</tool_call><tool_call>read_file<arg_key>path</arg_key><arg_value>build"
++    if cut_by == "max_tokens":
++        app, fields = make_app(tmp_path, ids(written, ended=False)), {"max_tokens": len(ids(written, ended=False))}
++    else:
++        app, fields = make_app(tmp_path, ids(written + " STOP and more")), {"stop": " STOP"}
++    status, text = ask(app, {"messages": USER, "tools": TOOLS, "stream": streamed, **fields})
++    assert status == 200, text
++    finish = "length" if cut_by == "max_tokens" else "stop"
++    if streamed:
++        assert merged(stream_parts(text)) == [("content", "Removing it. "), ("call", (0, "now", "{}")),
++                                              ("finish", finish)]
++    else:
++        assert reply_of(text) == ("Removing it.", None, [("now", {})], finish)
++
++
++# -- calls in the think block -------------------------------------------------------------------------------------
++
++
++@SWITCH
++@pytest.mark.parametrize("streamed", [False, True])
++def test_a_call_that_ends_the_think_block_is_a_call(tmp_path, monkeypatch, switch, streamed):
++    monkeypatch.setenv(TOOL_CALLS, switch)
++    app = make_app(tmp_path, ids("I need the file.<tool_call>read_file<arg_key>path</arg_key><arg_value>x"
++                                 "</arg_value></tool_call>"), thinking=True)
++    status, text = ask(app, {"messages": USER, "tools": TOOLS, "stream": streamed})
++    assert status == 200, text
++    if streamed:
++        assert merged(stream_parts(text)) == [("reasoning", "I need the file."),
++                                              ("call", (0, "read_file", '{"path":"x"}')), ("finish", "tool_calls")]
++    else:
++        assert reply_of(text) == (None, "I need the file.", [("read_file", {"path": "x"})], "tool_calls")
++
++
++@SWITCH
++@pytest.mark.parametrize("streamed", [False, True])
++def test_a_call_inside_a_closed_think_block_is_reasoning(tmp_path, monkeypatch, switch, streamed):
++    monkeypatch.setenv(TOOL_CALLS, switch)
++    thought = "Maybe <tool_call>now</tool_call> but no, I know it."
++    app = make_app(tmp_path, ids(thought + "</think>It is noon."), thinking=True)
++    status, text = ask(app, {"messages": USER, "tools": TOOLS, "stream": streamed})
++    assert status == 200, text
++    if streamed:
++        assert merged(stream_parts(text)) == [("reasoning", thought), ("content", "It is noon."), ("finish", "stop")]
++    else:
++        assert reply_of(text) == ("It is noon.", thought, [], "stop")
++
++
++@SWITCH
++def test_an_unclosed_think_block_that_goes_on_past_a_call(tmp_path, monkeypatch, switch):
++    monkeypatch.setenv(TOOL_CALLS, switch)
++    thought = "Maybe <tool_call>now</tool_call> but no, the answer is noon."
++    status, text = ask(make_app(tmp_path, ids(thought), thinking=True), {"messages": USER, "tools": TOOLS})
++    assert status == 200, text
++    if switch == "1":           # trailing calls only: text follows the call, so it was reasoning, and nothing is called
++        assert reply_of(text) == (None, thought, [], "stop")
++    else:                       # TensorFold v0.6.5 reads a call in an unclosed block as the answer
++        assert reply_of(text) == ("but no, the answer is noon.", "Maybe ", [("now", {})], "tool_calls")
++
++
++def test_think_split_commits_a_long_call_so_a_file_write_streams():
++    split = ThinkSplit(hold=16)
++    text = "plan<tool_call>read_file<arg_key>path</arg_key><arg_value>" + "y" * 30
++    assert split(text, False) == ("plan", text[4:])
++    assert split.stream_from == 4
++
++
++# -- tool_choice, parallel_tool_calls and func_probe's cases --------------------------------------------------------
++
++CALL = "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Rochester, New York</arg_value></tool_call>"
++
++
++def calls_in(text, streamed):
++    if not streamed:
++        return reply_of(text)[2], reply_of(text)[3]
++    got: dict[int, list[str]] = {}
++    for kind, value in stream_parts(text):
++        if kind == "call":
++            entry = got.setdefault(value[0], ["", ""])
++            entry[0] += value[1] or ""
++            entry[1] += value[2] or ""
++    return [(n, json.loads(a)) for n, a in (got[i] for i in sorted(got))], merged(stream_parts(text))[-1][1]
++
++
++@SWITCH
++@pytest.mark.parametrize("streamed", [False, True])
++def test_tool_choice_none_offers_no_tools_and_reads_no_calls(tmp_path, monkeypatch, switch, streamed):
++    monkeypatch.setenv(TOOL_CALLS, switch)
++    app = make_app(tmp_path, ids("Sunny." + CALL))
++    status, text = ask(app, {"messages": USER, "tools": TOOLS, "tool_choice": "none", "stream": streamed})
++    assert status == 200, text
++    assert "tools:" not in prompt_text(app)
++    if streamed:
++        assert merged(stream_parts(text)) == [("content", "Sunny." + CALL), ("finish", "stop")]
++    else:
++        assert reply_of(text) == ("Sunny." + CALL, None, [], "stop")
++
++
++@SWITCH
++@pytest.mark.parametrize("streamed", [False, True])
++@pytest.mark.parametrize("choice", ["required", {"type": "function", "function": {"name": "get_weather"}}, "auto"],
++                         ids=["required", "named", "auto"])
++def test_required_named_and_auto_calls(tmp_path, monkeypatch, switch, streamed, choice):
++    """func_probe.py's forced (named) and auto checks, plus required, on the request path."""
++
++    monkeypatch.setenv(TOOL_CALLS, switch)
++    app = make_app(tmp_path, ids(CALL))
++    question = [{"role": "user", "content": "What is the weather in Rochester, New York right now? Use the tool."}]
++    status, text = ask(app, {"messages": question, "tools": TOOLS, "tool_choice": choice, "stream": streamed,
++                             "max_tokens": 256, "chat_template_kwargs": {"enable_thinking": False}})
++    assert status == 200, text
++    offered = prompt_text(app).split("<|user|>")[0]
++    assert offered == ("<|system|>tools:get_weather;" if isinstance(choice, dict)
++                       else "<|system|>tools:read_file;now;get_weather;")
++    assert calls_in(text, streamed) == ([("get_weather", {"city": "Rochester, New York"})], "tool_calls")
++
++
++@SWITCH
++@pytest.mark.parametrize("streamed", [False, True])
++def test_func_probe_exact(tmp_path, monkeypatch, switch, streamed):
++    monkeypatch.setenv(TOOL_CALLS, switch)
++    status, text = ask(make_app(tmp_path, ids("MIA-WEIGHTS-OK")),
++                       {"messages": [{"role": "user", "content": "Reply with exactly: MIA-WEIGHTS-OK"}],
++                        "stream": streamed, "chat_template_kwargs": {"enable_thinking": False}})
++    assert status == 200, text
++    got = reply_of(text) if not streamed else merged(stream_parts(text))
++    assert got == (("MIA-WEIGHTS-OK", None, [], "stop") if not streamed
++                   else [("content", "MIA-WEIGHTS-OK"), ("finish", "stop")])
++
++
++@SWITCH
++@pytest.mark.parametrize("streamed", [False, True])
++def test_parallel_tool_calls_false_sends_one_call(tmp_path, monkeypatch, switch, streamed):
++    monkeypatch.setenv(TOOL_CALLS, switch)
++    app = make_app(tmp_path, ids("Two.<tool_call>now</tool_call>" + CALL))
++    status, text = ask(app, {"messages": USER, "tools": TOOLS, "parallel_tool_calls": False, "stream": streamed})
++    assert status == 200, text
++    assert calls_in(text, streamed) == ([("now", {})], "tool_calls")
++    content = (reply_of(text)[0] if not streamed
++               else "".join(v for k, v in merged(stream_parts(text)) if k == "content"))
++    assert content == "Two."
++
++
++# -- the history ------------------------------------------------------------------------------------------------------
++
++
++def history(arguments, *, result_id="call_1", reasoning_field=None):
++    step = {"role": "assistant", "content": None,
++            "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "now", "arguments": arguments}}]}
++    if reasoning_field:
++        step[reasoning_field] = "Check the clock."
++    return [{"role": "user", "content": "time?"}, step,
++            {"role": "tool", "tool_call_id": result_id, "content": "12:00"}, {"role": "user", "content": "and now?"}]
++
++
++@pytest.mark.parametrize("arguments", ["", None, "  "], ids=["empty", "null", "blank"])
++def test_empty_arguments_and_null_content_in_the_history(tmp_path, monkeypatch, arguments):
++    rendered = {}
++    for switch in ("0", "1"):
++        monkeypatch.setenv(TOOL_CALLS, switch)
++        app = make_app(tmp_path, ids("12:01"))
++        status, text = ask(app, {"messages": history(arguments), "tools": TOOLS})
++        assert status == 200 and reply_of(text)[0] == "12:01", text
++        rendered[switch] = prompt_text(app)
++    # v0.6.5 renders an argument the model never wrote; with the setting, the call as the model writes it
++    assert "<tool_call>now<arg_key>_invalid_arguments</arg_key>" in rendered["0"]
++    assert "<|assistant|><think></think><tool_call>now</tool_call><|observation|><tool_response>12:00" in rendered["1"]
++
++
++def test_a_call_whose_arguments_are_not_an_object_is_left_out_with_its_result(tmp_path, on, capsys):
++    messages = history('{"cmd": "ls"')            # cut JSON, as a proxy or a cut reply leaves it
++    messages[1]["content"] = "Looking."
++    app = make_app(tmp_path, ids("ok"))
++    status, text = ask(app, {"messages": messages, "tools": TOOLS})
++    assert status == 200, text
++    got = prompt_text(app)
++    assert "<|assistant|><think></think>Looking.<|user|>and now?" in got and "12:00" not in got
++    assert "arguments are not a JSON object" in capsys.readouterr().err
++
++
++def test_results_whose_ids_match_no_call_render_in_order(tmp_path, monkeypatch):
++    for switch, shown in (("0", False), ("1", True)):
++        monkeypatch.setenv(TOOL_CALLS, switch)
++        app = make_app(tmp_path, ids("ok"))
++        assert ask(app, {"messages": history("{}", result_id="renumbered_7"), "tools": TOOLS})[0] == 200
++        assert ("<tool_response>12:00</tool_response>" in prompt_text(app)) is shown   # v0.6.5: dropped
++
++
++def test_a_steps_reasoning_field_is_rendered(tmp_path, monkeypatch):
++    for switch, shown in (("0", False), ("1", True)):
++        monkeypatch.setenv(TOOL_CALLS, switch)
++        app = make_app(tmp_path, ids("ok"))
++        assert ask(app, {"messages": history("{}", reasoning_field="reasoning"), "tools": TOOLS})[0] == 200
++        assert ("<think>Check the clock.</think><tool_call>now" in prompt_text(app)) is shown
++
++
++def test_agent_history_leaves_the_callers_messages_alone(on):
++    messages = history("")
++    before = json.dumps(messages)
++    out = agent_history(messages)
++    assert json.dumps(messages) == before and out is not messages
++    assert out[1]["tool_calls"][0]["function"]["arguments"] == {}
++
++
++# -- pictures in tool results without --vision ---------------------------------------------------------------------
++
++
++def test_a_tool_results_picture_without_vision(tmp_path, monkeypatch):
++    shot = [{"type": "text", "text": "the page:"},
++            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
++    messages = [{"role": "user", "content": "look"},
++                {"role": "assistant", "content": "", "tool_calls": [
++                    {"id": "call_1", "type": "function", "function": {"name": "now", "arguments": "{}"}}]},
++                {"role": "tool", "tool_call_id": "call_1", "content": shot}]
++    status, text = ask(make_app(tmp_path, ids("I cannot see it.")), {"messages": messages, "tools": TOOLS})
++    assert status == 400 and "--vision" in text                    # v0.6.5, and every later turn of the session
++    monkeypatch.setenv(TOOL_CALLS, "1")
++    app = make_app(tmp_path, ids("I cannot see it."))
++    status, text = ask(app, {"messages": messages, "tools": TOOLS})
++    assert status == 200, text
++    assert ("<tool_response>the page:<reminder>You are unable to process this image.</reminder></tool_response>"
++            in prompt_text(app))
++    status, text = ask(make_app(tmp_path, ids("x")), {"messages": [{"role": "user", "content": shot}]})
++    assert status == 400 and "--vision" in text                    # a user's picture still needs --vision
++
++
++# -- kept reasoning ---------------------------------------------------------------------------------------------------
++
++
++def test_kept_reasoning_puts_a_dropped_steps_reasoning_back(tmp_path, monkeypatch):
++    monkeypatch.setenv("TF_GLM_KEEP_REASONING", "8")
++    kept = KeptReasoning.from_env()
++    first = [{"role": "user", "content": "time?"}]
++    app = make_app(tmp_path, ids("I should check the clock.</think><tool_call>now</tool_call>"), thinking=True,
++                   kept=kept)
++    message = json.loads(ask(app, {"messages": first, "tools": TOOLS})[1])["choices"][0]["message"]
++    assert message["reasoning_content"] == "I should check the clock." and len(kept) == 1
++    nxt = [*first, {"role": "assistant", "content": "", "tool_calls": message["tool_calls"]},     # reasoning dropped
++           {"role": "tool", "tool_call_id": message["tool_calls"][0]["id"], "content": "12:00"}]
++    app = make_app(tmp_path, ids("Noon."), thinking=True, kept=kept)
++    assert ask(app, {"messages": nxt, "tools": TOOLS})[0] == 200
++    assert "<think>I should check the clock.</think><tool_call>now</tool_call>" in prompt_text(app)
++    app = make_app(tmp_path, ids("Noon."), thinking=True, kept=None)          # off: the client's history as sent
++    assert ask(app, {"messages": nxt, "tools": TOOLS})[0] == 200
++    assert "<think></think><tool_call>now</tool_call>" in prompt_text(app)
++
++
++# -- schema types -------------------------------------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("schema, text, off, on_", [
++    ({"type": ["integer", "null"]}, "5", "5", 5),
++    ({"anyOf": [{"type": "integer"}, {"type": "null"}]}, "null", "null", None),
++    ({"type": ["string", "null"]}, "null", "null", None),
++    ({"type": ["string", "null"]}, "nullable", "nullable", "nullable"),
++    ({"enum": [1, 2]}, "2", "2", 2),
++    ({"const": True}, "true", "true", True),
++    ({"type": "integer"}, "7", 7, 7),
++    ({"type": "string"}, "null", "null", "null"),
++])
++def test_schema_types(monkeypatch, schema, text, off, on_):
++    assert decode_parameter(text, schema, python=False) == off
++    monkeypatch.setenv(TOOL_CALLS, "1")
++    assert decode_parameter(text, schema, python=False) == on_
++
++
++@SWITCH
++def test_a_nullable_argument_streams_as_null(tmp_path, monkeypatch, switch):
++    monkeypatch.setenv(TOOL_CALLS, switch)
++    reply = ids("<tool_call>read_file<arg_key>path</arg_key><arg_value>a</arg_value><arg_key>note</arg_key>"
++                "<arg_value>null</arg_value><arg_key>limit</arg_key><arg_value>3</arg_value></tool_call>")
++    whole = reply_of(ask(make_app(tmp_path, reply), {"messages": USER, "tools": TOOLS})[1])
++    want = {"path": "a", "note": None, "limit": 3} if switch == "1" else {"path": "a", "note": "null", "limit": "3"}
++    assert whole[2] == [("read_file", want)]
++    streamed = calls_in(ask(make_app(tmp_path, reply), {"messages": USER, "tools": TOOLS, "stream": True})[1], True)
++    assert streamed == ([("read_file", want)], "tool_calls")
++    if switch == "1":           # the streamer alone, fed a character at a time, gives the end parser's arguments
++        streamer, text = GlmCallStreamer(TOOLS), TOK.decode(reply[:-1], skip_special_tokens=False)
++        deltas = [d for k in range(1, len(text) + 1) for d in streamer.feed(text[:k])]
++        assert [json.loads(d["tool_calls"][0]["function"]["arguments"]) for d in deltas] == [want]
++
++
++# -- the checkpoint's own template --------------------------------------------------------------------------------
++
++
++def _first_revision() -> Path:
++    found = os.environ.get("TF_GLM5_TR3_MODEL")
++    folder = Path(found) if found else None
++    if folder is None or not (folder / "tokenizer_config.json").is_file():
++        pytest.skip("needs Mia-AiLab's first-revision GLM-5.3 template (TF_GLM5_TR3_MODEL)")
++    return folder
++
++
++def test_the_checkpoints_template_renders_the_fixed_history(monkeypatch):
++    inner = ChatTemplate(_first_revision())
++    render = ThinkingOffTemplate(inner).render
++    for arguments in ("", None):
++        monkeypatch.setenv(TOOL_CALLS, "0")
++        assert "_invalid_arguments" in render(history(arguments), tools=TOOLS, enable_thinking=False)
++        monkeypatch.setenv(TOOL_CALLS, "1")
++        assert "<tool_call>now</tool_call>" in render(history(arguments), tools=TOOLS, enable_thinking=False)
++    renumbered = history("{}", result_id="renumbered_7")
++    monkeypatch.setenv(TOOL_CALLS, "0")
++    assert "<tool_response>12:00</tool_response>" not in render(renumbered, tools=TOOLS, enable_thinking=False)
++    monkeypatch.setenv(TOOL_CALLS, "1")
++    assert "<tool_response>12:00</tool_response>" in render(renumbered, tools=TOOLS, enable_thinking=False)
++    shot = [{"role": "user", "content": "look"}, {"role": "tool", "content": [{"type": "image"}]}]
++    assert "You are unable to process this image" in render(shot, tools=None, enable_thinking=False,
++                                                            allow_images=True)
