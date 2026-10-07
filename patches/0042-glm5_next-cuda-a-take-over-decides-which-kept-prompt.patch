@@ -1,0 +1,434 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 08:27:16 -0400
+Subject: [PATCH] glm5_next/cuda: a take-over decides which kept prompts stay
+ before it copies any, TF_GLM_DECIDE_THEN_COPY (MiaAI-Lab recipe patch 0078)
+
+A request that takes the caches over (a new conversation, one stream at a time) saved the rows of every kept snapshot
+the next prefill overwrites, in order, and dropped the oldest ones whenever the next copy did not fit the budget: a
+fresh conversation after a long one cloned every turn's state, each larger than the last, and dropped each for the
+next, so the allocator's reserved memory grew to the sum of their sizes. On two Sparks both ranks died with
+NV_ERR_NO_MEMORY. MiaAI-Lab's recipe v1.8 decides first and copies after, with patch
+0078-glm-take-over-decide-then-copy: which snapshots stay is worked out from their sizes alone, the rest are dropped
+without a copy, and only the survivors are cloned; the snapshots that stay and the replies are the same by design.
+After a 256k, 21-turn conversation, a fresh one on two Sparks: save_rows 22 -> 1, reserved +14.8 -> +1.4 GiB,
+take_over 3.3 -> 0.10 s (the recipe's CHANGELOG). On the AFD split this is the attention node's (rank 0 of world 1,
+which holds every kept prompt); the expert nodes keep no snapshots and never take over. This ports it behind a switch
+of this tree's own, off by default:
+
+- engine.py: decide_then_copy() reads TF_GLM_DECIDE_THEN_COPY (0 or unset: off, 1: on, anything else refused at
+  start) at each take-over; _take_over runs _take_over_decided when it is on: the patch's walk, verbatim but for its
+  calls passing the drafter only when there is one, as this tree's _take_over does. A startup line when it is on.
+  Under --parallel the pool keeps prompts in place and _take_over is not called: the switch acts with --parallel 1
+  and on the label scores' prefill.
+- THIRD_PARTY_NOTICES.md: "GLM take-over, decided then copied".
+
+Unset, _take_over walks as before.
+
+Tests (CPU): tests/test_glm_decide_then_copy.py (8): 400 random kept caches (snapshots of the live conversation and of
+others, some already saved, with and without DFlash2's window, a resume point or none) taken over both ways keep,
+save and drop the same snapshots with the same bytes and windows, and empty torch's pool after the same drops; the
+decided walk copies only the snapshots that stay, never more bytes, and never holds more than the budget; the
+recipe's case, 22 turns of one conversation then a fresh one: 22 copies before, 1 after, the same one kept; a
+mutation of any of its three rules fails the random cases. tests/test_glm_cuda_kept.py's three tests run with the
+switch unset and set (its stand-in snapshot gains decode.Snapshot's drafter_end and drafter_rows, which the decided
+walk reads), and so do tests/test_glm_score_cache.py's three, a decision's take-over (its stand-in snapshot gains
+decode.Snapshot's drafter_rows).
+
+Credit: patch 0078 was written by m-naoki-m (https://github.com/m-naoki-m) in
+MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold pull request #71 (commit b9fa2ff), also proposed to TensorFold
+as ashhart/TensorFold pull request #421; MiaAI-Lab applied it as contributed (merge a58841b, v1.8 at 33b50fd), Apache
+License 2.0.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patch 0078,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 33b50fde06fd7ea604cbc6a663880068ab1e2ee4 (v1.8); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |  19 ++
+ .../families/glm5_next/cuda/engine.py         |  82 ++++++++
+ tests/test_glm_cuda_kept.py                   |   9 +-
+ tests/test_glm_decide_then_copy.py            | 177 ++++++++++++++++++
+ tests/test_glm_score_cache.py                 |  11 ++
+ 5 files changed, 295 insertions(+), 3 deletions(-)
+ create mode 100644 tests/test_glm_decide_then_copy.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index e2ca0b8..1ac276f 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -604,3 +604,22 @@ Apache License 2.0 (see [the license text](LICENSES/Apache-2.0.txt)). Changes in
+ `cap_victim`, and here it sits beside it as `cap_victim_recency`, used only with `TF_GLM_CAP_SHARED_RECENCY=1`
+ (`MultiDecoder.cap_recency`; unset or 0: `cap_victim`, as before); with `--parallel` the ranks' startup comparison
+ carries the switch, since both ranks drop the same kept prompt.
++
++## GLM take-over, decided then copied (TF_GLM_DECIDE_THEN_COPY)
++
++`families/glm5_next/cuda/engine.py`'s `GlmEngine._take_over_decided` (a request that takes the caches over works out
++which kept snapshots stay within the budget from their sizes, drops the rest without a copy and clones only the ones
++that stay; the same snapshots stay as before, so a fresh conversation after a long one no longer clones every kept
++state first and runs out of memory) is MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/33b50fde06fd7ea604cbc6a663880068ab1e2ee4)
++patch 0078-glm-take-over-decide-then-copy's `_take_over` (v1.8), written by
++[m-naoki-m](https://github.com/m-naoki-m) in
++[pull request #71](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/71) (commit
++[`b9fa2ff`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/commit/b9fa2ff98a78b1a6e9fc9d349de9757c3b27cbd5))
++and applied by MiaAI-Lab as contributed; m-naoki-m also proposed it to TensorFold as
++[pull request #421](https://github.com/ashhart/TensorFold/pull/421). Under the recipe's Apache License 2.0 (see
++[the license text](LICENSES/Apache-2.0.txt)). Changes in the port: the recipe replaces `_take_over`'s walk, and here
++it sits beside it as `_take_over_decided`, used only with `TF_GLM_DECIDE_THEN_COPY=1` (`decide_then_copy`, read at
++each take-over; unset or 0: the walk as before); its calls pass the drafter only when there is one, as this tree's
++`_take_over` does (the patch passes `drafter=drafter`). It acts on the one-stream path (`--parallel 1`) and the
++label scores' prefill; under `--parallel` the pool keeps prompts in place and `_take_over` is not called.
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index f2760ab..926b486 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -431,6 +431,20 @@ def user_opener(model_dir: Path) -> int | None:
+     return next((int(t["id"]) for t in added if t.get("content") == "<|user|>"), None)
+ 
+ 
++def decide_then_copy(value: str | None = None) -> bool:
++    """TF_GLM_DECIDE_THEN_COPY (MiaAI-Lab recipe patch 0078, by m-naoki-m; off by default here): 1, ``_take_over``
++    works out which kept snapshots stay within the budget before it copies any, and copies only those
++    (``_take_over_decided``); 0 or unset, it copies each in turn as before. Read at each take-over, so an engine made
++    without ``__init__`` follows the environment too (``multi.recipe_switch``'s values, without importing it)."""
++
++    raw = os.environ.get("TF_GLM_DECIDE_THEN_COPY", "") if value is None else value
++    if raw.strip() in ("", "0"):
++        return False
++    if raw.strip() == "1":
++        return True
++    raise ValueError(f"TF_GLM_DECIDE_THEN_COPY: 0 (off, the default) or 1 (on), not {raw!r}")
++
++
+ class GlmEngine:
+     """GLM-5.3-Flash on two ranks (this one ``rank``): weights, MTP and DFlash2 drafting, per-request policies."""
+ 
+@@ -743,6 +757,10 @@ class GlmEngine:
+         self.cache: list = []
+         self.live: list[int] = []
+         self.cache_entries = self.kept_cap or self._cache_entries()
++        if decide_then_copy() and rank == 0:     # TF_GLM_DECIDE_THEN_COPY (recipe 0078): a bad value refuses here
++            print("[tensorfold] TF_GLM_DECIDE_THEN_COPY=1: a request that takes the caches over works out which kept "
++                  "prompts stay before it copies any, and copies only those (one stream at a time; under --parallel "
++                  "the pool keeps prompts in place) (MiaAI-Lab recipe patch 0078, by m-naoki-m)", flush=True)
+         if parallel > 1:
+             from . import fill_pairs, prefill_order
+             from .multi import GlmScheduler, MultiDecoder
+@@ -981,6 +999,8 @@ class GlmEngine:
+ 
+     def _take_over(self, keep: list[int]) -> None:
+         """Save the rows of every kept snapshot the next prefill overwrites, dropping the oldest entries past the memory budget; both ranks decide alike."""
++        if decide_then_copy():                   # TF_GLM_DECIDE_THEN_COPY=1 (MiaAI-Lab recipe patch 0078)
++            return self._take_over_decided(keep)
+         from .decode import row_bytes, save_rows
+ 
+         # TF_GLM_SHARED_PREFIX (MiaAI-Lab recipe patch 0015): saved rows keep DFlash2's window
+@@ -1016,6 +1036,68 @@ class GlmEngine:
+ 
+             torch.cuda.empty_cache()             # give the freed rows back rather than keep them in torch's pool
+ 
++    def _take_over_decided(self, keep: list[int]) -> None:
++        """``_take_over`` with TF_GLM_DECIDE_THEN_COPY=1 (MiaAI-Lab recipe patch 0078, by m-naoki-m): the same
++        snapshots stay and are saved, the same ones are dropped.
++
++        Decided first, copied after: which snapshots stay within the budget is worked out from their sizes alone, the
++        rest are dropped without a copy, and only the survivors are cloned. Cloning each in turn and dropping it for the
++        next grew the allocator's pool with every larger copy (reserved memory far past the budget)."""
++        from .decode import row_bytes, save_rows, snapshot_bytes
++
++        # TF_GLM_SHARED_PREFIX (MiaAI-Lab recipe patch 0015): saved rows keep DFlash2's window
++        drafter = self._kept_drafter()
++        kw = {"drafter": drafter} if drafter is not None else {}
++        live = self.live
++        order = list(self.cache)
++
++        def resumes(c) -> bool:
++            return len(c.ids) <= len(keep) and keep[:len(c.ids)] == c.ids
++
++        alive = {id(c) for c in order}
++        saved: dict[int, int] = {}                   # a survivor's held bytes once its rows are saved
++        drops: list = []
++        over_budget = False                          # a drop made for the budget (not a row already gone)
++
++        def held() -> int:
++            return sum(saved[id(c)] if id(c) in saved else snapshot_bytes(c) for c in order if id(c) in alive)
++
++        def forget(c) -> None:
++            alive.discard(id(c))
++            saved.pop(id(c), None)
++            drops.append(c)
++
++        for snap in order:                           # the walk of saving one by one, with the sizes standing in for the copies
++            n = len(snap.ids)
++            if id(snap) not in alive or snap.rows is not None or resumes(snap):
++                continue
++            if live[:n] != snap.ids:                  # its rows are already gone: nothing to resume from
++                forget(snap)
++                continue
++            need = row_bytes(self.e, snap, **kw)
++            while held() + need > self.cache_bytes:
++                old = next((c for c in order if id(c) in alive and c is not snap and not resumes(c)), None)
++                if old is None:
++                    break
++                forget(old)
++                over_budget = True
++            if held() + need > self.cache_bytes:
++                forget(snap)
++                over_budget = True
++                continue
++            shed = 0 if drafter is not None and snap.drafter_end == n else sum(
++                t.numel() * t.element_size() for t in snap.drafter_rows or [])
++            saved[id(snap)] = snapshot_bytes(snap) - shed + need
++        for snap in drops:
++            self._drop(snap)
++        for snap in order:
++            if id(snap) in saved:
++                save_rows(self.e, snap, **kw)
++        if over_budget:
++            import torch
++
++            torch.cuda.empty_cache()             # give the freed rows back rather than keep them in torch's pool
++
+     def _kept_drafter(self):
+         """The drafter whose context window saved snapshots keep (TF_GLM_SHARED_PREFIX), or None: they drop it.
+         (MiaAI-Lab recipe patch 0015)"""
+diff --git a/tests/test_glm_cuda_kept.py b/tests/test_glm_cuda_kept.py
+index b6c752a..c3c165d 100644
+--- a/tests/test_glm_cuda_kept.py
++++ b/tests/test_glm_cuda_kept.py
+@@ -16,11 +16,14 @@ pytestmark = pytest.mark.torch
+ class Snap:
+     def __init__(self, ids, need, states=5):
+         self.ids, self.need, self.states, self.rows, self.nbytes = list(ids), need, states, None, 0
++        self.drafter_end, self.drafter_rows = -1, None    # decode.Snapshot's without DFlash2's window (0078 reads them)
+ 
+ 
+-@pytest.fixture
+-def kept(monkeypatch):
+-    """An engine with only its kept-conversation state; save_rows records the saved bytes of every snapshot."""
++@pytest.fixture(params=["", "1"], ids=["copy-each", "decide-then-copy"])
++def kept(monkeypatch, request):
++    """An engine with only its kept-conversation state; save_rows records the saved bytes of every snapshot. Each test
++    runs with TF_GLM_DECIDE_THEN_COPY unset and set (MiaAI-Lab recipe patch 0078): the same snapshots stay either way."""
++    monkeypatch.setenv("TF_GLM_DECIDE_THEN_COPY", request.param)
+     made, peaks = [], []
+ 
+     def save_rows(e, snap):
+diff --git a/tests/test_glm_decide_then_copy.py b/tests/test_glm_decide_then_copy.py
+new file mode 100644
+index 0000000..0e39fa4
+--- /dev/null
++++ b/tests/test_glm_decide_then_copy.py
+@@ -0,0 +1,177 @@
++"""MiaAI-Lab recipe patch 0078 (by m-naoki-m), ``TF_GLM_DECIDE_THEN_COPY``: ``GlmEngine._take_over`` works out which
++kept snapshots stay within the budget before it copies any, and copies only those. Without a GPU, over stand-ins for
++decode's row_bytes / save_rows / snapshot_bytes (as tests/test_glm_cuda_kept.py): random kept caches taken over both
++ways keep, save and drop the same snapshots (the patch's own check was 200 random cases against the old walk), and a
++fresh conversation after a long one copies only what stays (the recipe's case: save_rows 22 -> 1)."""
++
++from __future__ import annotations
++
++import copy
++import random
++import sys
++from types import SimpleNamespace
++
++import pytest
++
++from tensorfold.families.glm5_next.cuda.engine import GlmEngine, decide_then_copy
++
++pytestmark = pytest.mark.torch
++
++
++class Rows:
++    """A stand-in tensor of ``n`` one-byte elements."""
++
++    def __init__(self, n):
++        self.n = n
++
++    def numel(self):
++        return self.n
++
++    def element_size(self):
++        return 1
++
++
++class Snap:
++    """decode.Snapshot's fields the take-over reads: ids, saved rows, what the snapshot holds beside them (KDA states
++    and the like), and a ring drafter's window (``drafter_rows``, kept only while the snapshot fits DFlash2)."""
++
++    def __init__(self, k, ids, need, states, window=0, drafter_end=-1, view=0):
++        self.k, self.ids, self.need, self.states, self.view = k, list(ids), need, states, view
++        self.rows, self.nbytes = None, 0
++        self.drafter_end = drafter_end
++        self.drafter_rows = [Rows(window)] if window else None
++
++
++def _fits(snap, drafter):
++    return drafter is not None and snap.drafter_end == len(snap.ids)
++
++
++def _engine(monkeypatch, snaps, live, budget, drafter):
++    """An engine with only its kept state, over decode stand-ins that record each copy and the bytes held then."""
++    log = {"saves": [], "copied": 0, "peak": 0, "emptied": 0}
++    engine = GlmEngine.__new__(GlmEngine)
++
++    def snapshot_bytes(s):                   # decode.snapshot_bytes: what it holds, plus any saved rows
++        return s.states + sum(r.n for r in s.drafter_rows or []) + (s.nbytes if s.rows is not None else 0)
++
++    def row_bytes(e, s, drafter=None):       # decode.row_bytes: its attention rows, and DFlash2's when it keeps them
++        return s.need + (s.view if _fits(s, drafter) else 0)
++
++    def save_rows(e, s, drafter=None):       # decode.save_rows: the copy; the window goes unless it still fits
++        s.rows, s.nbytes = object(), row_bytes(e, s, drafter)
++        if not _fits(s, drafter):
++            s.drafter_end, s.drafter_rows = -1, None
++        log["saves"].append(s.k)
++        log["copied"] += s.nbytes
++        log["peak"] = max(log["peak"], sum(snapshot_bytes(c) for c in engine.cache))
++
++    decode = SimpleNamespace(row_bytes=row_bytes, save_rows=save_rows, snapshot_bytes=snapshot_bytes)
++    monkeypatch.setitem(sys.modules, "tensorfold.families.glm5_next.cuda.decode", decode)
++    import torch
++
++    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: log.__setitem__("emptied", log["emptied"] + 1))
++    engine.cache, engine.live, engine.cache_bytes, engine.cache_entries = list(snaps), list(live), budget, 32
++    engine.e = engine
++    engine.shared, engine.drafter = (1, object()) if drafter else (0, None)
++    return engine, log
++
++
++def _state(engine, snaps):
++    """The kept order, and each snapshot's saved rows, bytes and window while kept; a dropped one only as dropped (its
++    rows and window freed: ``_drop``). A snapshot the old walk copied and then dropped keeps the drafter_end its copy
++    reset; nothing reads a dropped snapshot, so that field is left out."""
++    kept = {id(s) for s in engine.cache}
++    return ([s.k for s in engine.cache],
++            [(s.k, s.rows is not None, s.nbytes, s.drafter_end, s.drafter_rows is not None) if id(s) in kept
++             else (s.k, "dropped", s.rows is None and s.nbytes == 0 and s.drafter_rows is None) for s in snaps])
++
++
++def _case(rng):
++    """A kept cache: snapshots of the live conversation's prefixes (resumable from the caches), of others whose rows
++    are gone, some already saved; a next prompt resuming one of them or none; sizes and a budget at random."""
++    live = list(range(rng.randint(40, 400)))
++    snaps = []
++    for k in range(rng.randint(1, 14)):
++        kind = rng.random()
++        if kind < 0.55:
++            ids = live[:rng.randint(1, len(live))]
++        else:
++            ids = [10_000 + k] + live[:rng.randint(0, 30)]
++        end = rng.choice([len(ids), len(ids), -1, max(0, len(ids) - 3)])
++        s = Snap(k, ids, need=rng.randint(1, 80), states=rng.randint(0, 12),
++                 window=rng.choice([0, 0, rng.randint(1, 30)]), drafter_end=end, view=rng.randint(0, 25))
++        if rng.random() < 0.2:
++            s.rows, s.nbytes = object(), rng.randint(1, 60)
++        snaps.append(s)
++    pick = rng.random()
++    if pick < 0.4:
++        keep = []
++    elif pick < 0.8:
++        keep = list(rng.choice(snaps).ids) + [7, 8, 9]
++    else:
++        keep = live[:rng.randint(1, len(live))] + [5]
++    return snaps, live, keep, rng.randint(10, 260), rng.random() < 0.5
++
++
++def _walk(monkeypatch, case, value):
++    snaps, live, keep, budget, drafter = copy.deepcopy(case)
++    monkeypatch.setenv("TF_GLM_DECIDE_THEN_COPY", value)
++    engine, log = _engine(monkeypatch, snaps, live, budget, drafter)
++    engine._take_over(keep)
++    return _state(engine, snaps), log, budget, snaps
++
++
++def test_the_switch_reads_0_or_1():
++    assert decide_then_copy("") is False and decide_then_copy("0") is False and decide_then_copy(" 1 ") is True
++    with pytest.raises(ValueError, match="TF_GLM_DECIDE_THEN_COPY"):
++        decide_then_copy("yes")
++
++
++@pytest.mark.parametrize("seed", range(4))
++def test_random_kept_caches_keep_save_and_drop_the_same_snapshots_either_way(monkeypatch, seed):
++    rng = random.Random(780 + seed)
++    for _ in range(100):
++        case = _case(rng)
++        old, old_log, budget, _ = _walk(monkeypatch, case, "")
++        new, new_log, _, _ = _walk(monkeypatch, case, "1")
++        assert new == old                                       # the same order, saves, drops, bytes and windows
++        assert bool(new_log["emptied"]) == bool(old_log["emptied"])   # torch's pool emptied after the same drops
++        assert set(new_log["saves"]) <= set(old_log["saves"])  # only snapshots the old walk copied too ...
++        survivors = {s[0] for s in new[1] if s[1] is True} & set(old_log["saves"])
++        assert set(new_log["saves"]) == survivors               # ... and only the ones that stay
++        assert new_log["copied"] <= old_log["copied"]
++        assert new_log["peak"] <= budget and old_log["peak"] <= budget
++
++
++@pytest.mark.parametrize("drafter", [False, True])
++def test_a_fresh_conversation_after_a_long_one_copies_only_what_stays(monkeypatch, drafter):
++    """The recipe's case: 22 turns of one long conversation kept, each its prompt's state; a fresh conversation then
++    takes the caches over. The old walk saves each turn's rows and drops it for the next (22 copies, each larger than
++    the last, which grew the allocator's pool); decided first, only the last turn is copied."""
++    live = list(range(23 * 100))
++    snaps = [Snap(k, live[:(k + 1) * 100], need=(k + 1) * 10, states=4, window=6 if drafter else 0,
++                  drafter_end=(k + 1) * 100 if drafter else -1, view=3) for k in range(22)]
++    budget = 300                                     # the last turn's copy fits, never two of the last turns'
++    case = (snaps, live, [], budget, drafter)
++    old, old_log, _, _ = _walk(monkeypatch, case, "")
++    new, new_log, _, _ = _walk(monkeypatch, case, "1")
++    assert new == old
++    assert old_log["saves"] == list(range(22)) and new_log["saves"] == [21]
++    assert old[0] == new[0] == [21]
++    assert new_log["copied"] < old_log["copied"] / 10
++
++
++def test_a_resumed_snapshot_and_rows_already_gone_are_handled_alike(monkeypatch):
++    """The prompt's own resume point is never dropped or copied; a snapshot whose rows the caches no longer hold is
++    dropped without the budget's empty_cache (only drops for the budget empty torch's pool), either way."""
++    live = list(range(300))
++    hit = Snap(0, live[:100], need=50, states=5)
++    gone = Snap(1, [99_999] + live[:10], need=10, states=5)
++    other = Snap(2, live[:200], need=50, states=5)
++    for budget, emptied in ((200, False), (55, True)):
++        case = ([hit, gone, other], live, live[:100] + [1, 2], budget, False)
++        old, old_log, _, _ = _walk(monkeypatch, case, "")
++        new, new_log, _, _ = _walk(monkeypatch, case, "1")
++        assert new == old
++        assert 0 in old[0] and 1 not in old[0]
++        assert bool(new_log["emptied"]) == bool(old_log["emptied"]) == emptied
+diff --git a/tests/test_glm_score_cache.py b/tests/test_glm_score_cache.py
+index 0788d5f..40fba8f 100644
+--- a/tests/test_glm_score_cache.py
++++ b/tests/test_glm_score_cache.py
+@@ -5,6 +5,8 @@ from __future__ import annotations
+ import sys
+ from types import SimpleNamespace
+ 
++import pytest
++
+ from tensorfold.families.glm5_next.cuda.engine import GlmEngine
+ 
+ 
+@@ -23,6 +25,15 @@ class _Snap:
+         self.ids, self.need, self.states = list(ids), need, 5
+         self.rows, self.nbytes = None, 0
+         self.mtp_len, self.drafter_end = len(self.ids), len(self.ids)
++        self.drafter_rows = None                     # decode.Snapshot's, without DFlash2's window (0078 reads it)
++
++
++@pytest.fixture(autouse=True, params=["", "1"], ids=["copy-each", "decide-then-copy"])
++def take_over(monkeypatch, request):
++    """Each test runs with TF_GLM_DECIDE_THEN_COPY unset and set (MiaAI-Lab recipe patch 0078): a decision's take-over
++    keeps, saves and drops the same snapshots either way."""
++    monkeypatch.setenv("TF_GLM_DECIDE_THEN_COPY", request.param)
++    return request.param
+ 
+ 
+ def _engine(monkeypatch, cells, logits):

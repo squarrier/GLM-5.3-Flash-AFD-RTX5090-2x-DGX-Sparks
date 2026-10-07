@@ -1,13 +1,15 @@
 # NOTICE
 
-GLM-5.3-Flash on 1x RTX 5090 + 2x DGX Spark, version 2.0: TensorFold with MiaAI-Lab's GLM work
+GLM-5.3-Flash on 1x RTX 5090 + 2x DGX Spark, version 2.1: TensorFold with MiaAI-Lab's GLM work
 Copyright 2026 Scott Quarrier
 
 This version's own scripts, patches and documentation are licensed under the Apache License, Version 2.0
 ([LICENSE](LICENSE)). If you redistribute it or a modified version of it, keep this NOTICE file and state what you
-changed (Apache-2.0, section 4). Version 1.0, the glm53f-afd version of 2026-09-30, stays MIT-licensed at the tag
-[`v1.0`](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/tree/v1.0); its credits are kept
-below, verbatim, in [Previous version (v1.0)](#previous-version-v10).
+changed (Apache-2.0, section 4). Version 2.0 (2026-10-05) stays at the tag
+[`v2.0`](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/tree/v2.0), under the same licence;
+every credit it gives is kept in this version. Version 1.0, the glm53f-afd version of 2026-09-30, stays MIT-licensed
+at the tag [`v1.0`](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/tree/v1.0); its credits are
+kept below, verbatim, in [Previous version (v1.0)](#previous-version-v10).
 
 This version ships no weights, no binaries and no container images. It builds TensorFold and MCDMA from source and
 downloads the weights from their own repositories. Each component keeps its own licence, stated below for the revision
@@ -29,6 +31,12 @@ this version pins.
   whose DFlash2 architecture its drafter ports.
 - `build.sh` clones it at that revision and applies `patches/`. The patches' changes are offered under Apache-2.0; the
   TensorFold code they modify, and quote as diff context, stays under TensorFold's licences.
+- **Patches 0046-0048 are TensorFold's own v0.6.6 commits** (v0.6.6 = v0.6.5 plus these three, released 2026-10-06),
+  carried with their authorship under TensorFold's licence (Apache-2.0): `dce62cfa3c6752c828c4a17338d3ae585e43e65a` by
+  Philip Mossop ([philip-pentatonic](https://github.com/philip-pentatonic); `--name-priority ID=background`,
+  [TensorFold#445](https://github.com/ashhart/TensorFold/pull/445)), and `07f3777a4d1739534d04beaf9f14b1f6d3024472` and
+  `cb2ebf0540f42604e2759b2ddef497861e928248` (the v0.6.6 release) by Ash Hart. Each patch's credit note names its
+  commit.
 
 ## MiaAI-Lab's TensorFold pull requests
 
@@ -65,17 +73,57 @@ with her authorship; each patch names its pull request and her upstream commit:
 | 0024 (`TF_GLM_EXL3_PROMPT`: the EXL3 prompt kernel for the routed experts' prompt chunks) | 0004 (its EXL3 prompt kernels), with 0009's shared-row inputs and 0020's item order | `1576746` (v1.5) |
 | 0028 (`TF_GLM_LATENT_MMA`, `TF_GLM_HC_MMA`, `TF_GLM_SEQ_ROWS`, `TF_GLM_SPARSE_ONEPASS`, `TF_GLM_PROMPT_DSA`: the attention node's prompt-chunk kernels) | 0004, 0009, 0028 (with 0038's FP8 cache rows in the one-pass kernel) | `1576746` (v1.5) |
 | 0030 (`TF_GLM_MULTI_WINDOW`: up to eight concurrent streams) | 0069 | `1576746` (v1.5) |
+| 0031 (`TF_GLM_PREFILL_ROWS`: 4,096-row prompt chunks and expert calls; off) | 0004, 0008 | `1576746` (v1.5) |
+| 0036 (`TF_GLM_SHARED_PREFIX_COPY`; off) | 0071, by E-Zou Shen (her recipe's pull request #44) | `68ebd67b5326974b8004009e202268b1fa7c551d` (v1.7.1) |
+| 0037 (`TF_GLM_QUEUED_CANCEL`; off) | 0073, by desy0305 (#51), with johnwhited's delivery-failure handling (#48) | `68ebd67` (v1.7.1) |
+| 0038 (`TF_GLM_COMPACT_BEFORE_EVICT`; off) | 0074, by E-Zou Shen (#62) | `68ebd67` (v1.7.1) |
+| 0039 (`TF_GLM_ASSISTANT_ENDS`; off) | 0075 (issue #60, reported by Lukas-tek-no-logic) | `68ebd67` (v1.7.1) |
+| 0040 (`TF_GLM_CAP_SHARED_RECENCY`; off) | 0077 (issue #75, diagnosed by meleesciony) | `68ebd67` (v1.7.1) |
+| 0041 (the tests of 0036, 0038 and 0040 with the host RAM tier) | 0071, 0074, 0077 | `68ebd67` (v1.7.1) |
+| 0042 (`TF_GLM_DECIDE_THEN_COPY`) | 0078, by m-naoki-m (#71) | `33b50fde06fd7ea604cbc6a663880068ab1e2ee4` (v1.8) |
+| 0043 (`TF_GLM_CAPACITY_STATUS`) | 0081, by johnwhited (#48) | `33b50fd` (v1.8) |
+| 0044 (`TF_GLM_MAX_QUEUED`, her name; unset, as in her lane) | 0082, by johnwhited (#48) | `33b50fd` (v1.8) |
+| 0045 (`TF_GLM_DELIVERY_ABORT`) | 0083, by johnwhited (#48) | `33b50fd` (v1.8) |
 
   Two of the notices in her NOTICE apply here, because patches 0017 and 0020 carry code she adapted from Jay
   Leaton's project (next section). Her other third-party notices cover recipe patches that are not ported here
   (0006, 0044, 0045, 0046, 0058, 0059, and the contributed 0054, 0057, 0060), so they do not apply to this project.
-- Two of this project's patches change code ported from her recipe, and keep `Co-authored-by: MiaAI-Lab` and a credit
+- Three of this project's patches change code ported from her recipe, and keep `Co-authored-by: MiaAI-Lab` and a credit
   header naming her patch and commit (`1576746`, v1.5): 0025 (`TF_GLM_CACHE_ROOM`, the pool's room rule) changes her
-  patch 0030's `MultiDecoder._room` and `_grow`, and 0029 (`TF_GLM_PREFILL_ORDER`, shortest-first prompt order)
-  changes her patch 0049's grouped chunk (`_group`). TensorFold's `THIRD_PARTY_NOTICES.md` in the patched tree records
-  both changes in the sections of the code they change.
+  patch 0030's `MultiDecoder._room` and `_grow`, 0029 (`TF_GLM_PREFILL_ORDER`, shortest-first prompt order) changes her
+  patch 0049's grouped chunk (`_group`), and 0033 (`TF_GLM_FILL_PAIRS`, prompt chunks filled as pairs while streams
+  decode) changes her patch 0062's sliced fills. TensorFold's `THIRD_PARTY_NOTICES.md` in the patched tree records each
+  change in the section of the code it changes.
+- Patch 0034 reimplements parts of her recipe patches 0009 and 0020 (`1576746`, v1.5) inside glm53f-afd's expert
+  prompt kernels (below): the one rotation a row for a layer whose experts share one gate/up `suh`, and the group
+  order. It keeps `Co-authored-by: MiaAI-Lab` and a credit header naming her patches and commit. Patches 0021, 0032
+  and 0035 also keep `Co-authored-by: MiaAI-Lab` (0032 changes the `--parallel` decoder's kept prompts in `multi.py`;
+  0035 extends 0034).
 - This project's own patches are 0001, 0008, 0011, 0021, 0022 (prompt chunk pairs), 0026 (prefill lanes and FP8 wire
-  rows, off) and 0027 (exchanges in flight); 0026 and 0027 write designs of Hugh Madden's (below).
+  rows, off), 0027 (exchanges in flight) and 0032 (kept prompts in host RAM); 0026, 0027 and 0032 write designs of
+  Hugh Madden's (below).
+
+## Contributors to her recipe whose patches are ported here
+
+Each wrote the patch into her recipe ([MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold),
+Apache-2.0), where she applied it; the ports name them in their messages and in TensorFold's `THIRD_PARTY_NOTICES.md`
+in the patched tree.
+
+- E-Zou Shen ([ezoushen](https://github.com/ezoushen), [@ezoushen](https://x.com/ezoushen)): her patches 0071 (pull
+  request #44, issue #43) and 0074 (#62, issue #61), with 0074's `tools/pool_room_check.py`; here 0036, 0038 and the
+  tests in 0041.
+- desy0305 ([desy0305](https://github.com/desy0305)): her patch 0073 (#51) and its checks,
+  `tools/test_queued_cancellation.py`; here 0037.
+- johnwhited ([johnwhited](https://github.com/johnwhited)): her patches 0081, 0082 and 0083 (#48), and the
+  delivery-failure handling in 0073; here 0043, 0044, 0045 and 0037. His patches take vLLM v1's admission check and
+  generate-abort behaviour as their reference; no vLLM code is used.
+- m-naoki-m ([m-naoki-m](https://github.com/m-naoki-m), [@\_m\_naoki\_m\_](https://x.com/_m_naoki_m_)): her patch 0078
+  (#71, commit `b9fa2ff`), also proposed to TensorFold as
+  [ashhart/TensorFold#421](https://github.com/ashhart/TensorFold/pull/421); here 0042.
+- meleesciony ([meleesciony](https://github.com/meleesciony)) diagnosed the failure of her issue #75 and proposed the
+  fix her patch 0077 makes (here 0040 and 0041). Lukas-tek-no-logic
+  ([Lukas-tek-no-logic](https://github.com/Lukas-tek-no-logic)) reported the leak of issue #60 that her patch 0075
+  fixes (here 0039).
 
 ## glm53-tensorfold-spark (code adapted in two of her ported patches)
 
@@ -101,7 +149,24 @@ with her authorship; each patch names its pull request and her upstream commit:
   wrote [ashhart/MCDMA#5](https://github.com/ashhart/MCDMA/pull/5): its setup notes and build fix. `build.sh` does
   not apply #5; it keeps the one compiler warning that #5 fixes as a warning.
 
-## The attention/expert split: its authors (no code from them is used)
+## glm53f-afd (code in patches 0034 and 0035)
+
+- <https://github.com/hughmadden/glm53f-afd> by Hugh Madden / Turquoise Bay AI
+  ([hughmadden](https://github.com/hughmadden), [@dangerm00se](https://x.com/dangerm00se)), **MIT**, pinned at v1.1.0
+  `91db3cc6fe672e2724efa3464f63bd31493f63f6`, Copyright (c) 2026 Turquoise Bay AI Pty Ltd.
+- Patch 0034 carries his expert prompt kernels for the Sparks' prompt chunks (`TF_GLM_EXPERT_KERNEL=g53`): the plan,
+  the large-M gate/up and down kernels, and the fused epilogue and reduce of glm53f-rank's
+  `crates/glm53f-rank/kernels/exl3_rank.cu`, at the two-rank width, in `families/glm5_next/cuda/g53_rank.cu`, `.cpp`,
+  `.h` and `g53_experts.py` of the patched tree; patch 0035 runs them on every prompt window from one row. Their EXL3
+  decoder, fragment MMA and Hadamard butterfly are TensorFold's MIT code (TensorFold `bb4b4a3`, v0.3.4.1, "Copyright
+  (c) 2026 TensorFold contributors"), as glm53f-rank carries it; their split of every expert by intermediate channel
+  follows the design of T.J. Purtell's glmrt.
+- The patch adds both MIT licence texts to the patched tree (`LICENSES/glm53f-afd-MIT.txt`, glm53f-afd's own, and
+  `LICENSES/glm53f-afd-LICENSE.tensorfold.txt`, the TensorFold MIT notice glm53f-rank keeps), names them in the files'
+  headers, and records the code in TensorFold's `THIRD_PARTY_NOTICES.md` ("GLM expert prompt kernels from
+  glm53f-afd"). Keep them with any copy of a patched tree. The patch's other changes are offered under Apache-2.0.
+
+## The attention/expert split: its authors (designs; their code only as stated above)
 
 - Hugh Madden / Turquoise Bay AI ([@dangerm00se](https://x.com/dangerm00se), [hughmadden](https://github.com/hughmadden))
   wrote [glm53f-afd](https://github.com/hughmadden/glm53f-afd) (MIT; v1.1.0, `91db3cc6fe672e2724efa3464f63bd31493f63f6`,
@@ -126,6 +191,13 @@ with her authorship; each patch names its pull request and her upstream commit:
   through mimo26f-afd. TensorFold's `THIRD_PARTY_NOTICES.md` in the patched tree names them, in its "GLM prefill lanes
   and FP8 wire rows" and "GLM exchanges in flight" sections, with glm53f-afd's MIT notice (Copyright (c) 2026
   Turquoise Bay AI Pty Ltd).
+- Patch 0032 writes a fourth of his designs, with no code copied: glm53f-afd's host RAM tier
+  (`crates/glm53f-coordinator/src/hostcache.rs`, `crates/glm53f-coordinator/src/scheduler.rs` and `docs/RUNNING.md`,
+  "KV snapshots and the RAM tier"; `TF_GLM_KEPT_HOST`, `TF_GLM_HOST_CACHE_GIB`, on in `.env.example`). glm53f-afd's
+  NOTICE credits the tier to his mimo26f-afd, and its host cache's eviction design to T.J. Purtell's ds41rt.
+  TensorFold's `THIRD_PARTY_NOTICES.md` in the patched tree names it in "GLM kept prompts in host RAM".
+- glm53f-rank's expert prompt kernels in patch 0034 (above) keep glmrt's split of every expert by intermediate
+  channel, which T.J. Purtell designed.
 
 ## Other authors of work the ported patches build on (no code from them is used)
 
@@ -173,9 +245,11 @@ with her authorship; each patch names its pull request and her upstream commit:
 
 ## Not used
 
-- No vLLM, and no code from glm53f-afd, mimo26f-afd, ds41rt, glmrt or cuteafd.
-- No vision: GLM's vision encoder and image paths (her recipe patches 0003, 0050, 0054 and 0056's image part) are not
-  ported; this project serves text only.
+- No vLLM: johnwhited's patches 0081-0083 (here 0043-0045) follow vLLM v1's admission and abort behaviour as their
+  reference, written anew; no vLLM code is in them.
+- No code from mimo26f-afd, ds41rt, glmrt or cuteafd, and none from glm53f-afd beyond patches 0034 and 0035 (above).
+- No vision: GLM's vision encoder and image paths (her recipe patches 0003, 0050, 0054 and 0056's image part, and her
+  v1.8's 0079 and 0080 by ThomasWadeZ) are not ported; this project serves text only.
 - No Local Inference Lab weights: the EXL3 TR3 4-bpw quantization by Local Inference Lab, Inc. that this repo's v1.0
   serves is not used by this version (v1.0's licence-required attribution is kept below).
 

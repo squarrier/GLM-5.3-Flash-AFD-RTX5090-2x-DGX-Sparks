@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ashhart <71890694+ashhart@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 10:37:11 +0100
+Subject: [PATCH] release: TensorFold 0.6.6
+
+---
+Credit: TensorFold's own commit cb2ebf0540f42604e2759b2ddef497861e928248 (v0.6.6), by ashhart,
+  https://github.com/ashhart/TensorFold/commit/cb2ebf0540f42604e2759b2ddef497861e928248
+  (Apache-2.0, as TensorFold); carried with its authorship.
+
+ CHANGELOG.md               | 8 ++++++++
+ src/tensorfold/__init__.py | 2 +-
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4b791af..47732d1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,14 @@
+ `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
+ GitHub has the full notes and the measurements behind them.
+ 
++## 0.6.6 (6 Oct 2026)
++
++- **`--name-priority ID=background` on the CUDA server.** A request that names that served id (`--name` or an
++  `--alias`) and sends no `priority` of its own is served as `priority: "background"`, so it yields to foreground
++  requests. A request's own `priority` always wins. This suits clients that can choose a model id but cannot add a
++  field to the request, such as batch extractors. On one DGX Spark, a foreground request behind four background ones
++  got its first token in 0.2 s instead of 21 s, with replies unchanged (#445). Thanks to @philip-pentatonic.
++
+ ## 0.6.5 (3 Oct 2026)
+ 
+ - **Qwen3.6-35B-A3B drafts with its own MTP layer on Macs,** as on CUDA. Chains of up to four drafts are verified in
+diff --git a/src/tensorfold/__init__.py b/src/tensorfold/__init__.py
+index 7f3475a..5230b95 100644
+--- a/src/tensorfold/__init__.py
++++ b/src/tensorfold/__init__.py
+@@ -1,3 +1,3 @@
+ """TensorFold: fast, exact LLM decoding on Apple Silicon and NVIDIA GPUs behind an OpenAI-compatible endpoint."""
+ 
+-__version__ = "0.6.5"
++__version__ = "0.6.6"

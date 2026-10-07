@@ -1,0 +1,323 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 19:55:29 -0400
+Subject: [PATCH] glm5_next/cuda: a resumed shared prefix copies its rows into
+ free rows, TF_GLM_SHARED_PREFIX_COPY (MiaAI-Lab recipe patch 0071)
+
+A request that resumes a shared system prompt's kept state took over the extent that held it and evicted every longer
+kept state in that extent. The extent belongs to the conversation that first wrote the shared prefix, so another
+conversation with the same system prompt (an agent's sub-agent, several chats on one system prompt) deleted that
+conversation's state, and its next turn read its whole history again (the recipe's issue #43). MiaAI-Lab's recipe
+v1.6 copies the shared rows into an extent of their own when free rows hold it, with patch 0071-glm-shared-prefix-copy;
+with no free rows, or with TF_GLM_MULTI_LONE=1, the rows are overwritten as before. Placement only: the same replies.
+This ports it behind a switch of this tree's own, off by default:
+
+- multi.py: recipe_switch (a recipe behaviour behind a switch of this tree's own: 0 or unset off, 1 on);
+  MultiDecoder.share_copy (TF_GLM_SHARED_PREFIX_COPY); admit's placement is the patch's hunk, gated by the switch.
+  The ADMIT's copy path, which both ranks already apply, moves the rows. A longer state is told apart by token ids
+  (prompt, c.ids for the recipe's key, c.key): this tree keys no images into kept prompts.
+- engine.py: a startup line when the switch is on.
+- THIRD_PARTY_NOTICES.md: "GLM shared-prefix copy".
+
+Unset, admit takes the same path as before (the same evictions in the same order), so replies, kept states, cached
+counts and pool rows do not change.
+
+Tests: tests/test_glm_shared_prefix_copy.py (7, CPU): the switch's values; two ranks with free rows, off and on (off:
+the sub-agent's resume evicts the writer's own state, and the writer's next turn resumes only the system block; on:
+nothing is evicted, and the writer's next turn resumes its whole first turn); with no free rows, and with
+TF_GLM_MULTI_LONE=1, the takeover as before; world 1 over the fake AFD wire, off and on. Every reply equals the request
+served alone, and both ranks hold the same pools and kept states.
+
+Credit: patch 0071 was written by ezoushen (https://github.com/ezoushen) in
+MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold pull request #44 (issue #43), and MiaAI-Lab applied it as
+contributed in recipe commit 90d0c8e (v1.6), Apache License 2.0.
+
+Changed from the picked commit: tests/test_glm_shared_prefix_copy.py's world-1 test runs with the host RAM tier
+(TF_GLM_KEPT_HOST, TF_GLM_HOST_CACHE_GIB) unset; with the tier, the takeover's eviction parks the writer's state and
+its next turn resumes it from host RAM (tests/test_glm_recipe_host_tier.py covers that case).
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patch 0071,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 68ebd67b5326974b8004009e202268b1fa7c551d (v1.7.1); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |  16 ++
+ .../families/glm5_next/cuda/engine.py         |   4 +
+ .../families/glm5_next/cuda/multi.py          |  39 ++++-
+ tests/test_glm_shared_prefix_copy.py          | 152 ++++++++++++++++++
+ 4 files changed, 205 insertions(+), 6 deletions(-)
+ create mode 100644 tests/test_glm_shared_prefix_copy.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index 034439a..b6fb7ce 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -519,3 +519,19 @@ prompt's state goes to host RAM when it is kept (glm53f-afd moves it under press
+ bytes from startup; rows park in pages of the pool's 2,048-token alignment, per kept prompt (no page sharing between
+ prefixes); the tier is only on the AFD attention node (world 1). With both switches unset, pool, kept prompts and calls
+ are the ones before.
++
++## GLM shared-prefix copy (TF_GLM_SHARED_PREFIX_COPY)
++
++The `TF_GLM_SHARED_PREFIX_COPY=1` placement in `families/glm5_next/cuda/multi.py`'s `MultiDecoder.admit` (a request
++that resumes a shared prefix kept in another conversation's extent copies those rows into free rows of its own, instead
++of taking the extent over and evicting that conversation's longer states) is MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/68ebd67)
++patch 0071-glm-shared-prefix-copy (v1.6, recipe commit
++[`90d0c8e`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/commit/90d0c8e6e4b2b02b2fda02cdbd8a7935cddfb15f)),
++written by [ezoushen](https://github.com/ezoushen) in
++[pull request #44](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/44) for
++[issue #43](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/43) and applied by MiaAI-Lab
++as contributed, under the recipe's Apache License 2.0 (see [the license text](LICENSES/Apache-2.0.txt)). Changes in the
++port: the recipe always runs it, and here it is off unless `TF_GLM_SHARED_PREFIX_COPY=1` (`multi.recipe_switch`); unset,
++`admit` overwrites the rows as before, with the same evictions in the same order. A longer state is told apart by its
++token ids (`prompt`, `c.ids`, for the recipe's `key`, `c.key`), since this tree keys no images into its kept prompts.
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index ad55edf..0e325e0 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -766,6 +766,10 @@ class GlmEngine:
+                     print("[tensorfold] TF_GLM_CACHE_ROOM=1: room in the pool comes from its free rows first (extents "
+                           "moved together), kept prompts are evicted only for rows it lacks, those no waiting request "
+                           "resumes first", flush=True)
++                if self.multi.share_copy:
++                    print("[tensorfold] TF_GLM_SHARED_PREFIX_COPY=1: a request resuming a shared prefix kept in another "
++                          "conversation's extent copies its rows into free rows of its own, so that conversation keeps "
++                          "its state (MiaAI-Lab recipe patch 0071, by ezoushen)", flush=True)
+ 
+     @staticmethod
+     def _cache_entries() -> int:
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index 9f93140..5b6f74f 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -189,6 +189,18 @@ def fill_share(value: str | None = None) -> float:
+     return share
+ 
+ 
++def recipe_switch(env: str, value: str | None = None) -> bool:
++    """A MiaAI-Lab recipe behaviour that this tree ports behind a switch of its own (the recipe runs it always): 0 or
++    unset, off (the default: this tree's behaviour before the port); 1, on (the recipe's behaviour)."""
++
++    raw = os.environ.get(env, "") if value is None else value
++    if raw.strip() in ("", "0"):
++        return False
++    if raw.strip() == "1":
++        return True
++    raise ValueError(f"{env}: 0 (off, the default) or 1 (on), not {raw!r}")
++
++
+ def multi_code(code: list[int], dflash: bool, mtp: bool, dflash_policy: list[int], greedy: bool = True) -> list[int]:
+     """A request's policy code under --parallel (``engine.encode_policy``'s, after ``GlmEngine._effective``): serial
+     stays serial; auto becomes ``engine.DFLASH_POLICY`` with the draft model, else the single-stream auto's MTP rule
+@@ -431,6 +443,7 @@ class MultiDecoder:
+     age_s = prefill_order.AGE_MS / 1000.0
+     ordered = None
+     window = MAX_WINDOW                # rows of a round's windows together (TF_GLM_MULTI_WINDOW; set by __init__; 0069)
++    share_copy = False                 # TF_GLM_SHARED_PREFIX_COPY (``__init__`` reads it; MiaAI-Lab recipe patch 0071)
+ 
+     def __init__(self, engine, streams: int, *, verify=None, drafts=None, draft_graphs: bool | None = None,
+                  tune: MultiSettings | None = None, row_ms: Sequence[float] | None = None, fill_costs=None,
+@@ -498,6 +511,9 @@ class MultiDecoder:
+         self.room = cache_room.enabled()
+         self.room_stats = cache_room.counters()
+         self.wanted: Callable[[], list] | None = None
++        # TF_GLM_SHARED_PREFIX_COPY=1 (MiaAI-Lab recipe patch 0071, by ezoushen; off by default here): rank 0 copies a
++        # resumed shared prefix's rows into an extent of their own, so the conversation that wrote them keeps its state
++        self.share_copy = recipe_switch("TF_GLM_SHARED_PREFIX_COPY")
+         self.laned = {"groups": 0, "chunks": 0, "rows": 0}               # groups of 3 or more lanes
+         # TF_GLM_PREFILL_ORDER=sjf (``prefill_order``, ours): rank 0 fills, and its scheduler admits, the waiting prompts
+         # fewest uncached tokens first, those that have waited TF_GLM_PREFILL_AGE_MS first by arrival
+@@ -843,13 +859,24 @@ class MultiDecoder:
+         base = None
+         if hit is not None and not parked and hit.extent.owner is None:
+             x = hit.extent
+-            for c in list(x.kept):            # kept prompts the stream would overwrite: gone
+-                if len(c.ids) > len(hit.ids) and prompt[:len(c.ids)] != c.ids:
++            # kept prompts the stream would overwrite: another conversation's longer states in the same rows (a shared
++            # system prompt's state lives in the extent of the conversation that wrote it). Copy the shared rows into
++            # an extent of their own instead, so that conversation keeps its state. Only into free rows: evicting other
++            # conversations to make room would cost more than it saves, so then the rows are overwritten as before.
++            # Not with TF_GLM_MULTI_LONE=1: the copy, decoding alone, would move home to the pool's first rows and evict
++            # the writer's whole extent there, the shared state included. (MiaAI-Lab recipe patch 0071, by ezoushen,
++            # with TF_GLM_SHARED_PREFIX_COPY=1; unset, the rows are overwritten as before)
++            others = [c for c in x.kept if len(c.ids) > len(hit.ids) and prompt[:len(c.ids)] != c.ids]
++            if others and self.share_copy and not self.tune.lone:
++                base = self.pool.place(need)
++                copy = int(base is not None)
++            if base is None:
++                for c in others:
+                     self._evict(c)
+-            if self._grow(x, need, protect=[x]):
+-                base = x.base
+-            else:
+-                hit = None
++                if self._grow(x, need, protect=[x]):
++                    base = x.base
++                else:
++                    hit = None
+         if base is None:
+             base = self._room(need, [hit.extent] if hit is not None and not parked else [])
+             if base is None and hit is not None:          # no room beside the kept rows: start fresh
+diff --git a/tests/test_glm_shared_prefix_copy.py b/tests/test_glm_shared_prefix_copy.py
+new file mode 100644
+index 0000000..c7fb393
+--- /dev/null
++++ b/tests/test_glm_shared_prefix_copy.py
+@@ -0,0 +1,152 @@
++"""TF_GLM_SHARED_PREFIX_COPY (MiaAI-Lab recipe patch 0071, by ezoushen): a request that resumes a shared system prompt's
++kept state copies its rows into free rows of its own, so the conversation that wrote that state keeps its own, on the
++CPU with tests/test_glm_multi.py's fake model (two ranks, rank 1 applying rank 0's messages, and world 1 over the fake
++AFD wire; every reply checked against the request served alone).
++
++A shared-prefix state (TF_GLM_SHARED_PREFIX) lives in the extent of the conversation that wrote it, beside that
++conversation's own longer state. Another conversation with the same system prompt (an agent's sub-agent) resumes the
++shared state; unset, it takes that extent over and evicts the writer's longer state, so the writer's next turn reads
++its whole history again; set, it copies the shared rows into free rows and the writer's state stays. With no free rows,
++or with TF_GLM_MULTI_LONE=1, it behaves as before.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from tests import test_glm_multi as tm
++from tests import test_glm_multi_afd as ta
++from tests.test_cuda_geometry import allocations  # noqa: F401  (fixture: fake triton, so decode imports)
++
++pytestmark = pytest.mark.torch
++
++fake = tm.fake
++afd_fake = ta.afd_fake
++
++HEAD, USER, DOT, TAIL = [40, 41, 42], 43, 44, [45, 46, 39]      # [gMASK]<sop><|system|>, <|user|>, ".", the tail
++LEAST = 256                                                       # TF_GLM_SHARED_PREFIX=1
++
++
++def benchy(context, user):
++    return HEAD + list(context) + [USER] + list(user) + TAIL
++
++
++def sharing(gs) -> None:
++    """TF_GLM_SHARED_PREFIX on these engines (every rank); rank 0 knows ``<|user|>``."""
++    for g in gs:
++        g.shared, g.opener = LEAST, USER if g.rank == 0 else None
++
++
++def logged(g0) -> list:
++    """Rank 0's sent messages, in order."""
++    log: list = []
++    real = g0._share
++    g0._share = lambda values: (log.append(list(values)), real(values))[1]
++    return log
++
++
++def evictions(log) -> list[int]:
++    from tensorfold.families.glm5_next.cuda.multi import EVICT
++
++    return [pl[0] for m in log for op, pl in tm._ops(m) if op == EVICT]
++
++
++def test_the_switch(fake, monkeypatch):
++    from tensorfold.families.glm5_next.cuda.multi import recipe_switch
++
++    assert [recipe_switch("TF_GLM_SHARED_PREFIX_COPY", v) for v in ("", "0", " 0 ", "1", " 1")] == [False] * 3 + [True] * 2
++    with pytest.raises(ValueError, match="TF_GLM_SHARED_PREFIX_COPY"):
++        recipe_switch("TF_GLM_SHARED_PREFIX_COPY", "on")
++    monkeypatch.delenv("TF_GLM_SHARED_PREFIX_COPY", raising=False)
++    assert not tm.Pair(fake, streams=2, blocks=4).d[0].share_copy
++    monkeypatch.setenv("TF_GLM_SHARED_PREFIX_COPY", "1")
++    assert all(d.share_copy for d in tm.Pair(fake, streams=2, blocks=4).d)
++    monkeypatch.setenv("TF_GLM_SHARED_PREFIX_COPY", "2")
++    with pytest.raises(ValueError, match="TF_GLM_SHARED_PREFIX_COPY"):
++        tm.Pair(fake, streams=2, blocks=4)
++
++
++def agent_and_subagent(torch, node, g0, *, copy: bool, fill=None) -> dict:
++    """Conversation A (the system block, then its own user turn) keeps the shared state and its own; conversation B
++    with the same system prompt resumes the shared state; then A takes its next turn. ``fill``: another conversation
++    served between A and B (to leave no free rows)."""
++
++    sharing([g0] if not isinstance(node, tm.Pair) else node.g)
++    d = node.d[0] if isinstance(node.d, list) else node.d
++    context = tm._prompt(600, 500)
++    at = len(HEAD) + 600
++    a = benchy(context, tm._prompt(40, 501))
++    first = node.submit(a, 12, None)
++    node.run()
++    assert [(len(k.ids), k.shared) for k in d.kept] == [(at, True), (len(a) - 1, False)]
++    if fill is not None:
++        node.submit(fill, 4, None)
++        node.run()
++    log = logged(g0)
++    b = benchy(context, tm._prompt(64, 502))
++    second = node.submit(b, 16, None)
++    assert second.cached == at                                      # B resumes the system block either way
++    node.run()
++    assert second.got == tm.solo(torch, b, 16, None)
++    out = {"evicted": evictions(log), "kept": sorted(len(k.ids) for k in d.kept), "a": len(a) - 1}
++    turn = a + first.got + [USER] + tm._prompt(30, 503) + TAIL
++    nxt = node.submit(turn, 20, tm._sampling("topk", 3))
++    out["turn_cached"] = nxt.cached
++    node.run()
++    assert nxt.got == tm.solo(torch, turn, 20, tm._sampling("topk", 3))
++    assert first.got == tm.solo(torch, a, 12, None)
++    out["at"] = at
++    return out
++
++
++@pytest.mark.parametrize("copy", ["", "1"], ids=["off", "on"])
++def test_a_subagent_resuming_the_system_block_keeps_the_writers_state(fake, monkeypatch, copy):
++    """Two ranks with free rows: unset, B evicts A's own state (the in-place takeover) and A's next turn resumes only
++    the system block; set, B's rows are a copy, nothing is evicted, and A's next turn resumes its whole first turn."""
++
++    monkeypatch.setenv("TF_GLM_SHARED_PREFIX_COPY", copy)
++    p = tm.Pair(fake, streams=2, blocks=8)
++    out = agent_and_subagent(fake, p, p.g[0], copy=bool(copy))
++    p.check()
++    if copy:
++        assert out["evicted"] == [] and out["a"] in out["kept"] and out["turn_cached"] == out["a"]
++    else:
++        assert len(out["evicted"]) == 1 and out["a"] not in out["kept"] and out["turn_cached"] == out["at"]
++
++
++def test_without_free_rows_the_rows_are_overwritten_as_before(fake, monkeypatch):
++    """Set, but the pool's only other block holds another conversation's kept prompt: no free rows, so B takes the
++    extent over and evicts A's state as before (evicting a third conversation to copy would cost more)."""
++
++    monkeypatch.setenv("TF_GLM_SHARED_PREFIX_COPY", "1")
++    p = tm.Pair(fake, streams=2, blocks=2)
++    out = agent_and_subagent(fake, p, p.g[0], copy=True, fill=tm._prompt(1500, 504))
++    p.check()
++    assert len(out["evicted"]) == 1 and out["a"] not in out["kept"] and out["turn_cached"] == out["at"]
++
++
++def test_a_lone_stream_setting_keeps_the_takeover(fake, monkeypatch):
++    """Set with TF_GLM_MULTI_LONE=1: the in-place takeover as before (the recipe's rule: a copy decoding alone would
++    move home and evict the writer's extent there)."""
++
++    monkeypatch.setenv("TF_GLM_SHARED_PREFIX_COPY", "1")
++    monkeypatch.setenv("TF_GLM_MULTI_LONE", "1")
++    p = tm.Pair(fake, streams=2, blocks=8)
++    out = agent_and_subagent(fake, p, p.g[0], copy=True)
++    p.check()
++    assert len(out["evicted"]) == 1 and out["turn_cached"] == out["at"]
++
++
++@pytest.mark.parametrize("copy", ["", "1"], ids=["off", "on"])
++def test_world1_afd(afd_fake, monkeypatch, copy):
++    """The AFD attention node (world 1 over the fake AFD wire): the same as two ranks. The host RAM tier unset: with
++    it, the takeover's eviction parks the writer's state, which its next turn resumes from host RAM
++    (tests/test_glm_recipe_host_tier.py)."""
++
++    monkeypatch.setenv("TF_GLM_SHARED_PREFIX_COPY", copy)
++    for name in ("TF_GLM_KEPT_HOST", "TF_GLM_HOST_CACHE_GIB"):
++        monkeypatch.delenv(name, raising=False)
++    n1 = ta.World1(afd_fake, streams=2)
++    out = agent_and_subagent(afd_fake.torch, n1, n1.g, copy=bool(copy))
++    assert n1.d.world == 1
++    assert out["turn_cached"] == (out["a"] if copy else out["at"])

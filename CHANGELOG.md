@@ -1,5 +1,57 @@
 # Changelog
 
+## 2.1: kept prompts in host RAM, Hugh Madden's expert prompt kernels, her v1.8 fixes, TensorFold 0.6.6
+- **Same engine, machines, checkpoint and drafter as 2.0**, which stays at the tag
+  [`v2.0`](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/tree/v2.0). TensorFold v0.6.5
+  (`609ca41`) plus 48 patches: 2.0's 30, unchanged byte for byte, and 18 new ones (0031-0048).
+- **New patches, on in `.env.example`:**
+  - kept prompts' states and evicted prompts' rows in pinned host RAM on the attention node (0032,
+    `TF_GLM_KEPT_HOST=1`, `TF_GLM_HOST_CACHE_GIB=24`), written to the design of glm53f-afd's host RAM tier by Hugh
+    Madden ([@dangerm00se](https://x.com/dangerm00se)): the KV pool grows from 727,040 to 1,579,008 tokens at
+    `CACHE_GIB=8.5` (2.0: 6.5), and the attention host pins 33.35 GiB of RAM for it;
+  - prompt chunks filled as pairs while streams decode (0033, `TF_GLM_FILL_PAIRS=1`), this recipe's change to her
+    recipe patch 0062's sliced fills;
+  - Hugh Madden's expert prompt kernels from glm53f-afd (glm53f-rank's large-M EXL3 kernels, MIT) for the Sparks'
+    prompt chunks, on every prompt window from one row (0034, 0035, `TF_GLM_EXPERT_KERNEL=g53` in `EXPERT_ENV`), with
+    parts reimplemented from her recipe patches 0009 and 0020; the prebuild covers its new CUDA extension;
+  - her v1.8 fixes: a take-over decides which kept prompts stay before it copies any (0042, her 0078 by m-naoki-m),
+    capacity refusals answer 429 with `Retry-After: 5` (0043, her 0081 by johnwhited) and a stream whose delivery
+    fails ends at once (0045, her 0083 by johnwhited): `TF_GLM_DECIDE_THEN_COPY=1`, `TF_GLM_CAPACITY_STATUS=1`,
+    `TF_GLM_DELIVERY_ABORT=1`, as her lane applies them;
+  - TensorFold v0.6.6's three commits with their authorship (0046-0048: `--name-priority ID=background` by Philip
+    Mossop, [TensorFold#445](https://github.com/ashhart/TensorFold/pull/445); its local-path fix and the 0.6.6 release
+    by Ash Hart). This recipe sets no `--name-priority`.
+- **New patches, shipped off** (measured: [docs/DESIGN.md](docs/DESIGN.md#measured-and-off)): her 4,096-row prompt
+  chunks (0031, her 0004 and 0008: on GB10 the expert nodes' EXL3 grouping kernel cannot launch a prompt window over
+  2,812 rows, so it must stay off on this split); her v1.7.1
+  kept-prompt patches 0071 and 0074 by E-Zou Shen, 0073 by desy0305 (with johnwhited's delivery-failure handling),
+  0075 (reported by Lukas-tek-no-logic) and 0077 (diagnosed by meleesciony), with their tests (0036-0041: the
+  ten-client arena cell's prompt rate 8.1% lower); admission at saturation (0044, her 0082 by johnwhited), unset as in
+  her lane.
+- **Measured** in the lab on the final head, each lever against the configuration without it, with the determinism,
+  greedy-bits and memory gates on every boot; and the combined configuration on one boot (2026-10-06): fresh prompts
+  2,890 / 2,992 / 3,145 tok/s at 8K / 31K / 62K (2.0: 2,599 / 2,618 / 2,762), a cold 100K prompt's first token in
+  32.3 s (2.0: 36.8 s), the arena's 65,535 x 10 cell at 1,147 / 63.9 t/s and 7.8 s to the first token (2.0: 833.9 /
+  46.1 and 13.4 s), one-stream decode 75.0 / 80.8 / 83.1 tok/s (2.0: 77.4 / 79.0 / 90.4), AEON-30 23 of 30. Not run
+  for this release: a soak, failure drills and the full arena grid.
+- **Against Mia's recipe v1.8** (`33b50fd`) on its own two Sparks, in the same window on 2026-10-06 (15:57-19:04 EDT),
+  with the same harnesses: one-stream decode 75.7 / 81.5 / 83.2 tok/s against her 58.4 / 65.4 / 66.7 (1.25-1.30x);
+  four streams 110.6 against 100.7 (1.10x); fresh 8K / 31K / 62K prompts 2,946 / 3,030 / 3,138 tok/s against 1,875 /
+  1,897 / 1,866 (1.57-1.68x); a cold 100K prompt's first token in 32.4 s against 55.4 s (0.58x); the coding-agent load
+  236.2 / 71.3 against 185.8 / 52.6 tok/s (1.27x / 1.36x); the arena's 65,535 x 10 cell at 1,198 / 64.2 t/s and 7.7 s
+  to the first token, against 618.4 / 37.9 t/s and 17.3 s. Her lane leads on generation per request at ten clients
+  (16.0 against 12.7 tok/s) and on pool size (1,710,080 against 1,579,008 tokens).
+- **Upstream:** Ash Hart answered [TensorFold#214](https://github.com/ashhart/TensorFold/issues/214) on 2026-10-06:
+  TensorFold's Python engine is frozen ([#286](https://github.com/ashhart/TensorFold/issues/286)), cross-machine
+  splits now live in the Zig engine's cluster layer, and this layout would be a new placement there once GLM-5.3-Flash
+  and CUDA serving reach the Zig engine. This repo stays on the Python engine ([README](README.md#upstream)).
+- **Credits** follow Mia's attribution rules ([AGENTS.md](AGENTS.md)), with 2.0 as the before: every 2.0 name is kept,
+  and the authors of 2.1's patches are added on the README's first screen with profile, repo and commit: E-Zou Shen,
+  desy0305, johnwhited, m-naoki-m and Philip Mossop, with meleesciony and Lukas-tek-no-logic under the table; Hugh
+  Madden's and T.J. Purtell's rows name the new code and designs. `tools/patch_credits.py` writes the credit notes of
+  the new kinds (her parts reimplemented, TensorFold's own commits), and `tests/test_static.sh` checks them.
+- **Not in 2.1:** the watcher (`extras/watch`); it follows with a soak's results.
+
 ## 2.0: TensorFold with Mia's GLM work
 - **The engine and the weights change.** v1.0 ran glm53f-afd v1.1.0 (`91db3cc`) by Hugh Madden / Turquoise Bay AI
   ([@dangerm00se](https://x.com/dangerm00se), [hughmadden](https://github.com/hughmadden)), with the routed experts as

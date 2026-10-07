@@ -1,0 +1,2921 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 18:23:31 -0400
+Subject: [PATCH] glm5_next/cuda: glm53f-afd's expert prompt kernels for GLM's
+ prompt chunks, TF_GLM_EXPERT_KERNEL=g53 (glm53f-afd @ 91db3cc; MiaAI-Lab
+ recipe patches 0009, 0020 reimplemented)
+
+Hugh Madden (@dangerm00se, github.com/hughmadden) authored these expert prompt kernels in glm53f-afd @ 91db3cc
+(https://github.com/hughmadden/glm53f-afd, MIT License, Copyright (c) 2026 Turquoise Bay AI Pty Ltd): the
+plan, the large-M gate/up and down kernels, and the fused epilogue and reduce of crates/glm53f-rank/kernels/
+exl3_rank.cu, at the two-rank width (1,024 channels a rank) with its once-a-row rotation and its group order, run on
+the AFD expert node's resident TP2 half for a prompt chunk's routed experts. Its EXL3 decoder, fragment MMA and
+Hadamard butterfly come from TensorFold by Ash Hart (@ashxhart, github.com/ashhart; TensorFold @ bb4b4a3, MIT); its TP
+split of every expert by intermediate channel follows glmrt by T.J. Purtell (@wrldsuksgo2mars, github.com/tpurtell);
+its ROWROT (one rotation a row for a layer whose experts share one gate/up suh) and its group order were reimplemented
+from MiaAI-Lab's GLM-5.3-Flash EXL3 TensorFold recipe @ 1576746, patches 0009-glm-prefill-kernels and
+0020-glm-prompt-experts-order (Apache License 2.0, Copyright 2026 MiaAI-Lab), and the port chooses that rotation by
+her recipe's shared_suh test (already in cuda/exl3/experts.py, ported unchanged).
+
+- families/glm5_next/cuda/g53_rank.cu (new): glm53f-rank's kernels with data movement changed only. 17 units are
+  byte-identical to glm53f-rank's (mcg2, decode_tile, mma16816, fwht128, the load helpers, down_tail, reduce_kernel,
+  order_kernel, launch_persistent, ...); 15 are adapted: the weights are this node's layer (each expert's gate, up and
+  down trellis through the layer's pointer tables, the stacked suh/svh vectors; no second copy of any weight) in place
+  of glm53f-rank's layer image; the rows are the node's BF16 rows (any row stride; a BF16 value widened to FP32 where
+  glm53f-rank widens an E4M3 code and multiplies its UE8M0 scale) in place of FP8 rows; the routes are the node's
+  pick/wts rows (the 8 routed slots); the output is the half's FP32 rows (glm53f-rank's g53r_ffn_f32) in the node's
+  reply buffer; no host staging or sync; an invalid route empties the plan as there and fills the call's rows with NaN.
+  The split (decode-size) kernels, the rotation warps, the self-planning blocks and the dependent launch are not
+  ported. g53_rank.h / g53_rank.cpp: the launch's arguments and the torch binding (every tensor checked).
+- families/glm5_next/cuda/g53_experts.py (new): the switch, the layer scope (4-bit mcg, 288 experts, 4,096 -> 1,024),
+  glm53f-rank's large-M default configuration (up to 2,048 rows: 32-row groups, one K split each; above: 64-row
+  groups), the plan's buffers (the large ones are views of the node's prompt scratch), routed() and the node hook.
+  The extension tensorfold_glm_g53_v1 is built with glm53f-rank's flags (-O3 --fmad=false --ftz=false
+  --prec-div=true) and loaded when the node starts.
+- families/glm5_next/cuda/experts_node.py: the expert node marks its MODE_CHUNK, MODE_SLICE and MODE_PAIR forwards as
+  prompt chunks; ExpertNode reads the switch before the load and, when it is set, compute runs a prompt chunk's window
+  of an in-scope layer through g53_experts. Decode windows (MODE_EAGER) never take it.
+
+The arithmetic (glm53f-rank's): every row is rotated (x suh, the 128-point butterfly in FP32, x 1/sqrt(128), FP16);
+gate and up are one FP32 MMA chain a sum over ascending k tiles (one K split; FP16 products); the fused epilogue (the
+last of a group's blocks) sums the splits in order, rotates back, x 1/sqrt(128) x svh, GLM's clamped BF16 SwiGLU,
+x down suh, rotates, FP16; down is one FP32 MMA chain a sum; the fused reduce (the block bringing a row's chunk to
+its 8 arrivals) adds the 8 slots in slot order, acc + w * (rot(z) x 1/sqrt(128) x svh), each multiply and add
+rounded on its own. A row's bits depend on its own values only. They are glm53f-rank's, not the grouped kernel's
+(split-K partial sums, then combine), so a prompt row's routed-expert sum changes class when the switch is set.
+
+TF_GLM_EXPERT_KERNEL is unset by default (and "tf" is the same): every call is the one before, and no existing CUDA
+source changed. "g53": prompt chunks of TF_GLM_EXPERT_KERNEL_ROWS rows or more (default 65, glm53f-rank's large-M
+boundary; up to 4,096) on in-scope layers run through these kernels; TF_GLM_EXPERT_KERNEL_ROWROT (default 1, as
+glm53f-afd serves it) and TF_GLM_EXPERT_KERNEL_ORDER (default 0) choose the two schedules, which keep every bit. Any
+other value refuses before the load. The new CUDA source needs a prebuild entry (tensorfold.families.glm5_next.cuda.
+g53_experts._ext) wherever the extensions are prebuilt.
+
+Tests: tests/test_glm_g53_kernel.py (CPU, 32: the documented arithmetic in tests/glm_g53_reference.py, op for op: its
+butterfly is the Hadamard transform, in float64 the pipeline is the dense math of diag(suh) H W_q H diag(svh) with
+GLM's clamped SwiGLU, with the kernels' roundings it stays within their rounding error, the row rotation gives the
+per-matrix rotation's bits, the reduce's order; glm53f-rank's plan and group bound at 65-4,096 rows; its default
+configuration; its two-rank image layout; the switch's names, defaults and refusals; unset, compute makes the calls
+before; set, only prompt chunks of in-scope layers take the kernels; the node refuses a bad value before the load and
+shares its prompt scratch). tests/cuda/test_glm_g53_kernel.py (GPU, on an expert node's GPU: against glm53f-rank's own
+kernels built in the test from its pinned source, through its C API, on an image cut from the same tensors: the FP32
+rows byte-equal at 65-4,096 rows, both group sizes, uniform and skewed routing, rotation once a row and per (row,
+matrix), group order on and off, BF16 and FP32 SwiGLU, and the intermediates route by route; the same bytes twice and
+a row's bits whatever its window; faults; the distance from the grouped kernel's outputs, bounded; both against the
+CPU reference; the node's dispatch; times at 2,048 and 4,096 rows).
+
+Credit: the kernel file's header, g53_experts.py, THIRD_PARTY_NOTICES.md ("GLM expert prompt kernels from glm53f-afd
+(TF_GLM_EXPERT_KERNEL=g53)"), LICENSES/glm53f-afd-MIT.txt (glm53f-afd's LICENSE) and
+LICENSES/glm53f-afd-LICENSE.tensorfold.txt (its LICENSE.tensorfold), both verbatim.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: parts reimplemented from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patches 0009, 0020,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 1576746a04983b6eded0551dbf22512ee9e95654 (v1.5); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  The parts: the one rotation a row for a layer whose experts share one gate/up suh, and the group order.
+  The rest is credited in the message; Co-authored-by: MiaAI-Lab is kept there.
+
+ LICENSES/glm53f-afd-LICENSE.tensorfold.txt    |  21 +
+ LICENSES/glm53f-afd-MIT.txt                   |  21 +
+ THIRD_PARTY_NOTICES.md                        |  38 +
+ .../families/glm5_next/cuda/experts_node.py   |   7 +
+ .../families/glm5_next/cuda/g53_experts.py    | 254 +++++
+ .../families/glm5_next/cuda/g53_rank.cpp      | 160 +++
+ .../families/glm5_next/cuda/g53_rank.cu       | 994 ++++++++++++++++++
+ .../families/glm5_next/cuda/g53_rank.h        |  54 +
+ tests/cuda/test_glm_g53_kernel.py             | 494 +++++++++
+ tests/glm_g53_reference.py                    | 252 +++++
+ tests/test_glm_g53_kernel.py                  | 436 ++++++++
+ 11 files changed, 2731 insertions(+)
+ create mode 100644 LICENSES/glm53f-afd-LICENSE.tensorfold.txt
+ create mode 100644 LICENSES/glm53f-afd-MIT.txt
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/g53_experts.py
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/g53_rank.cpp
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/g53_rank.cu
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/g53_rank.h
+ create mode 100644 tests/cuda/test_glm_g53_kernel.py
+ create mode 100644 tests/glm_g53_reference.py
+ create mode 100644 tests/test_glm_g53_kernel.py
+
+diff --git a/LICENSES/glm53f-afd-LICENSE.tensorfold.txt b/LICENSES/glm53f-afd-LICENSE.tensorfold.txt
+new file mode 100644
+index 0000000..a8e2167
+--- /dev/null
++++ b/LICENSES/glm53f-afd-LICENSE.tensorfold.txt
+@@ -0,0 +1,21 @@
++MIT License
++
++Copyright (c) 2026 TensorFold contributors
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/LICENSES/glm53f-afd-MIT.txt b/LICENSES/glm53f-afd-MIT.txt
+new file mode 100644
+index 0000000..99cfbcc
+--- /dev/null
++++ b/LICENSES/glm53f-afd-MIT.txt
+@@ -0,0 +1,21 @@
++MIT License
++
++Copyright (c) 2026 Turquoise Bay AI Pty Ltd
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index 70305bf..46ae8a6 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -198,6 +198,44 @@ grouping, the A-fragment prefetch joins the kernel's own word prefetch, and the
+ GLM's tile settings, from 64-row windows, set by GLM's call sites only. Every other launch, GLM's decode windows
+ included, runs the kernels as before.
+ 
++## GLM expert prompt kernels from glm53f-afd (TF_GLM_EXPERT_KERNEL=g53)
++
++`families/glm5_next/cuda/g53_rank.cu` (with `g53_rank.h`, `g53_rank.cpp` and `g53_experts.py`) holds expert prompt
++kernels from glm53f-afd, written by Hugh Madden (@dangerm00se, [github.com/hughmadden](https://github.com/hughmadden)),
++[glm53f-afd @ 91db3cc](https://github.com/hughmadden/glm53f-afd/tree/91db3cc6fe672e2724efa3464f63bd31493f63f6):
++`crates/glm53f-rank/kernels/exl3_rank.cu`'s plan, its large-M gate/up and down kernels (`gateup_big`, `down_big`), its
++fused epilogue and reduce (`epilogue_item`, `reduce_item`, `gateup_tail`, `down_tail`), its unfused epilogue and reduce
++kernels and its persistent launch, MIT License, Copyright (c) 2026 Turquoise Bay AI Pty Ltd (see
++[the license text](LICENSES/glm53f-afd-MIT.txt)). That file's EXL3 trellis decoder (`mcg2`, `decode_tile`), fragment
++MMA (`mma16816`) and Hadamard butterfly (`fwht128`) come from TensorFold by Ash Hart (@ashxhart,
++[github.com/ashhart](https://github.com/ashhart)), [TensorFold @ bb4b4a3](https://github.com/ashhart/TensorFold/tree/bb4b4a3),
++MIT License, Copyright (c) 2026 TensorFold contributors, kept with glm53f-afd's `LICENSE.tensorfold`
++([the license text](LICENSES/glm53f-afd-LICENSE.tensorfold.txt)). Its TP split of every expert by intermediate channel
++follows glmrt by T.J. Purtell (@wrldsuksgo2mars, [github.com/tpurtell](https://github.com/tpurtell)), a design that
++glm53f-afd reused with no code copied. Its once-a-row rotation (`rotrows_kernel` and `gateup_big`'s rotated-row copy)
++and its group order (`order_kernel`) were reimplemented for glm53f-afd, with no code copied, from MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/1576746)
++patches 0009-glm-prefill-kernels (ROWROT/SHX) and 0020-glm-prompt-experts-order (Apache License 2.0, Copyright 2026
++MiaAI-Lab); the port takes that rotation for a layer whose experts share one gate/up `suh` by the recipe's own test
++(`shared_suh`, ported unchanged in `cuda/exl3/experts.py`). The kernels are glm53f-afd at 91db3cc at its two-rank
++width (1,024 channels a rank, glm53f-rank's `G53R_WID`) with its row rotation and group order, as two evaluation
++patches of glm53f-afd build them; the reference source the GPU test pins (`tests/cuda/test_glm_g53_kernel.py`) is that
++build's `exl3_rank.cu`.
++
++The port changes data movement only; every product, sum, rounding and its order is glm53f-rank's (built with its
++`--fmad=false --ftz=false --prec-div=true`): the kernels read this node's resident TP2 half (each expert's gate, up and
++down trellis through the layer's pointer tables, and the stacked `suh`/`svh` vectors) in place of glm53f-rank's layer
++image, so no weight is copied; they take the node's BF16 rows (any row stride) in place of FP8 E4M3 rows with UE8M0
++scales (a BF16 value is widened to FP32 where glm53f-rank widens an E4M3 code and multiplies its scale; the rest of the
++rotation is theirs); the routes are the node's `pick`/`wts` rows (the 8 routed slots); the output is the half's FP32
++rows (glm53f-rank's `g53r_ffn_f32`); there is no host staging or sync, and an invalid route (glm53f-rank's fault)
++empties the plan as there and fills the call's rows with NaN; only the large-M kernels at the two-rank width are
++ported (the decode-size split kernels, the gate/up rotation warps and the dependent launch are not). `TF_GLM_EXPERT_KERNEL`
++is unset by default: the expert node then runs every call as before. Set to `g53`, the node's prompt chunks
++(`MODE_CHUNK`, `MODE_SLICE` and `MODE_PAIR` forwards) of at least `TF_GLM_EXPERT_KERNEL_ROWS` rows (default 65,
++glm53f-rank's large-M boundary) run through these kernels, and a prompt row's routed-expert sum then has glm53f-rank's
++arithmetic (outputs class); decode windows keep TensorFold's kernels.
++
+ ## GLM multi-prompt prefill
+ 
+ `families/glm5_next/cuda/multi_prefill.py` (`enabled`, `wait_ms`, `Piece`, `layout`, `PieceMixer`, `prefill_pieces`)
+diff --git a/src/tensorfold/families/glm5_next/cuda/experts_node.py b/src/tensorfold/families/glm5_next/cuda/experts_node.py
+index 5d7c127..bda3696 100644
+--- a/src/tensorfold/families/glm5_next/cuda/experts_node.py
++++ b/src/tensorfold/families/glm5_next/cuda/experts_node.py
+@@ -107,11 +107,15 @@ class ExpertNode:
+ 
+     def __init__(self, model_dir, half: int, layers, *, device: str = "cuda", rows: int = 8,
+                  prefill_rows: int = 2048) -> None:
++        from . import g53_experts
++        g53 = g53_experts.switch()                       # TF_GLM_EXPERT_KERNEL: a bad value refuses before the load
+         self.cfg = Config.read(model_dir)
+         self.half, self.layers = half, list(layers)
+         self.experts = load_half(model_dir, half, self.layers, device=device)
+         self.by_layer = dict(zip(self.layers, self.experts))
+         self.buf = ExpertBuffers(self.cfg, rows=rows, prefill_rows=prefill_rows, device=device)
++        # TF_GLM_EXPERT_KERNEL=g53: prompt chunks through glm53f-afd's expert kernels (g53_experts); None: as before
++        self.g53 = g53_experts.Node(self, g53) if g53 else None
+ 
+     def compute(self, layer_i: int, R: int, x: tuple | None = None, out: torch.Tensor | None = None) -> torch.Tensor:
+         """``routed_half[:R] = sum_k wts[:, k] * y_k`` in slot order, the shared slot zeroed, fp32.
+@@ -123,6 +127,9 @@ class ExpertNode:
+         b = self.buf
+         if R > b.prefill_rows:
+             raise ValueError(f"{R} rows: buffers hold {b.prefill_rows}")
++        g53 = getattr(self, "g53", None)
++        if g53 is not None and g53.takes(layer_i, R, self.prompt):      # a prompt chunk through g53_experts
++            return g53.compute(layer_i, R, x)
+         normed, pick, wts = x if x is not None else (b.normed[:R], b.pick[:R], b.wts[:R])
+         exl3_generic.routed(normed, pick, self.by_layer[layer_i], b.scratch(R), R, self.cfg.limit, prompt=self.prompt)
+         b.ey(R)[:, b.top_k].zero_()                          # the shared slot: attention adds its own sy
+diff --git a/src/tensorfold/families/glm5_next/cuda/g53_experts.py b/src/tensorfold/families/glm5_next/cuda/g53_experts.py
+new file mode 100644
+index 0000000..1fa6229
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/g53_experts.py
+@@ -0,0 +1,254 @@
++"""glm53f-afd's large-M expert kernels for the AFD expert node's prompt chunks (TF_GLM_EXPERT_KERNEL=g53).
++
++Expert prompt kernels from glm53f-afd, written by Hugh Madden (@dangerm00se, github.com/hughmadden), glm53f-afd @
++91db3cc (https://github.com/hughmadden/glm53f-afd, MIT License, Copyright (c) 2026 Turquoise Bay AI Pty Ltd): the
++plan, the large-M gate/up and down kernels, the fused epilogue and reduce of crates/glm53f-rank/kernels/exl3_rank.cu,
++at the two-rank (TP2) width, with its once-a-row rotation and its group order, ported in g53_rank.cu onto this node's
++resident TP2 half. That file's EXL3 decoder, fragment MMA and Hadamard butterfly come from TensorFold by Ash Hart
++(@ashxhart, github.com/ashhart; TensorFold @ bb4b4a3, MIT); its TP split follows glmrt by T.J. Purtell
++(@wrldsuksgo2mars, github.com/tpurtell); its row rotation was reimplemented from MiaAI-Lab's TensorFold recipe patch
++0009 (ROWROT/SHX). See g53_rank.cu's header and THIRD_PARTY_NOTICES.md.
++
++The switch, on the expert containers: TF_GLM_EXPERT_KERNEL unset, empty or ``tf``: TensorFold's kernels, every call as
++before. ``g53``: a prompt chunk's window (the node's MODE_CHUNK, MODE_SLICE and MODE_PAIR forwards) of at least
++TF_GLM_EXPERT_KERNEL_ROWS rows (default 65: glm53f-rank's own large-M boundary; at most 4,096, its row cap) on a layer
++in the kernels' scope (4-bit mcg, the TP2 half of GLM-5.3-Flash's 288 experts) runs through these kernels: BF16 rows
++in, the half's FP32 rows out (glm53f-rank's g53r_ffn_f32), written straight into the node's reply buffer. Decode
++windows (MODE_EAGER, batched or not) and anything out of scope stay on TensorFold's kernels. Anything else refuses at
++the node's start, before the load.
++
++Bits: outputs class. A prompt row's routed-expert sum then has glm53f-rank's arithmetic (one K split each, sk 1 and
++skd 1: one FP32 MMA chain a sum over ascending k tiles; its fused epilogue; the 8 slots reduced in slot order as
++acc + w * (y * 1/sqrt(128) * svh), built with --fmad=false), not the grouped kernel's split-K sums and combine. The
++rotation and order schedules keep every bit (glm53f-rank's own statement). It never becomes a default by itself.
++"""
++
++from __future__ import annotations
++
++import math
++import os
++from dataclasses import dataclass
++from functools import lru_cache
++from pathlib import Path
++
++import torch
++
++ENV = "TF_GLM_EXPERT_KERNEL"
++ROWS_ENV = "TF_GLM_EXPERT_KERNEL_ROWS"
++ROWROT_ENV = "TF_GLM_EXPERT_KERNEL_ROWROT"   # glm53f-rank's GLM53F_RANK_ROWROT (rot 2): on by default, as served
++ORDER_ENV = "TF_GLM_EXPERT_KERNEL_ORDER"     # glm53f-rank's GLM53F_RANK_ORDER (gord 2): off by default, as served
++LARGE_M = 65             # glm53f-rank runs its large-M kernels above 64 rows (g53r_default_cfg)
++MAX_ROWS = 4096          # glm53f-rank's MAX_ROWS (a wire lane's cap)
++H, WID, E, TOPK = 4096, 1024, 288, 8
++NVCC = ["-O3", "--fmad=false", "--ftz=false", "--prec-div=true"]   # glm53f-rank's build.rs flags (arch from build)
++
++
++@lru_cache(maxsize=1)
++def _ext():
++    from tensorfold.cuda.build import load
++
++    here = Path(__file__).parent
++    return load(name="tensorfold_glm_g53_v1", sources=[str(here / "g53_rank.cpp"), str(here / "g53_rank.cu")],
++                extra_cuda_cflags=list(NVCC), extra_include_paths=[str(here)], verbose=False)
++
++
++@dataclass(frozen=True)
++class Cfg:
++    """glm53f-rank's g53r_cfg fields for its large-M kernels (only sk, skd and swiglu change a bit)."""
++
++    mt: int        # 16-row tiles a group: 2 (32-row groups) or 4 (64)
++    sk: int        # gate/up K splits
++    skd: int       # down K splits
++    nt: int        # down: 16-column tiles a warp (1, 2, 4)
++    gw: int        # gate/up MMA warps a block (8, 16)
++    l2: int        # 2: trellis words loaded evict-first
++    fuse: int      # 2: the epilogue and the reduce fused into gate/up and down
++    discard: int   # 2: consumed partial sums dropped from L2 (fused only)
++    swiglu: int    # 0: the reference model's BF16 roundings, 1: FP32
++    rot: int       # 2: every row rotated once (a layer whose experts share one gate/up suh)
++    gord: int      # 2: the group order (single- and multi-group experts interleaved)
++
++
++def default_cfg(rows: int, *, rowrot: bool = True, order: bool = False) -> Cfg:
++    """glm53f-rank's g53r_default_cfg for its large-M regimes: up to 2,048 rows {mt 2, sk 1, skd 1, nt 2, gw 8, l2 2},
++    above {mt 4, sk 1, skd 1, nt 4, gw 16, l2 1}, both fused with discard and BF16 SwiGLU; rot 2 when ``rowrot`` (its
++    serving GLM53F_RANK_ROWROT=1), gord 2 when ``order`` (GLM53F_RANK_ORDER, off where it is served)."""
++
++    if not LARGE_M <= rows <= MAX_ROWS:
++        raise ValueError(f"the large-M kernels take {LARGE_M}..{MAX_ROWS} rows, not {rows}")
++    rot, gord = (2 if rowrot else 1), (2 if order else 1)
++    if rows <= 2048:
++        return Cfg(mt=2, sk=1, skd=1, nt=2, gw=8, l2=2, fuse=2, discard=2, swiglu=0, rot=rot, gord=gord)
++    return Cfg(mt=4, sk=1, skd=1, nt=4, gw=16, l2=1, fuse=2, discard=2, swiglu=0, rot=rot, gord=gord)
++
++
++def _flag(name: str, default: bool) -> bool:
++    v = os.environ.get(name, "").strip()
++    if v == "":
++        return default
++    if v not in ("0", "1"):
++        raise ValueError(f"{name} is 1 (on) or 0 (off), not {v!r}")
++    return v == "1"
++
++
++def switch() -> dict | None:
++    """TF_GLM_EXPERT_KERNEL, read once at the node's start: None (unset, empty or ``tf``: TensorFold's kernels) or the
++    settings of ``g53``: min_rows (TF_GLM_EXPERT_KERNEL_ROWS, 65..4,096, default 65), rowrot
++    (TF_GLM_EXPERT_KERNEL_ROWROT, default 1) and order (TF_GLM_EXPERT_KERNEL_ORDER, default 0). Bad values refuse."""
++
++    v = os.environ.get(ENV, "").strip().lower()
++    if v in ("", "tf"):
++        return None
++    if v != "g53":
++        raise ValueError(f"{ENV} is g53 (glm53f-afd's expert kernels for prompt chunks) or tf (TensorFold's; the "
++                         f"default), not {v!r}")
++    r = os.environ.get(ROWS_ENV, "").strip() or str(LARGE_M)
++    try:
++        rows = int(r)
++    except ValueError:
++        raise ValueError(f"{ROWS_ENV} is a row count, not {r!r}") from None
++    if not LARGE_M <= rows <= MAX_ROWS:
++        raise ValueError(f"{ROWS_ENV}: {LARGE_M}..{MAX_ROWS} (the large-M kernels' rows), not {rows}")
++    return {"min_rows": rows, "rowrot": _flag(ROWROT_ENV, True), "order": _flag(ORDER_ENV, False)}
++
++
++def layer_ready(ex) -> str | None:
++    """Why a layer (``Exl3RoutedExperts``) cannot take the kernels, or None: 4-bit mcg trellises for gate, up and down,
++    GLM-5.3-Flash's 288 experts of width 4,096, this TP2 half's 1,024 channels, 4-byte aligned trellises, and
++    contiguous fp16 scale vectors."""
++
++    from tensorfold.cuda.exl3 import experts as generic
++
++    if not isinstance(ex, generic.Exl3RoutedExperts):
++        return "not an EXL3 routed-experts layer"
++    if ex.cb != generic.CB_MCG:
++        return "codebook is not mcg"
++    if tuple(ex.k2_gu) != (8, 8) or tuple(ex.k2_d) != (8, 8):
++        return "not 4 bits a weight"
++    if (ex.count, ex.dims, ex.width) != (E, H, WID):
++        return f"shape {ex.count} experts x {ex.dims} -> {ex.width}, not {E} x {H} -> {WID}"
++    if any(t.data_ptr() % 4 for t in ex.keep):
++        return "a trellis is not 4-byte aligned"
++    for name, n in (("suh_g", H), ("suh_u", H), ("svh_d", H), ("svh_g", WID), ("svh_u", WID), ("suh_d", WID)):
++        t = getattr(ex, name)
++        if t.dtype != torch.float16 or not t.is_contiguous() or tuple(t.shape) != (E, n) or t.data_ptr() % 8:
++            return f"{name} is not a contiguous, 8-byte aligned fp16 [{E}, {n}]"
++    return None
++
++
++def max_groups(rows: int, mt: int = 2) -> int:
++    """glm53f-rank's bound on a call's groups: routes / (16 mt) full groups plus one partial group a distinct expert,
++    never more than the routes (32-row groups, mt 2, bound the 64-row ones)."""
++
++    routes, gr = rows * TOPK, 16 * mt
++    return min(routes, routes // gr + min(routes, E))
++
++
++class Scratch:
++    """The plan's buffers for up to ``rows`` rows (the arrival counters zero between calls), and the large buffers:
++    views of ``share`` (the node's prompt scratch, ``Exl3Scratch``: gate/up sums in its z, down sums in its y, down
++    inputs in its xd, rotated rows in its xg; no other user while a call of these kernels runs) when it is large
++    enough, else owned."""
++
++    def __init__(self, rows: int, device, share=None) -> None:
++        if not 1 <= rows <= MAX_ROWS:
++            raise ValueError(f"scratch rows: 1..{MAX_ROWS}, not {rows}")
++        P, G = rows * TOPK, max_groups(rows)
++        i32 = {"dtype": torch.int32, "device": device}
++        self.rows = rows
++        self.groups = torch.zeros((4 * G,), **i32)
++        self.meta = torch.zeros((4,), **i32)
++        self.pair_row = torch.zeros((P,), **i32)
++        self.pair_route = torch.zeros((P,), **i32)
++        self.inverse = torch.zeros((P,), **i32)
++        self.gcnt = torch.zeros((G,), **i32)
++        self.rcnt = torch.zeros((rows * 32,), **i32)
++        self.gorder = torch.zeros((G,), **i32)
++        self.share, self._own = share, None
++        self.device = device
++
++    def big(self, R: int, cfg: Cfg):
++        """(z, xd, zd, xh) for R rows at ``cfg``'s K splits: views of the shared prompt scratch, else owned."""
++
++        P = R * TOPK
++        nz, nd, nxd, nxh = 2 * cfg.sk * P * WID, cfg.skd * P * H, P * WID, R * H
++        s = self.share
++        if s is not None and all(hasattr(s, a) for a in ("z", "y", "xd", "xg")):
++            z, y, xd, xg = s.z.view(-1), s.y.view(-1), s.xd.view(-1), s.xg.view(-1)
++            if (z.dtype == y.dtype == torch.float32 and xd.dtype == xg.dtype == torch.float16
++                    and z.numel() >= nz and y.numel() >= nd and xd.numel() >= nxd and xg.numel() >= nxh):
++                return z[:nz], xd[:nxd], y[:nd], xg[:nxh]
++        if self._own is None or self._own[0].numel() < nz + nd or self._own[1].numel() < nxd \
++                or self._own[2].numel() < nxh:
++            self._own = (torch.empty((nz + nd,), dtype=torch.float32, device=self.device),
++                         torch.empty((nxd,), dtype=torch.float16, device=self.device),
++                         torch.empty((nxh,), dtype=torch.float16, device=self.device))
++        z, xd, xg = self._own
++        return z[:nz], xd[:nxd], z[nz:nz + nd], xg[:nxh]
++
++    def fault(self) -> int:
++        """The last call's fault bits (a host sync): 1 routes, 2 a NaN input value, 4 a non-finite gate/up output, 8 a
++        non-finite output sum."""
++
++        return int(self.meta[1].item())
++
++    def groups_formed(self) -> int:
++        return int(self.meta[0].item())
++
++
++def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor, ex, s: Scratch, out: torch.Tensor, R: int,
++           limit: float = 10.0, cfg: Cfg | None = None, *, rowrot: bool = True, order: bool = False) -> torch.Tensor:
++    """``out[:R]`` (fp32 [R, 4096]) = the half's routed experts of R BF16 rows ``x`` (any row stride): pick / wts
++    slots 0..7 (the routed slots; a shared slot after them is not read), through glm53f-rank's large-M kernels on
++    ``ex``'s resident tensors; no host sync. ``cfg``: default_cfg(R) unless given; rot 2 needs ``ex.shared_suh``
++    (else the per-(row, matrix) rotation runs: the same bits)."""
++
++    if R > s.rows:
++        raise ValueError(f"{R} rows but the scratch holds {s.rows}")
++    if not math.isfinite(limit):
++        raise ValueError("the kernels clamp at a finite swiglu_limit")
++    c = cfg or default_cfg(R, rowrot=rowrot, order=order)
++    shared = getattr(ex, "shared_suh", None)
++    rot = c.rot if shared is not None else 1
++    z, xd, zd, xh = s.big(R, c)
++    _ext().ffn(ex.gate_ptr, ex.up_ptr, ex.down_ptr, ex.suh_g, ex.suh_u, ex.svh_g, ex.svh_u, ex.suh_d, ex.svh_d,
++               shared if rot == 2 else None, x[:R], pick[:R], wts[:R], out, z, xd, zd, xh, s.groups, s.meta,
++               s.pair_row, s.pair_route, s.inverse, s.gcnt, s.rcnt, s.gorder, R, c.mt, c.sk, c.skd, c.nt, c.gw, c.l2,
++               c.fuse, c.discard, c.swiglu, rot, c.gord, float(limit))
++    return out[:R]
++
++
++class Node:
++    """An expert node's hook (``ExpertNode.g53``, made only under TF_GLM_EXPERT_KERNEL=g53): ``takes`` a prompt chunk's
++    window of an in-scope layer, ``compute`` runs it into the node's reply buffer."""
++
++    def __init__(self, node, settings: dict) -> None:
++        b = node.buf
++        self.node, self.min_rows = node, int(settings["min_rows"])
++        self.rowrot, self.order = bool(settings["rowrot"]), bool(settings["order"])
++        self.max_rows = min(MAX_ROWS, b.prefill_rows)
++        self.ready = {i: layer_ready(ex) is None for i, ex in node.by_layer.items()}
++        self.scratch = Scratch(self.max_rows, b.routed.device, share=getattr(b, "pref", None))
++        if any(self.ready.values()) and b.routed.is_cuda:
++            _ext()                  # loaded (prebuilt: tools/prebuild_ext.py) at the start, not in a prompt forward
++        shared = sum(1 for i, ok in self.ready.items()
++                     if ok and getattr(node.by_layer[i], "shared_suh", None) is not None)
++        print(f"[tensorfold] afd expert {node.half + 1}: {ENV}=g53: prompt chunks of {self.min_rows}-{self.max_rows} "
++              f"rows through glm53f-afd's large-M expert kernels (Hugh Madden; outputs class; rowrot "
++              f"{'on' if self.rowrot else 'off'} ({shared} layers share one gate/up suh), order "
++              f"{'on' if self.order else 'off'}); {sum(self.ready.values())} of {len(self.ready)} MoE layers in scope",
++              flush=True)
++
++    def takes(self, layer_i: int, R: int, prompt: bool) -> bool:
++        """A prompt chunk's window (``prompt``: the node's MODE_CHUNK, MODE_SLICE and MODE_PAIR forwards) of
++        min_rows..max_rows rows, on a layer in the kernels' scope. Decode windows (MODE_EAGER) never."""
++
++        return bool(prompt) and self.min_rows <= R <= self.max_rows and self.ready.get(layer_i, False)
++
++    def compute(self, layer_i: int, R: int, x: tuple | None = None) -> torch.Tensor:
++        """``routed_half[:R]``, fp32, as ``ExpertNode.compute`` returns it (the shared slot not read)."""
++
++        b = self.node.buf
++        normed, pick, wts = x if x is not None else (b.normed[:R], b.pick[:R], b.wts[:R])
++        return routed(normed, pick, wts, self.node.by_layer[layer_i], self.scratch, b.routed[:R], R,
++                      self.node.cfg.limit, rowrot=self.rowrot, order=self.order)
+diff --git a/src/tensorfold/families/glm5_next/cuda/g53_rank.cpp b/src/tensorfold/families/glm5_next/cuda/g53_rank.cpp
+new file mode 100644
+index 0000000..508429a
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/g53_rank.cpp
+@@ -0,0 +1,160 @@
++// The torch binding of glm53f-afd's large-M expert kernels (g53_rank.cu; expert prompt kernels from glm53f-afd,
++// written by Hugh Madden (@dangerm00se, github.com/hughmadden), glm53f-afd @ 91db3cc, MIT License, Copyright (c) 2026
++// Turquoise Bay AI Pty Ltd; see g53_rank.cu's header and THIRD_PARTY_NOTICES.md). Checks every tensor, then launches
++// one call on torch's current stream; no host sync.
++#include <torch/extension.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++
++#include "g53_rank.h"
++
++namespace {
++
++constexpr int64_t H = 4096, WID = 1024, E = 288, TOPK = 8, MAX_ROWS = 4096;
++
++void check(const at::Tensor& t, at::ScalarType dt, const char* name, bool contiguous = true) {
++    TORCH_CHECK(t.is_cuda() && t.scalar_type() == dt, name, ": expected a CUDA tensor of dtype ", dt, ", got ",
++                t.scalar_type(), t.is_cuda() ? "" : " (not CUDA)");
++    TORCH_CHECK(!contiguous || t.is_contiguous(), name, ": expected a contiguous tensor");
++}
++
++void aligned(const at::Tensor& t, int64_t bytes, const char* name) {
++    TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % bytes == 0, name, ": expected a ", bytes,
++                "-byte aligned start");
++}
++
++void rows_of(const at::Tensor& t, int64_t rows, int64_t width, const char* name) {
++    TORCH_CHECK(t.dim() == 2 && t.size(0) >= rows && t.size(1) >= width && t.stride(1) == 1, name,
++                ": expected rows of at least ", width, " unit-stride values, ", rows, " of them");
++}
++
++}  // namespace
++
++// out[rows][4096] (fp32) = the half's routed experts of `rows` rows: pick / wts slots 0..7 (the 8 routed slots).
++// Returns nothing; meta[1] holds the call's fault bits once the stream reaches it (1 routes, 2 a NaN input value,
++// 4 a non-finite gate/up output, 8 a non-finite output sum).
++void ffn(const at::Tensor& gate_t, const at::Tensor& up_t, const at::Tensor& down_t, const at::Tensor& suh_g,
++         const at::Tensor& suh_u, const at::Tensor& svh_g, const at::Tensor& svh_u, const at::Tensor& suh_d,
++         const at::Tensor& svh_d, c10::optional<at::Tensor> shared_suh, const at::Tensor& x, const at::Tensor& pick,
++         const at::Tensor& wts, at::Tensor out, at::Tensor z, at::Tensor xd, at::Tensor zd, at::Tensor xh,
++         at::Tensor groups, at::Tensor meta, at::Tensor pair_row, at::Tensor pair_route, at::Tensor inverse,
++         at::Tensor gcnt, at::Tensor rcnt, at::Tensor gorder, int64_t rows, int64_t mt, int64_t sk, int64_t skd,
++         int64_t nt, int64_t gw, int64_t l2, int64_t fuse, int64_t discard, int64_t swiglu, int64_t rot, int64_t gord,
++         double limit) {
++    TORCH_CHECK(rows >= 1 && rows <= MAX_ROWS, "rows: 1..", MAX_ROWS, ", not ", rows);
++    TORCH_CHECK((mt == 2 || mt == 4) && (nt == 1 || nt == 2 || nt == 4) && (gw == 8 || gw == 16) &&
++                    sk >= 1 && 32 % sk == 0 && skd >= 1 && skd <= 4 && 32 % skd == 0 && (l2 == 1 || l2 == 2) &&
++                    (fuse == 1 || fuse == 2) && (discard == 1 || discard == 2) && (swiglu == 0 || swiglu == 1) &&
++                    (rot == 1 || rot == 2) && (gord == 1 || gord == 2),
++                "configuration: mt 2 or 4, nt 1, 2 or 4, gw 8 or 16, sk dividing 32, skd 1, 2 or 4, l2, fuse, discard,"
++                " rot and gord 1 or 2, swiglu 0 or 1");
++    for (const auto* t : {&gate_t, &up_t, &down_t}) {
++        check(*t, at::kLong, "trellis table");
++        TORCH_CHECK(t->numel() == E, "trellis table: one pointer per expert (", E, ")");
++    }
++    check(suh_g, at::kHalf, "suh_g");
++    check(suh_u, at::kHalf, "suh_u");
++    check(svh_d, at::kHalf, "svh_d");
++    check(svh_g, at::kHalf, "svh_g");
++    check(svh_u, at::kHalf, "svh_u");
++    check(suh_d, at::kHalf, "suh_d");
++    TORCH_CHECK(suh_g.numel() == E * H && suh_u.numel() == E * H && svh_d.numel() == E * H, "suh_g, suh_u, svh_d: [",
++                E, ", ", H, "]");
++    TORCH_CHECK(svh_g.numel() == E * WID && svh_u.numel() == E * WID && suh_d.numel() == E * WID,
++                "svh_g, svh_u, suh_d: [", E, ", ", WID, "]");
++    for (const auto* t : {&suh_g, &suh_u, &svh_g, &svh_u, &suh_d, &svh_d}) aligned(*t, 8, "scale vector");
++    const void* shared = nullptr;
++    if (rot == 2) {
++        TORCH_CHECK(shared_suh.has_value(), "rot 2: the layer's shared gate/up suh is needed");
++        check(*shared_suh, at::kHalf, "shared_suh");
++        TORCH_CHECK(shared_suh->numel() == H, "shared_suh: [", H, "]");
++        aligned(*shared_suh, 8, "shared_suh");
++        shared = shared_suh->data_ptr();
++    }
++    check(x, at::kBFloat16, "x", false);
++    rows_of(x, rows, H, "x");
++    TORCH_CHECK(x.stride(0) % 4 == 0, "x: a row stride of a multiple of 4 values (8-byte loads)");
++    aligned(x, 8, "x");
++    check(pick, at::kInt, "pick", false);
++    rows_of(pick, rows, TOPK, "pick");
++    check(wts, at::kFloat, "wts", false);
++    rows_of(wts, rows, TOPK, "wts");
++    check(out, at::kFloat, "out");
++    TORCH_CHECK(out.numel() >= rows * H, "out: [rows, ", H, "]");
++    aligned(out, 16, "out");
++    const int64_t P = rows * TOPK, gr = 16 * mt;
++    const int64_t bound = P / gr + (P < E ? P : E), max_groups = P < bound ? P : bound;
++    check(z, at::kFloat, "z");
++    check(xd, at::kHalf, "xd");
++    check(zd, at::kFloat, "zd");
++    TORCH_CHECK(z.numel() >= 2 * sk * P * WID, "z: 2 sk rows*8 x ", WID, " floats");
++    TORCH_CHECK(xd.numel() >= P * WID, "xd: rows*8 x ", WID, " halves");
++    TORCH_CHECK(zd.numel() >= skd * P * H, "zd: skd rows*8 x ", H, " floats");
++    aligned(z, 128, "z");
++    aligned(xd, 128, "xd");
++    aligned(zd, 128, "zd");
++    if (rot == 2) {
++        check(xh, at::kHalf, "xh");
++        TORCH_CHECK(xh.numel() >= rows * H, "xh: rows x ", H, " halves");
++        aligned(xh, 128, "xh");
++    }
++    for (const auto* t : {&groups, &meta, &pair_row, &pair_route, &inverse, &gcnt, &rcnt, &gorder})
++        check(*t, at::kInt, "plan buffer");
++    TORCH_CHECK(groups.numel() >= 4 * max_groups && gcnt.numel() >= max_groups && gorder.numel() >= max_groups,
++                "groups (4 words a group), gcnt, gorder: ", max_groups, " groups");
++    TORCH_CHECK(meta.numel() >= 4, "meta: 4 words");
++    TORCH_CHECK(pair_row.numel() >= P && pair_route.numel() >= P && inverse.numel() >= P, "pair buffers: rows*8");
++    TORCH_CHECK(rcnt.numel() >= rows * (32 / nt), "rcnt: rows x ", 32 / nt, " chunks");
++    aligned(groups, 16, "groups");
++    c10::cuda::CUDAGuard guard(x.device());
++    G53Call c{};
++    c.gate_t = gate_t.data_ptr<int64_t>();
++    c.up_t = up_t.data_ptr<int64_t>();
++    c.down_t = down_t.data_ptr<int64_t>();
++    c.suh_g = suh_g.data_ptr();
++    c.suh_u = suh_u.data_ptr();
++    c.svh_g = svh_g.data_ptr();
++    c.svh_u = svh_u.data_ptr();
++    c.suh_d = suh_d.data_ptr();
++    c.svh_d = svh_d.data_ptr();
++    c.shared_suh = shared;
++    c.x = x.data_ptr();
++    c.xs = static_cast<int>(x.stride(0));
++    c.pick = pick.data_ptr<int32_t>();
++    c.ps = static_cast<int>(pick.stride(0));
++    c.wts = wts.data_ptr<float>();
++    c.ws = static_cast<int>(wts.stride(0));
++    c.out = out.data_ptr<float>();
++    c.z = z.data_ptr<float>();
++    c.xd = xd.data_ptr();
++    c.zd = zd.data_ptr<float>();
++    c.xh = rot == 2 ? xh.data_ptr() : nullptr;
++    c.groups = groups.data_ptr();
++    c.meta = meta.data_ptr<int32_t>();
++    c.pair_row = pair_row.data_ptr<int32_t>();
++    c.pair_route = pair_route.data_ptr<int32_t>();
++    c.inverse = inverse.data_ptr<int32_t>();
++    c.gcnt = gcnt.data_ptr<int32_t>();
++    c.rcnt = rcnt.data_ptr<int32_t>();
++    c.gorder = gorder.data_ptr<int32_t>();
++    c.rows = static_cast<int>(rows);
++    c.mt = static_cast<int>(mt);
++    c.sk = static_cast<int>(sk);
++    c.skd = static_cast<int>(skd);
++    c.nt = static_cast<int>(nt);
++    c.gw = static_cast<int>(gw);
++    c.l2 = static_cast<int>(l2);
++    c.fuse = static_cast<int>(fuse);
++    c.discard = static_cast<int>(discard);
++    c.swiglu = static_cast<int>(swiglu);
++    c.rot = static_cast<int>(rot);
++    c.gord = static_cast<int>(gord);
++    c.limit = static_cast<float>(limit);
++    c.sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
++    const cudaError_t e = g53_ffn_launch(c, at::cuda::getCurrentCUDAStream());
++    TORCH_CHECK(e == cudaSuccess, "glm53f-afd expert kernels: launch failed: ", cudaGetErrorString(e));
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("ffn", &ffn, "glm53f-afd's large-M expert kernels: one call of a TP2 half's routed experts (fp32 out)");
++}
+diff --git a/src/tensorfold/families/glm5_next/cuda/g53_rank.cu b/src/tensorfold/families/glm5_next/cuda/g53_rank.cu
+new file mode 100644
+index 0000000..798130a
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/g53_rank.cu
+@@ -0,0 +1,994 @@
++// glm53f-afd's large-M expert kernels in TensorFold's AFD expert node (TF_GLM_EXPERT_KERNEL=g53): one TP2 half's
++// routed experts of a prompt chunk, GLM-5.3-Flash, EXL3 4-bit "mcg" trellises.
++//
++// Expert prompt kernels from glm53f-afd, written by Hugh Madden (@dangerm00se, github.com/hughmadden),
++// glm53f-afd @ 91db3cc (https://github.com/hughmadden/glm53f-afd/tree/91db3cc6fe672e2724efa3464f63bd31493f63f6),
++// crates/glm53f-rank/kernels/exl3_rank.cu: its plan, its large-M gate/up and down kernels, its fused epilogue and
++// reduce, its persistent launch and its group order. MIT License, Copyright (c) 2026 Turquoise Bay AI Pty Ltd
++// (LICENSES/glm53f-afd-MIT.txt). The file's EXL3 decoder (mcg2, decode_tile), fragment MMA (mma16816) and Hadamard
++// butterfly (fwht128) come from TensorFold by Ash Hart (@ashxhart, github.com/ashhart), TensorFold @ bb4b4a3, MIT
++// License, Copyright (c) 2026 TensorFold contributors (glm53f-rank's LICENSE.tensorfold, kept as
++// LICENSES/glm53f-afd-LICENSE.tensorfold.txt). Its TP split of every expert by intermediate channel follows glmrt by
++// T.J. Purtell (@wrldsuksgo2mars, github.com/tpurtell), a design reused there with no code copied. Its once-a-row
++// rotation (rotrows_kernel, gateup_big's XH) and its group order (order_kernel) were reimplemented for glm53f-afd from
++// MiaAI-Lab's TensorFold GLM-5.3-Flash recipe patches 0009 (ROWROT/SHX) and 0020 (ORDER), Apache-2.0, with no code
++// copied. The rank width of 1,024 channels (two ranks) and those two schedules are glm53f-afd at 91db3cc with two
++// evaluation patches applied, one for a two-rank build and one for the row rotation and group order (each kept in the
++// code's own form below); see THIRD_PARTY_NOTICES.md, "GLM expert prompt kernels from glm53f-afd".
++//
++// Ported here (TensorFold side), data movement only; every product, sum, rounding and its order is glm53f-rank's:
++// - weights: TensorFold's resident layer (Exl3RoutedExperts) in place of glm53f-rank's layer image: each expert's
++//   gate, up and down trellis through the layer's pointer tables (the same tile bytes: [K/16][N/16][64] int16, the
++//   half's columns of gate and up, rows of down), and the stacked suh / svh vectors; no second copy of any weight;
++// - inputs: BF16 rows (the expert node's wire rows, any row stride) in place of FP8 E4M3 rows with UE8M0 scales:
++//   row_rotate widens a BF16 value to FP32 where glm53f-rank widens an E4M3 value and multiplies its scale, then x
++//   suh, the butterfly in FP32, x 1/sqrt(128) and FP16 as there (a row whose values are E4M3 values times their scale
++//   gives the same FP32 products, so the same bits); a NaN input raises the row fault as a NaN code does there;
++// - routes: the node's pick / wts [rows][slots] (the 8 routed slots; slot 8, the shared expert, is not read) in place
++//   of ids / weights [rows * 8];
++// - output: FP32 rows (glm53f-rank's g53r_ffn_f32: the reduce's sums before their BF16 rounding) into the caller's
++//   [rows][4096] buffer, which the node returns as its half, as before;
++// - host side: no uploads, downloads or host sync; the caller's scratch tensors and torch's current stream. An
++//   invalid route (glm53f-rank's F_ROUTE: an id outside the layer, a negative or non-finite weight, an id twice in a
++//   row) leaves the plan empty as there, and the plan then writes NaN into the call's output rows (glm53f-rank's call
++//   returns an error instead);
++// - scope: the large-M kernels at the TP2 width only (gate/up rotation warps, gp 2, the split kernels, the plan in the
++//   split blocks and the dependent launch are not ported: those serve glm53f-rank's decode sizes).
++//
++// The arithmetic (glm53f-rank's own description): every output depends only on its own row: the tensor cores keep
++// rows independent, and every sum (K splits, the 8 slots) runs in a fixed order. With the same K splits (sk, skd) and
++// SwiGLU a row gets the same bits whatever else is in the batch; the rows per group, the tilings, the plan, the
++// fusion, the L2 policies, the block order do not change a bit. Build with --fmad=false (the epilogues' separate
++// multiplies and adds). The large-M defaults are one K split each (sk 1, skd 1): one FP32 MMA chain a sum over
++// ascending k tiles.
++
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++#include <cuda_runtime.h>
++#include <cstdint>
++
++#include "g53_rank.h"
++
++namespace g53 {
++
++constexpr int H = 4096;      // model width: gate/up K, down N
++constexpr int WID = 1024;    // the half's width: gate/up N, down K (two ranks: G53R_WID 1,024)
++constexpr int CB = WID / 512;  // 512-column blocks of a gate/up slice: a large-M item covers one
++constexpr int NB = WID / 128;  // 128-wide Hadamard blocks of the rank width (epilogue items per pair)
++constexpr int NTG = WID / 16;  // n tiles of a gate/up slice, k tiles of a down slice
++constexpr int LOG_NB = 3;      // log2 NB
++constexpr int LOG_2CB = 2;     // log2 (2 CB): (matrix, column block) pairs
++constexpr int LOG_LPP = 5;     // log2 (WID / 32)
++constexpr int E = 288;       // routed experts per layer
++constexpr int TOPK = 8;
++constexpr int MAX_ROWS = 4096;
++constexpr float HAD_SCALE = 0.08838834764831845f;  // 1 / sqrt(128)
++static_assert(E % 32 == 0, "the plan scans the experts a warp at a time");
++
++// Fault bits (OR-ed into one word).
++constexpr unsigned F_ROUTE = 1u;   // bad expert id, weight or a duplicate id in a row
++constexpr unsigned F_ROW = 2u;     // a NaN value in an input row (glm53f-rank: an E4M3 NaN code or a UE8M0 NaN scale)
++constexpr unsigned F_GATEUP = 4u;  // a non-finite gate/up output
++constexpr unsigned F_OUT = 8u;     // a non-finite output sum
++
++struct Group {
++    int expert;  // expert id
++    int start;   // first grouped pair
++    int count;   // pairs (<= 16 * MT)
++    int pad;
++};
++
++// ---- TensorFold exl3.cu (bb4b4a3), verbatim (as glm53f-rank carries them) -----------------------------------
++
++// Two values of the "mcg" codebook from two 16-bit states, as a half2 (first state in .x).
++__device__ __forceinline__ uint32_t mcg2(uint32_t s0, uint32_t s1) {
++    uint32_t x0 = s0 * 0xCBAC1FEDu;
++    uint32_t x1 = s1 * 0xCBAC1FEDu;
++    x0 = (x0 & 0x8FFF8FFFu) ^ 0x3B603B60u;
++    x1 = (x1 & 0x8FFF8FFFu) ^ 0x3B603B60u;
++    uint32_t lo = __byte_perm(x0, x1, 0x5410);
++    uint32_t hi = __byte_perm(x0, x1, 0x7632);
++    half2 r = __hadd2(*reinterpret_cast<half2*>(&lo), *reinterpret_cast<half2*>(&hi));
++    return *reinterpret_cast<uint32_t*>(&r);
++}
++
++// This lane's eight values of a 4-bit tile (word = tile[lane]) as the B fragments of its two n8 halves.
++__device__ __forceinline__ void decode_tile(uint32_t w, int lane, uint32_t (&b0)[2], uint32_t (&b1)[2]) {
++    uint32_t p = __shfl_sync(0xffffffffu, w, (lane + 31) & 31);
++    uint32_t s = __funnelshift_r(w, p, 20);
++    b0[0] = mcg2((s >> 8) & 0xffffu, (s >> 4) & 0xffffu);
++    b0[1] = mcg2(s & 0xffffu, w >> 16);
++    b1[0] = mcg2((w >> 12) & 0xffffu, (w >> 8) & 0xffffu);
++    b1[1] = mcg2((w >> 4) & 0xffffu, w & 0xffffu);
++}
++
++__device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
++                 "{%0,%1,%2,%3};\n"
++                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
++}
++
++// Fast Walsh-Hadamard transform of 128 values held 4 per lane (lane L: values 4L..4L+3), natural order, fixed
++// butterfly order: strides 1, 2 in registers, 4..64 across lanes.
++__device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
++    float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
++    v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
++#pragma unroll
++    for (int m = 1; m < 32; m <<= 1) {
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            float o = __shfl_xor_sync(0xffffffffu, v[j], m);
++            v[j] = (lane & m) ? o - v[j] : v[j] + o;
++        }
++    }
++}
++
++// ---- end of the TensorFold functions -------------------------------------------------------------------------
++
++__device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
++
++// The A fragment of an m16n8k16 MMA (rows `r0..r0+15`, columns `c0..c0+15` of a row-major FP16 tile in shared
++// memory) with one ldmatrix: lane L gives the address of row (L & 7) + 8 ((L >> 3) & 1), column 8 (L >> 4).
++// The same registers as four 32-bit loads (a[0] rows g, cols 2t; a[1] rows g + 8; a[2], a[3] cols + 8).
++__device__ __forceinline__ void ldsm_a(uint32_t (&a)[4], const half* p) {
++    const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(p));
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
++                 : "r"(s));
++}
++
++__device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
++    const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem) : "memory");
++}
++__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
++template <int N>
++__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory"); }
++
++// A trellis word through L2 with an evict-first policy (`pol` from `evict_first_policy`): streamed weights then
++// give way to the partial sums and down inputs that are read again soon. Plain `__ldg` otherwise.
++__device__ __forceinline__ uint64_t evict_first_policy() {
++    uint64_t pol = 0;
++#if __CUDA_ARCH__ >= 800
++    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(pol));
++#endif
++    return pol;
++}
++
++__device__ __forceinline__ uint32_t ldg_w(const uint32_t* p, bool hint, uint64_t pol) {
++#if __CUDA_ARCH__ >= 800
++    if (hint) {
++        uint32_t v;
++        asm("ld.global.nc.L2::cache_hint.b32 %0, [%1], %2;\n" : "=r"(v) : "l"(p), "l"(pol));
++        return v;
++    }
++#endif
++    return __ldg(p);
++}
++
++// Drop one 128-byte line of scratch from L2 without writing it back (its contents become undefined).
++__device__ __forceinline__ void discard_line(const void* p) {
++#if __CUDA_ARCH__ >= 800
++    asm volatile("discard.global.L2 [%0], 128;\n" ::"l"(p) : "memory");
++#endif
++}
++
++// Everything a call's kernels read and write (passed by value to every kernel).
++// TF port: the layer is TensorFold's resident layer (pointer tables and stacked scale vectors), the rows are BF16
++// with a row stride, the routes are the node's pick / wts with a row stride, and the output is FP32.
++struct Args {
++    const int64_t* gate_t;   // per expert: its gate trellis [256][64][64] int16 (the half's 64 n tiles)
++    const int64_t* up_t;     // per expert: its up trellis, the same shape
++    const int64_t* down_t;   // per expert: its down trellis [64][256][64] int16 (the half's 64 k tiles)
++    const half* suh_g;       // [E][H]
++    const half* suh_u;       // [E][H]
++    const half* svh_g;       // [E][WID]
++    const half* svh_u;       // [E][WID]
++    const half* suh_d;       // [E][WID]
++    const half* svh_d;       // [E][H]
++    const __nv_bfloat16* x;  // rows [rows][xs] BF16
++    int xs;                  // row stride of x (elements)
++    const int32_t* pick;     // [rows][ps]: slots 0..7 the routed experts
++    const float* wts;        // [rows][ws]
++    int ps, ws;              // row strides of pick and wts (elements)
++    const Group* groups;
++    const int* counts;       // counts[0]: groups the plan formed (0: invalid routes)
++    const int* pair_row;     // per grouped pair: its row
++    const int* pair_route;   // per grouped pair: its route (row * 8 + slot)
++    const int* inverse;      // per route: its grouped pair
++    float* z;                // gate/up split partials [2][sk][P][WID]
++    half* xd;                // down input [P][WID]
++    float* zd;               // down split partials [skd][P][4096]
++    float* out;              // [rows][4096] FP32
++    int* gcnt;               // fused epilogue: arrivals per group
++    int* rcnt;               // fused reduce: arrivals per (row, output chunk)
++    int* work;               // large-M kernels: the next item of gate/up [0] and down [1] (zero at the start)
++    unsigned* fault;
++    int P, rows, sk, skd;
++    int bf16;                // BF16 SwiGLU (the default) or FP32
++    int fused;               // epilogue and reduce fused into gate/up and down
++    int discard;             // drop consumed partial sums from L2
++    int nch;                 // down output chunks (4,096 / chunk width)
++    int l2hint;              // trellis words loaded evict-first
++    float limit;             // swiglu_limit (10 for GLM-5.3-Flash, glm53f-rank's LIMIT)
++    const half* xh;          // rowrot: every row rotated once [rows][4096] FP16 (large-M gate/up), or null
++    const int* gorder;       // order: the large-M kernels' group launch order [groups], or null (plan order)
++};
++
++// ---- the arithmetic outside the matrix products, shared by every kernel ---------------------------------------
++
++// A lane's inputs for rotating one row's 128-wide K block `kb`: 4 values and 4 suh values, loaded ahead of
++// `row_rotate` so that several rows' loads are in flight at once.
++// TF port: 4 BF16 values (8 bytes) in place of 4 E4M3 codes and their UE8M0 scale byte.
++struct RowIn {
++    uint2 q;
++    uint2 su;
++};
++
++__device__ __forceinline__ RowIn row_load(const __nv_bfloat16* __restrict__ xr, const half* __restrict__ suh, int kb,
++                                          int lane) {
++    RowIn r;
++    r.q = *reinterpret_cast<const uint2*>(xr + kb * 128 + lane * 4);
++    r.su = *reinterpret_cast<const uint2*>(suh + kb * 128 + lane * 4);
++    return r;
++}
++
++// The row block rotated for the tensor cores: widened to FP32, x suh, the butterfly in FP32, x 1/sqrt(128), FP16.
++// Lane L gets values 4L..4L+3. `bad` collects NaN values.
++// TF port: a BF16 value widened to FP32 (exact) where glm53f-rank computes e4m3(code) * scale (exact).
++__device__ __forceinline__ uint2 row_rotate(const RowIn& in, int lane, bool& bad) {
++    const half2 s01 = *reinterpret_cast<const half2*>(&in.su.x), s23 = *reinterpret_cast<const half2*>(&in.su.y);
++    const float su[4] = {__low2float(s01), __high2float(s01), __low2float(s23), __high2float(s23)};
++    const __nv_bfloat162 q01 = *reinterpret_cast<const __nv_bfloat162*>(&in.q.x);
++    const __nv_bfloat162 q23 = *reinterpret_cast<const __nv_bfloat162*>(&in.q.y);
++    const float q[4] = {__low2float(q01), __high2float(q01), __low2float(q23), __high2float(q23)};
++    float v[4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        bad = bad || isnan(q[j]);
++        v[j] = q[j] * su[j];
++    }
++    fwht128(v, lane);
++    const half2 h0 = __floats2half2_rn(v[0] * HAD_SCALE, v[1] * HAD_SCALE);
++    const half2 h1 = __floats2half2_rn(v[2] * HAD_SCALE, v[3] * HAD_SCALE);
++    return make_uint2(*reinterpret_cast<const uint32_t*>(&h0), *reinterpret_cast<const uint32_t*>(&h1));
++}
++
++__device__ __forceinline__ uint2 rotate_row(const __nv_bfloat16* __restrict__ xr, const half* __restrict__ suh, int kb,
++                                            int lane, bool& bad) {
++    return row_rotate(row_load(xr, suh, kb, lane), lane, bad);
++}
++
++// Four FP16 values (8 bytes) as floats.
++__device__ __forceinline__ void half4(uint2 h, float (&f)[4]) {
++    const half2 h01 = *reinterpret_cast<const half2*>(&h.x), h23 = *reinterpret_cast<const half2*>(&h.y);
++    f[0] = __low2float(h01);
++    f[1] = __high2float(h01);
++    f[2] = __low2float(h23);
++    f[3] = __high2float(h23);
++}
++
++// The gate/up epilogue of one (pair gp, 128-block blk), one warp (after TensorFold's gateup_epilogue_kernel): the
++// splits summed in order, rotated back, x svh, GLM's clamped SwiGLU, x down suh, rotated, FP16 into Xd. `e` is
++// the pair's expert. Returns whether a gate/up sum was not finite. The scale vectors are loaded with the first
++// splits' partial sums, not one value at a time after them.
++__device__ __forceinline__ bool epilogue_item(const Args& a, int e, int gp, int blk, int lane) {
++    const int n = blk * 128 + lane * 4;
++    const uint2 sg = *reinterpret_cast<const uint2*>(a.svh_g + size_t(e) * WID + n);
++    const uint2 su = *reinterpret_cast<const uint2*>(a.svh_u + size_t(e) * WID + n);
++    const uint2 sd = *reinterpret_cast<const uint2*>(a.suh_d + size_t(e) * WID + n);
++    float gv[4] = {0.f, 0.f, 0.f, 0.f}, uv[4] = {0.f, 0.f, 0.f, 0.f};
++    for (int s = 0; s < a.sk; ++s) {
++        const float4 zg = __ldcg(reinterpret_cast<const float4*>(a.z + (size_t(0 * a.sk + s) * a.P + gp) * WID + n));
++        const float4 zu = __ldcg(reinterpret_cast<const float4*>(a.z + (size_t(1 * a.sk + s) * a.P + gp) * WID + n));
++        gv[0] += zg.x; gv[1] += zg.y; gv[2] += zg.z; gv[3] += zg.w;
++        uv[0] += zu.x; uv[1] += zu.y; uv[2] += zu.z; uv[3] += zu.w;
++    }
++    float svh_g[4], svh_u[4], suh_d[4];
++    half4(sg, svh_g);
++    half4(su, svh_u);
++    half4(sd, suh_d);
++    bool bad = false;
++#pragma unroll
++    for (int j = 0; j < 4; ++j) bad = bad || !isfinite(gv[j]) || !isfinite(uv[j]);
++    fwht128(gv, lane);
++    fwht128(uv, lane);
++    float v[4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        float gg = gv[j] * HAD_SCALE * svh_g[j];
++        float uu = uv[j] * HAD_SCALE * svh_u[j];
++        float act;
++        if (a.bf16) {  // the reference model's BF16 SwiGLU (TensorFold's default)
++            gg = fminf(bf16r(gg), a.limit);
++            uu = fminf(fmaxf(bf16r(uu), -a.limit), a.limit);
++            act = bf16r(bf16r(gg / (1.f + expf(-gg))) * uu);
++        } else {       // FP32 throughout (an option for the KL gate and for tight kernel tests)
++            gg = fminf(gg, a.limit);
++            uu = fminf(fmaxf(uu, -a.limit), a.limit);
++            act = gg / (1.f + expf(-gg)) * uu;
++        }
++        v[j] = act * suh_d[j];
++    }
++    fwht128(v, lane);
++    const half2 h0 = __floats2half2_rn(v[0] * HAD_SCALE, v[1] * HAD_SCALE);
++    const half2 h1 = __floats2half2_rn(v[2] * HAD_SCALE, v[3] * HAD_SCALE);
++    *reinterpret_cast<uint2*>(a.xd + size_t(gp) * WID + n) =
++        make_uint2(*reinterpret_cast<const uint32_t*>(&h0), *reinterpret_cast<const uint32_t*>(&h1));
++    return bad;
++}
++
++// The route reduce of one (row, 128-block blk), one warp: out[row] = sum over the 8 slots, in slot order, of
++// w * (rot(sum of the down splits) * svh), in FP32 (glm53f-rank's FP32 output: the sums before its BF16 rounding).
++// Every slot's inputs are loaded before the first is used. Returns whether a sum was not finite.
++__device__ __forceinline__ bool reduce_item(const Args& a, int row, int blk, int lane) {
++    const int n = blk * 128 + lane * 4;
++    int gp[TOPK];
++    float wt[TOPK];
++    uint2 sv[TOPK];
++    float4 z0[TOPK];
++#pragma unroll
++    for (int s = 0; s < TOPK; ++s) {
++        const int r = row * TOPK + s;
++        gp[s] = a.inverse[r];
++        wt[s] = a.wts[size_t(row) * a.ws + s];
++        sv[s] = *reinterpret_cast<const uint2*>(a.svh_d + size_t(a.pick[size_t(row) * a.ps + s]) * H + n);
++    }
++#pragma unroll
++    for (int s = 0; s < TOPK; ++s) z0[s] = __ldcg(reinterpret_cast<const float4*>(a.zd + size_t(gp[s]) * H + n));
++    float acc[4] = {0.f, 0.f, 0.f, 0.f};
++#pragma unroll
++    for (int s = 0; s < TOPK; ++s) {
++        float v[4] = {0.f + z0[s].x, 0.f + z0[s].y, 0.f + z0[s].z, 0.f + z0[s].w};
++        for (int k = 1; k < a.skd; ++k) {
++            const float4 t = __ldcg(reinterpret_cast<const float4*>(a.zd + (size_t(k) * a.P + gp[s]) * H + n));
++            v[0] += t.x; v[1] += t.y; v[2] += t.z; v[3] += t.w;
++        }
++        fwht128(v, lane);
++        const half2 s01 = *reinterpret_cast<const half2*>(&sv[s].x), s23 = *reinterpret_cast<const half2*>(&sv[s].y);
++        const float svh[4] = {__low2float(s01), __high2float(s01), __low2float(s23), __high2float(s23)};
++#pragma unroll
++        for (int j = 0; j < 4; ++j) acc[j] = acc[j] + wt[s] * (v[j] * HAD_SCALE * svh[j]);
++    }
++    bool bad = false;
++#pragma unroll
++    for (int j = 0; j < 4; ++j) bad = bad || !isfinite(acc[j]);
++    *reinterpret_cast<float4*>(a.out + size_t(row) * H + n) = make_float4(acc[0], acc[1], acc[2], acc[3]);
++    return bad;
++}
++
++// Fused epilogue: after a gate/up block has stored its partial sums, the last of the group's 2 * CB * SK blocks
++// (both matrices, both column blocks, every split) runs the epilogue for all of the group's pairs, reading the
++// others' partials from L2 (`last` is a shared flag). It also clears the group's counter for the next call
++// (counters are zeroed when allocated and every arrival of a call comes before its last). Called by every thread.
++template <int NW>
++__device__ __forceinline__ void gateup_tail(const Args& a, const Group& G, int g, int* last) {
++    __threadfence();
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        *last = atomicAdd(&a.gcnt[g], 1) == 2 * CB * a.sk - 1;
++        if (*last) a.gcnt[g] = 0;
++    }
++    __syncthreads();
++    if (!*last) return;
++    __threadfence();
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    bool bad = false;
++    for (int item = warp; item < G.count * NB; item += NW)
++        bad = epilogue_item(a, G.expert, G.start + (item >> LOG_NB), item & (NB - 1), lane) || bad;
++    if (__any_sync(0xffffffffu, bad) && lane == 0) atomicOr(a.fault, F_GATEUP);
++    if (a.discard) {
++        __syncthreads();  // every item has read its partials
++        constexpr int LPP = WID / 32;  // lines of 128 bytes per pair and (matrix, split): 32 at TP2
++        const int lines = 2 * a.sk * G.count * LPP;
++        for (int i = threadIdx.x; i < lines; i += NW * 32) {
++            const int line = i & (LPP - 1), rest = i >> LOG_LPP, pr = rest % G.count, ms = rest / G.count;
++            discard_line(a.z + (size_t(ms) * a.P + G.start + pr) * WID + line * 32);
++        }
++    }
++}
++
++// Fused reduce: after a down block has stored its partial sums (chunk `chunk` of the output, `cwb` 128-blocks
++// wide), each (row, chunk) of its group counts one arrival; the block that brings a (row, chunk) to all 8 * SKD
++// arrivals (8 slots, every split) reduces it and clears its counter. Thread t holds the row of the group's pair t
++// in `my_row` (loaded when the block started; a group has at most 64 pairs), -1 past the group's pairs.
++// `list` holds up to the group's pair count, `nl` is shared.
++template <int NW>
++__device__ __forceinline__ void down_tail(const Args& a, int chunk, int cwb, int my_row, int* list, int* nl) {
++    static_assert(NW * 32 >= 64, "a thread per pair of a group of up to 64");
++    __threadfence();
++    if (threadIdx.x == 0) *nl = 0;
++    __syncthreads();
++    const int target = TOPK * a.skd;
++    if (my_row >= 0 && atomicAdd(&a.rcnt[my_row * a.nch + chunk], 1) == target - 1) {
++        a.rcnt[my_row * a.nch + chunk] = 0;
++        list[atomicAdd(nl, 1)] = my_row;
++    }
++    __syncthreads();
++    const int nrows = *nl;
++    if (nrows == 0) return;
++    __threadfence();
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    bool bad = false;
++    for (int item = warp; item < nrows * cwb; item += NW)
++        bad = reduce_item(a, list[item / cwb], chunk * cwb + item % cwb, lane) || bad;
++    if (__any_sync(0xffffffffu, bad) && lane == 0) atomicOr(a.fault, F_OUT);
++    if (a.discard) {
++        __syncthreads();  // every item has read its partials
++        const int lines = cwb * 4, per = TOPK * a.skd * lines;  // 4 lines of 128 bytes per 128-block
++        for (int i = threadIdx.x; i < nrows * per; i += NW * 32) {
++            const int row = list[i / per], rem = i % per, line = rem % lines, ks = rem / lines;
++            const int k = ks % a.skd, s = ks / a.skd;
++            discard_line(a.zd + (size_t(k) * a.P + a.inverse[row * TOPK + s]) * H + chunk * cwb * 128 + line * 32);
++        }
++    }
++}
++
++// ---- plan: rows x 8 routes -> pairs grouped by expert ---------------------------------------------------------
++// One 1,024-thread CTA (after MiMo's plan_parallel). Pairs of expert e occupy [base[e], base[e] + cnt[e]) in
++// ascending expert order, cut into groups of at most `gr` pairs. The order of an expert's pairs follows the
++// atomics and is not stable; that cannot change a value, since every pair is computed on its own rows.
++// TF port: the routes are pick / wts [rows][ps / ws] (the 8 routed slots); on invalid routes the plan also writes
++// NaN into the call's output rows (no host sync reads the fault word here).
++__global__ void __launch_bounds__(1024) plan_kernel(const int32_t* __restrict__ ids, int ps,
++                                                    const float* __restrict__ w,
++                                                    int ws, int rows, int gr, Group* __restrict__ groups,
++                                                    int* __restrict__ counts, int* __restrict__ pair_row,
++                                                    int* __restrict__ pair_route, int* __restrict__ inverse,
++                                                    unsigned* __restrict__ fault, float* __restrict__ out) {
++    __shared__ int cnt[E], base[E], gbase[E], cursor[E];
++    __shared__ int bad;
++    const int tid = threadIdx.x, nt = blockDim.x, routes = rows * TOPK;
++    for (int e = tid; e < E; e += nt) { cnt[e] = 0; cursor[e] = 0; }
++    if (tid == 0) bad = 0;
++    __syncthreads();
++    for (int r = tid; r < routes; r += nt) {
++        const int row = r / TOPK, s = r % TOPK;
++        const int e = ids[size_t(row) * ps + s];
++        const float wt = w[size_t(row) * ws + s];
++        bool ok = e >= 0 && e < E && wt >= 0.0f && wt <= 0x1.fffffep127f;  // finite, not negative, not NaN
++        if (ok)
++            for (int k = 0; k < s; ++k) ok = ok && ids[size_t(row) * ps + k] != e;  // no expert twice in a row
++        if (!ok) atomicOr(&bad, 1); else atomicAdd(&cnt[e], 1);
++    }
++    __syncthreads();
++    if (bad) {
++        if (tid == 0) { atomicOr(fault, F_ROUTE); counts[0] = 0; }
++        const float qnan = __int_as_float(0x7fc00000);
++        for (size_t i = tid; i < size_t(rows) * H; i += nt) out[i] = qnan;
++        return;
++    }
++    // Exclusive prefix sums of the pair and group counts over the 288 experts: nine warps scan 32 experts each
++    // with shuffles, then every warp adds the totals of the warps before it (a serial scan here cost ~10 us).
++    __shared__ int wsum[E / 32], wgsum[E / 32];
++    const int warp = tid >> 5, lane = tid & 31;
++    int c = 0, gc = 0, ic = 0, igc = 0;
++    if (warp < E / 32) {
++        c = cnt[warp * 32 + lane];
++        gc = (c + gr - 1) / gr;
++        ic = c;
++        igc = gc;
++#pragma unroll
++        for (int d = 1; d < 32; d <<= 1) {
++            const int u = __shfl_up_sync(0xffffffffu, ic, d), ug = __shfl_up_sync(0xffffffffu, igc, d);
++            if (lane >= d) { ic += u; igc += ug; }
++        }
++        if (lane == 31) { wsum[warp] = ic; wgsum[warp] = igc; }
++    }
++    __syncthreads();
++    if (warp < E / 32) {
++        int off = 0, goff = 0;
++        for (int w2 = 0; w2 < warp; ++w2) { off += wsum[w2]; goff += wgsum[w2]; }
++        base[warp * 32 + lane] = off + ic - c;
++        gbase[warp * 32 + lane] = goff + igc - gc;
++        if (warp == E / 32 - 1 && lane == 31) counts[0] = goff + igc;
++    }
++    __syncthreads();
++    for (int r = tid; r < routes; r += nt) {
++        const int e = ids[size_t(r / TOPK) * ps + r % TOPK];
++        const int gp = base[e] + atomicAdd(&cursor[e], 1);
++        pair_row[gp] = r / TOPK;
++        pair_route[gp] = r;
++        inverse[r] = gp;
++    }
++    for (int e = tid; e < E; e += nt) {
++        const int c2 = cnt[e];
++        for (int k = 0; k * gr < c2; ++k)
++            groups[gbase[e] + k] = Group{e, base[e] + k * gr, c2 - k * gr < gr ? c2 - k * gr : gr, 0};
++    }
++}
++
++// ---- gate and up, large-M kernel -----------------------------------------------------------------------------
++// Persistent blocks of NW MMA warps (8 or 16) take (mat, column block, group, split) items in grid order
++// (launch_persistent). An item covers the group's rows (up to 16 MT) and one matrix's 512 columns of a column
++// block; MMA warp w owns columns [16 NT w, 16 NT (w + 1)) of it with NT = 32 / NW, so each decoded tile feeds 2 MT
++// MMAs. The rotated rows are double-buffered in shared memory with one barrier per 128-wide K block: while the MMA
++// warps multiply one K block, the next one is rotated by the MMA warps themselves, one row per k tile of the first
++// R / NW k tiles with its inputs loaded a k tile ahead. The trellis words are loaded PF k tiles ahead; the A
++// fragments come from ldmatrix and the MMAs of m tiles past the group's rows are predicated off. The products are
++// the split kernel's, accumulated in the same order.
++//
++// XH (rowrot): when every expert of the layer has one `suh` for gate and up, `rotrows_kernel` has rotated every
++// row once into a.xh, and the blocks copy the rotated K blocks into the same shared buffers with cp.async (one K
++// block ahead) instead of rotating them per (row, matrix). row_rotate's FP16 values are the same whichever kernel
++// computes them, so the products are the same bits.
++// TF port: gate/up rotation warps (NP > 0, glm53f-rank's gp 2) are not ported; the trellis of an item comes from
++// the layer's pointer table, and suh from the stacked vectors.
++template <int MT, int NW, bool XH = false>
++__global__ void __launch_bounds__(NW * 32, (MT == 2 && NW == 8) ? 2 : 1) gateup_big(const Args a) {
++    constexpr int NT = 32 / NW, R = MT * 16, RPW = XH ? 0 : R / NW, PF = NT >= 4 ? 2 : 4;
++    static_assert(XH || (RPW >= 1 && RPW <= 8), "a row a warp per k tile rotates a whole K block");
++    __shared__ __align__(16) half As[2][R][136];
++    __shared__ int rows_sh[R];
++    __shared__ int last_sh, item_sh;
++    // Persistent blocks take (mat, column block, group, split) items in grid order, the matrix varying fastest.
++    const int ngroups = a.counts[0], items = 2 * CB * ngroups * a.sk;
++    for (;;) {
++        if (threadIdx.x == 0) item_sh = atomicAdd(a.work, 1);
++        __syncthreads();
++        const int item = item_sh;
++        if (item >= items) break;
++        const int mc = item & (2 * CB - 1), rest = item >> LOG_2CB;
++        const int mat = mc & 1, cb = mc >> 1, gs = rest % ngroups, split = rest / ngroups;
++        const int g = a.gorder ? a.gorder[gs] : gs;
++        const Group G = a.groups[g];
++        const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g8 = lane >> 2, t4 = lane & 3;
++        if (tid < R) rows_sh[tid] = tid < G.count ? a.pair_row[G.start + tid] : -1;
++        __syncthreads();
++
++        const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? a.up_t[G.expert] : a.gate_t[G.expert]);
++        const half* suh = (mat ? a.suh_u : a.suh_g) + size_t(G.expert) * H;
++        const int mt_used = (G.count + 15) >> 4, rows_used = mt_used * 16;
++        const int kbs = 32 / a.sk, kb0 = split * kbs, kt0 = kb0 * 8, kt_last = kt0 + kbs * 8 - 1;
++        bool bad = false;
++
++        // XH: copy K block kb0 + kbi of the group's rotated rows into buffer `buf` (16-byte cp.async, 16 per row);
++        // rows past the group are zeroed (their products are never stored).
++        auto stage_xh = [&](int kbi, int buf) {
++            const int kb = kb0 + kbi;
++            for (int i = tid; i < rows_used * 16; i += NW * 32) {
++                const int rr = i >> 4, p = i & 15, r = rows_sh[rr];
++                half* dst = &As[buf][rr][p * 8];
++                if (r >= 0) cp_async16(dst, a.xh + size_t(r) * H + kb * 128 + p * 8);
++                else *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
++            }
++            cp_async_commit();
++        };
++
++        if constexpr (XH) {
++            stage_xh(0, 0);
++        } else {
++            // The first K block, every warp a row at a time.
++            for (int rr = warp; rr < rows_used; rr += NW) {
++                const int r = rows_sh[rr];
++                const uint2 packed = r >= 0 ? rotate_row(a.x + size_t(r) * a.xs, suh, kb0, lane, bad)
++                                            : make_uint2(0u, 0u);
++                *reinterpret_cast<uint2*>(&As[0][rr][lane * 4]) = packed;
++            }
++        }
++
++        {
++            // Trellis words of tile (kt, nt) are at (kt * NTG + nt) * 32 + lane; this warp's NT n tiles are
++            // contiguous. A ring of PF k tiles of words in flight.
++            const uint32_t* Tw = T + size_t(cb * 32 + warp * NT) * 32 + lane;
++            const bool hint = a.l2hint != 0;
++            const uint64_t pol = hint ? evict_first_policy() : 0;
++            uint32_t wr[PF][NT];
++#pragma unroll
++            for (int p = 0; p < PF; ++p)
++#pragma unroll
++                for (int i = 0; i < NT; ++i)
++                    wr[p][i] = ldg_w(Tw + (size_t(kt0 + p < kt_last ? kt0 + p : kt_last) * NTG + i) * 32, hint, pol);
++            // The inputs of row warp + NW j of K block kb0 + kbi + 1 (rows past the group read row 0's inputs; their
++            // results are not stored).
++            auto load_next = [&](int kbi, int j) -> RowIn {
++                const int r = rows_sh[warp + NW * j];
++                const int kb = kb0 + kbi + 1 < 32 ? kb0 + kbi + 1 : 31;
++                return row_load(a.x + size_t(r >= 0 ? r : rows_sh[0]) * a.xs, suh, kb, lane);
++            };
++            RowIn nx;
++            if constexpr (RPW > 0) nx = load_next(0, 0);
++
++            float acc[MT][NT][2][4];
++#pragma unroll
++            for (int m = 0; m < MT; ++m)
++#pragma unroll
++                for (int i = 0; i < NT; ++i)
++#pragma unroll
++                    for (int h = 0; h < 2; ++h)
++#pragma unroll
++                        for (int c = 0; c < 4; ++c) acc[m][i][h][c] = 0.f;
++            const int lrow = (lane & 7) + ((lane >> 3) & 1) * 8, lcol = (lane >> 4) * 8;
++
++            for (int kbi = 0; kbi < kbs; ++kbi) {
++                if constexpr (XH) cp_async_wait<0>();  // this thread's copies into buffer kbi & 1 have landed
++                __syncthreads();  // buffer kbi & 1 is complete; the other one's last readers are done
++                const int buf = kbi & 1;
++                const bool more = kbi + 1 < kbs;
++                if constexpr (XH) {
++                    if (more) stage_xh(kbi + 1, buf ^ 1);
++                }
++#pragma unroll
++                for (int ktl = 0; ktl < 8; ++ktl) {
++                    if (ktl < RPW) {  // rotate this warp's row ktl of the next K block, then load the next one's inputs
++                        const int rr = warp + NW * ktl;
++                        bool b = false;
++                        const uint2 packed = row_rotate(nx, lane, b);
++                        if (more && rr < rows_used) {
++                            const bool real = rows_sh[rr] >= 0;
++                            *reinterpret_cast<uint2*>(&As[buf ^ 1][rr][lane * 4]) = real ? packed : make_uint2(0u, 0u);
++                            bad = bad || (real && b);
++                        }
++                        nx = ktl + 1 < RPW ? load_next(kbi, ktl + 1) : load_next(kbi + 1, 0);
++                    }
++                    const int kt = kt0 + kbi * 8 + ktl, slot = ktl % PF;
++                    uint32_t w[NT];
++#pragma unroll
++                    for (int i = 0; i < NT; ++i) w[i] = wr[slot][i];
++                    const int ktn = kt + PF < kt_last ? kt + PF : kt_last;
++#pragma unroll
++                    for (int i = 0; i < NT; ++i) wr[slot][i] = ldg_w(Tw + (size_t(ktn) * NTG + i) * 32, hint, pol);
++                    uint32_t af[MT][4];
++#pragma unroll
++                    for (int m = 0; m < MT; ++m) ldsm_a(af[m], &As[buf][m * 16 + lrow][ktl * 16 + lcol]);
++#pragma unroll
++                    for (int i = 0; i < NT; ++i) {
++                        uint32_t b0[2], b1[2];
++                        decode_tile(w[i], lane, b0, b1);
++#pragma unroll
++                        for (int m = 0; m < MT; ++m)
++                            if (m < mt_used) {
++                                mma16816(acc[m][i][0], af[m], b0);
++                                mma16816(acc[m][i][1], af[m], b1);
++                            }
++                    }
++                }
++            }
++
++            float* zbase = a.z + (size_t(mat) * a.sk + split) * size_t(a.P) * WID;
++#pragma unroll
++            for (int m = 0; m < MT; ++m) {
++                if (m >= mt_used) break;
++                const int r0 = m * 16 + g8, r1 = r0 + 8;
++#pragma unroll
++                for (int i = 0; i < NT; ++i)
++#pragma unroll
++                    for (int h = 0; h < 2; ++h) {
++                        const int col = cb * 512 + warp * NT * 16 + i * 16 + h * 8 + 2 * t4;
++                        if (r0 < G.count)
++                            *reinterpret_cast<float2*>(zbase + size_t(G.start + r0) * WID + col) =
++                                make_float2(acc[m][i][h][0], acc[m][i][h][1]);
++                        if (r1 < G.count)
++                            *reinterpret_cast<float2*>(zbase + size_t(G.start + r1) * WID + col) =
++                                make_float2(acc[m][i][h][2], acc[m][i][h][3]);
++                    }
++            }
++        }
++        if (bad) atomicOr(a.fault, F_ROW);
++        if (a.fused) gateup_tail<NW>(a, G, g, &last_sh);
++        __syncthreads();  // the next item reuses the shared buffers and item_sh
++    }
++}
++
++// ---- epilogue kernel (unfused): one warp per (pair, 128-block of the rank width) --------------------------------
++__global__ void __launch_bounds__(128) gateup_epilogue(const Args a) {
++    const int item = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
++    const int gp = item >> LOG_NB, blk = item & (NB - 1);
++    if (gp >= a.P || a.counts[0] <= 0) return;  // no plan (invalid routes): ids may be out of range
++    const int r = a.pair_route[gp];
++    const int e = a.pick[size_t(r / TOPK) * a.ps + r % TOPK];
++    const bool bad = epilogue_item(a, e, gp, blk, lane);
++    if (__any_sync(0xffffffffu, bad) && lane == 0) atomicOr(a.fault, F_GATEUP);
++}
++
++// ---- down, large-M kernel -------------------------------------------------------------------------------------
++// Persistent blocks of 8 warps take (group, chunk of 128 NT output columns, split) items in grid order: the
++// group's rows (up to 16 MT), warp w owning NT n tiles of the chunk, so each decoded tile feeds 2 MT MMAs. The
++// group's down input is staged in shared memory with cp.async, 128 K columns at a time, double-buffered; the A
++// fragments come from ldmatrix and the MMAs of m tiles past the group's rows are predicated off (the loop body
++// has no branch); the trellis words are loaded PF k tiles ahead. Items run chunk by chunk (the group index
++// varies fastest), so a chunk's partial sums are written and reduced (fused) while still in L2.
++// TF port: the trellis of an item comes from the layer's pointer table.
++template <int MT, int NT>
++__global__ void __launch_bounds__(256) down_big(const Args a) {
++    constexpr int NW = 8, R = MT * 16, CW = NW * NT * 16, KC = 8, PF = 4;
++    __shared__ __align__(16) half As[2][R][136];
++    __shared__ int list_sh[R], nl_sh, item_sh;
++    // Persistent blocks take (group, chunk, split) items in grid order, the group varying fastest.
++    const int ngroups = a.counts[0], items = ngroups * a.nch * a.skd;
++    for (;;) {
++        if (threadIdx.x == 0) item_sh = atomicAdd(a.work + 1, 1);
++        __syncthreads();
++        const int item = item_sh;
++        if (item >= items) break;
++        const int g = a.gorder ? a.gorder[item % ngroups] : item % ngroups;
++        const int chunk = (item / ngroups) % a.nch, split = item / (ngroups * a.nch);
++        const Group G = a.groups[g];
++        const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g8 = lane >> 2, t4 = lane & 3;
++        const int my_row = tid < G.count ? a.pair_row[G.start + tid] : -1;  // for the fused reduce
++        const int mt_used = (G.count + 15) >> 4;
++        const int kts = NTG / a.skd, kt0 = split * kts, nkc = kts / KC, kt_last = kt0 + kts - 1;
++        const half* xg = a.xd + size_t(G.start) * WID;
++
++        // Stage K columns [16 (kt0 + KC c), + 16 KC) of the group's rows into buffer b: 16-byte copies; rows past the
++        // group are zeroed (their products are never stored).
++        auto stage = [&](int c, int b) {
++            const int k0 = (kt0 + c * KC) * 16;
++            for (int i = tid; i < mt_used * 16 * 2 * KC; i += NW * 32) {
++                const int r = i / (2 * KC), p = i % (2 * KC);
++                half* dst = &As[b][r][p * 8];
++                if (r < G.count) cp_async16(dst, xg + size_t(r) * WID + k0 + p * 8);
++                else *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
++            }
++            cp_async_commit();
++        };
++        stage(0, 0);
++
++        const uint32_t* T = reinterpret_cast<const uint32_t*>(a.down_t[G.expert]);
++        // Down tiles are [64 k tiles][256 n tiles]; this warp's NT n tiles start at chunk * CW / 16 + warp * NT.
++        // A ring of PF k tiles of words in flight.
++        const uint32_t* Tw = T + size_t(chunk * (CW / 16) + warp * NT) * 32 + lane;
++        const bool hint = a.l2hint != 0;
++        const uint64_t pol = hint ? evict_first_policy() : 0;
++        uint32_t wr[PF][NT];
++#pragma unroll
++        for (int p = 0; p < PF; ++p)
++#pragma unroll
++            for (int i = 0; i < NT; ++i)
++                wr[p][i] = ldg_w(Tw + (size_t(kt0 + p < kt_last ? kt0 + p : kt_last) * 256 + i) * 32, hint, pol);
++
++        float acc[MT][NT][2][4];
++#pragma unroll
++        for (int m = 0; m < MT; ++m)
++#pragma unroll
++            for (int i = 0; i < NT; ++i)
++#pragma unroll
++                for (int h = 0; h < 2; ++h)
++#pragma unroll
++                    for (int c = 0; c < 4; ++c) acc[m][i][h][c] = 0.f;
++        const int lrow = (lane & 7) + ((lane >> 3) & 1) * 8, lcol = (lane >> 4) * 8;
++
++        for (int c = 0; c < nkc; ++c) {
++            if (c + 1 < nkc) {
++                stage(c + 1, (c + 1) & 1);
++                cp_async_wait<1>();
++            } else {
++                cp_async_wait<0>();
++            }
++            __syncthreads();
++            const int b = c & 1;
++#pragma unroll
++            for (int ktl = 0; ktl < KC; ++ktl) {
++                const int kt = kt0 + c * KC + ktl, slot = ktl % PF;
++                uint32_t w[NT];
++#pragma unroll
++                for (int i = 0; i < NT; ++i) w[i] = wr[slot][i];
++                const int ktn = kt + PF < kt_last ? kt + PF : kt_last;
++#pragma unroll
++                for (int i = 0; i < NT; ++i) wr[slot][i] = ldg_w(Tw + (size_t(ktn) * 256 + i) * 32, hint, pol);
++                uint32_t af[MT][4];
++#pragma unroll
++                for (int m = 0; m < MT; ++m) ldsm_a(af[m], &As[b][m * 16 + lrow][ktl * 16 + lcol]);
++#pragma unroll
++                for (int i = 0; i < NT; ++i) {
++                    uint32_t b0[2], b1[2];
++                    decode_tile(w[i], lane, b0, b1);
++#pragma unroll
++                    for (int m = 0; m < MT; ++m)
++                        if (m < mt_used) {
++                            mma16816(acc[m][i][0], af[m], b0);
++                            mma16816(acc[m][i][1], af[m], b1);
++                        }
++                }
++            }
++            __syncthreads();  // buffer b is read; the next stage may overwrite it
++        }
++        float* zbase = a.zd + size_t(split) * size_t(a.P) * H;
++#pragma unroll
++        for (int m = 0; m < MT; ++m) {
++            if (m >= mt_used) break;
++            const int r0 = m * 16 + g8, r1 = r0 + 8;
++#pragma unroll
++            for (int i = 0; i < NT; ++i)
++#pragma unroll
++                for (int h = 0; h < 2; ++h) {
++                    const int col = chunk * CW + warp * NT * 16 + i * 16 + h * 8 + 2 * t4;
++                    if (r0 < G.count)
++                        *reinterpret_cast<float2*>(zbase + size_t(G.start + r0) * H + col) =
++                            make_float2(acc[m][i][h][0], acc[m][i][h][1]);
++                    if (r1 < G.count)
++                        *reinterpret_cast<float2*>(zbase + size_t(G.start + r1) * H + col) =
++                            make_float2(acc[m][i][h][2], acc[m][i][h][3]);
++                }
++        }
++        if (a.fused) down_tail<NW>(a, chunk, CW / 128, my_row, list_sh, &nl_sh);
++        __syncthreads();  // the next item reuses the shared buffers and item_sh
++    }
++}
++
++// ---- reduce kernel (unfused): one warp per (row, 128-block of the model width) ---------------------------------
++__global__ void __launch_bounds__(128) reduce_kernel(const Args a) {
++    const int item = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
++    const int row = item >> 5, blk = item & 31;
++    if (row >= a.rows || a.counts[0] <= 0) return;  // no plan (invalid routes)
++    const bool bad = reduce_item(a, row, blk, lane);
++    if (__any_sync(0xffffffffu, bad) && lane == 0) atomicOr(a.fault, F_OUT);
++}
++
++// ---- rowrot and order (glm53f-afd's reimplementations of MiaAI-Lab's recipe patches 0009 and 0020) -----------
++// rowrot: every row's 32 K blocks rotated once with the layer's shared gate/up suh, into xh [rows][4096] FP16, one
++// warp per (row, K block). The values are row_rotate's, so the large-M gate/up kernel that reads them (XH) does the
++// products of the per-(row, matrix) rotation bit for bit. NaN values fault as in the gate/up kernels.
++__global__ void __launch_bounds__(256) rotrows_kernel(const Args a, const half* __restrict__ suh,
++                                                      half* __restrict__ xh) {
++    const int w = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
++    const int row = w >> 5, kb = w & 31;
++    if (row >= a.rows) return;  // warp-uniform
++    bool bad = false;
++    const uint2 packed = rotate_row(a.x + size_t(row) * a.xs, suh, kb, lane, bad);
++    *reinterpret_cast<uint2*>(xh + size_t(row) * H + kb * 128 + lane * 4) = packed;
++    if (__any_sync(0xffffffffu, bad) && lane == 0) atomicOr(a.fault, F_ROW);
++}
++
++// order: the large-M kernels' group launch order. Groups of experts that have one group (their weights come from
++// DRAM for few rows) and of experts that have several (read once from DRAM, then from L2: mostly MMA) are merged
++// evenly, each list in plan order (an expert's groups stay adjacent), so DRAM and the tensor cores stay busy
++// together instead of in turns. Only which block runs which item changes: every output keeps its bits.
++// gorder[slot] = group. One block of 1,024 threads, each over a contiguous range of groups.
++__global__ void __launch_bounds__(1024) order_kernel(const Group* __restrict__ groups, const int* __restrict__ counts,
++                                                     int* __restrict__ gorder) {
++    __shared__ int wsum[32];
++    const int n = counts[0];
++    if (n <= 0) return;
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    const int per = (n + 1023) / 1024, lo = min(n, tid * per), hi = min(n, lo + per);
++    auto heavy = [&](int i) {
++        const int e = groups[i].expert;
++        return (i > 0 && groups[i - 1].expert == e) || (i + 1 < n && groups[i + 1].expert == e);
++    };
++    int h = 0;
++    for (int i = lo; i < hi; ++i) h += heavy(i);
++    int v = h;  // inclusive scan of the heavy counts over the threads
++#pragma unroll
++    for (int d = 1; d < 32; d <<= 1) {
++        const int u = __shfl_up_sync(0xffffffffu, v, d);
++        if (lane >= d) v += u;
++    }
++    if (lane == 31) wsum[warp] = v;
++    __syncthreads();
++    if (warp == 0) {
++        int s = wsum[lane];
++#pragma unroll
++        for (int d = 1; d < 32; d <<= 1) {
++            const int u = __shfl_up_sync(0xffffffffu, s, d);
++            if (lane >= d) s += u;
++        }
++        wsum[lane] = s;
++    }
++    __syncthreads();
++    int hb = v - h + (warp ? wsum[warp - 1] : 0);  // heavy groups before `lo`
++    const long long nh = wsum[31], nl = n - nh;
++    // Heavy h sits at key (2h + 1) / 2nh, light l at (2l + 1) / 2nl; equal keys put the heavy group first.
++    for (int i = lo; i < hi; ++i) {
++        int pos;
++        if (heavy(i)) {
++            const long long hh = hb++, q = nh ? ((2 * hh + 1) * nl + nh - 1) / nh : 0;
++            pos = int(hh + (q / 2 < nl ? q / 2 : nl));
++        } else {
++            const long long l = i - hb, f = nl ? ((2 * l + 1) * nh) / nl : 0;
++            pos = int(l + ((f + 1) / 2 < nh ? (f + 1) / 2 : nh));
++        }
++        gorder[pos] = i;
++    }
++}
++
++// Launch a persistent large-M kernel: as many blocks as fit on the device at once, at most one per item.
++template <class K>
++cudaError_t launch_persistent(K* fn, int threads, int items, int sms, cudaStream_t st, const Args& a) {
++    int occ = 0;
++    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fn, threads, 0) != cudaSuccess || occ < 1) occ = 1;
++    int n = sms * occ;
++    if (n > items) n = items;
++    if (n < 1) n = 1;
++    fn<<<n, threads, 0, st>>>(a);
++    return cudaGetLastError();
++}
++
++}  // namespace g53
++
++// Launch one call on `st` (G53Call: g53_rank.h): meta cleared, the plan (and the group order), the row rotation
++// (rot 2), gate/up (with the fused epilogue), the epilogue kernel (fuse 1), down (with the fused reduce), the reduce
++// kernel (fuse 1). Returns the first launch error (cudaSuccess when every launch was accepted).
++cudaError_t g53_ffn_launch(const G53Call& c, cudaStream_t st) {
++    using namespace g53;
++    const int routes = c.rows * TOPK, gr = 16 * c.mt;
++    const int nch = 32 / c.nt;  // output chunks of the down kernel (128 nt columns)
++    const int bound = routes / gr + (routes < E ? routes : E);
++    const int max_groups = routes < bound ? routes : bound;
++    const bool fused = c.fuse == 2, discard = fused && c.discard == 2;
++    cudaError_t e = cudaMemsetAsync(c.meta, 0, 16, st);  // groups, fault, the two work counters
++    if (e != cudaSuccess) return e;
++    Args a;
++    a.gate_t = c.gate_t; a.up_t = c.up_t; a.down_t = c.down_t;
++    a.suh_g = static_cast<const half*>(c.suh_g);
++    a.suh_u = static_cast<const half*>(c.suh_u);
++    a.svh_g = static_cast<const half*>(c.svh_g);
++    a.svh_u = static_cast<const half*>(c.svh_u);
++    a.suh_d = static_cast<const half*>(c.suh_d);
++    a.svh_d = static_cast<const half*>(c.svh_d);
++    a.x = static_cast<const __nv_bfloat16*>(c.x);
++    a.xs = c.xs; a.pick = c.pick; a.ps = c.ps; a.wts = c.wts; a.ws = c.ws;
++    Group* const groups = static_cast<Group*>(c.groups);
++    a.groups = groups;
++    a.counts = c.meta;
++    a.pair_row = c.pair_row; a.pair_route = c.pair_route; a.inverse = c.inverse;
++    a.z = c.z;
++    a.xd = static_cast<half*>(c.xd);
++    a.zd = c.zd;
++    a.out = c.out;
++    a.gcnt = c.gcnt; a.rcnt = c.rcnt;
++    a.work = c.meta + 2;  // meta words 2 and 3, cleared with the fault word
++    a.fault = reinterpret_cast<unsigned*>(c.meta + 1);
++    a.P = routes; a.rows = c.rows; a.sk = c.sk; a.skd = c.skd;
++    a.bf16 = c.swiglu ? 0 : 1;
++    a.fused = fused ? 1 : 0;
++    a.discard = discard ? 1 : 0;
++    a.nch = nch;
++    a.l2hint = c.l2 == 2 ? 1 : 0;
++    a.limit = c.limit;
++    const bool rowrot = c.rot == 2 && c.shared_suh != nullptr;
++    a.xh = rowrot ? static_cast<const half*>(c.xh) : nullptr;
++    a.gorder = c.gord == 2 ? c.gorder : nullptr;
++
++    plan_kernel<<<1, 1024, 0, st>>>(c.pick, c.ps, c.wts, c.ws, c.rows, gr, groups, c.meta, c.pair_row, c.pair_route,
++                                    c.inverse, a.fault, c.out);
++    if ((e = cudaGetLastError()) != cudaSuccess) return e;
++    if (a.gorder) {
++        order_kernel<<<1, 1024, 0, st>>>(groups, c.meta, c.gorder);
++        if ((e = cudaGetLastError()) != cudaSuccess) return e;
++    }
++    const int items = 2 * CB * max_groups * c.sk;
++    if (rowrot) {
++        // Every row rotated once (one warp per (row, K block)), then the gate/up blocks read the rotated rows.
++        rotrows_kernel<<<(c.rows * 32 + 7) / 8, 256, 0, st>>>(a, static_cast<const half*>(c.shared_suh),
++                                                              static_cast<half*>(c.xh));
++        if ((e = cudaGetLastError()) != cudaSuccess) return e;
++        if (c.gw == 8) {
++            if (c.mt == 2) e = launch_persistent(gateup_big<2, 8, true>, 256, items, c.sms, st, a);
++            else e = launch_persistent(gateup_big<4, 8, true>, 256, items, c.sms, st, a);
++        } else {
++            if (c.mt == 2) e = launch_persistent(gateup_big<2, 16, true>, 512, items, c.sms, st, a);
++            else e = launch_persistent(gateup_big<4, 16, true>, 512, items, c.sms, st, a);
++        }
++    } else {
++        if (c.gw == 8) {
++            if (c.mt == 2) e = launch_persistent(gateup_big<2, 8, false>, 256, items, c.sms, st, a);
++            else e = launch_persistent(gateup_big<4, 8, false>, 256, items, c.sms, st, a);
++        } else {
++            if (c.mt == 2) e = launch_persistent(gateup_big<2, 16, false>, 512, items, c.sms, st, a);
++            else e = launch_persistent(gateup_big<4, 16, false>, 512, items, c.sms, st, a);
++        }
++    }
++    if (e != cudaSuccess) return e;
++    if (!fused) {
++        gateup_epilogue<<<routes * NB / 4, 128, 0, st>>>(a);
++        if ((e = cudaGetLastError()) != cudaSuccess) return e;
++    }
++    const int ditems = max_groups * nch * c.skd;
++    if (c.mt == 2) {
++        if (c.nt == 1) e = launch_persistent(down_big<2, 1>, 256, ditems, c.sms, st, a);
++        else if (c.nt == 2) e = launch_persistent(down_big<2, 2>, 256, ditems, c.sms, st, a);
++        else e = launch_persistent(down_big<2, 4>, 256, ditems, c.sms, st, a);
++    } else {
++        if (c.nt == 1) e = launch_persistent(down_big<4, 1>, 256, ditems, c.sms, st, a);
++        else if (c.nt == 2) e = launch_persistent(down_big<4, 2>, 256, ditems, c.sms, st, a);
++        else e = launch_persistent(down_big<4, 4>, 256, ditems, c.sms, st, a);
++    }
++    if (e != cudaSuccess) return e;
++    if (!fused) {
++        reduce_kernel<<<c.rows * 8, 128, 0, st>>>(a);
++        if ((e = cudaGetLastError()) != cudaSuccess) return e;
++    }
++    return cudaSuccess;
++}
+diff --git a/src/tensorfold/families/glm5_next/cuda/g53_rank.h b/src/tensorfold/families/glm5_next/cuda/g53_rank.h
+new file mode 100644
+index 0000000..571c408
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/g53_rank.h
+@@ -0,0 +1,54 @@
++// glm53f-afd's large-M expert kernels in TensorFold's AFD expert node (TF_GLM_EXPERT_KERNEL=g53): the launch's
++// arguments, shared by g53_rank.cu (the kernels, from glm53f-afd by Hugh Madden; see its header) and g53_rank.cpp
++// (the torch binding). Plain pointer types, so the host compiler needs no CUDA half types.
++#pragma once
++
++#include <cuda_runtime_api.h>
++#include <cstdint>
++
++// One call's tensors and configuration (glm53f-rank's g53r_cfg fields for the large-M kernels; g53_experts.py
++// resolves the defaults): mt 2 or 4 (16-row tiles a group), sk and skd (K splits; sk divides 32, skd divides 8 and
++// is at most 4), nt 1, 2 or 4 (down: 16-column tiles a warp), gw 8 or 16 (gate/up MMA warps), l2 1 or 2 (2: the
++// trellis words loaded evict-first), fuse 1 or 2 (2: the epilogue and reduce fused), discard 1 or 2 (2: the consumed
++// partial sums dropped from L2, fused only), swiglu 0 (BF16 roundings) or 1 (FP32), rot 1 or 2 (2: every row rotated
++// once with the layer's shared gate/up suh), gord 1 or 2 (2: the group order).
++struct G53Call {
++    // the layer: per-expert trellis pointer tables (int64) and stacked fp16 scale vectors
++    const int64_t* gate_t;
++    const int64_t* up_t;
++    const int64_t* down_t;
++    const void* suh_g;       // fp16 [288][4096]
++    const void* suh_u;
++    const void* svh_g;       // fp16 [288][1024]
++    const void* svh_u;
++    const void* suh_d;       // fp16 [288][1024]
++    const void* svh_d;       // fp16 [288][4096]
++    const void* shared_suh;  // fp16 [4096], the layer's one gate/up suh (rot 2), or null
++    // the call: BF16 rows, routes, the FP32 output
++    const void* x;           // bf16 [rows][xs]
++    int xs;
++    const int32_t* pick;     // [rows][ps]: slots 0..7 routed
++    int ps;
++    const float* wts;        // [rows][ws]
++    int ws;
++    float* out;              // fp32 [rows][4096]
++    // scratch
++    float* z;                // [2][sk][rows * 8][1024]
++    void* xd;                // fp16 [rows * 8][1024]
++    float* zd;               // [skd][rows * 8][4096]
++    void* xh;                // fp16 [rows][4096] (rot 2)
++    void* groups;            // 16 bytes a group
++    int* meta;               // 4 words: groups, fault, two work counters
++    int* pair_row;
++    int* pair_route;
++    int* inverse;
++    int* gcnt;               // zero between calls
++    int* rcnt;               // zero between calls
++    int* gorder;
++    int rows;
++    int mt, sk, skd, nt, gw, l2, fuse, discard, swiglu, rot, gord;
++    float limit;
++    int sms;
++};
++
++cudaError_t g53_ffn_launch(const G53Call& c, cudaStream_t st);
+diff --git a/tests/cuda/test_glm_g53_kernel.py b/tests/cuda/test_glm_g53_kernel.py
+new file mode 100644
+index 0000000..3242b85
+--- /dev/null
++++ b/tests/cuda/test_glm_g53_kernel.py
+@@ -0,0 +1,494 @@
++"""glm53f-afd's large-M expert kernels in the AFD expert node (TF_GLM_EXPERT_KERNEL=g53; families/glm5_next/cuda/
++g53_rank.cu; expert prompt kernels from glm53f-afd, written by Hugh Madden (@dangerm00se, github.com/hughmadden),
++glm53f-afd @ 91db3cc, MIT, Copyright (c) 2026 Turquoise Bay AI Pty Ltd) on the GPU. GPU only: it runs on an expert
++node's GPU with no model server loaded.
++
++- Against glm53f-rank's own kernels on the same tiles: its two-rank source (TF_G53_RANK_SRC: glm53f-afd @ 91db3cc with
++  the two-rank width and the row rotation patches applied, pinned by sha256) is built here with its build.rs flags and
++  -DG53R_WID=1024 and called through its C API (g53r_layer_new on an image cut from this layer's tensors, g53r_ffn_f32
++  on FP8 rows whose values the port gets as BF16 rows). The half's FP32 rows must be byte-equal at 65-4,096 rows, both
++  configurations (32- and 64-row groups), uniform and skewed routing, row rotation once a row and per (row, matrix),
++  group order on and off, BF16 and FP32 SwiGLU; and, with discard off, the intermediates (gate/up sums, down inputs,
++  down sums) byte-equal route by route.
++- Its own properties: the same bytes twice; a row's bits whatever window it is in; invalid routes fault and poison
++  the call's rows with NaN; the binding's refusals.
++- Against TensorFold's kernels (the node's path before: exl3_generic.routed and glue.combine) on the same layer and
++  rows: an outputs-class distance, reported and bounded (rel. L2 <= 1e-3); and both against the CPU reference
++  (tests/glm_g53_reference.py) on a few rows.
++- The expert node: a prompt chunk's window takes the kernels and a decode window does not.
++- Times (report only): ms per call at 2,048 and 4,096 rows for the port, glm53f-rank and TensorFold's kernels
++  (TF_G53_TIMES: a JSON file to write them to).
++
++TF_GLM_MODEL_DIR (with TF_G53_LAYER, default the first MoE layer, and TF_G53_HALF, default 0): one MoE layer's half of
++the real checkpoint instead of synthetic tiles.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import hashlib
++import json
++import os
++import shutil
++import subprocess
++from pathlib import Path
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++
++from tests import glm_g53_reference as ref
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
++
++E, D, NI, TOPK, LIMIT, LAYER = 288, 4096, 1024, 8, 10.0, 3
++REF_SHA256 = "59d8edd8a54f9a566d466ab5e23fb17510af2b4a8764ee90e488e9d95efc8566"   # glm53f-rank two-rank exl3_rank.cu
++ROWS = [65, 128, 594, 2048, 2049, 4096]
++
++
++# ------------------------------------------------------------------------------------------------- the two layers
++
++def _synthetic(shared: bool):
++    from tensorfold.cuda.exl3 import experts as generic
++    from tensorfold.families.glm5_next.cuda import exl3_generic
++
++    g = torch.Generator().manual_seed(53)
++
++    def trel(k, n):
++        v = torch.randint(-32768, 32768, (E, k // 16, n // 16, 64), dtype=torch.int32, generator=g)
++        return v.to(torch.int16).cuda().contiguous()
++
++    def sc(n, mag, one=False):
++        rows = 1 if one else E
++        sign = torch.randint(0, 2, (rows, n), generator=g).float() * 2 - 1
++        v = (sign * (torch.rand((rows, n), generator=g) + 0.5) * mag).half()
++        return v.expand(E, n).contiguous().cuda() if one else v.cuda().contiguous()
++
++    suh_g = sc(D, 0.02, one=shared)
++    suh_u = suh_g.clone() if shared else sc(D, 0.02)
++    ex = generic.prepare_stacked(trel(D, NI), trel(D, NI), trel(NI, D), suh_g, suh_u, sc(NI, 0.5), sc(NI, 0.5),
++                                 sc(NI, 0.05), sc(D, 0.2), "mcg")
++    return exl3_generic.share_suh(ex)
++
++
++def _real():
++    from tensorfold.families.glm5_next.cuda.experts_node import load_half
++    from tensorfold.families.glm5_next.cuda.weights import Config
++
++    d = os.environ["TF_GLM_MODEL_DIR"]
++    cfg = Config.read(d)
++    layer = int(os.environ.get("TF_G53_LAYER", str(cfg.mlp_kinds.index("moe"))))
++    return load_half(d, int(os.environ.get("TF_G53_HALF", "0")), [layer])[0]
++
++
++@pytest.fixture(scope="module", params=["shared", "per-expert"] + (["real"] if os.environ.get("TF_GLM_MODEL_DIR")
++                                                                    else []))
++def layer(request):
++    ex = _real() if request.param == "real" else _synthetic(request.param == "shared")
++    from tensorfold.families.glm5_next.cuda import g53_experts
++
++    assert g53_experts.layer_ready(ex) is None
++    if request.param == "shared":
++        assert ex.shared_suh is not None
++    if request.param == "per-expert":
++        assert ex.shared_suh is None
++    yield request.param, ex
++    torch.cuda.empty_cache()
++
++
++# ------------------------------------------------------------------------------------------ glm53f-rank's own build
++
++class Cfg(ctypes.Structure):
++    _fields_ = [(n, ctypes.c_int) for n in ("mt", "sk", "skd", "fp32_swiglu", "big", "nt", "fuse", "discard", "gw",
++                                             "gp", "plan", "l2", "pf", "ord", "pdl", "rot", "gord")]
++
++
++def _their_cfg(c) -> Cfg:
++    """glm53f-rank's g53r_cfg for the port's Cfg: every field given (big 2 alone would take its 4,096-row defaults)."""
++
++    return Cfg(mt=c.mt, sk=c.sk, skd=c.skd, fp32_swiglu=c.swiglu, big=2, nt=c.nt, fuse=c.fuse, discard=c.discard,
++               gw=c.gw, gp=-1, plan=1, l2=c.l2, pf=1, ord=1, pdl=1, rot=c.rot, gord=c.gord)
++
++
++@pytest.fixture(scope="module")
++def rank_lib(tmp_path_factory):
++    src = os.environ.get("TF_G53_RANK_SRC", "")
++    if not src:
++        pytest.skip("TF_G53_RANK_SRC (glm53f-rank's two-rank exl3_rank.cu) unset")
++    data = Path(src).read_bytes()
++    assert hashlib.sha256(data).hexdigest() == REF_SHA256, "not the pinned glm53f-rank source"
++    major, minor = torch.cuda.get_device_capability()
++    arch = f"{major}{minor}"
++    nvcc = os.environ.get("TF_G53_NVCC") or shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
++    out = tmp_path_factory.mktemp("g53r") / "libg53r.so"
++    cmd = [nvcc, "-O3", "-std=c++17", "--fmad=false", "--ftz=false", "--prec-div=true", f"-arch=sm_{arch}",
++           "-Xcompiler=-fPIC", f"-DG53R_BAKED_ARCH={arch}", "-DG53R_WID=1024", "-shared", "-cudart", "shared",
++           "-o", str(out), src]
++    subprocess.run(cmd, check=True, capture_output=True)
++    lib = ctypes.CDLL(str(out))
++    vp, sz, i32 = ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int
++    lib.g53r_layer_new.argtypes = [vp, ctypes.c_uint64, ctypes.POINTER(vp), ctypes.c_char_p, sz]
++    lib.g53r_layer_new.restype = i32
++    lib.g53r_layer_shared_suh.argtypes = [vp]
++    lib.g53r_layer_shared_suh.restype = i32
++    lib.g53r_layer_free.argtypes = [vp]
++    lib.g53r_scratch_new.argtypes = [ctypes.POINTER(vp), ctypes.c_char_p, sz]
++    lib.g53r_scratch_new.restype = i32
++    lib.g53r_scratch_free.argtypes = [vp]
++    lib.g53r_ffn_f32.argtypes = [vp, vp, vp, sz, vp, sz, vp, vp, ctypes.c_uint32, vp, ctypes.POINTER(Cfg), vp,
++                                 ctypes.c_char_p, sz]
++    lib.g53r_ffn_f32.restype = i32
++    lib.g53r_debug_copy.argtypes = [vp, vp, sz, vp, sz, vp, sz, vp, sz, ctypes.c_char_p, sz]
++    lib.g53r_debug_copy.restype = i32
++    return lib
++
++
++def _np(t: torch.Tensor) -> np.ndarray:
++    return t.detach().cpu().contiguous().numpy()
++
++
++@pytest.fixture(scope="module")
++def theirs(rank_lib, layer):
++    """glm53f-rank's layer (an image cut from the same tensors) and scratch."""
++
++    _, ex = layer
++    keep = ex.keep                                    # prepare's order: E gate trellises, E up, E down
++    assert len(keep) == 3 * E
++    for e in (0, E - 1):
++        assert keep[e].data_ptr() == int(ex.gate_ptr[e]) and keep[2 * E + e].data_ptr() == int(ex.down_ptr[e])
++    img = ref.rank_image([_np(t) for t in keep[:E]], [_np(t) for t in keep[E:2 * E]], [_np(t) for t in keep[2 * E:]],
++                         _np(ex.suh_g), _np(ex.suh_u), _np(ex.svh_g), _np(ex.svh_u), _np(ex.suh_d), _np(ex.svh_d))
++    err = ctypes.create_string_buffer(512)
++    L, S = ctypes.c_void_p(), ctypes.c_void_p()
++    assert rank_lib.g53r_layer_new(img.ctypes.data_as(ctypes.c_void_p), img.size, ctypes.byref(L), err, 512) == 0, \
++        err.value
++    del img
++    assert rank_lib.g53r_scratch_new(ctypes.byref(S), err, 512) == 0, err.value
++    assert bool(rank_lib.g53r_layer_shared_suh(L)) == (ex.shared_suh is not None)   # the two scans agree
++    yield SimpleNamespace(lib=rank_lib, L=L, S=S)
++    rank_lib.g53r_scratch_free(S)
++    rank_lib.g53r_layer_free(L)
++
++
++def _their_ffn(t, codes, scales, pick8, w8, cfg, ms=None):
++    R = codes.shape[0]
++    out = np.zeros((R, D), np.float32)
++    ids = np.ascontiguousarray(pick8[:, :TOPK], dtype=np.int32)
++    wts = np.ascontiguousarray(w8[:, :TOPK], dtype=np.float32)
++    msb = np.zeros(9, np.float32)
++    err = ctypes.create_string_buffer(512)
++    c = _their_cfg(cfg)
++    torch.cuda.synchronize()
++    rc = t.lib.g53r_ffn_f32(t.L, t.S, codes.ctypes.data_as(ctypes.c_void_p), D, scales.ctypes.data_as(ctypes.c_void_p),
++                            D // 32, ids.ctypes.data_as(ctypes.c_void_p), wts.ctypes.data_as(ctypes.c_void_p), R,
++                            out.ctypes.data_as(ctypes.c_void_p), ctypes.byref(c), msb.ctypes.data_as(ctypes.c_void_p),
++                            err, 512)
++    assert rc == 0, err.value
++    if ms is not None:
++        ms.append(float(msb[1]))
++    return out
++
++
++# ----------------------------------------------------------------------------------------------- inputs and calls
++
++def _inputs(R: int, kind: str, seed: int):
++    rng = np.random.default_rng(seed)
++    codes, scales, vals = ref.fp8_rows(R, rng)
++    if kind == "uniform":
++        sel = np.stack([rng.permutation(E)[:TOPK] for _ in range(R)])
++    else:                                              # skewed: a few hot experts, as real routing has
++        p = 1.0 / np.arange(1, E + 1) ** 1.1
++        p = p[rng.permutation(E)]
++        sel = np.stack([rng.choice(E, TOPK, replace=False, p=p / p.sum()) for _ in range(R)])
++    w = (rng.random((R, TOPK)) * 0.3 + 0.05).astype(np.float32)
++    pick = np.concatenate([sel, np.full((R, 1), E)], 1).astype(np.int32)             # the shared slot after them
++    wts = np.concatenate([w, np.ones((R, 1), np.float32)], 1)
++    x = torch.from_numpy(vals).to(torch.bfloat16).cuda()
++    assert torch.equal(x.float().cpu(), torch.from_numpy(vals))                       # FP8 values, exactly BF16
++    return SimpleNamespace(codes=codes, scales=scales, x=x, pick=torch.from_numpy(pick).cuda(),
++                           wts=torch.from_numpy(wts).cuda(), pick_np=pick, wts_np=wts)
++
++
++_SCRATCH = {}
++
++
++def _scratch(R: int):
++    from tensorfold.families.glm5_next.cuda import g53_experts
++
++    s = _SCRATCH.get("s")
++    if s is None or s.rows < R:
++        s = _SCRATCH["s"] = g53_experts.Scratch(max(R, 4096), "cuda")
++    return s
++
++
++def _ours(ex, inp, cfg, R=None):
++    from tensorfold.families.glm5_next.cuda import g53_experts
++
++    R = R or inp.x.shape[0]
++    s = _scratch(R)
++    out = torch.full((R, D), float("nan"), dtype=torch.float32, device="cuda")
++    g53_experts.routed(inp.x, inp.pick, inp.wts, ex, s, out, R, LIMIT, cfg)
++    torch.cuda.synchronize()
++    assert s.fault() == 0
++    return out
++
++
++def _cfg(R, **kw):
++    from dataclasses import replace
++
++    from tensorfold.families.glm5_next.cuda import g53_experts
++
++    return replace(g53_experts.default_cfg(R), **kw)
++
++
++def _tf(ex, inp, R, s=None, sync=True):
++    """The node's path before: exl3_generic.routed into a prompt scratch, the shared slot zeroed, glue.combine."""
++
++    from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
++    from tensorfold.families.glm5_next.cuda import exl3_generic, glue
++
++    s = s or Exl3Scratch(SimpleNamespace(dims=D, width=NI, count=E), R, TOPK + 1, device="cuda")
++    exl3_generic.routed(inp.x, inp.pick, ex, s, R, LIMIT)
++    ey = s.y.view(s.rows, TOPK + 1, D)[:R]
++    ey[:, TOPK].zero_()
++    out = torch.empty((R, D), dtype=torch.float32, device="cuda")
++    glue.combine(ey, inp.wts, out)
++    if sync:
++        torch.cuda.synchronize()
++    return out
++
++
++def _bits_equal(a: torch.Tensor, b) -> bool:
++    b = torch.as_tensor(b, device=a.device)
++    return bool(torch.equal(a.contiguous().view(torch.int32), b.contiguous().view(torch.int32)))
++
++
++# ---------------------------------------------------------------------------------------- against glm53f-rank
++
++@pytest.mark.parametrize("R", ROWS)
++@pytest.mark.parametrize("kind", ["uniform", "skewed"])
++def test_outputs_byte_equal_glm53f_rank(layer, theirs, R, kind):
++    name, ex = layer
++    inp = _inputs(R, kind, R)
++    for kw in ({}, {"gord": 2}, {"rot": 1}):
++        cfg = _cfg(R, **kw)
++        got = _ours(ex, inp, cfg)
++        want = _their_ffn(theirs, inp.codes, inp.scales, inp.pick_np, inp.wts_np, cfg)
++        assert np.isfinite(want).all()
++        assert _bits_equal(got, want), f"{name} R{R} {kind} {kw}: max |diff| {(got.cpu() - want).abs().max():.3e}"
++
++
++@pytest.mark.parametrize("R", [128, 2049])
++def test_fp32_swiglu_byte_equal_glm53f_rank(layer, theirs, R):
++    _, ex = layer
++    inp = _inputs(R, "skewed", 7 + R)
++    cfg = _cfg(R, swiglu=1)
++    assert _bits_equal(_ours(ex, inp, cfg), _their_ffn(theirs, inp.codes, inp.scales, inp.pick_np, inp.wts_np, cfg))
++
++
++@pytest.mark.parametrize("R", [594, 4096])
++def test_intermediates_byte_equal_route_by_route(layer, theirs, R):
++    _, ex = layer
++    inp = _inputs(R, "uniform", 11 + R)
++    cfg = _cfg(R, discard=1)                              # the partial sums kept for the copy
++    _ours(ex, inp, cfg)
++    s = _scratch(R)
++    z, xd, zd, _ = s.big(R, cfg)
++    P = R * TOPK
++    _their_ffn(theirs, inp.codes, inp.scales, inp.pick_np, inp.wts_np, cfg)
++    tz, tpr = np.zeros(2 * P * NI, np.float32), np.zeros(P, np.int32)
++    txd, tzd = np.zeros(P * NI, np.uint16), np.zeros(P * D, np.float32)
++    err = ctypes.create_string_buffer(512)
++    rc = theirs.lib.g53r_debug_copy(theirs.S, tz.ctypes.data_as(ctypes.c_void_p), tz.size,
++                                    tpr.ctypes.data_as(ctypes.c_void_p), tpr.size,
++                                    txd.ctypes.data_as(ctypes.c_void_p), txd.size,
++                                    tzd.ctypes.data_as(ctypes.c_void_p), tzd.size, err, 512)
++    assert rc == 0, err.value
++    ours_pr = _np(s.pair_route[:P]).astype(np.int64)
++    theirs_inv, ours_inv = np.empty(P, np.int64), np.empty(P, np.int64)
++    theirs_inv[tpr.astype(np.int64)] = np.arange(P)                      # route -> its pair, theirs and ours
++    ours_inv[ours_pr] = np.arange(P)
++    assert np.array_equal(np.sort(ours_pr), np.arange(P))
++    a, b = ours_inv, theirs_inv
++    oz, oxd, ozd = _np(z).reshape(2, P, NI), _np(xd.view(torch.int16)).reshape(P, NI), _np(zd).reshape(P, D)
++    assert np.array_equal(oz[:, a].view(np.uint32), tz.reshape(2, P, NI)[:, b].view(np.uint32))      # gate / up sums
++    assert np.array_equal(oxd[a].view(np.uint16), txd.reshape(P, NI)[b])                              # down inputs
++    assert np.array_equal(ozd[a].view(np.uint32), tzd.reshape(P, D)[b].view(np.uint32))               # down sums
++
++
++# ---------------------------------------------------------------------------------------------- its own properties
++
++def test_same_bytes_twice_and_a_rows_bits_whatever_its_window(layer):
++    _, ex = layer
++    inp = _inputs(4096, "skewed", 3)
++    full = _ours(ex, inp, _cfg(4096))                                        # 64-row groups
++    assert _bits_equal(_ours(ex, inp, _cfg(4096)), full)
++    for lo, hi in ((0, 2048), (2048, 2113), (2113, 4096)):                  # 32-row groups, and 64 again
++        part = SimpleNamespace(x=inp.x[lo:hi], pick=inp.pick[lo:hi], wts=inp.wts[lo:hi])
++        assert _bits_equal(_ours(ex, part, _cfg(hi - lo)), full[lo:hi]), (lo, hi)
++
++
++def test_invalid_routes_fault_and_poison_the_rows(layer):
++    from tensorfold.families.glm5_next.cuda import g53_experts
++
++    _, ex = layer
++    R = 128
++    s = _scratch(R)
++    for bad in ("id", "duplicate", "weight"):
++        inp = _inputs(R, "uniform", 5)
++        if bad == "id":
++            inp.pick[7, 3] = E
++        elif bad == "duplicate":
++            inp.pick[7, 3] = inp.pick[7, 2]
++        else:
++            inp.wts[7, 3] = -1.0
++        out = torch.zeros((R, D), dtype=torch.float32, device="cuda")
++        g53_experts.routed(inp.x, inp.pick, inp.wts, ex, s, out, R, LIMIT)
++        torch.cuda.synchronize()
++        assert s.fault() & 1 and s.groups_formed() == 0 and bool(torch.isnan(out).all()), bad
++    inp = _inputs(R, "uniform", 5)                                          # the next good call is clean
++    _ours(ex, inp, _cfg(R))
++
++
++def test_binding_refusals(layer):
++    from tensorfold.families.glm5_next.cuda import g53_experts
++
++    _, ex = layer
++    inp = _inputs(128, "uniform", 9)
++    s = _scratch(128)
++    out = torch.empty((128, D), dtype=torch.float32, device="cuda")
++    wide = torch.zeros((128, D + 2), dtype=torch.bfloat16, device="cuda")[:, 1:D + 1]   # a 2-byte aligned start
++    for args, what in (((inp.x.float(), inp.pick, inp.wts), "x"), ((wide, inp.pick, inp.wts), "x"),
++                       ((inp.x, inp.pick.long(), inp.wts), "pick"), ((inp.x, inp.pick[:, :7], inp.wts), "pick")):
++        with pytest.raises(RuntimeError, match=what):
++            g53_experts.routed(*args, ex, s, out, 128, LIMIT)
++    with pytest.raises(RuntimeError, match="configuration"):
++        g53_experts.routed(inp.x, inp.pick, inp.wts, ex, s, out, 128, LIMIT, _cfg(128, mt=3))
++
++
++# --------------------------------------------------------------------------------- against TensorFold's kernels
++
++def _dist(a: torch.Tensor, b: torch.Tensor) -> dict:
++    a, b = a.double(), b.double()
++    return {"rel_l2": float((a - b).norm() / b.norm()), "max_abs": float((a - b).abs().max()),
++            "cos": float((a * b).sum() / (a.norm() * b.norm())), "equal": float((a == b).double().mean())}
++
++
++@pytest.mark.parametrize("R", [594, 2048])
++def test_outputs_class_distance_from_tensorfolds_kernels(layer, R):
++    name, ex = layer
++    inp = _inputs(R, "skewed", 21 + R)
++    got, tf = _ours(ex, inp, _cfg(R)), _tf(ex, inp, R)
++    d = _dist(got, tf)
++    print(f"[g53 vs TensorFold's kernels] {name} R{R}: {d}")
++    assert d["rel_l2"] <= 1e-3 and d["cos"] >= 0.999999, d
++
++
++def test_both_near_the_cpu_reference(layer):
++    from tensorfold.cuda.exl3 import experts as generic
++
++    name, ex = layer
++    R = 65
++    inp = _inputs(R, "uniform", 31)
++    got, tf = _ours(ex, inp, _cfg(R)), _tf(ex, inp, R)
++    rows = [0, 1]
++    used = sorted({int(e) for r in rows for e in inp.pick_np[r, :TOPK]})
++    keep = ex.keep
++    L = {}
++    for e in used:
++        L[e] = {"wg": _np(generic.dequant(keep[e], "mcg")), "wu": _np(generic.dequant(keep[E + e], "mcg")),
++                "wd": _np(generic.dequant(keep[2 * E + e], "mcg")), "suh_g": _np(ex.suh_g[e]),
++                "suh_u": _np(ex.suh_u[e]), "svh_g": _np(ex.svh_g[e]), "svh_u": _np(ex.svh_u[e]),
++                "suh_d": _np(ex.suh_d[e]), "svh_d": _np(ex.svh_d[e])}
++    x = _np(inp.x[rows].float())
++    want = ref.ffn(x, inp.pick_np[rows], inp.wts_np[rows], L, LIMIT, rowrot=ex.shared_suh is not None)
++    want_t = torch.from_numpy(want)
++    dg, dt = _dist(got[rows].cpu(), want_t), _dist(tf[rows].cpu(), want_t)
++    print(f"[vs the CPU reference] {name}: g53 {dg}, TensorFold {dt}")
++    assert dg["rel_l2"] <= 5e-3 and dt["rel_l2"] <= 5e-3, (dg, dt)
++
++
++# ------------------------------------------------------------------------------------------------- the expert node
++
++def test_expert_node_takes_prompt_chunks_only(layer, capsys):
++    from tensorfold.families.glm5_next.cuda import g53_experts
++    from tensorfold.families.glm5_next.cuda.experts_node import ExpertBuffers, ExpertNode
++
++    _, ex = layer
++    node = ExpertNode.__new__(ExpertNode)
++    node.cfg = SimpleNamespace(hidden=D, top_k=TOPK, moe_width=2 * NI, experts=E, limit=LIMIT)
++    node.half, node.layers, node.experts, node.by_layer = 0, [LAYER], [ex], {LAYER: ex}
++    node.buf = ExpertBuffers(node.cfg, rows=8, prefill_rows=2048)
++    node.g53 = g53_experts.Node(node, {"min_rows": 65, "rowrot": True, "order": False})
++    assert "TF_GLM_EXPERT_KERNEL=g53" in capsys.readouterr().out
++    assert node.g53.scratch.share is node.buf.pref
++    for R in (64, 65, 2048):
++        inp = _inputs(R, "skewed", 41 + R)
++        x = (inp.x, inp.pick, inp.wts)
++        node.prompt = True
++        got = node.compute(LAYER, R, x).clone()
++        node.prompt = False
++        dec = node.compute(LAYER, R, x).clone()
++        torch.cuda.synchronize()
++        tf = _tf(ex, inp, R)
++        assert _bits_equal(dec, tf)                                         # a decode window: TensorFold's bits
++        if R >= 65:
++            assert _bits_equal(got, _ours(ex, inp, _cfg(R)))                 # a prompt chunk: the kernels'
++        else:
++            assert _bits_equal(got, tf)                                     # under the threshold: as before
++
++
++# -------------------------------------------------------------------------------------------------------- times
++
++def _time(fn, n=10):
++    for _ in range(3):
++        fn()
++    torch.cuda.synchronize()
++    a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++    ms = []
++    for _ in range(n):
++        a.record()
++        fn()
++        b.record()
++        torch.cuda.synchronize()
++        ms.append(a.elapsed_time(b))
++    return float(np.median(ms))
++
++
++def test_times_report(layer, request):
++    from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
++    from tensorfold.families.glm5_next.cuda import g53_experts
++
++    name, ex = layer
++    res = {}
++    lib = None
++    if os.environ.get("TF_G53_RANK_SRC"):
++        lib = request.getfixturevalue("theirs")
++    for R in (2048, 4096):
++        for kind in ("uniform", "skewed"):
++            inp = _inputs(R, kind, 61 + R)
++            s = _scratch(R)
++            out = torch.empty((R, D), dtype=torch.float32, device="cuda")
++            cfg = _cfg(R)
++            ts = Exl3Scratch(SimpleNamespace(dims=D, width=NI, count=E), R, TOPK + 1, device="cuda")
++
++            def ours(inp=inp, s=s, out=out, R=R, cfg=cfg):
++                g53_experts.routed(inp.x, inp.pick, inp.wts, ex, s, out, R, LIMIT, cfg)
++
++            def tfk(inp=inp, R=R, ts=ts):
++                _tf(ex, inp, R, ts, sync=False)
++
++            row = {"g53": _time(ours), "tensorfold": _time(tfk)}
++            if lib is not None:
++                ms = []
++                for _ in range(5):
++                    _their_ffn(lib, inp.codes, inp.scales, inp.pick_np, inp.wts_np, cfg, ms)
++                row["glm53f_rank_gpu"] = float(np.median(ms[2:]))
++            res[f"{name} R{R} {kind}"] = row
++            print(f"[times, ms a call] {name} R{R} {kind}: {row}")
++    path = os.environ.get("TF_G53_TIMES")
++    if path:
++        old = json.loads(Path(path).read_text()) if Path(path).exists() else {}
++        old.update(res)
++        Path(path).write_text(json.dumps(old, indent=1))
+diff --git a/tests/glm_g53_reference.py b/tests/glm_g53_reference.py
+new file mode 100644
+index 0000000..1d1778e
+--- /dev/null
++++ b/tests/glm_g53_reference.py
+@@ -0,0 +1,252 @@
++"""A CPU reference of glm53f-afd's large-M expert arithmetic as g53_rank.cu runs it (TF_GLM_EXPERT_KERNEL=g53; expert
++prompt kernels from glm53f-afd, written by Hugh Madden (@dangerm00se, github.com/hughmadden), glm53f-afd @ 91db3cc,
++MIT, Copyright (c) 2026 Turquoise Bay AI Pty Ltd): the documented math, shared by tests/test_glm_g53_kernel.py (CPU)
++and tests/cuda/test_glm_g53_kernel.py (GPU).
++
++Per row and routed slot s (expert e, weight w), one TP2 half (gate/up 4096 -> 1024 channels, down 1024 -> 4096):
++1. rotation, once a row (a layer whose experts share one gate/up suh; else the same values per (row, matrix)): per
++   128-block, x (BF16 widened to FP32) * suh in FP32, fwht128 (the kernels' lane butterfly, FP32), * 1/sqrt(128) in
++   FP32, rounded to FP16;
++2. gate and up: Z = X_h @ W_q (FP16 x FP16 products, FP32 sums; one K split: one MMA chain over ascending k tiles);
++3. epilogue, per 128-block: (0 + Z) (the splits in order), fwht128, * 1/sqrt(128) then * svh in FP32, the reference
++   model's BF16 SwiGLU (gate min(bf16(g), limit), up clamp(bf16(u), +-limit), bf16(bf16(silu(g)) * u)), * down suh,
++   fwht128, * 1/sqrt(128), FP16: X_d;
++4. down: Z_d = X_d @ W_q(down) (FP32 sums, one K split);
++5. reduce, per 128-block, slots in order 0..7: acc = acc + w * ((fwht128(0 + Z_d) * 1/sqrt(128)) * svh_d), FP32, each
++   multiply and add rounded on its own (built with --fmad=false). The half's row is acc (FP32).
++Steps 1, 3 and 5 are emulated here bit for bit (IEEE float32 / float16 / bfloat16 roundings in the same order; expf is
++the CPU's, which may differ from CUDA's in the last place); the matrix products are exact float64 sums rounded once to
++float32 (the MMA chain's order is the hardware's). ``exact=True`` runs everything in float64 with no rounding, for the
++dense-math check.
++"""
++
++from __future__ import annotations
++
++import numpy as np
++
++H, WID, E, TOPK, HAD = 4096, 1024, 288, 8, 128
++HAD_SCALE = np.float32(1.0 / np.sqrt(128.0))     # 1 / sqrt(128) as float32, the kernels' HAD_SCALE constant
++
++# glm53f-rank's layer image layout at the two-rank width (G53R_WID 1,024), byte offsets in
++# an expert's block: the GPU test builds glm53f-rank's own image from the same tensors with it.
++TRELLIS = H * WID // 2
++OFF_GATE_T, OFF_UP_T, OFF_DOWN_T = 0, TRELLIS, 2 * TRELLIS
++OFF_SUH_G = 3 * TRELLIS
++OFF_SUH_U = OFF_SUH_G + 2 * H
++OFF_SVH_G = OFF_SUH_U + 2 * H
++OFF_SVH_U = OFF_SVH_G + 2 * WID
++OFF_SUH_D = OFF_SVH_U + 2 * WID
++OFF_SVH_D = OFF_SUH_D + 2 * WID
++EXPERT_BYTES = OFF_SVH_D + 2 * H                 # 6,322,176 (exl3_rank.cu's static_assert for TP2)
++
++
++def fwht128(v: np.ndarray) -> np.ndarray:
++    """The kernels' fwht128 on [..., 128] in float32, op for op: lane L holds values 4L..4L+3; strides 1 and 2 in
++    registers, then 4..64 across lanes (lane & m: o - v, else v + o)."""
++
++    v = np.asarray(v, dtype=np.float32)
++    shape = v.shape
++    v = v.reshape(*shape[:-1], 32, 4)
++    a, b = v[..., 0] + v[..., 1], v[..., 0] - v[..., 1]
++    c, d = v[..., 2] + v[..., 3], v[..., 2] - v[..., 3]
++    v = np.stack([a + c, b + d, a - c, b - d], axis=-1)
++    lane = np.arange(32)
++    for m in (1, 2, 4, 8, 16):
++        o = v[..., lane ^ m, :]
++        v = np.where(((lane & m) != 0)[:, None], o - v, v + o)
++    return v.reshape(shape).astype(np.float32)
++
++
++def blocks(f, v: np.ndarray) -> np.ndarray:
++    """``f`` on every 128-block of the last axis."""
++
++    shape = v.shape
++    return f(v.reshape(*shape[:-1], shape[-1] // HAD, HAD)).reshape(shape)
++
++
++def bf16r(x: np.ndarray) -> np.ndarray:
++    """float32 -> bfloat16 (round to nearest even) -> float32, as __float2bfloat16_rn (finite values)."""
++
++    u = np.asarray(x, dtype=np.float32).view(np.uint32).astype(np.uint64)
++    u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000
++    return u.astype(np.uint32).view(np.float32)
++
++
++def e4m3(code: np.ndarray) -> np.ndarray:
++    """E4M3 (FN) codes to float32, exactly (glm53f-rank's e4m3; NaN codes are the caller's to avoid)."""
++
++    c = np.asarray(code, dtype=np.uint32)
++    e, m = (c >> 3) & 0xF, c & 7
++    mag = np.where(e > 0, np.ldexp(1.0 + m / 8.0, e.astype(np.int64) - 7), m * 2.0 ** -9)
++    return np.where(c & 0x80, -mag, mag).astype(np.float32)
++
++
++def fp8_rows(rows: int, rng: np.random.Generator, std: float = 1.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
++    """(codes uint8 [rows, H], UE8M0 scale bytes uint8 [rows, H / 32], values float32 [rows, H]): normal rows
++    quantized as the wire's FP8 rows (a UE8M0 scale 2^ceil(log2(amax / 448)) a 32-value block, E4M3 codes rounded to
++    nearest even), whose values (code * 2^(byte - 127)) are exactly BF16 values: glm53f-rank (FP8 rows in) and the
++    port (BF16 rows in) then see the same numbers. No NaN code."""
++
++    import torch
++
++    x = (rng.standard_normal((rows, H)) * std).astype(np.float32).reshape(rows, H // 32, 32)
++    amax = np.maximum(np.abs(x).max(-1), np.float32(2.0 ** -100))
++    e = np.ceil(np.log2(amax / 448.0)).astype(np.int64)
++    q = (x * np.ldexp(1.0, -e)[..., None]).astype(np.float32)                    # |q| <= 448, exact
++    codes = torch.from_numpy(q.reshape(rows, H)).to(torch.float8_e4m3fn).view(torch.uint8).numpy().copy()
++    scales = (e + 127).astype(np.uint8)
++    vals = e4m3(codes) * np.ldexp(1.0, e).repeat(32, axis=1).astype(np.float32)
++    return codes, scales, vals.astype(np.float32)
++
++
++def plan(pick8: np.ndarray, gr: int) -> tuple[list[tuple[int, int, int]], np.ndarray, np.ndarray, np.ndarray]:
++    """glm53f-rank's plan: (groups [(expert, start, count)], pair_row, pair_route, inverse). Pairs of expert e occupy
++    [base[e], base[e] + cnt[e]) in ascending expert order, cut into groups of at most ``gr``; within an expert the
++    kernel's order follows its atomics (here: route order), which cannot change a value."""
++
++    ids = np.asarray(pick8, dtype=np.int64)[:, :TOPK].reshape(-1)
++    routes = ids.size
++    cnt = np.bincount(ids, minlength=E)
++    base = np.concatenate([[0], np.cumsum(cnt)[:-1]])
++    order = np.argsort(ids, kind="stable")               # route order within an expert
++    pair_route = order.astype(np.int64)
++    pair_row = pair_route // TOPK
++    inverse = np.empty(routes, dtype=np.int64)
++    inverse[pair_route] = np.arange(routes)
++    groups = [(e, int(base[e]) + k * gr, int(min(gr, cnt[e] - k * gr)))
++              for e in range(E) for k in range((int(cnt[e]) + gr - 1) // gr)]
++    return groups, pair_row, pair_route, inverse
++
++
++def max_groups(rows: int, gr: int) -> int:
++    """glm53f-rank's bound: routes / gr full groups plus one partial group a distinct expert, at most the routes."""
++
++    routes = rows * TOPK
++    return min(routes, routes // gr + min(routes, E))
++
++
++def rotate(x: np.ndarray, suh: np.ndarray, *, exact: bool = False) -> np.ndarray:
++    """Step 1: X_h [R, K] (FP16 values as float32, or float64 when ``exact``) from rows x [R, K] and suh [K]."""
++
++    if exact:
++        from tensorfold.cuda.exl3 import format as fmt
++
++        return fmt.rotate(np.asarray(x, np.float64) * np.asarray(suh, np.float64), -1)
++    v = np.asarray(x, np.float32) * np.asarray(suh, np.float16).astype(np.float32)
++    v = blocks(fwht128, v) * HAD_SCALE
++    return v.astype(np.float16).astype(np.float32)
++
++
++def matmul(a: np.ndarray, w: np.ndarray, *, exact: bool = False) -> np.ndarray:
++    """Steps 2 and 4: a @ w with exact float64 sums, rounded once to float32 (float64 kept when ``exact``)."""
++
++    out = np.asarray(a, np.float64) @ np.asarray(w, np.float64)
++    return out if exact else out.astype(np.float32)
++
++
++def epilogue(zg: np.ndarray, zu: np.ndarray, svh_g, svh_u, suh_d, limit: float = 10.0, *, bf16: bool = True,
++             exact: bool = False) -> np.ndarray:
++    """Step 3: X_d [P, N] from one split's gate and up sums [P, N] and the pair's svh_g, svh_u, suh_d [P or 1, N]."""
++
++    if exact:
++        from tensorfold.cuda.exl3 import format as fmt
++
++        gg = fmt.rotate(np.asarray(zg, np.float64), -1) * np.asarray(svh_g, np.float64)
++        uu = fmt.rotate(np.asarray(zu, np.float64), -1) * np.asarray(svh_u, np.float64)
++        gg, uu = np.minimum(gg, limit), np.clip(uu, -limit, limit)
++        act = gg / (1.0 + np.exp(-gg)) * uu
++        return fmt.rotate(act * np.asarray(suh_d, np.float64), -1)
++    f32 = np.float32
++    lim = f32(limit)
++    gv = blocks(fwht128, f32(0) + np.asarray(zg, f32))
++    uv = blocks(fwht128, f32(0) + np.asarray(zu, f32))
++    gg = (gv * HAD_SCALE) * np.asarray(svh_g, np.float16).astype(f32)
++    uu = (uv * HAD_SCALE) * np.asarray(svh_u, np.float16).astype(f32)
++    with np.errstate(over="ignore"):
++        if bf16:
++            gg = np.minimum(bf16r(gg), lim)
++            uu = np.minimum(np.maximum(bf16r(uu), -lim), lim)
++            act = bf16r(bf16r(gg / (f32(1) + np.exp(-gg))) * uu)
++        else:
++            gg = np.minimum(gg, lim)
++            uu = np.minimum(np.maximum(uu, -lim), lim)
++            act = gg / (f32(1) + np.exp(-gg)) * uu
++    v = act.astype(f32) * np.asarray(suh_d, np.float16).astype(f32)
++    v = blocks(fwht128, v) * HAD_SCALE
++    return v.astype(np.float16).astype(f32)
++
++
++def reduce(zd: np.ndarray, svh_d: np.ndarray, w: np.ndarray, *, exact: bool = False) -> np.ndarray:
++    """Step 5: one row's [H] from its 8 slots' down sums zd [8, H], their svh_d [8, H] and weights w [8]."""
++
++    if exact:
++        from tensorfold.cuda.exl3 import format as fmt
++
++        y = fmt.rotate(np.asarray(zd, np.float64), -1) * np.asarray(svh_d, np.float64)
++        return (np.asarray(w, np.float64)[:, None] * y).sum(0)
++    f32 = np.float32
++    acc = np.zeros(zd.shape[-1], dtype=f32)
++    for s in range(zd.shape[0]):
++        v = blocks(fwht128, f32(0) + np.asarray(zd[s], f32))
++        t = (v * HAD_SCALE) * np.asarray(svh_d[s], np.float16).astype(f32)
++        acc = acc + f32(w[s]) * t
++    return acc
++
++
++def ffn(x: np.ndarray, pick8: np.ndarray, w8: np.ndarray, layer: dict, limit: float = 10.0, *, bf16: bool = True,
++        exact: bool = False, rowrot: bool = True) -> np.ndarray:
++    """The half's rows [R, H] (float32; float64 when ``exact``) for rows x [R, H] (BF16 values), routes pick8 / w8
++    [R, 8], and ``layer``: per expert id, a dict of numpy arrays: wg, wu [H, N] and wd [N, H] (W_q, decoded), suh_g,
++    suh_u [H], svh_g, svh_u, suh_d [N], svh_d [H]. ``rowrot``: one rotation a row with expert pick8[0, 0]'s gate suh
++    (the layer's shared vector; the per-(row, matrix) rotation gives the same values when the vectors are equal)."""
++
++    R = x.shape[0]
++    out = np.zeros((R, x.shape[1]), dtype=np.float64 if exact else np.float32)
++    for r in range(R):
++        zd, svh, ws = [], [], []
++        for s in range(TOPK):
++            L = layer[int(pick8[r, s])]
++            xg = rotate(x[r:r + 1], L["suh_g"], exact=exact)
++            xu = xg if rowrot else rotate(x[r:r + 1], L["suh_u"], exact=exact)
++            zg, zu = matmul(xg, L["wg"], exact=exact), matmul(xu, L["wu"], exact=exact)
++            xd = epilogue(zg, zu, L["svh_g"], L["svh_u"], L["suh_d"], limit, bf16=bf16, exact=exact)
++            zd.append(matmul(xd, L["wd"], exact=exact)[0])
++            svh.append(L["svh_d"])
++            ws.append(w8[r, s])
++        out[r] = reduce(np.stack(zd), np.stack(svh), np.asarray(ws, np.float32 if not exact else np.float64),
++                        exact=exact)
++    return out
++
++
++def dense(x: np.ndarray, pick8: np.ndarray, w8: np.ndarray, weights: dict, limit: float = 10.0) -> np.ndarray:
++    """The same half's rows in float64 from the dense weights W = diag(suh) H W_q H diag(svh) (``weights``: per expert
++    id, gate, up [H, N], down [N, H] from tensorfold.cuda.exl3.format.dequantize) and an FP32-free SwiGLU."""
++
++    out = np.zeros(x.shape, dtype=np.float64)
++    for r in range(x.shape[0]):
++        for s in range(TOPK):
++            Wg, Wu, Wd = weights[int(pick8[r, s])]
++            g = np.minimum(x[r].astype(np.float64) @ Wg, limit)
++            u = np.clip(x[r].astype(np.float64) @ Wu, -limit, limit)
++            out[r] += float(w8[r, s]) * ((g / (1.0 + np.exp(-g)) * u) @ Wd)
++    return out
++
++
++def rank_image(gate: list, up: list, down: list, suh_g, suh_u, svh_g, svh_u, suh_d, svh_d) -> np.ndarray:
++    """glm53f-rank's two-rank layer image (uint8 [E * EXPERT_BYTES]) from the same per-expert tensors as numpy arrays:
++    trellis int16 gate / up [256, 64, 64], down [64, 256, 64]; fp16 suh_g, suh_u, svh_d [E, H], svh_g, svh_u, suh_d
++    [E, WID]. The trellis bytes are copied as they are (the slicer's tile columns / rows of the checkpoint)."""
++
++    n = len(gate)
++    img = np.zeros(n * EXPERT_BYTES, dtype=np.uint8)
++    for e in range(n):
++        b = img[e * EXPERT_BYTES:(e + 1) * EXPERT_BYTES]
++        for off, t, size in ((OFF_GATE_T, gate[e], TRELLIS), (OFF_UP_T, up[e], TRELLIS), (OFF_DOWN_T, down[e], TRELLIS),
++                             (OFF_SUH_G, suh_g[e], 2 * H), (OFF_SUH_U, suh_u[e], 2 * H),
++                             (OFF_SVH_G, svh_g[e], 2 * WID), (OFF_SVH_U, svh_u[e], 2 * WID),
++                             (OFF_SUH_D, suh_d[e], 2 * WID), (OFF_SVH_D, svh_d[e], 2 * H)):
++            raw = np.ascontiguousarray(t).view(np.uint8).reshape(-1)
++            if raw.size != size:
++                raise ValueError(f"expert {e}: a part of {raw.size} bytes where the layout has {size}")
++            b[off:off + size] = raw
++    return img
+diff --git a/tests/test_glm_g53_kernel.py b/tests/test_glm_g53_kernel.py
+new file mode 100644
+index 0000000..d5bbe75
+--- /dev/null
++++ b/tests/test_glm_g53_kernel.py
+@@ -0,0 +1,436 @@
++"""glm53f-afd's large-M expert kernels in the AFD expert node (TF_GLM_EXPERT_KERNEL=g53; families/glm5_next/cuda/
++g53_rank.cu and g53_experts.py; expert prompt kernels from glm53f-afd, written by Hugh Madden (@dangerm00se,
++github.com/hughmadden), glm53f-afd @ 91db3cc, MIT, Copyright (c) 2026 Turquoise Bay AI Pty Ltd). CPU only:
++
++- the documented arithmetic (tests/glm_g53_reference.py): the kernels' butterfly is the 128-point Hadamard transform;
++  the whole pipeline (row rotation, gate/up, epilogue, down, slot reduce) in float64 is the dense math of
++  diag(suh) H W_q H diag(svh) with GLM's clamped SwiGLU, and with the kernels' FP16 / BF16 / FP32 roundings stays
++  within their rounding error of it; FP8 test rows are exact BF16 values;
++- glm53f-rank's plan and its group bound, its large-M default configuration, its two-rank image layout;
++- the switch: names, defaults and refusals; unset, the expert node's every call is the one before (no hook, the same
++  calls); set, only prompt chunks (MODE_CHUNK, MODE_SLICE, MODE_PAIR forwards) of at least the threshold's rows on
++  in-scope layers take the kernels, decode windows never; the node refuses a bad value before the load; the scratch
++  shares the node's prompt scratch.
++The GPU test (tests/cuda/test_glm_g53_kernel.py) checks the CUDA kernels against glm53f-rank's own build.
++"""
++
++from __future__ import annotations
++
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++
++from tensorfold.cuda.exl3 import experts as generic
++from tensorfold.cuda.exl3 import format as fmt
++from tensorfold.families.glm5_next.cuda import g53_experts
++from tests import glm_g53_reference as ref
++
++ENVS = (g53_experts.ENV, g53_experts.ROWS_ENV, g53_experts.ROWROT_ENV, g53_experts.ORDER_ENV)
++
++
++@pytest.fixture(autouse=True)
++def _clean_env(monkeypatch):
++    for k in ENVS:
++        monkeypatch.delenv(k, raising=False)
++
++
++# ----------------------------------------------------------------------------------------- the documented arithmetic
++
++def test_butterfly_is_the_hadamard_transform():
++    rng = np.random.default_rng(1)
++    v = rng.standard_normal((16, 128)).astype(np.float32)
++    got = ref.fwht128(v).astype(np.float64) * float(ref.HAD_SCALE)
++    want = fmt.rotate(v.astype(np.float64), -1)
++    assert np.allclose(got, want, rtol=1e-5, atol=1e-5)
++    twice = ref.fwht128(ref.fwht128(v)).astype(np.float64) / 128.0          # H H = 128 I
++    assert np.allclose(twice, v, rtol=1e-5, atol=1e-5)
++    assert ref.fwht128(v).dtype == np.float32
++
++
++def test_bf16_rounding_and_fp8_rows_are_exact():
++    rng = np.random.default_rng(2)
++    x = rng.standard_normal(4096).astype(np.float32) * 3
++    want = torch.from_numpy(x).to(torch.bfloat16).float().numpy()
++    assert np.array_equal(ref.bf16r(x), want)
++    codes, scales, vals = ref.fp8_rows(4, rng)
++    assert codes.shape == (4, ref.H) and scales.shape == (4, ref.H // 32)
++    assert not np.any((codes & 0x7F) == 0x7F)                                    # no NaN code
++    assert np.all((scales >= 110) & (scales <= 125))                            # normal rows: 2^-17 .. 2^-2
++    back = torch.from_numpy(vals).to(torch.bfloat16).float().numpy()
++    assert np.array_equal(back, vals)                                            # every value is a BF16 value
++    blocks = np.abs(vals.reshape(4, ref.H // 32, 32)).max(-1) / np.ldexp(1.0, scales.astype(np.int64) - 127)
++    assert np.all(blocks <= 448) and np.all(blocks >= 224)                       # the scale is the block's own
++    x = rng.standard_normal((4, ref.H)).astype(np.float32)
++    assert np.abs(vals - x).max() > 0                                            # quantized, not the input
++    assert np.array_equal(ref.e4m3(np.array([0x38, 0xB8, 0x01, 0x7E], np.uint8)),
++                          np.array([1.0, -1.0, 2.0 ** -9, 448.0], np.float32))
++
++
++def _small_layer(rng, n_exp=10, K=256, N=128, shared=True):
++    """Experts K -> N (gate, up) and N -> K (down), 4-bit mcg trellises, GLM-like scale magnitudes."""
++
++    def trel(k, n):
++        return rng.integers(-32768, 32768, size=(k // 16, n // 16, 64), dtype=np.int64).astype(np.int16)
++
++    def sc(n, mag):
++        return (rng.choice([-1.0, 1.0], n) * (rng.random(n) + 0.5) * mag).astype(np.float16)
++
++    suh0 = sc(K, 1.0)
++    layer, dense = {}, {}
++    for e in range(n_exp):
++        tg, tu, td = trel(K, N), trel(K, N), trel(N, K)
++        L = {"suh_g": suh0 if shared else sc(K, 1.0), "svh_g": sc(N, 0.02), "svh_u": sc(N, 0.02),
++             "suh_d": sc(N, 1.0), "svh_d": sc(K, 0.03)}
++        L["suh_u"] = L["suh_g"] if shared else sc(K, 1.0)
++        L["wg"] = fmt.unpack(tg, 4, "mcg").astype(np.float32)
++        L["wu"] = fmt.unpack(tu, 4, "mcg").astype(np.float32)
++        L["wd"] = fmt.unpack(td, 4, "mcg").astype(np.float32)
++        layer[e] = L
++        dense[e] = (fmt.dequantize(tg, L["suh_g"], L["svh_g"], 4, "mcg"),
++                    fmt.dequantize(tu, L["suh_u"], L["svh_u"], 4, "mcg"),
++                    fmt.dequantize(td, L["suh_d"], L["svh_d"], 4, "mcg"))
++    return layer, dense
++
++
++@pytest.mark.parametrize("shared", [True, False])
++def test_pipeline_is_the_dense_math(shared):
++    rng = np.random.default_rng(3)
++    layer, dense = _small_layer(rng, shared=shared)
++    R = 3
++    x = torch.from_numpy(rng.standard_normal((R, 256)).astype(np.float32)).to(torch.bfloat16).float().numpy()
++    pick = np.stack([rng.permutation(10)[:8] for _ in range(R)])
++    w = (rng.random((R, 8)) * 0.3 + 0.05).astype(np.float32)
++    want = ref.dense(x, pick, w, dense)
++    exact = ref.ffn(x, pick, w, layer, exact=True, rowrot=shared)
++    assert np.allclose(exact, want, rtol=1e-9, atol=1e-9 * np.abs(want).max())   # the math, no rounding
++    got = ref.ffn(x, pick, w, layer, rowrot=shared)                              # the kernels' roundings
++    rel = np.linalg.norm(got - want) / np.linalg.norm(want)
++    assert got.dtype == np.float32 and 0 < rel < 2e-2
++    got32 = ref.ffn(x, pick, w, layer, bf16=False, rowrot=shared)                # FP32 SwiGLU: closer
++    assert np.linalg.norm(got32 - want) / np.linalg.norm(want) < rel
++
++
++def test_rowrot_gives_the_per_matrix_rotation_bits():
++    rng = np.random.default_rng(4)
++    layer, _ = _small_layer(rng, shared=True)
++    x = torch.from_numpy(rng.standard_normal((2, 256)).astype(np.float32)).to(torch.bfloat16).float().numpy()
++    pick = np.stack([rng.permutation(10)[:8] for _ in range(2)])
++    w = (rng.random((2, 8)) * 0.3).astype(np.float32)
++    a = ref.ffn(x, pick, w, layer, rowrot=True)
++    b = ref.ffn(x, pick, w, layer, rowrot=False)
++    assert np.array_equal(a.view(np.uint32), b.view(np.uint32))
++
++
++def test_reduce_order_is_slot_order_with_separate_roundings():
++    rng = np.random.default_rng(5)
++    zd = rng.standard_normal((8, 128)).astype(np.float32) * 50
++    svh = (rng.random((8, 128)) * 0.03).astype(np.float16)
++    w = rng.random(8).astype(np.float32)
++    got = ref.reduce(zd, svh, w)
++    acc = np.zeros(128, np.float32)
++    for s in range(8):
++        y = (ref.fwht128(np.float32(0) + zd[s]) * ref.HAD_SCALE) * svh[s].astype(np.float32)
++        acc = np.float32(acc + np.float32(w[s] * y))
++    assert np.array_equal(got.view(np.uint32), acc.view(np.uint32))
++
++
++# --------------------------------------------------------------------------------------- glm53f-rank's plan and setup
++
++def _routes(rng, R, kind):
++    if kind == "uniform":
++        return np.stack([rng.permutation(ref.E)[:8] for _ in range(R)])
++    if kind == "skewed":                                      # a few hot experts, as real routing has
++        p = 1.0 / np.arange(1, ref.E + 1) ** 1.1
++        p /= p.sum()
++        return np.stack([rng.choice(ref.E, 8, replace=False, p=p) for _ in range(R)])
++    return np.tile(np.arange(8), (R, 1))                      # every row the same 8 experts
++
++
++@pytest.mark.parametrize("R", [65, 594, 2048, 2049, 4096])
++@pytest.mark.parametrize("kind", ["uniform", "skewed", "same"])
++def test_plan_groups_every_route_once_within_the_bound(R, kind):
++    rng = np.random.default_rng(R)
++    pick = _routes(rng, R, kind)
++    for gr in (32, 64):
++        groups, pair_row, pair_route, inverse = ref.plan(pick, gr)
++        assert len(groups) <= ref.max_groups(R, gr)
++        assert ref.max_groups(R, gr) == g53_experts.max_groups(R, gr // 16)
++        assert np.array_equal(np.sort(pair_route), np.arange(R * 8))
++        assert np.array_equal(inverse[pair_route], np.arange(R * 8))
++        assert np.array_equal(pair_row, pair_route // 8)
++        start = 0
++        for e, s, c in groups:
++            assert s == start and 1 <= c <= gr and np.all(pick.reshape(-1)[pair_route[s:s + c]] == e)
++            start += c
++        assert start == R * 8
++        assert [g[0] for g in groups] == sorted(g[0] for g in groups)    # ascending expert order
++    assert g53_experts.max_groups(R) >= g53_experts.max_groups(R, 4)  # the scratch (mt 2) bounds 64-row groups too
++
++
++def test_default_cfg_is_glm53f_ranks_large_m_defaults():
++    # exl3_rank.cu g53r_default_cfg (fields mt, sk, skd, fp32_swiglu, big, nt, fuse, discard, gw, gp, plan, l2, pf, ord,
++    # pdl): rows <= 2048 {2, 1, 1, 0, 2, 2, 2, 2, 8, 0, 1, 2, 1, 1, 1};
++    # above {4, 1, 1, 0, 2, 4, 2, 2, 16, 0, 1, 1, 1, 1, 1}
++    small = g53_experts.Cfg(mt=2, sk=1, skd=1, nt=2, gw=8, l2=2, fuse=2, discard=2, swiglu=0, rot=2, gord=1)
++    large = g53_experts.Cfg(mt=4, sk=1, skd=1, nt=4, gw=16, l2=1, fuse=2, discard=2, swiglu=0, rot=2, gord=1)
++    for R in (65, 594, 2048):
++        assert g53_experts.default_cfg(R) == small
++    for R in (2049, 4096):
++        assert g53_experts.default_cfg(R) == large
++    assert g53_experts.default_cfg(100, rowrot=False, order=True).rot == 1
++    assert g53_experts.default_cfg(100, rowrot=False, order=True).gord == 2
++    for R in (1, 64, 4097):
++        with pytest.raises(ValueError):
++            g53_experts.default_cfg(R)
++
++
++def test_rank_image_layout():
++    assert ref.EXPERT_BYTES == 6322176                                           # exl3_rank.cu, TP2
++    rng = np.random.default_rng(6)
++
++    def arr(shape, dt):
++        return rng.integers(-1000, 1000, size=shape).astype(dt)
++
++    n = 2
++    gate = [arr((256, 64, 64), np.int16) for _ in range(n)]
++    up = [arr((256, 64, 64), np.int16) for _ in range(n)]
++    down = [arr((64, 256, 64), np.int16) for _ in range(n)]
++    sg, su, sd = arr((n, 4096), np.float16), arr((n, 4096), np.float16), arr((n, 4096), np.float16)
++    vg, vu, ud = arr((n, 1024), np.float16), arr((n, 1024), np.float16), arr((n, 1024), np.float16)
++    img = ref.rank_image(gate, up, down, sg, su, vg, vu, ud, sd)
++    assert img.size == n * ref.EXPERT_BYTES
++    b = img[ref.EXPERT_BYTES:]
++    assert np.array_equal(b[ref.OFF_UP_T:ref.OFF_UP_T + 16].view(np.int16), up[1].reshape(-1)[:8])
++    assert np.array_equal(b[ref.OFF_DOWN_T:ref.OFF_DOWN_T + ref.TRELLIS].view(np.int16), down[1].reshape(-1))
++    assert np.array_equal(b[ref.OFF_SVH_U:ref.OFF_SVH_U + 2048].view(np.float16), vu[1])
++    assert np.array_equal(b[ref.OFF_SVH_D:].view(np.float16), sd[1])
++
++
++# --------------------------------------------------------------------------------------------------------- the switch
++
++def test_switch_names_defaults_and_refusals(monkeypatch):
++    assert g53_experts.switch() is None
++    for v in ("", "tf", "TF", " tf "):
++        monkeypatch.setenv(g53_experts.ENV, v)
++        assert g53_experts.switch() is None
++    monkeypatch.setenv(g53_experts.ENV, "g53")
++    assert g53_experts.switch() == {"min_rows": 65, "rowrot": True, "order": False}
++    monkeypatch.setenv(g53_experts.ROWS_ENV, "2048")
++    monkeypatch.setenv(g53_experts.ROWROT_ENV, "0")
++    monkeypatch.setenv(g53_experts.ORDER_ENV, "1")
++    assert g53_experts.switch() == {"min_rows": 2048, "rowrot": False, "order": True}
++    for name, bad in ((g53_experts.ROWS_ENV, "64"), (g53_experts.ROWS_ENV, "4097"), (g53_experts.ROWS_ENV, "x"),
++                      (g53_experts.ROWROT_ENV, "on"), (g53_experts.ORDER_ENV, "2")):
++        monkeypatch.setenv(name, bad)
++        with pytest.raises(ValueError):
++            g53_experts.switch()
++        monkeypatch.delenv(name)
++    for bad in ("1", "on", "mia", "g53x"):
++        monkeypatch.setenv(g53_experts.ENV, bad)
++        with pytest.raises(ValueError, match=g53_experts.ENV):
++            g53_experts.switch()
++
++
++def _layer(cb=generic.CB_MCG, k2=8, E=288, D=4096, width=1024, device="cpu"):
++    t = torch.zeros((4,), dtype=torch.int16, device=device)
++    z = torch.zeros((E,), dtype=torch.int64, device=device)
++    k = torch.full((E,), k2, dtype=torch.int32, device=device)
++
++    def s(n):
++        return torch.zeros((E, n), dtype=torch.float16, device=device)
++
++    return generic.Exl3RoutedExperts(z, z, z, k, k, k, s(D), s(D), s(width), s(width), s(width), s(D), E, D, width, cb,
++                                     (k2, k2), (k2, k2), z, [t])
++
++
++def test_layer_scope():
++    assert g53_experts.layer_ready(_layer()) is None
++    assert "not an EXL3" in g53_experts.layer_ready(SimpleNamespace(cb=generic.CB_MCG))
++    assert "mcg" in g53_experts.layer_ready(_layer(cb=generic.CB_3INST))
++    assert "4 bits" in g53_experts.layer_ready(_layer(k2=6))
++    assert "shape" in g53_experts.layer_ready(_layer(width=2048))
++    assert "shape" in g53_experts.layer_ready(_layer(E=32))
++
++
++def test_scratch_shares_the_prompt_scratch():
++    R = 128
++    share = generic.Scratch(SimpleNamespace(dims=4096, width=1024, count=288), R, 9, device="cpu")
++    s = g53_experts.Scratch(R, "cpu", share=share)
++    cfg = g53_experts.default_cfg(R)
++    z, xd, zd, xh = s.big(R, cfg)
++    P = R * 8
++    assert z.data_ptr() == share.z.data_ptr() and xd.data_ptr() == share.xd.data_ptr()
++    assert zd.data_ptr() == share.y.data_ptr() and xh.data_ptr() == share.xg.data_ptr()
++    assert (z.numel(), xd.numel(), zd.numel(), xh.numel()) == (2 * P * 1024, P * 1024, P * 4096, R * 4096)
++    for big in (z, zd):                                   # the node's 9-slot prompt scratch holds the 8 routed slots
++        assert big.dtype == torch.float32
++    big4k = g53_experts.Scratch(2048, "cpu", share=generic.Scratch(SimpleNamespace(dims=4096, width=1024, count=288),
++                                                                    2048, 9, device="cpu"))
++    _, _, zd4, _ = big4k.big(2048, g53_experts.default_cfg(2048))
++    assert big4k._own is None and zd4.data_ptr() == big4k.share.y.data_ptr()       # 2,048 rows: shared, no new memory
++    own = g53_experts.Scratch(R, "cpu", share=SimpleNamespace(z=torch.zeros(8), y=torch.zeros(8),
++                                                              xd=torch.zeros(8).half(), xg=torch.zeros(8).half()))
++    z2, _xd2, zd2, xh2 = own.big(R, cfg)                   # too small to share: owned buffers
++    assert z2.numel() == 2 * P * 1024 and zd2.numel() == P * 4096 and xh2.dtype == torch.float16
++    assert s.gcnt.numel() == g53_experts.max_groups(R) and s.rcnt.numel() == R * 32 and int(s.gcnt.sum()) == 0
++    with pytest.raises(ValueError):
++        g53_experts.routed(torch.zeros((R + 1, 4096)), None, None, _layer(), s, None, R + 1)
++    with pytest.raises(ValueError):
++        g53_experts.routed(torch.zeros((R, 4096)), None, None, _layer(), s, None, R, limit=float("inf"))
++
++
++# ----------------------------------------------------------------------------------------------------- the expert node
++
++def _node(monkeypatch, hook=None):
++    from tensorfold.families.glm5_next.cuda import experts_node
++
++    ex = _layer()
++    node = experts_node.ExpertNode.__new__(experts_node.ExpertNode)
++    node.cfg = SimpleNamespace(hidden=4096, top_k=8, moe_width=2048, experts=288, limit=10.0)
++    node.half, node.layers, node.experts, node.by_layer = 0, [3, 4], [ex, ex], {3: ex, 4: ex}
++    node.buf = experts_node.ExpertBuffers(node.cfg, rows=8, prefill_rows=256, device="cpu")
++    if hook is not None:
++        node.g53 = hook
++    return experts_node, node
++
++
++def test_unset_compute_is_the_call_before(monkeypatch):
++    experts_node, node = _node(monkeypatch)
++    calls = []
++    monkeypatch.setattr(experts_node.exl3_generic, "routed", lambda *a, **k: calls.append(("routed", a, k)))
++    monkeypatch.setattr(experts_node.glue, "combine", lambda ey, wts, out: calls.append(("combine",)))
++    for R, prompt in ((1, False), (8, False), (65, True), (256, True)):
++        node.prompt = prompt
++        out = node.compute(3, R)
++        assert out.shape == (R, 4096)
++        (name, a, k), last = calls[-2], calls[-1]
++        # the call before: no keyword on this base; a tree that also has the EXL3 prompt kernel's switch passes the
++        # node's prompt mark as its one keyword (prompt=), which these kernels leave alone
++        assert name == "routed" and last == ("combine",) and k in ({}, {"prompt": prompt})
++        assert a[0].shape == (R, 4096) and a[1].shape == (R, 9) and a[2] is node.by_layer[3]
++        assert a[3] is node.buf.scratch(R) and a[4] == R and a[5] == 10.0
++    assert getattr(node, "g53", None) is None
++
++
++class _Hook:
++    def __init__(self, take):
++        self.take, self.seen = take, []
++
++    def takes(self, layer_i, R, prompt):
++        self.seen.append((layer_i, R, prompt))
++        return self.take
++
++    def compute(self, layer_i, R, x=None):
++        return ("g53", layer_i, R, x)
++
++
++def test_compute_dispatch(monkeypatch):
++    calls = []
++    for take in (True, False):
++        hook = _Hook(take)
++        experts_node, node = _node(monkeypatch, hook)
++        monkeypatch.setattr(experts_node.exl3_generic, "routed", lambda *a, **k: calls.append("routed"))
++        monkeypatch.setattr(experts_node.glue, "combine", lambda ey, wts, out: None)
++        node.prompt = True
++        got = node.compute(4, 100, x="landed" if take else None)
++        assert hook.seen == [(4, 100, True)]
++        if take:
++            assert got == ("g53", 4, 100, "landed") and calls == []
++        else:
++            assert calls == ["routed"] and got.shape == (100, 4096)
++
++
++def test_takes_prompt_chunks_of_in_scope_layers_only():
++    h = g53_experts.Node.__new__(g53_experts.Node)
++    h.min_rows, h.max_rows, h.ready = 65, 2048, {3: True, 4: False}
++    assert h.takes(3, 65, True) and h.takes(3, 2048, True)
++    assert not h.takes(3, 2048, False)                         # a decode window, batched or not
++    assert not h.takes(3, 64, True) and not h.takes(3, 2049, True)
++    assert not h.takes(4, 512, True) and not h.takes(7, 512, True)
++
++
++class _Done(Exception):
++    pass
++
++
++class FakeLink:
++    """forwards()'s link: a fixed list of forwards (seq, rows, mode[, span]), then _Done."""
++
++    def __init__(self, fwd):
++        self.fwd, self.pairs, self.span, self.rows = list(fwd), True, None, 0
++
++    def next_forward(self):
++        if not self.fwd:
++            raise _Done
++        seq, rows, mode, *span = self.fwd.pop(0)
++        self.span, self.rows = (span[0] if span else None), rows
++        return seq, rows, mode
++
++    def next_partner(self):
++        return (99,)
++
++    def use(self, slot):
++        pass
++
++    def land(self, pos, slots):
++        return slots
++
++    def reply(self, pos, routed):
++        pass
++
++
++def test_forwards_mark_prompt_chunks_and_the_hook_sees_the_mark(monkeypatch):
++    from tensorfold.families.glm5_next.cuda.afd import MODE_CHUNK, MODE_EAGER, MODE_PAIR, MODE_SLICE
++
++    hook = _Hook(False)
++    experts_node, node = _node(monkeypatch, hook)
++    monkeypatch.setattr(experts_node.exl3_generic, "routed", lambda *a, **k: None)
++    monkeypatch.setattr(experts_node.glue, "combine", lambda ey, wts, out: None)
++    link = FakeLink([(1, 8, MODE_EAGER), (2, 100, MODE_CHUNK), (3, 70, MODE_EAGER), (4, 64, MODE_SLICE, (1, 1)),
++                     (5, 32, MODE_PAIR), (6, 3, MODE_EAGER)])
++    with pytest.raises(_Done):
++        experts_node.forwards(node, link, store=None, rank=1)
++    assert [(R, p) for _, R, p in hook.seen] == [(8, False), (8, False), (100, True), (100, True), (70, False),
++                                                 (70, False), (64, True), (32, True), (32, True), (32, True),
++                                                 (32, True), (3, False), (3, False)]
++
++
++def test_node_refuses_a_bad_switch_before_the_load(monkeypatch):
++    from tensorfold.families.glm5_next.cuda import experts_node
++
++    loads = []
++    monkeypatch.setattr(experts_node.Config, "read", staticmethod(lambda _d: loads.append("config")))
++    monkeypatch.setattr(experts_node, "load_half", lambda *a, **k: loads.append("load"))
++    monkeypatch.setenv(g53_experts.ENV, "bogus")
++    with pytest.raises(ValueError, match=g53_experts.ENV):
++        experts_node.ExpertNode("/nowhere", 0, [3])
++    assert loads == []
++
++
++def test_node_hook_unset_and_set(monkeypatch, capsys):
++    from tensorfold.families.glm5_next.cuda import experts_node
++
++    cfg = SimpleNamespace(hidden=4096, top_k=8, moe_width=2048, experts=288, limit=10.0)
++    monkeypatch.setattr(experts_node.Config, "read", staticmethod(lambda _d: cfg))
++    monkeypatch.setattr(experts_node, "load_half",
++                        lambda _d, _h, layers, device="cuda": [_layer() if i != 5 else _layer(k2=6) for i in layers])
++    real = experts_node.ExpertBuffers
++
++    def cpu_buffers(c, rows, prefill_rows, device):
++        return real(c, rows=rows, prefill_rows=prefill_rows, device="cpu")
++
++    monkeypatch.setattr(experts_node, "ExpertBuffers", cpu_buffers)
++    node = experts_node.ExpertNode("/nowhere", 1, [3, 4, 5], prefill_rows=256)
++    assert node.g53 is None and node.prompt is False
++    monkeypatch.setenv(g53_experts.ENV, "g53")
++    monkeypatch.setenv(g53_experts.ROWS_ENV, "128")
++    node = experts_node.ExpertNode("/nowhere", 1, [3, 4, 5], prefill_rows=256)
++    assert isinstance(node.g53, g53_experts.Node) and node.g53.min_rows == 128 and node.g53.max_rows == 256
++    assert node.g53.ready == {3: True, 4: True, 5: False}
++    assert node.g53.scratch.share is node.buf.pref                  # the large buffers: the node's prompt scratch
++    line = capsys.readouterr().out
++    assert "afd expert 2: TF_GLM_EXPERT_KERNEL=g53: prompt chunks of 128-256 rows" in line
++    assert "2 of 3 MoE layers in scope" in line and "Hugh Madden" in line
++    assert "rowrot on (0 layers share one gate/up suh), order off" in line

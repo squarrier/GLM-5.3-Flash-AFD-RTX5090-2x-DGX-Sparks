@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ashhart <71890694+ashhart@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 10:37:00 +0100
+Subject: [PATCH] --name-priority resolves a local model path before naming it
+
+A model given as a relative path (`tensorfold serve .`) was named by the
+path's last segment, "" for ".", so --name-priority refused the served
+name the server actually uses. The check now resolves the path first, as
+the server does, and the background rule's comment is one line.
+
+---
+Credit: TensorFold's own commit 07f3777a4d1739534d04beaf9f14b1f6d3024472 (v0.6.6), by ashhart,
+  https://github.com/ashhart/TensorFold/commit/07f3777a4d1739534d04beaf9f14b1f6d3024472
+  (Apache-2.0, as TensorFold); carried with its authorship.
+
+ src/tensorfold/cuda/server.py    |  3 +--
+ src/tensorfold/serve_options.py  |  2 +-
+ tests/test_cuda_name_priority.py | 10 ++++++++++
+ 3 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/src/tensorfold/cuda/server.py b/src/tensorfold/cuda/server.py
+index f0e4453..0ed607b 100644
+--- a/src/tensorfold/cuda/server.py
++++ b/src/tensorfold/cuda/server.py
+@@ -567,8 +567,7 @@ class App:
+         shaped = prepared.grammar is not None or prepared.think_budget > 0
+         think_end = self.tok.token_to_id("</think>") if chat and thinking and shaped else None
+         budget = self._think_budget(prepared, think_end)
+-        # priority "background": the request's own field, else --name-priority's default for the id it asked for
+-        # (a request's own priority wins over the default); a session-title request is background either way
++        # background: the request's own priority, else --name-priority's default for its id; title requests always
+         by_name = "priority" not in body and self.reply_model(body) in getattr(self, "background_ids", ())
+         background = body.get("priority") == "background" or by_name or (chat and is_title_request(body.get("messages"), tools))
+         concurrent = getattr(self.engine, "concurrent", False)
+diff --git a/src/tensorfold/serve_options.py b/src/tensorfold/serve_options.py
+index a46e66b..3c8d9d0 100644
+--- a/src/tensorfold/serve_options.py
++++ b/src/tensorfold/serve_options.py
+@@ -16,7 +16,7 @@ def _served_name(args: argparse.Namespace) -> str:
+     from tensorfold import hub
+ 
+     model = str(args.model).rstrip("/")
+-    return model.split("/")[-1] if hub.is_repo_id(str(args.model)) else Path(model).name
++    return model.split("/")[-1] if hub.is_repo_id(str(args.model)) else Path(model).expanduser().resolve().name
+ 
+ 
+ def name_priority(args: argparse.Namespace) -> dict[str, str]:
+diff --git a/tests/test_cuda_name_priority.py b/tests/test_cuda_name_priority.py
+index 377a790..fc9e84d 100644
+--- a/tests/test_cuda_name_priority.py
++++ b/tests/test_cuda_name_priority.py
+@@ -107,6 +107,16 @@ def test_serve_options_accepts_a_valid_id(tmp_path):
+     assert _check_serve_options(args, family, "cuda") is None
+ 
+ 
++def test_serve_options_takes_the_served_name_of_a_relative_model_path(tmp_path, monkeypatch):
++    family = SimpleNamespace(title="Test family", package=SimpleNamespace(cuda_engine=lambda *a, **k: None),
++                             model_type="test")
++    model = tmp_path / "my-model"
++    model.mkdir()
++    monkeypatch.chdir(model)
++    args = SimpleNamespace(name="", alias=[], model=".", name_priority=["my-model=background"])
++    assert _check_serve_options(args, family, "cuda") is None
++
++
+ def test_serve_hands_the_background_ids_to_the_cuda_app(tmp_path, monkeypatch):
+     from tensorfold.cuda import server
+ 

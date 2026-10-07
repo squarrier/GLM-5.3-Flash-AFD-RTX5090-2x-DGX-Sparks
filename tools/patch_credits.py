@@ -13,6 +13,10 @@ usage: patch_credits.py PATCH CREDITS_TSV PUBLIC_IDENT NOTICES_ADDED
   else from a "port" row of CREDITS_TSV for that exact subject (a tests-only follow-up to a port).
 - A change of this recipe's own to her ported code (an "extends" row of CREDITS_TSV for that exact subject) must keep
   "Co-authored-by: MiaAI-Lab" too; its notes name her patches and recipe commit, and say the change is this recipe's.
+- A commit that reimplements parts of her recipe patches inside other authors' code (a "reimpl" row for that exact
+  subject) must keep "Co-authored-by: MiaAI-Lab"; its notes name the parts, her patches and recipe commit.
+- One of TensorFold's own release commits carried on top of the pinned release (an "upstream" row for that exact
+  subject) keeps its upstream author, who must be the row's; its notes name the upstream commit and release.
 - The notes go right after the "---" line: `git am` ignores them, readers see them under the message.
 Prints one summary line: kind, author, subject.
 """
@@ -29,7 +33,7 @@ def die(msg):
 
 def main():
     path, tsv, ident, added = sys.argv[1:5]
-    prs, recipes, ports, extends = {}, {}, {}, {}
+    prs, recipes, ports, extends, reimpls, upstreams = {}, {}, {}, {}, {}, {}
     for line in open(tsv, encoding="utf-8"):
         if not line.strip() or line.startswith("#"):
             continue
@@ -42,6 +46,10 @@ def main():
             ports[f[2]] = f[1]
         elif f[0] == "extends":
             extends[f[3]] = (f[1], f[2])
+        elif f[0] == "reimpl":
+            reimpls[f[4]] = (f[1], f[2], f[3])
+        elif f[0] == "upstream":
+            upstreams[f[4]] = (f[1], f[2], f[3])
     text = open(path, encoding="utf-8").read()
     head, sep, rest = text.partition("\n---\n")
     if not sep:
@@ -56,7 +64,17 @@ def main():
     subject = re.sub(r"\n ", " ", sm.group(1)) if sm else die(f"{path}: no Subject: header")
     body = head[sm.end():] if sm else ""
     notes = []
-    if author == MIA:
+    if subject in upstreams:
+        sha, release, who = upstreams[subject]
+        if author != who:
+            die(f"{path}: TensorFold's own commit {sha[:9]} must keep its author {who!r}, not {author!r}")
+        kind = f"upstream-{release}"
+        notes = [
+            f"Credit: TensorFold's own commit {sha} ({release}), by {who.split(' <')[0]},",
+            f"  https://github.com/ashhart/TensorFold/commit/{sha}",
+            "  (Apache-2.0, as TensorFold); carried with its authorship.",
+        ]
+    elif author == MIA:
         if subject not in prs:
             die(f"{path}: authored by MiaAI-Lab but not one of her pull-request commits in {tsv}: {subject!r}")
         pr, sha = prs[subject]
@@ -69,7 +87,26 @@ def main():
         if author != ident:
             die(f"{path}: author {author!r} is neither the public identity nor MiaAI-Lab")
         pm = re.search(r"MiaAI-Lab recipe patch(?:es)? ([^)]*)\)", subject)
-        if subject in extends:
+        if subject in reimpls:
+            short, patches, parts = reimpls[subject]
+            nums = re.findall(r"\b(\d{4})\b", patches)
+            if not nums:
+                die(f"{path}: no recipe patch numbers in its reimpl row")
+            if not re.search(r"^Co-authored-by: MiaAI-Lab <MiaAI-Lab@users\.noreply\.github\.com>$", body, re.M | re.I):
+                die(f"{path}: a reimplementation of MiaAI-Lab's recipe parts without 'Co-authored-by: MiaAI-Lab'")
+            if short not in recipes:
+                die(f"{path}: recipe commit {short} is not in {tsv}")
+            full, release = recipes[short]
+            kind = "reimpl"
+            notes = [
+                f"Credit: parts reimplemented from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, "
+                f"patch{'es' if len(nums) > 1 else ''} {', '.join(nums)},",
+                f"  {RECIPE_URL}",
+                f"  at commit {full} ({release}); Apache License 2.0, Copyright 2026 MiaAI-Lab.",
+                f"  The parts: {parts}.",
+                "  The rest is credited in the message; Co-authored-by: MiaAI-Lab is kept there.",
+            ]
+        elif subject in extends:
             short, patches = extends[subject]
             nums = re.findall(r"\b(\d{4})\b", patches)
             if not nums:

@@ -1,0 +1,519 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 20:44:41 -0400
+Subject: [PATCH] glm5_next/cuda: TF_GLM_PREFILL_ROWS, 4,096-row prompt chunks
+ and expert calls (MiaAI-Lab recipe patches 0004, 0008)
+
+TF_GLM_PREFILL_ROWS sets the rows a prompt chunk runs at once: a multiple of 64 from 64 to 16,384, as in the recipe;
+unset or empty, 2,048 as before. engine.py's prefill_rows_from_env reads it before GlmEngine's startup estimate, so
+that the estimate counts the chunk's rows: cuda/geometry.py's mla_geometry(prefill_rows=) and mla_chunk_scratch
+(prefill_rows=) (her geometry's parameter) size the prompt buffers, partials and token selection, the fp8 indexer
+rings and decode.Engine's ring rows follow, and the pairs' second chunk (TF_GLM_PREFILL_PAIRS, with its in-flight rows
+under TF_GLM_MCDMA_INFLIGHT) is planned at these rows. The AFD attention node reads it before the expert wire opens
+(with TF_GLM_PROMPT_GRID, which must divide it). The expert nodes size their EXL3 scratch and wire slots off the
+settings handshake's prefill_rows as before; an MCDMA mailbox that cannot carry a chunk is refused at startup
+(check_room: 36 + 68 MiB at 4,096 rows, 20 + 36 at 2,048).
+
+Unset, the estimate, the buffers and every call are the ones before. tests/test_glm_prefill_rows.py: the switch and its
+refusals; the estimate, the pairs' plan, the expert buffers and the mailbox need at 4,096 rows; KDA's chunked
+reference and the EXL3 prompt kernel's plan at 4,096 rows; and, under the Triton interpreter (or on a GPU), each
+prompt-path kernel's rows in one 4,096-row chunk against two 2,048-row chunks and in short tail chunks.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patches 0004, 0008,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 1576746a04983b6eded0551dbf22512ee9e95654 (v1.5); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |  15 +
+ src/tensorfold/cuda/geometry.py               |  23 +-
+ .../families/glm5_next/cuda/engine.py         |  29 +-
+ tests/test_glm_prefill_rows.py                | 323 ++++++++++++++++++
+ 4 files changed, 373 insertions(+), 17 deletions(-)
+ create mode 100644 tests/test_glm_prefill_rows.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index 50a0d38..5e385c9 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -443,3 +443,18 @@ only when it is not 32, and the AFD attention node reads TF_GLM_MULTI_WINDOW bef
+ 8-row stream windows (`MAX_ROWS`) keep the multi-stream drafter's 64-row updates and block passes up to eight streams,
+ so the estimate's activation term the recipe adds past four is 0 here. With `--parallel` at 4 or less and
+ TF_GLM_MULTI_WINDOW unset, tables, buffers, estimate and calls are the ones before.
++
++## GLM prompt chunk rows (TF_GLM_PREFILL_ROWS)
++
++`families/glm5_next/cuda/engine.py`'s `prefill_rows_from_env` (TF_GLM_PREFILL_ROWS: the rows a prompt chunk runs at
++once, a multiple of 64 from 64 to 16,384; 2,048 when unset) and `cuda/geometry.py`'s `mla_geometry(prefill_rows=)` and
++`mla_chunk_scratch(prefill_rows=)` (the estimate's prompt-chunk terms at the chunk's rows) are ported from MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/1576746)
++patches 0004-glm-prompt-kernels and 0008-glm-prompt-grid (her `GlmEngine` reads the switch; her geometry takes the
++rows), Apache License 2.0, Copyright 2026 MiaAI-Lab (see [the license text](LICENSES/Apache-2.0.txt)). Changes in the
++port: the engine reads the switch before its startup estimate, so that the estimate counts the chunk's buffers, the
++fp8 indexer rings and the pairs' second chunk (TF_GLM_PREFILL_PAIRS, in flight under TF_GLM_MCDMA_INFLIGHT) at these
++rows, and the AFD attention node reads it before the expert wire opens; the expert nodes size their scratch and wire
++slots off the settings handshake's `prefill_rows` as before, and an MCDMA mailbox too small for a chunk is refused at
++startup (`check_room`); a value passed as `GlmEngine(prefill_rows=)` is taken as given. Unset, the estimate, the
++buffers and the calls are the ones before.
+diff --git a/src/tensorfold/cuda/geometry.py b/src/tensorfold/cuda/geometry.py
+index bda9d16..d3acfee 100644
+--- a/src/tensorfold/cuda/geometry.py
++++ b/src/tensorfold/cuda/geometry.py
+@@ -278,7 +278,8 @@ def exl3_expert_scratch(rows: int, slots: int, d: int, width: int) -> int:
+ 
+ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560, latent: bool = False,
+                  mtp: bool | None = None, exl3_scratch: bool = True, kv: str = "bf16",
+-                 ring_rows: int | None = None, decode_rows: int | None = None) -> Geometry:
++                 ring_rows: int | None = None, decode_rows: int | None = None,
++                 prefill_rows: int = PREFILL_ROWS) -> Geometry:
+     """GLM's engine; ``mtp``: whether it holds the MTP head's caches and buffers (None: when the checkpoint has one);
+     ``kv``: the DSA caches' format (TF_GLM_KV, MiaAI-Lab's 0038): bf16 as before, or fp8, the latent rows and the
+     indexer's pooled keys as kv8 rows and the indexer's per-token keys and gates in a ring of ``mla_index_ring`` rows
+@@ -306,24 +307,24 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
+     extent += int(t.get("intermediate_size", width)) * 3 // world + int(t.get("index_n_heads", 32)) * index
+     fixed += (2 if mtp else 1) * (16 * rows * extent * 4 + 8 * rows * 16384 * 4)
+     # prompt-chunk buffers: at most 5 row extents a row without the head
+-    fixed += PREFILL_ROWS * 5 * (extent - int(t["vocab_size"]) // world)
++    fixed += prefill_rows * 5 * (extent - int(t["vocab_size"]) // world)
+     if exl3_scratch and (t.get("_quantization") or {}).get("quant_method") == "exl3":
+         # EXL3 experts' scratch (decode windows, the MTP head's, a prompt chunk) and the prompt's BF16 split-K partials
+         fixed += (2 if mtp else 1) * exl3_expert_scratch(rows, slots, d, width)
+-        fixed += exl3_expert_scratch(PREFILL_ROWS, slots, d, width) + 8 * PREFILL_ROWS * 16384 * 4
++        fixed += exl3_expert_scratch(prefill_rows, slots, d, width) + 8 * prefill_rows * 16384 * 4
+     count = attention + int(mtp)
+     lw = int(t.get("kv_lora_rank", 512))
+     if kv != "bf16" and not latent:
+         raise ValueError("TF_GLM_KV=fp8 needs the latent cache")
+-    ring_for = max(PREFILL_ROWS, rows) if ring_rows is None else int(ring_rows)
++    ring_for = max(prefill_rows, rows) if ring_rows is None else int(ring_rows)
+     def bytes_at(capacity: int) -> int:
+-        scratch = mla_chunk_scratch(t, world, capacity, latent=latent)
++        scratch = mla_chunk_scratch(t, world, capacity, latent=latent, prefill_rows=prefill_rows)
+         if latent:
+             # latent cache; a prompt chunk's partials (MLA_PROMPT_ATT_ROWS rows at a time) and absorbed rows (MTP's too)
+             cache = count * capacity * mla_row_bytes(lw, kv)
+-            dense = min(capacity, minimum_slots) + PREFILL_ROWS
+-            scratch += (((dense + 511) // 512) * min(PREFILL_ROWS, MLA_PROMPT_ATT_ROWS) * heads * (lw + 2) * 4
+-                        + 4 * PREFILL_ROWS * heads * lw)
++            dense = min(capacity, minimum_slots) + prefill_rows
++            scratch += (((dense + 511) // 512) * min(prefill_rows, MLA_PROMPT_ATT_ROWS) * heads * (lw + 2) * 4
++                        + 4 * prefill_rows * heads * lw)
+         else:
+             cache = count * capacity * heads * (kd + vd) * 2
+             scratch += (2 if mtp else 1) * ((capacity + rows + 511) // 512) * rows * heads * (kd + 2) * 4
+@@ -337,14 +338,14 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
+     return Geometry(bytes_at, reserve, minimum_slots)
+ 
+ 
+-def mla_chunk_scratch(t: dict, world: int, capacity: int, *, latent: bool) -> int:
++def mla_chunk_scratch(t: dict, world: int, capacity: int, *, latent: bool, prefill_rows: int = PREFILL_ROWS) -> int:
+     """A prompt chunk's transient bytes: token selection (fp32 pool scores, chosen pools, token lists), then sparse attention's partials."""
+ 
+     heads, topk = int(t["num_attention_heads"]) // world, int(t.get("index_topk", 2048))
+     # the fp32 pool scores of at most MLA_SELECT_ROWS rows at once, the chosen pools and token lists of the chunk's
+-    select = min(PREFILL_ROWS, MLA_SELECT_ROWS) * 4 * ((capacity + 3) // 4) + PREFILL_ROWS * 16 * (topk + 3)
++    select = min(prefill_rows, MLA_SELECT_ROWS) * 4 * ((capacity + 3) // 4) + prefill_rows * 16 * (topk + 3)
+     if latent:
+-        return select + ((topk + 515) // 512) * PREFILL_ROWS * heads * (int(t.get("kv_lora_rank", 512)) + 2) * 4
++        return select + ((topk + 515) // 512) * prefill_rows * heads * (int(t.get("kv_lora_rank", 512)) + 2) * 4
+     kd = int(t["qk_nope_head_dim"]) + int(t.get("qk_rope_head_dim", 0))
+     return select + 128 * heads * (kd + 2) * 4 * ((topk + 515) // 512)
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index e8c3d39..ff3eeca 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -296,6 +296,22 @@ def prompt_grid(prefill_rows: int, value: str | None = None, chunked: bool | Non
+     return grid
+ 
+ 
++def prefill_rows_from_env(value: str | None = None) -> int:
++    """TF_GLM_PREFILL_ROWS (MiaAI-Lab recipe patches 0004, 0008): the rows a prompt chunk runs at once, a multiple
++    of 64 from 64 to 16,384; unset or empty: ``geometry.PREFILL_ROWS`` (2,048), as before. More rows amortize each
++    chunk's expert weight decode over more tokens and cost buffer memory. Both ranks alike; under AFD the expert
++    nodes size their scratch and wire slots off the settings handshake's ``prefill_rows``, and every MCDMA mailbox
++    must carry a chunk of these rows (``Layout.mib``; the driver's REQ_MIB / REP_MIB)."""
++
++    from tensorfold.cuda.geometry import PREFILL_ROWS
++
++    value = (os.environ.get("TF_GLM_PREFILL_ROWS", "") if value is None else value).strip()
++    rows = PREFILL_ROWS if value == "" else int(value) if value.isdecimal() else -1
++    if not 64 <= rows <= 16384 or rows % 64:
++        raise ValueError(f"TF_GLM_PREFILL_ROWS: prefill rows, a multiple of 64 from 64 to 16,384, not {value!r}")
++    return rows
++
++
+ def grid_point(n: int, cut: int, grid: int) -> int | None:
+     """Where a drafted request of an n-token prompt resumed at ``cut`` keeps its prompt state, or None for nowhere.
+ 
+@@ -490,13 +506,17 @@ class GlmEngine:
+         if kv != "bf16" and not LATENT:
+             raise ValueError("TF_GLM_KV=fp8 holds the latent cache: it needs TF_GLM_LATENT=1")
+         self.kv = kv
+-        ring_rows = max(MAX_ROWS, PREFILL_ROWS if prefill_rows is None else int(prefill_rows))   # decode.Engine's
++        # rows a prompt chunk runs at once: TF_GLM_PREFILL_ROWS (both ranks alike; MiaAI-Lab recipe 0004), read before
++        # the estimate so that it counts the chunk's buffers, rings and the pairs' second chunk at these rows
++        prefill_rows = prefill_rows_from_env() if prefill_rows is None else int(prefill_rows)
++        ring_rows = max(MAX_ROWS, prefill_rows)                                                  # decode.Engine's
+         world = 1 if afd is not None else 2          # the AFD attention node holds every head and the whole draft
+         def geometry_for(text):                      # the afd attention runs no routed experts: no EXL3 scratch
+             return mla_geometry(text, world, MAX_ROWS, minimum_slots=DENSE_CAPACITY, latent=LATENT,
+                                 mtp=self.mtp_on, exl3_scratch=afd is None,
+                                 decode_rows=multi_decode_rows(parallel, self.multi_window),
+-                                **({"kv": kv, "ring_rows": ring_rows} if kv != "bf16" else {}))
++                                **({"kv": kv, "ring_rows": ring_rows} if kv != "bf16" else {}),
++                                **({"prefill_rows": prefill_rows} if prefill_rows != PREFILL_ROWS else {}))
+ 
+         from tensorfold.cuda.capacity import Geometry
+ 
+@@ -540,7 +560,6 @@ class GlmEngine:
+         capacity = self.capacity_plan["cache_slots"]
+         long_context = self.limit > cfg.dense_limit
+         # both ranks must run the same calls: refuse to start when they were given different settings
+-        prefill_rows = PREFILL_ROWS if prefill_rows is None else int(prefill_rows)
+         # TF_GLM_PROMPT_GRID=G (MiaAI-Lab recipe patch 0008; 64 under TF_GLM_KDA_CHUNKED=1, 0039): prompt chunks start
+         # on multiples of G and kept prompt states sit on them. Read before anything reaches the AFD wire
+         self.grid = prompt_grid(prefill_rows)
+@@ -1242,9 +1261,7 @@ class AfdEngine(GlmEngine):
+         prefill_pairs.enabled()                   # TF_GLM_PREFILL_PAIRS read now: a typo fails before the wire opens
+         prefill_pairs.lanes()                     # TF_GLM_PREFILL_LANES too
+         wire_fp8.enabled()                        # and TF_GLM_WIRE_FP8
+-        from tensorfold.cuda.geometry import PREFILL_ROWS
+-
+-        prompt_grid(PREFILL_ROWS)                 # TF_GLM_PROMPT_GRID / TF_GLM_KDA_CHUNKED too (0008, 0039)
++        prompt_grid(prefill_rows_from_env())      # TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID / TF_GLM_KDA_CHUNKED too
+         afd = make_afd(master, port, model_dir)   # AFD rank 0: the store lives here; the experts join
+         super().__init__(model_dir, rank=0, master=master, port=port, policy=policy, drafter=drafter,
+                          context=context, context_explicit=context_explicit, serial_only=serial_only,
+diff --git a/tests/test_glm_prefill_rows.py b/tests/test_glm_prefill_rows.py
+new file mode 100644
+index 0000000..4918e92
+--- /dev/null
++++ b/tests/test_glm_prefill_rows.py
+@@ -0,0 +1,323 @@
++"""TF_GLM_PREFILL_ROWS: 4,096-row prompt chunks and expert calls, the switch of MiaAI-Lab's recipe (patches
++0004 and 0008 read it in GlmEngine; our split engine had dropped the read), on the CPU.
++
++- The switch: unset or empty is 2,048, as before; her range (a multiple of 64 from 64 to 16,384) and her refusals.
++- What sizes off it: the estimate's prompt-chunk terms (``mla_geometry(prefill_rows=)``, default the bits before), the
++  pairs' second chunk, the expert node's buffers (the settings handshake's ``prefill_rows``), the MCDMA mailbox need
++  (``Layout.mib``: the driver's REQ_MIB / REP_MIB), the fill rows and the prompt grid.
++- Rows against chunk size, under the Triton interpreter (TRITON_INTERPRET=1, with ``test_glm_att6.bf16_dot``) and
++  the AFD release configuration's switches: a row's bits when it runs in one 4,096-row chunk against two 2,048-row chunks (``same``: the
++  same boundaries, the state between carried), and when it runs in a short tail chunk against inside the larger
++  chunk the switch makes (``tail``: a prompt of 2,048 + t rows is 2,048 + t at 2,048 rows, one chunk at 4,096).
++  ``cases`` also runs on a GPU (``test_cuda_rows``), the GPU identity step.
++- KDA's chunked form on the recipe's own fp32 reference (its CUDA kernel runs on the GPU only), and the EXL3 prompt kernel's plan
++  (her plan_kernel, modelled) at 4,096 rows: that kernel is CUDA, one fp32 chain a row (``exl3_mm.py:144-145`` in her
++  tree), so its rows' identity runs on a GPU.
++"""
++
++from __future__ import annotations
++
++import os
++import random
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from tests import test_glm_multi_afd as mafd
++
++pytestmark = pytest.mark.torch
++
++# the AFD release configuration's switches that the prompt-path kernels read per call
++RELEASE_ON = {"TF_GLM_LATENT_MMA": "1", "TF_GLM_HC_MMA": "1", "TF_GLM_SEQ_ROWS": "256", "TF_GLM_SPARSE_ONEPASS": "1",
++             "TF_GLM_PROMPT_DSA": "1", "TF_GLM_Q4_TILE": "table", "TF_GLM_LATENT_STAGES": "3",
++             "TF_GLM_KDA_WIDE_ROWS": "1", "TF_GLM_HC_DEC": "1", "TF_GLM_DECODE_SELECT": "1",
++             "TF_GLM_KDA_CHUNKED": "1"}
++
++
++# -- the switch -------------------------------------------------------------------------------------------------------
++
++def test_unset_is_2048_and_her_range(monkeypatch):
++    from tensorfold.cuda.geometry import PREFILL_ROWS
++    from tensorfold.families.glm5_next.cuda.engine import prefill_rows_from_env
++
++    monkeypatch.delenv("TF_GLM_PREFILL_ROWS", raising=False)
++    assert PREFILL_ROWS == 2048 and prefill_rows_from_env() == 2048
++    for value, rows in (("", 2048), (" ", 2048), ("2048", 2048), ("4096", 4096), ("64", 64), ("16384", 16384),
++                        (" 4096 ", 4096)):
++        monkeypatch.setenv("TF_GLM_PREFILL_ROWS", value)
++        assert prefill_rows_from_env() == rows
++        assert prefill_rows_from_env(value) == rows
++    for bad in ("4000", "32", "0", "16448", "32768", "-64", "4k", "4096.0"):
++        with pytest.raises(ValueError, match="TF_GLM_PREFILL_ROWS"):
++            prefill_rows_from_env(bad)
++
++
++def test_the_grid_and_fill_rows_take_4096():
++    from tensorfold.families.glm5_next.cuda.engine import prompt_grid
++    from tensorfold.families.glm5_next.cuda.multi import fill_rows
++
++    assert prompt_grid(4096, "", chunked=True) == 64 and prompt_grid(4096, "128") == 128
++    assert fill_rows(4096, "") == fill_rows(2048, "") == 1024                 # TF_GLM_FILL_ROWS' default unchanged
++    assert fill_rows(4096, "4096") == 4096
++    with pytest.raises(ValueError):
++        fill_rows(2048, "4096")
++
++
++def test_the_estimate_counts_the_chunk_rows():
++    """``mla_geometry``'s default is the 2,048-row estimate bit for bit; 4,096 rows grow only its prompt-chunk terms
++    (buffers, partials, selection, the rings), the same at every capacity (a fixed term), and the pairs' second chunk
++    doubles."""
++
++    from tensorfold.cuda.geometry import mla_geometry
++    from tensorfold.families.glm5_next.cuda import prefill_pairs
++
++    for kw in ({}, {"kv": "fp8", "ring_rows": 2048}):
++        base = dict(minimum_slots=2560, latent=True, mtp=False, exl3_scratch=False, decode_rows=72, **kw)
++        a = mla_geometry(mafd.GLM, 1, 8, **base)
++        b = mla_geometry(mafd.GLM, 1, 8, prefill_rows=2048, **base)
++        big = {**base, **({"ring_rows": 4096} if kw else {})}
++        c = mla_geometry(mafd.GLM, 1, 8, prefill_rows=4096, **big)
++        grow = [c.bytes_at(s) - a.bytes_at(s) for s in (2560, 262152, 727040)]
++        for slots in (2560, 262152, 727040):
++            assert a.bytes_at(slots) == b.bytes_at(slots) < c.bytes_at(slots)
++        assert min(grow) > 0 and grow[1] == grow[2]           # a fixed term once the fp8 ring is a chunk's
++    t = {"hidden_size": 4096, "hc_mult": 4}
++    for fly in ({}, {"flight": True}):
++        assert prefill_pairs.plan_bytes(t, 4096, taps=5, **fly) == 2 * prefill_pairs.plan_bytes(t, 2048, taps=5, **fly)
++
++
++def test_the_expert_node_and_the_mailboxes_size_off_the_rows():
++    """The expert node's buffers come from the handshake's ``prefill_rows`` (on the meta device here); a mailbox must
++    carry a chunk: 20 + 36 MiB at 2,048 rows, 36 + 68 MiB at 4,096 (mcdma-rpcd's req_mib / rep_mib)."""
++
++    from tensorfold.families.glm5_next.cuda import mcdma
++    from tensorfold.families.glm5_next.cuda.experts_node import ExpertBuffers
++
++    cfg = SimpleNamespace(hidden=4096, top_k=8, moe_width=2048, experts=288)
++    small = ExpertBuffers(cfg, rows=8, prefill_rows=2048, device="meta")
++    big = ExpertBuffers(cfg, rows=8, prefill_rows=4096, device="meta")
++    assert big.normed.shape == (4096, 4096) and big.routed.shape == (4096, 4096) and big.pref.rows == 4096
++    assert small.pref.rows == 2048 and big.decode.rows == small.decode.rows == 8
++    assert big.scratch(4096) is big.pref and big.scratch(8) is big.decode
++    assert big.ey(4096).shape == (4096, 9, 4096)
++    lay = mcdma.Layout(4096, 9)
++    assert lay.mib(2048) == (20, 36) and lay.mib(4096) == (36, 68)
++    assert lay.req(4096) == 33_849_600 and lay.rep(4096) == 2 * lay.rep(2048) == 67_108_864
++
++
++# -- rows against chunk size ------------------------------------------------------------------------------------------
++
++def _cmp(whole: torch.Tensor, parts: list[torch.Tensor]) -> tuple[bool, float]:
++    got = torch.cat(parts)
++    return bool(torch.equal(got, whole)), float((got.float() - whole.float()).abs().max())
++
++
++def cases(device: str = "cpu", setenv=None, *, rows: int = 4096, tails=(16, 100)) -> dict[str, tuple[bool, float]]:
++    """{path: (rows equal, max |difference|)} for each prompt-path kernel: ``same/...``: ``rows`` rows in one call
++    against two calls of ``rows // 2`` (state and caches between, as the engine carries them); ``tail{t}/...``:
++    ``half + t`` rows in one call against ``half`` then ``t``. The attention kernels whose cost grows with the
++    context (dense attention, token selection) run at 1,024 rows against 512 + 512: their sub-blocks (MLA_SELECT_ROWS,
++    MLA_PROMPT_ATT_ROWS: 512) and pool counts step the same way as 4,096 against 2,048."""
++
++    from tensorfold.families.glm5_next.cuda import forward, glue, latent, qmm, sparse
++    from tests.test_glm_att6 import _f8, _randn
++
++    setenv = setenv or os.environ.__setitem__
++    for name, value in RELEASE_ON.items():
++        setenv(name, value)
++    dev, out = device, {}
++    half = rows // 2
++
++    def splits(total: int, cut: int):
++        return [(0, cut), (cut, total)]
++
++    def run_rows(tag: str, total: int, cut: int, fn):
++        try:
++            whole = fn(0, total)
++            out[tag] = _cmp(whole, [fn(a, b) for a, b in splits(total, cut)])
++        except Exception as e:  # noqa: BLE001  (recorded: the test fails on any None)
++            print(f"{tag}: {type(e).__name__}: {e}")
++            out[tag] = (None, -1.0)
++
++    # absorb / expand (TF_GLM_LATENT_MMA), H=2 heads of 128 -> 256 latent columns
++    H, D, LW, DV = 2, 128, 256, 128
++    a = latent.AbsorbW(_randn((H, D, LW), 2, 0.05, device=dev), _randn((H, DV, LW), 3, 0.05, device=dev))
++    for tag, total, cut in [("same", rows, half)] + [(f"tail{t}", half + t, half) for t in tails]:
++        q = _randn((total, H, D), 1, device=dev)
++        v = _randn((total, H, LW), 4, device=dev)
++
++        def absorb(r0, r1, q=q):
++            o = torch.empty((r1 - r0, H, LW), dtype=torch.bfloat16, device=dev)
++            latent.absorb_q(q[r0:r1].contiguous(), a, o, prompt=True)
++            return o
++
++        def expand(r0, r1, v=v):
++            o = torch.empty((r1 - r0, H, DV), dtype=torch.bfloat16, device=dev)
++            latent.expand_v(v[r0:r1].contiguous(), a, o, prompt=True)
++            return o
++
++        run_rows(f"{tag}/absorb_mma", total, cut, absorb)
++        run_rows(f"{tag}/expand_mma", total, cut, expand)
++
++    # hyper-connections' pre pass (TF_GLM_HC_MMA), 4 streams of 512
++    S, DH = 4, 512
++    fn_w = _randn((24, S * DH), 6, 0.05, device=dev)
++    base = _randn((24,), 7, 0.1, torch.float32, device=dev)
++    scale = torch.tensor([0.5, 0.25, 0.125], device=dev)
++    norm_w = _randn((DH,), 8, 0.1, device=dev).float() + 1.0
++    for tag, total, cut in [("same", rows, half)] + [(f"tail{t}", half + t, half) for t in tails]:
++        x = _randn((total, S * DH), 5, device=dev)
++
++        def hc(r0, r1, x=x):
++            n = r1 - r0
++            bufs = (torch.empty((n, DH), dtype=torch.bfloat16, device=dev), torch.empty((n, DH // 64), device=dev),
++                    torch.empty((n, S), device=dev), torch.empty((n, S * S), device=dev),
++                    torch.zeros((n, glue.HC_BLOCKS, 32), device=dev))
++            glue.hc_pre(x[r0:r1].contiguous(), fn_w, base, scale, norm_w, *bufs, 1e-6, 1e-6, 3, prompt=True)
++            return torch.cat([bufs[0].float(), bufs[2], bufs[3]], 1)
++
++        run_rows(f"{tag}/hc_mma", total, cut, hc)
++
++    # dense prompt matmuls (TF_GLM_SEQ_ROWS=256, TF_GLM_Q4_TILE=table): bf16 and fp8 (Triton); the q4 dense weights
++    # on a GPU only (a capability-12 GPU runs them in the qmm_group CUDA kernel, group_tile 11 for every chunk past
++    # 96 rows, its split-K by shape)
++    N, K = 512, 1024
++    w = _randn((N, K), 10, 0.05, device=dev)
++    weights = {"b16": qmm.B16(weight=w.contiguous(), n=N, k=K), "f8": _f8(w)}
++    if dev != "cpu":
++        weights["q4"] = qmm.make_dense_q4(w)
++    for tag, total, cut in [("same", rows, half)] + [(f"tail{t}", half + t, half) for t in tails]:
++        xm = _randn((total, K), 9, device=dev)
++        for kind, wq in weights.items():
++            run_rows(f"{tag}/matmul_{kind}", total, cut,
++                     lambda r0, r1, xm=xm, wq=wq: qmm.matmul(xm[r0:r1].contiguous(), wq))
++
++    # one-pass sparse attention (TF_GLM_SPARSE_ONEPASS): rows over their own token lists
++    RS, HS, NC = 8, 16, 600
++    qa = _randn((RS, HS, 512), 11, device=dev)
++    cache = _randn((NC, 512), 12, device=dev).contiguous()
++    counts = torch.tensor([100, 37, 0, 64, 600, 1, 333, 512], dtype=torch.int32)
++    tokens = torch.full((RS, sparse.TOKENS), -1, dtype=torch.int32)
++    for r in range(RS):
++        pick = torch.randperm(NC, generator=torch.Generator().manual_seed(20 + r))[: int(counts[r])].sort().values
++        tokens[r, : len(pick)] = pick.to(torch.int32)
++    counts, tokens = counts.to(dev), tokens.to(dev)
++
++    def onepass(r0, r1):
++        op = torch.zeros((r1 - r0, HS, 512), dtype=torch.bfloat16, device=dev)
++        latent.sparse_onepass(qa[r0:r1].contiguous(), cache, tokens[r0:r1].contiguous(), counts[r0:r1].contiguous(),
++                              op, 0.0625)
++        return op
++
++    run_rows("same/sparse_onepass", RS, RS // 2, onepass)
++    run_rows("tail1/sparse_onepass", RS, RS - 1, onepass)
++
++    # token selection (TF_GLM_PROMPT_DSA): 1,024 rows against 512 + 512 at positions 0 and 3,072 (where the first
++    # half scores 1,024 pools and the whole chunk 2,048), the capacity's pooled keys as the forward passes them
++    NP = 4096 // sparse.POOL * 2 + 2
++    pk = _randn((NP + 2, 128), 32, device=dev)
++    for pos in (0, 3072):
++        qi = _randn((1024, 32 * 128), 30 + pos, device=dev)
++        wts = _randn((1024, 32), 31 + pos, device=dev)
++
++        def select(r0, r1, pos=pos, qi=qi, wts=wts):
++            pd = torch.tensor([pos + r0], dtype=torch.int32, device=dev)
++            tok, cnt = sparse._select_prompt(qi[r0:r1].contiguous(), wts[r0:r1].contiguous(), pk, pos + r0, r1 - r0,
++                                             NP, pd)
++            keep = torch.where(cnt[:, None] > 0, tok, torch.full_like(tok, -7))
++            return torch.cat([cnt[:, None].to(torch.int64), keep.to(torch.int64)], 1)
++
++        run_rows(f"same/select_prompt_at_{pos}", 1024, 512, select)
++
++    # dense latent attention over the first rows (TF_GLM_PROMPT_DSA's lean rows, 512-row parts): 1,024 rows against
++    # 512 + 512, and a 16-row tail; 4 heads
++    HD, lw = 4, 512
++    lc = _randn((1024 + 600, lw), 41, device=dev)
++    for tag, total, cut in (("same", 1024, 512), ("tail16", 512 + 16, 512)):
++        qa3 = _randn((total, HD, lw), 40, device=dev)
++
++        def dense(r0, r1, qa3=qa3):
++            n = r1 - r0
++            nch = latent.chunks_for(r1)
++            s = latent.LatentScratch(n, HD, nch, dev, lw=lw, part_rows=512)
++            o = torch.zeros((n, HD, lw), dtype=torch.bfloat16, device=dev)
++            starts = torch.arange(0, n, 512, dtype=torch.int32, device=dev)
++            forward.dense_attention(qa3[r0:r1].contiguous(), lc, torch.tensor([r0], dtype=torch.int32, device=dev),
++                                    s, scale=0.0625, nch=nch, out=o, hb=latent.head_block(n), starts=starts)
++            return o
++
++        run_rows(f"{tag}/dense_attention", total, cut, dense)
++    return out
++
++
++# The interpreter's outcome at 4,096 rows: every path gives a row the same bits in one chunk as in two, and in a 16-
++# or 100-row tail as inside the larger chunk
++EXPECT: dict[str, bool] = {
++    f"{tag}/{path}": True
++    for tag in ("same", "tail16", "tail100")
++    for path in ("absorb_mma", "expand_mma", "hc_mma", "matmul_b16", "matmul_f8")
++} | {k: True for k in ("same/sparse_onepass", "tail1/sparse_onepass", "same/select_prompt_at_0",
++                       "same/select_prompt_at_3072", "same/dense_attention", "tail16/dense_attention")}
++
++
++@pytest.mark.skipif(os.environ.get("TRITON_INTERPRET") != "1", reason="the Triton interpreter (TRITON_INTERPRET=1)")
++def test_interpreter_rows(monkeypatch):
++    from tests.test_glm_att6 import bf16_dot
++
++    with bf16_dot():
++        got = cases("cpu", lambda k, v: monkeypatch.setenv(k, v))
++    path = os.environ.get("TF_TEST_ROWS_JSON")
++    if path:
++        import json
++
++        with open(path, "w") as f:
++            json.dump({k: list(v) for k, v in got.items()}, f, indent=1)
++    for name, want in EXPECT.items():
++        assert got[name][0] is want, (name, got[name])
++    assert all(v[0] is not None for v in got.values()), got
++    assert all(v[1] < 0.1 for k, v in got.items() if "select_prompt" not in k), got
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
++def test_cuda_rows(monkeypatch):
++    got = cases("cuda", lambda k, v: monkeypatch.setenv(k, v))
++    path = os.environ.get("TF_TEST_ROWS_JSON")
++    if path:
++        import json
++
++        with open(path, "w") as f:
++            json.dump({k: list(v) for k, v in got.items()}, f, indent=1)
++    for name, want in EXPECT.items():
++        assert got[name][0] is want, (name, got[name])
++
++
++# -- KDA's chunked form, the EXL3 prompt plan ------------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("cut,total", [(2048, 4096), (2048, 2048 + 16), (2048, 2048 + 100)])
++def test_kda_chunked_rows_do_not_depend_on_the_chunk(cut, total):
++    """The recipe's fp32 reference of the chunked kernel: a 4,096-row chunk == 2,048 + 2,048 (the state between),
++    and a 2,048 + t chunk == 2,048 then t: every cut on the 32-row sub-chunk grid keeps the bits."""
++
++    from tests.test_glm_kda_chunked import _kc, _rows
++
++    kc = _kc()
++    q, k, v, lg, beta, state = _rows(torch, total, 1, seed=total)
++    y, S = kc.chunked_reference(q, k, v, lg, beta, state, 0, dtype=torch.float32)
++    ya, Sa = kc.chunked_reference(q[:cut], k[:cut], v[:cut], lg[:cut], beta[:cut], state, 0, dtype=torch.float32)
++    yb, Sb = kc.chunked_reference(q[cut:], k[cut:], v[cut:], lg[cut:], beta[cut:], Sa, cut, dtype=torch.float32)
++    assert torch.equal(torch.cat([ya, yb]), y) and torch.equal(Sb, S)
++
++
++@pytest.mark.parametrize("pm", (64, 128))
++@pytest.mark.parametrize("skew", (False, True))
++def test_the_prompt_plan_at_4096_rows(pm, skew):
++    """The EXL3 prompt kernel's plan (ours) is her plan_kernel's routed items at 4,096 rows too, within ``prompt_items``, which
++    the expert node's 4,096-row scratch sizes."""
++
++    from tensorfold.cuda.exl3 import experts as generic
++    from tests import test_exl3_prompt_kernel as kp
++
++    kp.test_our_plan_is_her_plans_routed_items(4096, skew, pm)
++    assert generic.prompt_items(4096, kp.SLOTS, kp.E, pm) >= generic.prompt_items(2048, kp.SLOTS, kp.E, pm)
++    random.seed(0)

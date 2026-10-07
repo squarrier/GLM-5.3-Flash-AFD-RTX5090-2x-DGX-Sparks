@@ -1,0 +1,331 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 08:46:56 -0400
+Subject: [PATCH] cuda: a stream whose delivery fails ends at once in the base
+ scheduler, TF_GLM_DELIVERY_ABORT (MiaAI-Lab recipe patch 0083)
+
+In TensorFold's base scheduler (cuda/scheduler.py), a delivery callback that raised (a broken pipe, a reset, a
+timeout) left submit with the exception while the stream decoded on into a queue nobody read, holding its lane until
+generation ended. MiaAI-Lab's recipe v1.8 ends such a stream at once with patch 0083-tfcap-delivery-abort (by
+johnwhited, after vLLM v1's generate-abort behaviour): _relay_token latches the cancel on a True return or a failure
+and skips later tokens. GLM's GlmScheduler.submit has its own loop and does not change, in the recipe too (its
+delivery failures are recipe patch 0073's, TF_GLM_QUEUED_CANCEL in this tree); on the AFD split the switch is
+therefore inert for GLM, and the CUDA server's on_tokens never raises into either loop (it keeps a failure and raises
+it after generate returns). Ported for the base scheduler's other users (TensorFold's other CUDA families), behind a
+switch of this tree's own, off by default:
+
+- cuda/scheduler.py: delivery_abort() reads TF_GLM_DELIVERY_ABORT when a Scheduler starts (0 or unset: off, 1: on,
+  anything else refused); _relay_token verbatim (its except Exception with a noqa comment); submit relays through it
+  when the switch is on, else as before.
+- engine.py: a startup line when the switch is on, saying GLM's own loop is unchanged.
+- THIRD_PARTY_NOTICES.md: "Delivery abort in the base scheduler".
+
+Unset, submit relays as before.
+
+Tests (CPU): tests/test_cuda_delivery_abort.py (9): the switch's values; unset, a failing delivery leaves submit and the
+stream decodes all its tokens; on, submit returns, the stream ends within a round or two and its lane serves the next
+request, and the failure is logged; a client that leaves (True) ends the stream either way; a reply served whole is
+unchanged either way; GlmScheduler keeps its own loop with the switch set; the relay fires once and latches.
+
+Credit: patch 0083 was written by johnwhited (https://github.com/johnwhited) in
+MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold pull request #48 (commits 2eaf324, 9d2fd5e), with vLLM v1's
+generate-abort behaviour as its reference; MiaAI-Lab applied it as contributed (merge 0cbe026, renumbered in e6bc3e0,
+v1.8 at 33b50fd), Apache License 2.0.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patch 0083,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 33b50fde06fd7ea604cbc6a663880068ab1e2ee4 (v1.8); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |  19 +++
+ src/tensorfold/cuda/scheduler.py              |  38 ++++-
+ .../families/glm5_next/cuda/engine.py         |   4 +
+ tests/test_cuda_delivery_abort.py             | 156 ++++++++++++++++++
+ 4 files changed, 216 insertions(+), 1 deletion(-)
+ create mode 100644 tests/test_cuda_delivery_abort.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index 22de6c7..d878952 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -659,3 +659,22 @@ and applied by MiaAI-Lab as contributed; the recipe credits [vLLM](https://githu
+ its `scripts/config.sh`). Changes in the port: `Waiting.foreground_count` skips TensorFold v0.6.5's `close()` stop
+ entry, which the recipe's queue never holds; the patch's unused `CapacityError` import in `multi.py` is left out;
+ `GlmScheduler.submit` runs the check before this tree's `TF_GLM_QUEUED_CANCEL` branch; a startup line names the cap.
++
++## Delivery abort in the base scheduler (TF_GLM_DELIVERY_ABORT)
++
++`cuda/scheduler.py`'s `Scheduler._relay_token` and its use in `Scheduler.submit` (a stream whose delivery callback
++raises, a broken pipe, a reset or a timeout, ends at once and frees its lane, instead of the exception leaving `submit`
++while the stream decodes on to its end) are MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/33b50fde06fd7ea604cbc6a663880068ab1e2ee4)
++patch 0083-tfcap-delivery-abort (v1.8), written by [johnwhited](https://github.com/johnwhited) in
++[pull request #48](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/48) (commits
++[`2eaf324`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/commit/2eaf32413addd3805f33dea9581dda5a0a5024b6)
++and
++[`9d2fd5e`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/commit/9d2fd5e32e2f9cf83a05f51a08ca4f440d9cf6f9))
++and applied by MiaAI-Lab as contributed; the recipe credits [vLLM](https://github.com/vllm-project/vllm) v1's
++generate-abort behaviour (Apache 2.0) as its reference. Under the recipe's Apache License 2.0 (see
++[the license text](LICENSES/Apache-2.0.txt)). Changes in the port: the recipe always relays through `_relay_token`, and
++here `submit` does only with `TF_GLM_DELIVERY_ABORT=1` (`delivery_abort`, read when the scheduler starts; unset or 0:
++the relay as before); its `except Exception` carries a `noqa` comment. GLM's `GlmScheduler.submit` has its own loop,
++which this does not change, in the recipe too (GLM's delivery failures are recipe patch 0073's,
++`TF_GLM_QUEUED_CANCEL`).
+diff --git a/src/tensorfold/cuda/scheduler.py b/src/tensorfold/cuda/scheduler.py
+index fda83ac..08bb88d 100644
+--- a/src/tensorfold/cuda/scheduler.py
++++ b/src/tensorfold/cuda/scheduler.py
+@@ -4,6 +4,7 @@
+ from __future__ import annotations
+ 
+ import itertools
++import os
+ import queue
+ import threading
+ from typing import Any, Callable
+@@ -14,6 +15,20 @@ from .memory_gate import NoRoom
+ from .streams import Stream
+ 
+ 
++def delivery_abort(value: str | None = None) -> bool:
++    """TF_GLM_DELIVERY_ABORT (MiaAI-Lab recipe patch 0083, by johnwhited; off by default here): 1, a stream whose
++    delivery callback (``emit``) raises ends at once and frees its lane (``Scheduler._relay_token``); 0 or unset, the
++    exception leaves ``submit`` and the stream decodes on until its end, as before. GLM's scheduler has its own submit
++    loop (``GlmScheduler.submit``; its delivery failures: TF_GLM_QUEUED_CANCEL, recipe patch 0073)."""
++
++    raw = os.environ.get("TF_GLM_DELIVERY_ABORT", "") if value is None else value
++    if raw.strip() in ("", "0"):
++        return False
++    if raw.strip() == "1":
++        return True
++    raise ValueError(f"TF_GLM_DELIVERY_ABORT: 0 (off, the default) or 1 (on), not {raw!r}")
++
++
+ class Waiting(queue.PriorityQueue):
+     """(stream, box) pairs in arrival order, background streams after every other."""
+ 
+@@ -65,6 +80,9 @@ class Scheduler:
+         # valve"). None queues, as every scheduler always has; a cap turns saturation into a
+         # refusal with a retry hint instead of invisible stacking.
+         self.max_in_system = max_in_system
++        # TF_GLM_DELIVERY_ABORT=1 (MiaAI-Lab recipe patch 0083, by johnwhited; off by default here): a stream whose
++        # delivery callback raises ends at once and frees its lane (``_relay_token``)
++        self.delivery_abort = delivery_abort()
+         self.waiting = Waiting()
+         self.held: tuple | None = None               # a request waiting for memory, admitted before any other
+         self.boxes: dict[int, queue.Queue] = {}
+@@ -88,6 +106,22 @@ class Scheduler:
+         if self.decoder.live() + self.waiting.foreground_count() >= self.max_in_system:
+             raise CapacityError("all serving lanes are busy; retry shortly")
+ 
++    def _relay_token(self, emit: Callable[[list[int]], bool | None], value: list[int], cancel: list[bool]) -> None:
++        # TFCAP-0076: a True return (the client left, or a stop string) or a delivery failure ends
++        # the stream. The old code let an exception escape the relay and the lane leaked until
++        # generation ended — minutes of decode into a queue nobody reads. Fires at most once per
++        # stream: cancel latches and later tokens skip the emit. The GLM submit loop's equivalent,
++        # with cleanup-before-error for its rank coordination, is patch 0073 (PR #51).
++        stop = False
++        if not cancel[0]:
++            try:
++                stop = emit(value)
++            except Exception as exc:  # noqa: BLE001  (a delivery failure ends the stream: recipe 0083)
++                print(f"[tensorfold] stream aborted: emit failed: {exc!r}", flush=True)
++                stop = True
++        if stop:
++            cancel[0] = True
++
+     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
+                emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
+                constraint: Any = None, background: bool = False, probabilities: Any = None) -> dict:
+@@ -103,7 +137,9 @@ class Scheduler:
+         while True:
+             kind, value = box.get()
+             if kind == "tokens":
+-                if not cancel[0] and emit(value):
++                if getattr(self, "delivery_abort", False):
++                    self._relay_token(emit, value, cancel)   # TF_GLM_DELIVERY_ABORT=1 (MiaAI-Lab recipe patch 0083)
++                elif not cancel[0] and emit(value):
+                     cancel[0] = True                 # the client left: the stream ends after its next round
+             elif kind == "error":
+                 raise value
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index bb4a0e3..7a94e66 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -817,6 +817,10 @@ class GlmEngine:
+                           "foreground request is refused instead of queueing (429 with Retry-After: 5 under "
+                           "TF_GLM_CAPACITY_STATUS=1, else 503; a streamed one gets the stream's error event); background "
+                           "requests still queue (MiaAI-Lab recipe patch 0082, by johnwhited)", flush=True)
++                if getattr(self.scheduler, "delivery_abort", False):
++                    print("[tensorfold] TF_GLM_DELIVERY_ABORT=1: the base scheduler ends a stream whose delivery fails "
++                          "at once (MiaAI-Lab recipe patch 0083, by johnwhited); GLM's own submit loop is unchanged (its "
++                          "delivery failures: TF_GLM_QUEUED_CANCEL, recipe patch 0073)", flush=True)
+                 if self.multi.compact_first:
+                     print("[tensorfold] TF_GLM_COMPACT_BEFORE_EVICT=1: room in the pool comes from moving extents "
+                           "together before any kept prompt is evicted, and evictions only while the free rows fall "
+diff --git a/tests/test_cuda_delivery_abort.py b/tests/test_cuda_delivery_abort.py
+new file mode 100644
+index 0000000..24490c9
+--- /dev/null
++++ b/tests/test_cuda_delivery_abort.py
+@@ -0,0 +1,156 @@
++"""MiaAI-Lab recipe patch 0083 (by johnwhited), ``TF_GLM_DELIVERY_ABORT``: in TensorFold's base scheduler, a stream
++whose delivery callback raises ends at once and frees its lane; unset, the exception leaves ``submit`` and the stream
++decodes on to its end (the lane leaks until then). CPU only: ``Scheduler`` over a stand-in decoder. GLM's scheduler
++has its own submit loop, which this switch does not touch (its delivery failures are recipe patch 0073's,
++TF_GLM_QUEUED_CANCEL)."""
++
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from tensorfold.cuda.scheduler import Scheduler, delivery_abort
++from tensorfold.families.glm5_next.cuda.multi import GlmScheduler
++
++COUNT = 40
++
++
++class Lanes:
++    """A stand-in decoder: every live stream takes one token a round and ends at its count."""
++
++    def __init__(self):
++        self.streams, self.requeue, self.rounds = {}, [], {}
++
++    def live(self):
++        return len(self.streams)
++
++    def fits(self, stream):
++        return True
++
++    def admit(self, stream):
++        stream.started = time.perf_counter()
++        self.streams[id(stream)] = stream
++
++    def round(self):
++        time.sleep(0.002)
++        done = []
++        for s in list(self.streams.values()):
++            s.take([7])
++            self.rounds[id(s)] = self.rounds.get(id(s), 0) + 1
++            if s.done:
++                done.append(s)
++        return done
++
++    def finish(self, done):
++        for s in done:
++            self.streams.pop(id(s), None)
++
++    def drop(self):
++        out = list(self.streams.values())
++        self.streams.clear()
++        return out
++
++    def stats(self, s):
++        return s.stats()
++
++
++def failing_emit(after, error=None):
++    """A delivery callback whose ``after``-th call raises ``error`` (a broken pipe); it records what it delivered."""
++
++    sent = []
++
++    def emit(new):
++        if len(sent) >= after:
++            raise error if error is not None else BrokenPipeError("the client has gone")
++        sent.append(list(new))
++        return False
++    emit.sent = sent
++    return emit
++
++
++@pytest.fixture
++def make(monkeypatch):
++    made = []
++
++    def build(cls, value):
++        monkeypatch.setenv("TF_GLM_DELIVERY_ABORT", value)
++        s = cls(Lanes(), max_streams=2)
++        made.append(s)
++        return s
++    yield build
++    for s in made:                                        # close() stops an idle worker: let streams end first
++        deadline = time.monotonic() + 5
++        while s.decoder.live() and time.monotonic() < deadline:
++            time.sleep(0.005)
++        s.close()
++
++
++def test_the_switch_reads_0_or_1():
++    assert delivery_abort("") is False and delivery_abort("0") is False and delivery_abort("1") is True
++    with pytest.raises(ValueError, match="TF_GLM_DELIVERY_ABORT"):
++        delivery_abort("on")
++
++
++def test_unset_the_failure_leaves_submit_and_the_stream_decodes_to_its_end(make):
++    s = make(Scheduler, "")
++    with pytest.raises(BrokenPipeError):
++        s.submit([1, 2], COUNT, None, True, failing_emit(3))
++    deadline = time.monotonic() + 5
++    while s.decoder.live() and time.monotonic() < deadline:
++        time.sleep(0.005)
++    assert max(s.decoder.rounds.values()) == COUNT       # every token decoded into a queue nobody read
++
++
++def test_on_the_stream_ends_at_once_and_frees_its_lane(make, capsys):
++    s = make(Scheduler, "1")
++    emit = failing_emit(3)
++    stats = s.submit([1, 2], COUNT, None, True, emit)      # no exception: the stream was ended
++    assert isinstance(stats, dict) and len(emit.sent) == 3
++    assert s.decoder.live() == 0 and max(s.decoder.rounds.values()) <= 5
++    assert "stream aborted: emit failed: BrokenPipeError" in capsys.readouterr().out
++    other = s.submit([3], 4, None, True, lambda new: False)   # the lane serves the next request
++    assert isinstance(other, dict)
++
++
++@pytest.mark.parametrize("value", ["", "1"])
++def test_a_client_that_leaves_ends_the_stream_either_way(make, value):
++    s = make(Scheduler, value)
++    calls = []
++
++    def emit(new):
++        calls.append(new)
++        return len(calls) >= 2                            # True: the client left
++    s.submit([1], COUNT, None, True, emit)
++    assert len(calls) == 2 and max(s.decoder.rounds.values()) <= 4
++
++
++def test_glms_scheduler_keeps_its_own_submit_loop(make):
++    """The switch is read by the base class but GLM's submit is its own: with it set and TF_GLM_QUEUED_CANCEL unset,
++    a delivery failure leaves GlmScheduler.submit as before (0073's loop is the one that ends such a stream)."""
++
++    s = make(GlmScheduler, "1")
++    assert s.delivery_abort is True
++    with pytest.raises(BrokenPipeError):
++        s.submit([1, 2], COUNT, None, True, failing_emit(3))
++
++
++@pytest.mark.parametrize("value", ["", "1"])
++def test_a_reply_served_whole_is_unchanged(make, value):
++    s = make(Scheduler, value)
++    got = []
++    s.submit([1], 6, None, True, lambda new: got.extend(new) or False)
++    assert got == [7] * 6
++
++
++def test_the_relay_fires_once_and_latches():
++    s = Scheduler.__new__(Scheduler)
++    cancel = [False]
++    calls = []
++
++    def emit(new):
++        calls.append(new)
++        raise ConnectionResetError("reset")
++    s._relay_token(emit, [1], cancel)
++    s._relay_token(emit, [2], cancel)
++    assert cancel == [True] and calls == [[1]]

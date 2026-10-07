@@ -1,0 +1,957 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 20:15:18 -0400
+Subject: [PATCH] glm5_next/cuda: kept prompts' states and evicted rows in host
+ RAM on the AFD attention node, TF_GLM_KEPT_HOST and TF_GLM_HOST_CACHE_GIB
+ (glm53f-afd's host RAM tier @ 91db3cc, design)
+
+Hugh Madden (@dangerm00se, github.com/hughmadden) authored the design this follows, glm53f-afd's host RAM tier, at
+glm53f-afd @ 91db3cc (https://github.com/hughmadden/glm53f-afd, MIT License, Copyright (c) 2026 Turquoise Bay AI Pty
+Ltd):
+crates/glm53f-coordinator/src/hostcache.rs, crates/glm53f-coordinator/src/scheduler.rs and docs/RUNNING.md ("KV
+snapshots and the RAM tier"). glm53f-afd's NOTICE credits the tier to Hugh Madden's mimo26f-afd, and its host cache's
+eviction design to T.J. Purtell's (@wrldsuksgo2mars, github.com/tpurtell) ds41rt. Only the design is taken; no code
+is copied.
+
+On the RTX 5090 the --parallel pool gets what TF_GLM_CACHE_GIB leaves after TF_GLM_CACHE_ENTRIES kept states (a KDA
+state and a DFlash2 window each, 0.178 GiB at world 1): at the release config (6.5 GiB, 20 kept prompts) 3.56 GiB of
+the 6.5 hold states and the pool is 727,040 tokens.
+
+- families/glm5_next/cuda/kept_host.py (new): TF_GLM_KEPT_HOST=1 moves a kept prompt's KDA states, convolution
+  windows and DFlash2 window to a slot of pinned host slabs when it is kept, and back into the stream's slot when a
+  request resumes it; the GPU reserves one state (STAGING) for a keep's copies instead of TF_GLM_CACHE_ENTRIES, so the
+  pool is 1,261,568 tokens at the release config in the same GPU bytes (TF_GLM_CACHE_GIB=8.5: 1,579,008, glm53f-afd
+  v1.0's 1.58M). TF_GLM_HOST_CACHE_GIB=G (with TF_GLM_KEPT_HOST=1): a kept prompt the pool evicts for room parks its
+  rows in pinned pages of 2,048 tokens (the rows pool.Arena.copy copies, plane by plane) with its states in their slot;
+  a request it prefixes gets a new extent with the rows copied back instead of prefilling them; parked prompts leave
+  least recently used first (pages, or TF_GLM_HOST_CACHE_ENTRIES, default 32), never the one being resumed. Every copy
+  is exact and runs on the current stream, as the device copies it replaces; a slot or page waits on its last copy's
+  event before the next, and a keep's device sources are recorded on the stream.
+- multi.py: MultiDecoder builds the tier (None when off; two ranks run without it); _keep stows, _admitted restores
+  (states, DFlash2 window, a parked prompt's rows), _resume and _kept_by_id see parked prompts after the GPU's, admit
+  places a parked prompt's resume in a new extent and never drops it meanwhile, _evict parks before it drops, _drop
+  gives the slot back, /health gains kept_host.
+- engine.py: the pool formula reserves kept_host.reserved_states (TF_GLM_CACHE_ENTRIES states, or one with the tier);
+  the settings are refused before the load off the AFD attention node, below --parallel 2, and TF_GLM_HOST_CACHE_GIB
+  without TF_GLM_KEPT_HOST=1; rank 0 prints the tier's line.
+
+Off (both unset): tier None, the pool formula's value, kept prompts, extents and calls are the ones before. On: the
+same replies, prompt chunks and kept points; only how many kept prompts survive, and where their bytes live, change.
+
+Tests: tests/test_glm_kept_host.py (CPU, 12): the switches and refusals; the pool formula (2.0's 727,040 ->
+1,261,568 at 6,780 B a token); a kept state's bytes through a slot and back (float32, bf16, the DFlash2 window); a full
+tier leaves a state on the GPU; parked rows come back as Arena.copy copies them (four lengths, a shorter cut, nothing
+else written); parked prompts leave least recently used first, never the held one, and past the count; the AFD node's
+decoder (World1 on the fake model): off and TF_GLM_KEPT_HOST=1 give the same replies, cached counts, kept prompts and
+extents, every kept state in a host slot; with TF_GLM_HOST_CACHE_GIB the three evicted prompts resume from host RAM
+(999 cached where off prefills) with the same replies; two ranks run without the tier.
+
+Credit: THIRD_PARTY_NOTICES.md ("GLM kept prompts in host RAM").
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+ THIRD_PARTY_NOTICES.md                        |  17 +
+ .../families/glm5_next/cuda/engine.py         |  12 +-
+ .../families/glm5_next/cuda/kept_host.py      | 382 ++++++++++++++++++
+ .../families/glm5_next/cuda/multi.py          |  54 ++-
+ tests/test_glm_kept_host.py                   | 272 +++++++++++++
+ 5 files changed, 726 insertions(+), 11 deletions(-)
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/kept_host.py
+ create mode 100644 tests/test_glm_kept_host.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index 5e385c9..423cf35 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -458,3 +458,20 @@ rows, and the AFD attention node reads it before the expert wire opens; the expe
+ slots off the settings handshake's `prefill_rows` as before, and an MCDMA mailbox too small for a chunk is refused at
+ startup (`check_room`); a value passed as `GlmEngine(prefill_rows=)` is taken as given. Unset, the estimate, the
+ buffers and the calls are the ones before.
++
++## GLM kept prompts in host RAM (TF_GLM_KEPT_HOST, TF_GLM_HOST_CACHE_GIB)
++
++`families/glm5_next/cuda/kept_host.py` and its call sites in `multi.py` (`_keep`, `_admitted`, `_resume`, `_evict`,
++`_drop`, `admit`, `health`) and `engine.py` (the `--parallel` pool formula) follow the design of glm53f-afd's host RAM
++tier, by Hugh Madden ([@dangerm00se](https://github.com/hughmadden)),
++[glm53f-afd](https://github.com/hughmadden/glm53f-afd) @ `91db3cc`, MIT License, Copyright (c) 2026 Turquoise Bay AI
++Pty Ltd: `crates/glm53f-coordinator/src/hostcache.rs` (page-locked slabs carved into fixed-size slots; a snapshot's
++KV rows and its positional state, the KDA recurrent states and convolution windows, in host RAM; RAM eviction least
++recently used first), `crates/glm53f-coordinator/src/scheduler.rs` (a snapshot the GPU evicts for room is stored to
++RAM first; a prompt that misses the GPU restores from RAM instead of prefilling) and `docs/RUNNING.md` ("KV snapshots
++and the RAM tier"); glm53f-afd credits mimo26f-afd's DS41RT host snapshot cache for it. Only the design is taken; no
++code is copied (glm53f-afd is Rust and CUDA; this is written on TensorFold's pool and extents). Changes: a kept
++prompt's state goes to host RAM when it is kept (glm53f-afd moves it under pressure), which gives the 5090's pool the
++bytes from startup; rows park in pages of the pool's 2,048-token alignment, per kept prompt (no page sharing between
++prefixes); the tier is only on the AFD attention node (world 1). With both switches unset, pool, kept prompts and calls
++are the ones before.
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index ff3eeca..6943a92 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -613,6 +613,10 @@ class GlmEngine:
+         # --parallel: one pool of per-token caches for every stream and kept prompt: the window's slots, plus what
+         # TF_GLM_CACHE_GIB gives kept prompts (their rows in the pool, their KDA states and DFlash2 windows beside it),
+         # whole 2,048-token extents; each stream holds up to the window (pool.py, multi.py)
++        # TF_GLM_KEPT_HOST=1 (``kept_host``, ours; glm53f-afd's host RAM tier): kept prompts' states in host RAM
++        from . import kept_host
++
++        host = kept_host.check(afd is not None, parallel)
+         pool_rows = None
+         if parallel > 1:
+             from tensorfold.cuda.capacity import config as read_config
+@@ -625,8 +629,10 @@ class GlmEngine:
+             # kept states: a KDA state and a DFlash2 window each (22 MiB a rank at two ranks, twice at world 1)
+             state = slot_bytes(text, world, rows=0) // 2 + (22 << 20) * 2 // world
+             if world == 1:                   # AFD: multi._keep bounds them by count alone; bound it by these bytes
+-                self.kept_cap = kept_most(self._cache_entries(), self.cache_bytes, state)
+-            states = (self.kept_cap or self._cache_entries()) * state
++                self.kept_cap = (max(1, self._cache_entries()) if host else
++                                 kept_most(self._cache_entries(), self.cache_bytes, state))
++            # TF_GLM_KEPT_HOST=1: the GPU keeps kept_host.STAGING states (a keep's copies), the rest go to pool rows
++            states = kept_host.reserved_states(self.kept_cap or self._cache_entries(), state, host)
+             pool_rows = (capacity + max(0, self.cache_bytes - states) // per_token) // ALIGN * ALIGN
+             if pool_rows < ALIGN:
+                 raise ValueError(f"--parallel {parallel}: a pool of {pool_rows} tokens is less than one {ALIGN}-token "
+@@ -753,6 +759,8 @@ class GlmEngine:
+                           f"TF_GLM_MULTI_GRAPHS ignored); prompt chunks between rounds; the expert nodes unchanged; "
+                           f"kept prompts at most {self.cache_entries} (what the window leaves, TF_GLM_CACHE_ENTRIES "
+                           f"{self._cache_entries()})", flush=True)
++                if getattr(self.multi, "host", None) is not None:
++                    print(f"[tensorfold] {self.multi.host.describe()}", flush=True)
+                 if self.multi.room:
+                     print("[tensorfold] TF_GLM_CACHE_ROOM=1: room in the pool comes from its free rows first (extents "
+                           "moved together), kept prompts are evicted only for rows it lacks, those no waiting request "
+diff --git a/src/tensorfold/families/glm5_next/cuda/kept_host.py b/src/tensorfold/families/glm5_next/cuda/kept_host.py
+new file mode 100644
+index 0000000..af695b7
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/kept_host.py
+@@ -0,0 +1,382 @@
++"""TF_GLM_KEPT_HOST and TF_GLM_HOST_CACHE_GIB (default off, ours): a host-RAM tier for the --parallel pool's kept
++prompts on the AFD attention node (world 1: one discrete GPU on a host with RAM to spare).
++
++The design is glm53f-afd's host RAM tier, by Hugh Madden (@dangerm00se, github.com/hughmadden), glm53f-afd @ 91db3cc
++(https://github.com/hughmadden/glm53f-afd): crates/glm53f-coordinator/src/hostcache.rs (page-locked slabs carved into
++fixed-size slots; a snapshot's KV rows plus its positional state, the KDA recurrent states and convolution windows; RAM
++eviction least recently used first), crates/glm53f-coordinator/src/scheduler.rs (a snapshot the GPU evicts for room is
++stored to RAM first, and a prompt that misses the GPU restores from RAM instead of prefilling) and docs/RUNNING.md ("KV
++snapshots and the RAM tier"); glm53f-afd took it from mimo26f-afd's DS41RT host snapshot cache (its on-evict mode).
++No code is copied: TensorFold's pool keeps a kept prompt's rows in its stream's extent (``pool.py``, ``multi.py``),
++and this is written on that pool.
++
++- **TF_GLM_KEPT_HOST=1**: a kept prompt's KDA states, convolution windows and DFlash2 window (0.178 GiB for
++  GLM-5.3-Flash at world 1: 34 KDA layers x 64 heads of 128 x 128 FP32 states are 136 MiB of it) go to a slot of
++  pinned host slabs when the prompt is kept (``MultiDecoder._keep``), and back into the stream's slot when a request
++  resumes it (``MultiDecoder._admitted``). The GPU holds none of them, so ``GlmEngine`` gives TF_GLM_CACHE_GIB to
++  pool rows instead of reserving TF_GLM_CACHE_ENTRIES states (``STAGING`` stays for a keep's device copies before
++  they reach the host), and the count of kept prompts is TF_GLM_CACHE_ENTRIES, no longer bounded by GPU bytes. At
++  the release config (6.5 GiB, 20 kept prompts) that is 1,261,568 pool tokens instead of 727,040 in the same GPU memory. glm53f-afd keeps a
++  snapshot's state on the GPU until pressure moves it; here it moves when taken, which gives the pool its size from
++  startup on, for one 0.18 GiB copy each way (about 7 ms each at the 5090's PCIe Gen5 x8).
++- **TF_GLM_HOST_CACHE_GIB=G** (with TF_GLM_KEPT_HOST=1): a kept prompt that rank 0 evicts for room (``_evict``: a
++  new extent, a growing one, a requeue or a stream's home rows need its rows) first parks its rows in pages of
++  ``PAGE`` tokens carved from G GiB of pinned slabs (a page holds those tokens' rows of every pool plane, the rows
++  ``pool.Arena.copy`` copies), with its states in their slot. A request whose prompt it prefixes (``_resume``; at
++  equal length a kept prompt on the GPU wins) gets a new extent, the parked rows copied into it (ADMIT's copy) and the
++  states as from a kept prompt; the parked prompt stays parked. Parked prompts leave least recently used first when
++  the pages run out or past TF_GLM_HOST_CACHE_ENTRIES (default ``HOST_ENTRIES``); the one being resumed never.
++
++Every copy is exact (bytes, no arithmetic) and runs on the current CUDA stream, as the device copies it replaces did
++(``take_snapshot``'s clones, ``Arena.copy``), so it is ordered with the forwards that wrote or read those rows; the
++host never waits on it. A slot or page records an event after each copy and the next copy that touches it waits on
++that event, so a slot is never rewritten while another stream still reads it, and a device source a keep frees is
++recorded on the stream (``record_stream``). Replies, prompt chunks, kept points and kernel calls do not change, only
++how many kept prompts survive and where their bytes live (a resume from host RAM is the resume from the kept prompt it
++was, byte for byte). Off (both unset) nothing here runs and ``GlmEngine``'s pool is the one before.
++"""
++
++from __future__ import annotations
++
++import os
++
++import torch
++
++from .pool import ALIGN
++
++SLAB = 1 << 30            # bytes a pinned slab holds; whole slots are carved from each (hostcache.rs's SLAB_BYTES)
++PAGE = ALIGN              # tokens a page of parked rows holds: an extent's alignment, so a page splits no pool row
++STAGING = 1               # kept states the GPU holds for a moment under TF_GLM_KEPT_HOST (a keep's copies)
++HOST_ENTRIES = 32         # TF_GLM_HOST_CACHE_ENTRIES unset: parked prompts at most
++_ALIGN_BYTES = 256        # every tensor a slot holds starts on this
++
++
++def _up(n: int, align: int = _ALIGN_BYTES) -> int:
++    return -(-int(n) // align) * align
++
++
++def _bytes(t: torch.Tensor) -> int:
++    return t.numel() * t.element_size()
++
++
++def _typed(raw: torch.Tensor, dtype, shape) -> torch.Tensor:
++    return raw.view(dtype).view(shape)
++
++
++def enabled(value: str | None = None) -> bool:
++    """TF_GLM_KEPT_HOST: 0 (off, the default) or 1 (on)."""
++
++    value = (os.environ.get("TF_GLM_KEPT_HOST", "") if value is None else value).strip().lower()
++    if value in ("", "0", "off"):
++        return False
++    if value in ("1", "on"):
++        return True
++    raise ValueError(f"TF_GLM_KEPT_HOST: 0 (off) or 1 (on), not {value!r}")
++
++
++def cache_gib(value: str | None = None) -> float:
++    """TF_GLM_HOST_CACHE_GIB: GiB of pinned host RAM for parked prompts' rows; 0 or unset: none (no parking)."""
++
++    raw = (os.environ.get("TF_GLM_HOST_CACHE_GIB", "") if value is None else value).strip()
++    if raw == "":
++        return 0.0
++    try:
++        gib = float(raw)
++    except ValueError:
++        gib = -1.0
++    if not 0 <= gib <= 4096:
++        raise ValueError(f"TF_GLM_HOST_CACHE_GIB: GiB of host RAM from 0 (off) to 4096, not {raw!r}")
++    return gib
++
++
++def host_entries(value: str | None = None) -> int:
++    """TF_GLM_HOST_CACHE_ENTRIES: parked prompts at most (default ``HOST_ENTRIES``), 1 or more."""
++
++    raw = (os.environ.get("TF_GLM_HOST_CACHE_ENTRIES", "") if value is None else value).strip()
++    if raw == "":
++        return HOST_ENTRIES
++    if not raw.isdecimal() or int(raw) < 1:
++        raise ValueError(f"TF_GLM_HOST_CACHE_ENTRIES: a count of 1 or more, not {raw!r}")
++    return int(raw)
++
++
++def check(afd: bool, parallel: int) -> bool:
++    """The settings, read before anything loads: whether the tier is on. It needs the AFD attention node and
++    --parallel's pool; TF_GLM_HOST_CACHE_GIB needs TF_GLM_KEPT_HOST=1."""
++
++    on = enabled()
++    gib = cache_gib()
++    host_entries()
++    if gib > 0 and not on:
++        raise ValueError("TF_GLM_HOST_CACHE_GIB parks evicted prompts with their states in host RAM: it needs "
++                         "TF_GLM_KEPT_HOST=1")
++    if on and not afd:
++        raise ValueError("TF_GLM_KEPT_HOST=1 is for the AFD attention node (--experts remote); a GB10's host memory "
++                         "is its GPU's")
++    if on and parallel < 2:
++        raise ValueError("TF_GLM_KEPT_HOST=1 keeps --parallel's kept prompts in host RAM: run with --parallel 2 or more")
++    return on
++
++
++def reserved_states(entries: int, state: int, on: bool) -> int:
++    """Bytes of kept states the pool formula leaves the GPU (``GlmEngine``): ``entries`` of them, or with
++    TF_GLM_KEPT_HOST only ``STAGING``."""
++
++    return (STAGING if on else int(entries)) * int(state)
++
++
++class Slots:
++    """Fixed-size byte slots carved from host slabs of at most ``SLAB`` bytes (pinned with CUDA; plain memory without
++    it, as in the CPU tests), and the event of each slot's last copy."""
++
++    def __init__(self, size: int, count: int, pinned: bool) -> None:
++        self.size, self.count, self.pinned = _up(size), int(count), bool(pinned)
++        per = max(1, SLAB // self.size)
++        self.slabs: list[torch.Tensor] = []
++        free = []
++        left = self.count
++        while left > 0:
++            n = min(left, per)
++            self.slabs.append(torch.empty((n * self.size,), dtype=torch.uint8, pin_memory=self.pinned))
++            free += [(len(self.slabs) - 1, j) for j in range(n)]
++            left -= n
++        self.free = free[::-1]                       # ``take`` pops the lowest slot first
++        self.events: dict = {}
++
++    def take(self):
++        return self.free.pop() if self.free else None
++
++    def give(self, slot) -> None:
++        self.free.append(slot)
++
++    def view(self, slot, offset: int, nbytes: int) -> torch.Tensor:
++        k, j = slot
++        base = j * self.size + offset
++        return self.slabs[k][base:base + nbytes]
++
++    def wait(self, slot) -> None:
++        """The current stream waits for the slot's last copy (one another stream may have queued)."""
++        ev = self.events.get(slot)
++        if ev is not None:
++            torch.cuda.current_stream().wait_event(ev)
++
++    def mark(self, slot) -> None:
++        if self.pinned:
++            ev = torch.cuda.Event()
++            ev.record()
++            self.events[slot] = ev
++
++    def nbytes(self) -> int:
++        return sum(t.numel() for t in self.slabs)
++
++
++class HostTier:
++    """The tier of one ``multi.MultiDecoder`` (the AFD attention node's; ``tier`` builds it)."""
++
++    def __init__(self, d, *, entries: int, gib: float = 0.0, parked_most: int = HOST_ENTRIES) -> None:
++        e = d.e
++        self.pinned = torch.cuda.is_available() and e.slots.rec.is_cuda
++        self.device = e.slots.rec.device
++        # a kept state at its largest (``decode.take_snapshot``, ``multi.draft_window``): one parity of a slot's KDA
++        # states, its convolution windows, and per DFlash2 context tensor its window (up to window + 1 rows)
++        shapes = [(tuple(e.slots.rec.shape[2:]), e.slots.rec.dtype), (tuple(e.slots.conv.shape[1:]),
++                                                                      e.slots.conv.dtype)]
++        contexts = getattr(getattr(d, "drafts", None), "contexts", None) or []
++        if contexts:
++            ctx = contexts[0]
++            rows = int(ctx.window) + 1
++            shapes += [((int(c.shape[0]), rows, *c.shape[2:]), c.dtype) for c in list(ctx.kc) + list(ctx.vc)]
++        self.state_bytes = sum(_up(torch.Size(s).numel() * torch.empty((), dtype=t).element_size()) for s, t in shapes)
++        self.entries = int(entries)
++        self.parked_most = int(parked_most) if gib > 0 else 0
++        # kept prompts at most, one more while ``_keep`` drops past the count, and the parked ones
++        self.states = Slots(self.state_bytes, self.entries + 1 + self.parked_most, self.pinned)
++        # TF_GLM_HOST_CACHE_GIB: pages of PAGE tokens, each those tokens' rows of every pool plane
++        self.planes = [(PAGE // p.div, tuple(p.tensor.shape[1:]), p.tensor.dtype,
++                        p.tensor[0].numel() * p.tensor.element_size()) for p in d.arena.planes]
++        self.page_bytes = sum(_up(rows * row) for rows, _, _, row in self.planes)
++        pages = int(gib * (1 << 30)) // self.page_bytes if gib > 0 else 0
++        if gib > 0 and pages < 1:
++            raise ValueError(f"TF_GLM_HOST_CACHE_GIB={gib:g}: less than one {PAGE}-token page "
++                             f"({self.page_bytes / 2 ** 20:.1f} MiB)")
++        self.pages = Slots(self.page_bytes, pages, self.pinned) if pages else None
++        self.parked: list = []                   # parked prompts (decode.Snapshot), least recently used first
++        self.hold = None                         # the parked prompt an admission resumes (never dropped meanwhile)
++        self.stats = {"stowed": 0, "restored": 0, "on_gpu": 0, "parks": 0, "unparks": 0, "dropped": 0, "missed": 0}
++
++    # -- kept states (TF_GLM_KEPT_HOST) -------------------------------------------------------------------------------
++    def stow(self, snap) -> bool:
++        """A new kept prompt's KDA states, convolution windows and DFlash2 window into a host slot; the snapshot then
++        holds the slot's views (its ring tail, MTP row and logits row stay on the GPU: a few hundred KB). False (no
++        free slot, or a window past the slot) leaves them on the GPU, as without the tier."""
++
++        tensors = [snap.rec, snap.conv] + list(snap.drafter_rows or [])
++        sizes = [_up(_bytes(t)) for t in tensors]
++        slot = self.states.take() if sum(sizes) <= self.states.size else None
++        if slot is None:
++            self.stats["on_gpu"] += 1
++            return False
++        self.states.wait(slot)
++        out, off = [], 0
++        for t, nb in zip(tensors, sizes):
++            h = _typed(self.states.view(slot, off, _bytes(t)), t.dtype, t.shape)
++            h.copy_(t, non_blocking=self.pinned)
++            if t.is_cuda:
++                t.record_stream(torch.cuda.current_stream())
++            out.append(h)
++            off += nb
++        self.states.mark(slot)
++        snap.rec, snap.conv = out[0], out[1]
++        if snap.drafter_rows is not None:
++            snap.drafter_rows = out[2:]
++        snap.host_slot = slot
++        self.stats["stowed"] += 1
++        return True
++
++    def restore(self, st, snap) -> None:
++        """A kept prompt's KDA states and convolution windows into ``st``'s slot (``_admitted``)."""
++
++        slot = getattr(snap, "host_slot", None)
++        if slot is None:                         # kept on the GPU (``stow`` returned False)
++            st.rec[st.cur[0]].copy_(snap.rec)
++            st.conv.copy_(snap.conv)
++            return
++        self.states.wait(slot)
++        st.rec[st.cur[0]].copy_(snap.rec, non_blocking=self.pinned)
++        st.conv.copy_(snap.conv, non_blocking=self.pinned)
++        self.states.mark(slot)
++        self.stats["restored"] += 1
++
++    def window(self, snap) -> list:
++        """A kept DFlash2 window where ``multi.put_draft_window`` reads it: on the device (index_copy_ takes a source
++        on its own device), copied from host RAM on the current stream."""
++
++        slot = getattr(snap, "host_slot", None)
++        if slot is None or not self.pinned:
++            return snap.drafter_rows
++        self.states.wait(slot)
++        rows = [r.to(self.device, non_blocking=True) for r in snap.drafter_rows]
++        self.states.mark(slot)
++        return rows
++
++    def release(self, snap) -> None:
++        slot = getattr(snap, "host_slot", None)
++        if slot is not None:
++            self.states.give(slot)
++            snap.host_slot = None
++
++    # -- parked prompts (TF_GLM_HOST_CACHE_GIB) -----------------------------------------------------------------------
++    def holds(self, c) -> bool:
++        return any(p is c for p in self.parked)
++
++    def find(self, kid: int):
++        return next((c for c in self.parked if c.kid == kid), None)
++
++    def touch(self, c) -> None:
++        self.parked = [p for p in self.parked if p is not c] + [c]
++
++    def _rows(self, arena, base: int, n: int, pages: list, *, out: bool) -> None:
++        """Tokens [0, n) of an extent at ``base``: to the pages (out) or from them, page by page and plane by plane,
++        the rows ``pool.Arena.copy`` copies for them (the last row of a plane whose rows hold several tokens too)."""
++
++        for k, page in enumerate(pages):
++            t0 = k * PAGE
++            cnt = min(PAGE, n - t0)
++            if cnt <= 0:
++                break
++            self.pages.wait(page)
++            off = 0
++            for p, (rows, shape, dtype, row) in zip(arena.planes, self.planes):
++                a = (base + t0) // p.div
++                m = min(-(-cnt // p.div), rows, p.tensor.shape[0] - a)
++                dev = p.tensor[a:a + m]
++                host = _typed(self.pages.view(page, off, rows * row), dtype, (rows, *shape))[:m]
++                if out:
++                    host.copy_(dev, non_blocking=self.pinned)
++                else:
++                    dev.copy_(host, non_blocking=self.pinned)
++                off += _up(rows * row)
++            self.pages.mark(page)
++
++    def _forget(self, c) -> None:
++        self.parked = [p for p in self.parked if p is not c]
++        for page in getattr(c, "pages", None) or []:
++            self.pages.give(page)
++        c.pages = None
++        self.release(c)
++        c.rec = c.conv = c.pending = None
++        c.tail = c.head = None
++        c.drafter_rows = None
++        self.stats["dropped"] += 1
++
++    def _drop_one(self) -> bool:
++        victim = next((c for c in self.parked if c is not self.hold), None)
++        if victim is None:
++            return False
++        self._forget(victim)
++        return True
++
++    def park(self, d, c) -> bool:
++        """Rank 0: kept prompt ``c``, evicted for room, parks its rows in host pages (its states stay in their slot):
++        True, and the caller unlists it without freeing them; False (no pages, its states on the GPU, or more rows
++        than the pages hold) leaves the eviction as it was."""
++
++        if self.pages is None or getattr(c, "host_slot", None) is None:
++            return False
++        n = len(c.ids)
++        need = -(-n // PAGE)
++        if need > self.pages.count:
++            self.stats["missed"] += 1
++            return False
++        while (len(self.pages.free) < need or len(self.parked) >= self.parked_most) and self._drop_one():
++            pass
++        if len(self.pages.free) < need or len(self.parked) >= self.parked_most:
++            self.stats["missed"] += 1
++            return False
++        pages = [self.pages.take() for _ in range(need)]
++        self._rows(d.arena, c.extent.base, n, pages, out=True)
++        c.pages = pages
++        self.parked.append(c)
++        self.stats["parks"] += 1
++        return True
++
++    def fetch(self, d, c, base: int, n: int) -> None:
++        """A parked prompt's first n tokens' rows into the pool at ``base`` (a new extent's): ADMIT's copy."""
++
++        if n > len(c.ids):
++            raise RuntimeError(f"a parked prompt of {len(c.ids)} tokens cannot give {n}")
++        self._rows(d.arena, base, n, c.pages[:-(-n // PAGE)], out=False)
++        self.touch(c)
++        self.stats["unparks"] += 1
++
++    # -- reports --------------------------------------------------------------------------------------------------------
++    def health(self) -> dict:
++        out = {"state_slots": self.states.count, "state_slots_free": len(self.states.free),
++               "state_mib": round(self.states.size / 2 ** 20, 1),
++               "pinned_gib": round((self.states.nbytes() + (self.pages.nbytes() if self.pages else 0)) / 2 ** 30, 2),
++               **self.stats}
++        if self.pages is not None:
++            out.update(parked=len(self.parked), pages=self.pages.count, pages_free=len(self.pages.free),
++                       page_tokens=PAGE, parked_tokens=sum(len(c.ids) for c in self.parked))
++        return out
++
++    def describe(self) -> str:
++        line = (f"TF_GLM_KEPT_HOST=1: kept prompts' KDA states and DFlash2 windows in pinned host RAM, "
++                f"{self.entries} at most ({self.states.size / 2 ** 20:.1f} MiB each), the pool given what they took "
++                f"(glm53f-afd's host tier, by Hugh Madden)")
++        if self.pages is not None:
++            line += (f"; TF_GLM_HOST_CACHE_GIB: a kept prompt evicted for room parks its rows in host RAM "
++                     f"({self.pages.count} pages of {PAGE} tokens, {self.pages.count * PAGE} tokens, "
++                     f"{self.pages.nbytes() / 2 ** 30:.1f} GiB pinned), {self.parked_most} parked at most "
++                     f"(TF_GLM_HOST_CACHE_ENTRIES), least recently used out first; a request they prefix copies "
++                     f"them back")
++        return line
++
++
++def tier(d) -> HostTier | None:
++    """``MultiDecoder``'s tier: None unless TF_GLM_KEPT_HOST=1 on the AFD attention node (world 1; two ranks run
++    without it, as TF_GLM_PREFILL_PAIRS does, and ``check`` refuses the setting there before the load)."""
++
++    if not enabled() or getattr(d, "world", 2) != 1:
++        return None
++    return HostTier(d, entries=max(1, int(d.g.cache_entries)), gib=cache_gib(), parked_most=host_entries())
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index ed229eb..ca11c84 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -549,6 +549,10 @@ class MultiDecoder:
+         self.dflash_code = encode_policy(DFLASH_POLICY)
+         if self.fill_budget:
+             self.fill_costs = fill_costs if fill_costs is not None else self._time_prompt_layers()
++        # TF_GLM_KEPT_HOST / TF_GLM_HOST_CACHE_GIB (``kept_host``, ours; glm53f-afd's host RAM tier): None when off
++        from . import kept_host
++
++        self.host = kept_host.tier(self)
+ 
+     # -- the scheduler's view ----------------------------------------------------------------------------------------
+     @property
+@@ -574,6 +578,7 @@ class MultiDecoder:
+                 **({"sliced_fill": dict(self.sliced)} if getattr(self, "fill_budget", 0) else {}),
+                 **({"prefill_pairs": dict(self.paired)} if getattr(self, "pairs", False) else {}),
+                 **({"cache_room": dict(self.room_stats)} if getattr(self, "room", False) else {}),
++                **({"kept_host": self.host.health()} if getattr(self, "host", None) is not None else {}),
+                 **({"prefill_lanes": dict(self.laned)} if getattr(self, "n_lanes", 1) >= 3 else {}),
+                 **({"prefill_order": {"order": "sjf", "age_ms": round(self.age_s * 1000.0, 3),
+                                       **(self.ordered or {})}} if getattr(self, "order", "fifo") == "sjf" else {}),
+@@ -817,10 +822,16 @@ class MultiDecoder:
+             raise NoRoom(f"every one of the {self.count} stream slots is taken")
+         hit = self._resume(prompt, *self._drafters(code)) if draft else None
+         need = self._need(len(prompt))
++        # TF_GLM_HOST_CACHE_GIB (``kept_host``): a parked prompt's rows come from host RAM into a new extent, and
++        # making room for it never drops it
++        host = getattr(self, "host", None)
++        parked = host is not None and hit is not None and host.holds(hit)
++        if host is not None:
++            host.hold = hit if parked else None
+         # placement: take a kept extent over in place, or copy its rows into a new one while a stream writes in it
+         copy = 0
+         base = None
+-        if hit is not None and hit.extent.owner is None:
++        if hit is not None and not parked and hit.extent.owner is None:
+             x = hit.extent
+             for c in list(x.kept):            # kept prompts the stream would overwrite: gone
+                 if len(c.ids) > len(hit.ids) and prompt[:len(c.ids)] != c.ids:
+@@ -830,7 +841,7 @@ class MultiDecoder:
+             else:
+                 hit = None
+         if base is None:
+-            base = self._room(need, [hit.extent] if hit is not None else [])
++            base = self._room(need, [hit.extent] if hit is not None and not parked else [])
+             if base is None and hit is not None:          # no room beside the kept rows: start fresh
+                 hit = None
+                 base = self._room(need)
+@@ -860,6 +871,8 @@ class MultiDecoder:
+         except Exception as exc:              # rank 1 applies the same ADMIT: the ranks may no longer agree
+             self.broken = exc
+             raise
++        if host is not None:
++            host.hold = None
+ 
+     @staticmethod
+     def _parse_admit(p: list[int]) -> dict:
+@@ -925,6 +938,7 @@ class MultiDecoder:
+         from .forward import State
+ 
+         e = self.e
++        host = getattr(self, "host", None)                # TF_GLM_KEPT_HOST (``kept_host``), or None
+         hit = self._kept_by_id(a["kid"]) if a["kid"] >= 0 else None
+         prompt = a["prompt"]
+         s.prompt = list(prompt)
+@@ -941,7 +955,9 @@ class MultiDecoder:
+                                    f"rank 0 said [{a['base']}, {a['base'] + a['size']})")
+         else:
+             x = self.pool.add(a["base"], a["size"])
+-            if hit is not None:
++            if hit is not None and host is not None and host.holds(hit):
++                host.fetch(self, hit, x.base, cut)          # TF_GLM_HOST_CACHE_GIB: a parked prompt's rows
++            elif hit is not None:
+                 self.arena.copy(hit.extent.base, x.base, cut)
+         x.owner = a["sid"]
+         st = State(self.w, x.size, e.rows, caches=e.caches, base=x.base, slots=e.slots, slot=a["slot"])
+@@ -960,14 +976,17 @@ class MultiDecoder:
+         if hit is not None:
+             from .decode import put_ring_tail
+ 
+-            st.rec[st.cur[0]].copy_(hit.rec)
+-            st.conv.copy_(hit.conv)
++            if host is not None:                # TF_GLM_KEPT_HOST: from host RAM
++                host.restore(st, hit)
++            else:
++                st.rec[st.cur[0]].copy_(hit.rec)
++                st.conv.copy_(hit.conv)
+             put_ring_tail(st, hit)          # the index rows of its pools still filling, into this slot's rings
+             st.set_pos(cut)
+             if dflash:
+                 if hit.drafter_end != cut or hit.drafter_rows is None:
+                     raise RuntimeError("a kept prompt without DFlash2's window was chosen for a DFlash2 stream")
+-                put_draft_window(self._ctx(lane), cut, hit.drafter_rows)
++                put_draft_window(self._ctx(lane), cut, hit.drafter_rows if host is None else host.window(hit))
+             if mtp:                           # the MTP cache up to the kept row's, that row with this prompt's token
+                 if hit.mtp_len != cut - 1 or hit.pending is None:
+                     raise RuntimeError("a kept prompt without the MTP head's rows was chosen for an MTP stream")
+@@ -982,7 +1001,8 @@ class MultiDecoder:
+                         e.use(prev)
+             if replay:
+                 lane.head = hit.head.clone()
+-            self._touch(hit)
++            if host is None or not host.holds(hit):      # a parked prompt stays parked (``kept_host.fetch``)
++                self._touch(hit)
+         # a drafted prompt keeps its state before its last token (``keep_point``; with TF_GLM_PROMPT_GRID at its grid
+         # point, ``engine.keep_at``), and at rank 0's shared-prefix points (TF_GLM_SHARED_PREFIX, MiaAI-Lab recipe
+         # patches 0015, 0030)
+@@ -1006,6 +1026,9 @@ class MultiDecoder:
+         for c in self.kept:
+             if c.kid == kid:
+                 return c
++        host = getattr(self, "host", None)              # TF_GLM_HOST_CACHE_GIB: a parked prompt
++        if host is not None and (c := host.find(kid)) is not None:
++            return c
+         raise RuntimeError(f"rank {self.rank} holds no kept prompt {kid}")
+ 
+     def _resume(self, prompt: list[int], dflash: bool = False, mtp: bool = False):
+@@ -1014,7 +1037,8 @@ class MultiDecoder:
+         logits row (a replay, MiaAI-Lab recipe patches 0008, 0042)."""
+ 
+         best = None
+-        for c in self.kept:
++        host = getattr(self, "host", None)              # TF_GLM_HOST_CACHE_GIB: parked prompts too, after these
++        for c in self.kept + (host.parked if host is not None else []):
+             n = len(c.ids)
+             fits = (not dflash or (c.drafter_end == n and c.drafter_rows is not None)) and (
+                 not mtp or (c.mtp_len == n - 1 and c.pending is not None))
+@@ -1059,6 +1083,8 @@ class MultiDecoder:
+         self.next_kid += 1
+         snap.extent = lane.extent
+         snap.shared = n in lane.shared                    # a shared-prefix state (recipe 0063's cap_victim)
++        if getattr(self, "host", None) is not None:      # TF_GLM_KEPT_HOST: its states to host RAM (``kept_host``)
++            self.host.stow(snap)
+         for c in [c for c in self.kept if c.ids == snap.ids]:
+             self._drop(c)
+         lane.extent.kept.append(snap)
+@@ -1072,6 +1098,8 @@ class MultiDecoder:
+         self.kept = [k for k in self.kept if k is not c]
+         x = c.extent
+         x.kept = [k for k in x.kept if k is not c]
++        if getattr(self, "host", None) is not None:      # TF_GLM_KEPT_HOST: its host slot back
++            self.host.release(c)
+         c.rec = c.conv = c.pending = None
+         c.tail = c.head = None
+         c.drafter_rows = None
+@@ -1088,9 +1116,17 @@ class MultiDecoder:
+             self.pool.resize(x, size)
+ 
+     def _evict(self, c) -> None:
+-        """Rank 0: drop a kept prompt on both ranks."""
++        """Rank 0: drop a kept prompt on both ranks. TF_GLM_HOST_CACHE_GIB: its rows park in host RAM first and its
++        states stay in their host slot (``kept_host.park``; the AFD attention node has no rank 1)."""
+ 
+         self._emit(EVICT, [c.kid])
++        host = getattr(self, "host", None)
++        if host is not None and host.park(self, c):
++            self.kept = [k for k in self.kept if k is not c]
++            x = c.extent
++            x.kept = [k for k in x.kept if k is not c]
++            self._settle(x)
++            return
+         self._drop(c)
+ 
+     # -- room --------------------------------------------------------------------------------------------------------------
+diff --git a/tests/test_glm_kept_host.py b/tests/test_glm_kept_host.py
+new file mode 100644
+index 0000000..a2735ca
+--- /dev/null
++++ b/tests/test_glm_kept_host.py
+@@ -0,0 +1,272 @@
++"""TF_GLM_KEPT_HOST and TF_GLM_HOST_CACHE_GIB (``kept_host``, ours; the design is glm53f-afd's host RAM tier by Hugh
++Madden, glm53f-afd @ 91db3cc, crates/glm53f-coordinator/src/hostcache.rs): kept prompts' states, and the rows of kept
++prompts evicted for room, in host RAM on the AFD attention node, on CPU.
++
++- the switches: names, defaults, refusals before anything loads;
++- the pool formula: with the states in host RAM the GPU reserves one (``STAGING``), not TF_GLM_CACHE_ENTRIES of them;
++- the tier on its own: a kept state's bytes go to a slot and come back unchanged; a full tier leaves a state on the
++  GPU; parked rows come back as ``pool.Arena.copy`` copies them; parked prompts leave least recently used first, never
++  the one being resumed;
++- the AFD node's decoder (tests/test_glm_multi_afd.py's ``World1`` on tests/test_glm_multi.py's fake model, every
++  reply checked against the request served alone): TF_GLM_KEPT_HOST=1 gives the same replies, cached counts, kept
++  prompts and extents as off, with every kept state in a host slot; with TF_GLM_HOST_CACHE_GIB the kept prompts the
++  pool evicted come back from host RAM (cached where off prefills), with the same replies.
++"""
++
++from __future__ import annotations
++
++from types import SimpleNamespace
++
++import pytest
++
++from tests.test_cuda_geometry import allocations  # noqa: F401  (fixture: fake triton, so decode imports)
++from tests.test_glm_multi import ALIGN, _prompt, fake, solo  # noqa: F401
++from tests.test_glm_multi_afd import GLM, World1, afd_fake  # noqa: F401
++
++pytestmark = pytest.mark.torch
++
++ENV = ("TF_GLM_KEPT_HOST", "TF_GLM_HOST_CACHE_GIB", "TF_GLM_HOST_CACHE_ENTRIES")
++
++
++def _env(monkeypatch, host=None, gib=None, entries=None) -> None:
++    for name, value in zip(ENV, (host, gib, entries)):
++        if value is None:
++            monkeypatch.delenv(name, raising=False)
++        else:
++            monkeypatch.setenv(name, str(value))
++
++
++# -- the switches ------------------------------------------------------------------------------------------------------
++def test_the_switches(monkeypatch):
++    from tensorfold.families.glm5_next.cuda import kept_host as kh
++
++    _env(monkeypatch)
++    assert not kh.enabled() and kh.cache_gib() == 0.0 and kh.host_entries() == kh.HOST_ENTRIES == 32
++    assert kh.check(afd=False, parallel=1) is False and kh.check(afd=True, parallel=8) is False
++    assert kh.enabled("1") and kh.enabled("on") and not kh.enabled("0") and not kh.enabled("off")
++    assert kh.cache_gib("24") == 24.0 and kh.cache_gib("0") == 0.0 and kh.host_entries("64") == 64
++    for bad in ("2", "yes"):
++        with pytest.raises(ValueError, match="TF_GLM_KEPT_HOST"):
++            kh.enabled(bad)
++    for bad in ("-1", "x", "5000"):
++        with pytest.raises(ValueError, match="TF_GLM_HOST_CACHE_GIB"):
++            kh.cache_gib(bad)
++    for bad in ("0", "-3", "a"):
++        with pytest.raises(ValueError, match="TF_GLM_HOST_CACHE_ENTRIES"):
++            kh.host_entries(bad)
++    _env(monkeypatch, host=1)
++    assert kh.check(afd=True, parallel=8) is True
++    with pytest.raises(ValueError, match="AFD attention node"):
++        kh.check(afd=False, parallel=8)
++    with pytest.raises(ValueError, match="--parallel 2"):
++        kh.check(afd=True, parallel=1)
++    _env(monkeypatch, gib=8)
++    with pytest.raises(ValueError, match="needs TF_GLM_KEPT_HOST=1"):
++        kh.check(afd=True, parallel=8)
++
++
++def test_the_pool_formula_reserves_one_state_with_the_tier():
++    """``GlmEngine``'s pool at world 1 is the window plus what TF_GLM_CACHE_GIB leaves after the kept states. A kept
++    state is 0.178 GiB (a KDA state and a DFlash2 window); at the release config's 6.5 GiB and 20 entries they take
++    3.56 GiB of it off, the tier one of them: 534,528 more tokens at 6,780 bytes a token (727,040 -> 1,261,568),
++    in the same GPU bytes."""
++
++    from tensorfold.families.glm5_next.cuda import kept_host as kh
++    from tensorfold.families.glm5_next.cuda.engine import kept_most, slot_bytes
++    from tensorfold.families.glm5_next.cuda.pool import ALIGN as A
++
++    state = slot_bytes(GLM, 1, rows=0) // 2 + (22 << 20) * 2
++    cache, entries, per_token, window = int(6.5 * 2 ** 30), 20, 6780, 262152
++    assert kept_most(entries, cache, state) == 20
++    assert kh.reserved_states(entries, state, False) == entries * state
++    assert kh.reserved_states(entries, state, True) == kh.STAGING * state == state
++
++    def pool(on: bool) -> int:
++        return (window + max(0, cache - kh.reserved_states(entries, state, on)) // per_token) // A * A
++
++    off, on = pool(False), pool(True)
++    assert off % A == 0 and on % A == 0
++    assert 520_000 < on - off < 540_000 and 1.7 < on / off < 1.8
++
++
++# -- the tier on its own -----------------------------------------------------------------------------------------------
++def _tiny(torch, *, entries: int = 2, gib: float = 0.0, parked_most: int = 32, blocks: int = 6):
++    from tensorfold.families.glm5_next.cuda.kept_host import HostTier
++    from tensorfold.families.glm5_next.cuda.pool import Arena, Plane
++
++    rows = blocks * ALIGN
++    slots = SimpleNamespace(rec=torch.zeros((2, 2, 3, 4, 4), dtype=torch.float32),
++                            conv=torch.zeros((2, 3, 2, 8), dtype=torch.bfloat16))
++    arena = Arena(rows, [Plane(torch.zeros((rows, 5), dtype=torch.bfloat16)),
++                         Plane(torch.zeros((rows // 4 + 2, 3), dtype=torch.float32), 4, 2),
++                         Plane(torch.zeros((rows, 2), dtype=torch.int8))])
++    ctx = SimpleNamespace(window=6, kc=[torch.zeros((2, 64, 4), dtype=torch.bfloat16)],
++                          vc=[torch.zeros((2, 64, 4), dtype=torch.bfloat16)])
++    d = SimpleNamespace(e=SimpleNamespace(slots=slots), drafts=SimpleNamespace(contexts=[ctx]), arena=arena, world=1,
++                        g=SimpleNamespace(cache_entries=entries))
++    return d, HostTier(d, entries=entries, gib=gib, parked_most=parked_most)
++
++
++def _snap(torch, kid: int, n: int, *, base: int = 0, window: int = 7):
++    g = torch.Generator().manual_seed(kid)
++    return SimpleNamespace(ids=list(range(n)), kid=kid, extent=SimpleNamespace(base=base),
++                           rec=torch.randn((3, 4, 4), generator=g),
++                           conv=torch.randn((3, 2, 8), generator=g).to(torch.bfloat16),
++                           drafter_rows=[torch.randn((2, window, 4), generator=g).to(torch.bfloat16) for _ in range(2)],
++                           pending=None, tail=None, head=None)
++
++
++def test_a_kept_state_goes_to_a_host_slot_and_comes_back_unchanged(fake):  # noqa: F811
++    torch = fake
++    _, h = _tiny(torch)
++    s = _snap(torch, 0, 100)
++    want = [s.rec.clone(), s.conv.clone()] + [r.clone() for r in s.drafter_rows]
++    assert h.stow(s) and s.host_slot is not None
++    for t in [s.rec, s.conv] + s.drafter_rows:             # views of the slot's slab, the bytes unchanged
++        assert t.untyped_storage().data_ptr() == h.states.slabs[s.host_slot[0]].untyped_storage().data_ptr()
++    for got, ref in zip([s.rec, s.conv] + s.drafter_rows, want):
++        assert got.dtype == ref.dtype and got.shape == ref.shape and torch.equal(got, ref)
++    st = SimpleNamespace(rec=torch.zeros((2, 3, 4, 4)), conv=torch.zeros((3, 2, 8), dtype=torch.bfloat16), cur=[1])
++    h.restore(st, s)
++    assert torch.equal(st.rec[1], want[0]) and torch.equal(st.conv, want[1]) and not st.rec[0].any()
++    assert all(torch.equal(a, b) for a, b in zip(h.window(s), want[2:]))
++    free = len(h.states.free)
++    h.release(s)
++    assert len(h.states.free) == free + 1 and s.host_slot is None
++    assert h.stats["stowed"] == 1 and h.stats["restored"] == 1
++
++
++def test_a_full_tier_leaves_a_state_on_the_gpu(fake):  # noqa: F811
++    torch = fake
++    _, h = _tiny(torch, entries=1, gib=0.0)                # entries + 1 slots
++    snaps = [_snap(torch, k, 50) for k in range(3)]
++    assert [h.stow(s) for s in snaps] == [True, True, False]
++    third = snaps[2]
++    assert getattr(third, "host_slot", None) is None and h.stats["on_gpu"] == 1
++    rec = third.rec.clone()
++    st = SimpleNamespace(rec=torch.zeros((2, 3, 4, 4)), conv=torch.zeros((3, 2, 8), dtype=torch.bfloat16), cur=[0])
++    h.restore(st, third)                                   # restored from where it is
++    assert torch.equal(st.rec[0], rec) and h.stats["restored"] == 0
++    assert h.window(third) is third.drafter_rows
++    big = _snap(torch, 9, 50, window=40)                   # a window past the slot stays on the GPU too
++    h.release(snaps[0])
++    assert not h.stow(big) and h.stats["on_gpu"] == 2
++
++
++def _fill(torch, arena, seed: int) -> None:
++    g = torch.Generator().manual_seed(seed)
++    for p in arena.planes:
++        t = p.tensor
++        if t.dtype == torch.int8:
++            t.copy_(torch.randint(-100, 100, t.shape, generator=g, dtype=torch.int8))
++        else:
++            t.copy_(torch.randn(t.shape, generator=g).to(t.dtype))
++
++
++@pytest.mark.parametrize("n,cut", [(3001, 3001), (3001, 1777), (2048, 2048), (5, 5)])
++def test_parked_rows_come_back_as_arena_copy_copies_them(fake, n, cut):  # noqa: F811
++    from tensorfold.families.glm5_next.cuda.pool import Arena, Plane
++
++    torch = fake
++    d, h = _tiny(torch, gib=0.01)
++    _fill(torch, d.arena, 7)
++    ref = Arena(d.arena.rows, [Plane(p.tensor.clone(), p.div, p.pad) for p in d.arena.planes])
++    ref.copy(2048, 3 * 2048, cut)                          # what the copy path of ADMIT leaves
++    s = _snap(torch, 1, n, base=2048)
++    assert h.stow(s) and h.park(d, s) and h.holds(s) and len(s.pages) == -(-n // ALIGN)
++    _fill(torch, d.arena, 8)                               # the evicted rows are someone else's now
++    keep = [p.tensor.clone() for p in d.arena.planes]
++    h.fetch(d, s, 3 * 2048, cut)
++    for p, r, k in zip(d.arena.planes, ref.planes, keep):
++        a, m = 3 * 2048 // p.div, -(-cut // p.div)
++        assert torch.equal(p.tensor[a:a + m], r.tensor[a:a + m])            # the copied rows, as Arena.copy's
++        assert torch.equal(p.tensor[:a], k[:a]) and torch.equal(p.tensor[a + m:], k[a + m:])   # nothing else
++    assert h.stats["parks"] == 1 and h.stats["unparks"] == 1
++
++
++def test_parked_prompts_leave_least_recently_used_first_never_the_held_one(fake):  # noqa: F811
++    torch = fake
++    d, h = _tiny(torch, entries=4, gib=0.0)
++    from tensorfold.families.glm5_next.cuda.kept_host import HostTier
++
++    page = h.page_bytes
++    h = HostTier(d, entries=4, gib=3 * page / 2 ** 30 + 1e-9, parked_most=8)     # three pages
++    assert h.pages.count == 3
++    a, b, c = (_snap(torch, k, 2048, base=0) for k in range(3))
++    for s in (a, b, c):
++        assert h.stow(s) and h.park(d, s)
++    assert h.parked == [a, b, c] and not h.pages.free
++    h.touch(a)                                             # a resumed: b is the oldest now
++    h.hold = b                                             # ... but b is being resumed
++    e = _snap(torch, 4, 2048)
++    assert h.stow(e) and h.park(d, e)
++    assert h.parked == [b, a, e] and c.pages is None and getattr(c, "host_slot", None) is None
++    f = _snap(torch, 5, 3 * 2048)                          # needs every page: only the held one may stay
++    assert h.stow(f) and not h.park(d, f) and h.parked == [b] and h.stats["missed"] == 1
++    h2 = HostTier(d, entries=4, gib=8 * page / 2 ** 30 + 1e-9, parked_most=2)    # the count bound
++    x, y, z = (_snap(torch, k, 10) for k in range(3))
++    for s in (x, y, z):
++        assert h2.stow(s) and h2.park(d, s)
++    assert h2.parked == [y, z] and h2.stats["dropped"] == 1
++
++
++# -- the AFD node's decoder --------------------------------------------------------------------------------------------
++def _scenario(env, monkeypatch, **switches):
++    """Six finished requests of 1,000 tokens in a four-block pool (each kept prompt holds a block, so the pool evicts
++    the oldest two), then the three oldest come back with 300 more tokens."""
++
++    _env(monkeypatch, **switches)
++    w = World1(env, streams=2, blocks=4)
++    torch = env.torch
++    out = []
++    prompts = [_prompt(1000, 70 + k) for k in range(6)]
++    for pr in prompts + [p + _prompt(300, 99) for p in prompts[:3]]:
++        s = w.submit(pr, 4)
++        w.run()
++        assert s.got == solo(torch, pr, 4, None)
++        out.append((list(s.got), s.cached))
++    return w, out, [c.ids for c in w.d.kept], [(x.base, x.size) for x in w.d.pool.extents]
++
++
++def test_the_tier_off_and_on_give_the_same_replies_kept_prompts_and_pool(afd_fake):  # noqa: F811
++    env = afd_fake
++    mp = env.monkeypatch
++    w0, out0, kept0, ext0 = _scenario(env, mp)
++    assert getattr(w0.d, "host", "missing") is None and "kept_host" not in w0.d.health()
++    w1, out1, kept1, ext1 = _scenario(env, mp, host=1)
++    assert (out1, kept1, ext1) == (out0, kept0, ext0)
++    assert [c for _, c in out0][6:] == [0, 0, 0]          # the two oldest were evicted, and the third since
++    h = w1.d.host
++    assert h is not None and h.pages is None and h.stats["stowed"] >= 9 and h.stats["on_gpu"] == 0
++    assert all(getattr(c, "host_slot", None) is not None for c in w1.d.kept)
++    assert len(h.states.free) == h.states.count - len(w1.d.kept)        # dropped prompts gave their slots back
++    health = w1.d.health()["kept_host"]
++    assert health["state_slots"] == h.states.count and health["stowed"] == h.stats["stowed"]
++
++
++def test_evicted_prompts_park_in_host_ram_and_resume_from_there(afd_fake):  # noqa: F811
++    env = afd_fake
++    mp = env.monkeypatch
++    _, out0, _, _ = _scenario(env, mp)
++    w, out, _, _ = _scenario(env, mp, host=1, gib=0.01)
++    assert [g for g, _ in out] == [g for g, _ in out0]                  # the same replies
++    assert [c for _, c in out][:6] == [c for _, c in out0][:6]
++    assert [c for _, c in out][6:] == [999, 999, 999]                    # resumed from host RAM, not prefilled
++    h = w.d.host
++    assert h.stats["parks"] >= 3 and h.stats["unparks"] == 3 and h.stats["restored"] >= 3
++    health = w.d.health()["kept_host"]
++    assert health["parked"] == len(h.parked) and health["pages"] == h.pages.count
++    assert all(p.pages for p in h.parked) and h.hold is None
++
++
++def test_two_ranks_run_without_the_tier(fake, monkeypatch):  # noqa: F811
++    """At two ranks (a GB10 pair) the decoder has no tier, the switch set or not; the engine refuses the setting
++    there before the load (``test_the_switches``)."""
++
++    from tensorfold.families.glm5_next.cuda import kept_host as kh
++    from tests.test_glm_multi import Pair
++
++    _env(monkeypatch, host=1, gib=1)
++    assert kh.tier(SimpleNamespace(world=2)) is None
++    p = Pair(fake, streams=2, blocks=4)
++    assert len(p.d) == 2 and all(getattr(d, "host", "missing") is None for d in p.d)

@@ -1,10 +1,12 @@
 # Benchmarks
 
 Everything below was measured on the hardware this recipe targets. Each table says which configuration it measured.
-**As shipped** is `.env.example` ([the configuration](#what-is-measured-and-how)); its own numbers come from one boot
-of it on 2026-10-05 ([the release configuration](#the-release-configuration)). [The levers](#the-levers-one-at-a-time)
-compare each lever this update adds with the same configuration without it, and
-[v2.0's first staging](#v20s-first-staging) is the configuration before them, kept for the record.
+**2.1** is this `.env.example`: [2.1 in the same window as Mia's recipe v1.8](#21-in-the-same-window-as-mias-recipe-v18)
+is the published comparison, [2.1 in the lab](#21-in-the-lab) its lab boot against 2.0 as shipped, and
+[2.1's levers](#21s-levers-one-at-a-time) each lever 2.1 adds against the configuration without it. **2.0 as shipped**
+is 2.0's `.env.example`, on one boot of 2026-10-05 ([2.0 as shipped](#20-as-shipped)); [2.0's levers](#20s-levers-one-at-a-time)
+compare each lever 2.0 added with the same configuration without it, and [v2.0's first staging](#v20s-first-staging)
+is the configuration before them, kept for the record.
 
 ## What is measured, and how
 
@@ -12,10 +14,16 @@ compare each lever this update adds with the same configuration without it, and
   DGX Sparks (GB10, 128 GB each) as the expert nodes; ConnectX-7 RoCE v2 between them, 200 Gb/s links (4X HDR) at
   MTU 9000.
   Mia's recipe ran on its own two DGX Sparks (TP2), with the SM clock cap of 2,200 MHz her recipe sets.
-- **Software.** TensorFold v0.6.5 plus `patches/` at this repository's commit; the checkpoint at revision `078455ff`
-  (its safetensors are byte-identical to `76c0b517`, the revision `.env.example` pins) and the drafter at `bf582e4e`.
+- **Software.** TensorFold v0.6.5 plus `patches/` at this repository's commit (2.0: 30 patches; 2.1: 48); the
+  checkpoint at revision `078455ff` (its safetensors are byte-identical to `76c0b517`, the revision `.env.example`
+  pins) and the drafter at `bf582e4e`.
 - **Configurations.**
-  - *as shipped*: eight streams with a 64-row verify window and a 6.5 GiB cache budget, 20 kept prompts, two
+  - *2.1*: 2.0 as shipped plus kept prompts in host RAM with an 8.5 GiB cache budget, prompt chunks filled as pairs
+    while streams decode, Hugh Madden's expert prompt kernels on the Sparks and her v1.8 serving fixes, on the 48
+    patches;
+  - *2.1's levers*: each lab boot adds one lever to the boot before it and names it; every boot ran the determinism
+    gate, the greedy and concurrent replies against the boot before, the long-prompt replies and the 5090's memory gate;
+  - *2.0 as shipped*: eight streams with a 64-row verify window and a 6.5 GiB cache budget, 20 kept prompts, two
     exchanges in flight to each Spark, her EXL3 prompt kernel on the Sparks, the pool's room rule, shortest-first prompt
     order, her draft policy at `fnc5:0.2`, prompt chunk pairs, her attention-side prompt kernels, and every other
     switch of `.env.example`;
@@ -35,7 +43,8 @@ compare each lever this update adds with the same configuration without it, and
   concurrency, a 2,048-token prompt after the context, 128 generated tokens, prefix caching on, three runs, thinking
   off.
 - **Coding-agent load.** A headless coding-agent benchmark at temperature 0.2: four concurrent requests generating
-  1,024 tokens each, and one request generating 4,096; sustained aggregate tok/s, median of three runs.
+  1,024 tokens each, and one request generating 4,096; sustained aggregate tok/s, median of three runs (the mean of two
+  runs per arm in [the same-window comparison](#21-in-the-same-window-as-mias-recipe-v18)).
 - **Mixed load.** Two or five clients sending prompts of 2,048, 8,192, 32,768 and 100,000 tokens (24 and 40 requests);
   each request's time to the first token, by prompt size.
 - **Agentic quality.** AEON-30: 30 agentic tasks, one at a time, thinking on.
@@ -47,13 +56,177 @@ compare each lever this update adds with the same configuration without it, and
 Every run of a comparison went through the same runner, with the endpoint otherwise idle; a run that saw any other
 client's request was discarded and repeated.
 
-## The release configuration
+## 2.1 in the same window as Mia's recipe v1.8
+
+Measured on 2026-10-06 from 15:57 to 19:04 EDT, each item on arm A and then at once on arm B: spark-bench (C1, then
+C4, three times), the coding-agent runs (twice), one warm-up of each prompt size on each arm, three cold ~2.6K
+prompts, the fresh-prompt set twice, two cold 100K prompts, the ~195K needle, then the arena cells (100,000 x 5, then
+65,535 x 10). Each pair of fresh or cold prompts sent the same text to both arms. Arm A: this `.env.example` on one
+RTX 5090 and two DGX Sparks. Arm B: Mia's recipe v1.8 (`33b50fd`, her latest release that day) on its own two DGX
+Sparks, as deployed by her scripts. The same harnesses and hashes on both arms, the arms alternated (A, B, A, B), each
+run with the endpoint otherwise idle, and every attempt recorded.
+
+| Metric | 2.1 (A) | Mia's recipe v1.8 (B) | A / B |
+| --- | ---: | ---: | ---: |
+| Decode, C1 prose / code / JSON (tok/s, median of 3) | 75.7 / 81.5 / 83.2 | 58.4 / 65.4 / 66.7 | 1.30x / 1.25x / 1.25x |
+| Decode, C4 aggregate (tok/s) | 110.6 | 100.7 | 1.10x |
+| Coding-agent load, 4 x 1,024 / 1 x 4,096 (tok/s) | 236.2 / 71.3 | 185.8 / 52.6 | 1.27x / 1.36x |
+| Fresh 8K / 31K / 62K (tok/s) | 2,946 / 3,030 / 3,138 | 1,875 / 1,897 / 1,866 | 1.57x / 1.60x / 1.68x |
+| Cold ~2.6K, time to first token | 1.313 s | 1.629 s | 0.81x |
+| Cold 100K, time to first token (2 runs) | 32.4 s (32.5, 32.2) | 55.4 s (55.5, 55.4) | 0.58x |
+| Arena 65,535 x 10: prompt / gen t/s, e2e first token, gen a request, cache hits | 1,198 / 64.2, 7.7 s, 12.7, 49.2% | 618.4 / 37.9, 17.3 s, 16.0, 49.2% | 1.94x / 1.69x, 0.45x, 0.80x, same |
+| Arena 100,000 x 5: the same | 1,872 / 65.8, 4.0 s, 18.6, 49.5% | 725.3 / 42.0, 8.2 s, 17.2, 49.5% | 2.58x / 1.57x, 0.49x, 1.08x, same |
+| A salted needle in ~195K tokens | found: 194,832 tokens, prefill 64.1 s, reply 65.0 s | found: 194,832 tokens, prefill 117.1 s, reply 118.5 s | — |
+| KV pool (tokens, all requests) | 1,579,008 | 1,710,080 | 0.92x |
+| AEON-30 | 23 of 30 (the lab's boot of this configuration, 2026-10-06, idle) | 23 of 30 (2026-10-06; another client's request overlapped the run, so only the score is quoted) | same |
+
+Runs: spark-bench three per arm (medians); the coding-agent load two per arm (means); fresh prompts two per size
+(means); cold ~2.6K three (median); cold 100K two; the needle and each arena cell one (llama-benchy's three runs
+inside). The harnesses were unchanged from the window's start to its end (sha256 prefixes):
+
+- spark-bench's `vllm-bench.py`: `824933bb`;
+- the runner that gated every run: `716bcc0f`;
+- the coding-agent benchmark: `51f7fbb5`;
+- the fresh-prompt sweep: `a2d9d2b7`;
+- the first-token probe: `86bd3160`;
+- the salted needle: `2d7e3bd6`, its client `751a754f`;
+- llama-benchy 0.4.0: lock file `dbea8ed7`;
+- the tokenizer: `19e77364`.
+
+Arm B is a deployment in daily use. Six of its runs saw another client's request: three spark-bench runs, one coding
+run and both arena cells. Each was discarded and repeated with the endpoint idle, and the table uses only the repeats.
+No run on arm A needed a repeat.
+
+Where arm B leads:
+
+- **Generation per request at ten clients** (16.0 against 12.7 tok/s). Her lane decodes four requests at a time and
+  queues the other six, while this split decodes eight together. So each of her four generates faster, while this
+  split's aggregate (1.69x) and first token (0.45x the time) are better. At five clients this split leads per request
+  too (1.08x).
+- **The KV pool:** 1,710,080 tokens at four streams against 1,579,008 at eight (0.92x).
+
+## 2.1 in the lab
+
+The lab's final check of 2.1's configuration on these 48 patches: one boot on 2026-10-06, with the harnesses of 2.0's
+numbers, against 2.0 as shipped (one boot on 2026-10-05). Different days and boots; the same-window run above is the
+comparison this release publishes.
+
+| Metric | 2.0 as shipped | 2.1 (lab) | 2.1 / 2.0 |
+| --- | ---: | ---: | ---: |
+| Decode, C1 prose / code / JSON (tok/s) | 77.4 / 79.0 / 90.4 | 75.0 / 80.8 / 83.1 | 0.97x / 1.02x / 0.92x |
+| Decode, C2 / C4 aggregate (tok/s) | 91.7 / 111.6 | 92.5 / 109.0 | 1.01x / 0.98x |
+| Decode, geometric mean of the five cells | 89.23 | 87.32 | 0.98x |
+| spark-bench's ~2.6K-token prompt (tok/s) | 1,779 | 1,953 | 1.10x |
+| Cold ~2.6K, time to first token | 1.449 s | 1.325 s | 0.91x |
+| Fresh 8K / 31K / 62K (tok/s) | 2,599 / 2,618 / 2,762 | 2,890 / 2,992 / 3,145 | 1.11x / 1.14x / 1.14x |
+| Cold 100K, time to first token | 36.8 s | 32.3 s | 0.88x |
+| Coding-agent load, 4 x 1,024 / 1 x 4,096 (tok/s) | 229.3 / 64.4 | 237.4 / 70.9 | 1.04x / 1.10x |
+| Arena 65,535 x 10: prompt / gen t/s, e2e first token, gen a request | 833.9 / 46.1, 13.4 s, 12.0 | 1,147 / 63.9, 7.8 s, 13.2 | 1.38x / 1.39x, 0.58x, 1.10x |
+| Arena 100,000 x 5: the same | 1,047.6 / 50.3, 6.4 s, 18.6 | 1,904 / 68.4, 3.9 s, 18.9 | 1.82x / 1.36x, 0.61x, 1.02x |
+| Two cold 200K prompts at once: first tokens | 152.1 s and 76.4 s (another boot of 2.0's configuration) | 135.3 s and 68.0 s | mean 0.89x |
+| KV pool (tokens, all requests) | 727,040 | 1,579,008 | 2.17x |
+| AEON-30 (idle) | 23 of 30, 83.1 tok/s | 23 of 30, 83.4 tok/s | same |
+
+- The boot passed every gate: deterministic replies (drafted equal plain, concurrent equal solo), its greedy,
+  concurrent and long-prompt replies equal to the lab's previous boot of the same configuration, the 5090's peak at
+  25.81 GiB within its 27.5 GiB gate, and each Spark's free memory at least 28.5 GiB (the floor is 12). Both arena
+  cells resumed every request (cache hits 49.2% and 49.5%, the ideal).
+- One-stream decode is lower on prose and JSON and higher on code: Hugh Madden's expert prompt kernels change the
+  replies, and the drafter accepts the new texts at a different rate ([below](#hugh-maddens-expert-prompt-kernels-patches-0034-0035)).
+  Every arena row, the prompts and the coding-agent load are faster.
+
+## 2.1's levers, one at a time
+
+Each lever was measured in the lab on 2026-10-06, against the boot before it with the same code, and kept only if its
+gates passed. The first two were measured on 2.0's configuration (boot B); the others on the configuration the levers
+before them made.
+
+### Kept prompts in host RAM (patch 0032)
+
+`TF_GLM_KEPT_HOST=1 TF_GLM_HOST_CACHE_GIB=24` with `CACHE_GIB=8.5`, against 2.0 as shipped (B), one boot each. Each
+cell entry is prompt / generation t/s, the e2e first token, and generation a request.
+
+| Measure | B (2.0) | + host RAM tier | Change |
+| --- | ---: | ---: | ---: |
+| KV pool (tokens) | 727,040 | 1,579,008 | 2.17x |
+| 65,535 x 10 | 818 / 46.4, 13.3 s, 12.1 | 808 / 44.1, 13.4 s, 12.1 | -1.2% / -4.9%, +1.0%, -0.2% |
+| 100,000 x 5 | 1,060 / 50.9, 6.3 s, 19.2 | 1,030 / 49.3, 6.5 s, 18.6 | -2.8% / -3.1%, +2.1%, -3.1% |
+| The 5090's peak | 24.26 GiB | 25.64 GiB | +1.4 GiB |
+| Host RAM pinned | — | 33.35 GiB (24 GiB of pages, 53 state slots) | — |
+
+- Replies equal B's: greedy 5 of 5 (twice), concurrent 11 of 11, long prompts 5 of 5.
+- These cells never needed the bigger pool, so it made nothing faster (single runs). A forced-eviction test (prompts
+  evicted for room, then sent again) brought four prompts back from host RAM with their cold replies, the first token in
+  0.15-0.44 s against 12-67 s to fill them again.
+
+### Prompt chunks filled as pairs while streams decode (patch 0033)
+
+`TF_GLM_FILL_PAIRS=1`, against B (the 32,768 x 10 row against 2.0 as shipped, the boot that ran that cell):
+
+| Cell | Before | + fills as pairs | Change |
+| --- | ---: | ---: | ---: |
+| 65,535 x 10 | 818 / 46.4, 13.3 s, 12.1 | 1,039 / 58.7, 8.8 s, 12.6 | +27% / +27%, -33%, +4.1% |
+| 32,768 x 10 | 849 / 45.5, 12.5 s, 11.5 | 989 / 57.6, 8.5 s, 14.2 | +17% / +27%, -32%, +22.7% |
+| 100,000 x 5 | 1,060 / 50.9, 6.3 s, 19.2 | 1,657 / 62.9, 4.4 s, 18.8 | +56% / +24%, -30%, -2.3% |
+
+- Replies equal B's (greedy, concurrent, long prompts); the coding-agent load and spark-bench within 0.3%.
+- The cost: several cold long prompts that arrive together fill 7-10% slower, and two cold 200K prompts sent at once
+  waited 16% longer for their first tokens on average.
+
+### Hugh Madden's expert prompt kernels (patches 0034-0035)
+
+`TF_GLM_EXPERT_KERNEL=g53` on both expert nodes, against the boot with the two levers above and nothing else changed
+(B2), the same session:
+
+| Measure | B2 | + his kernels | Change |
+| --- | ---: | ---: | ---: |
+| Fresh 8K / 31K / 62K (tok/s) | 2,569 / 2,671 / 2,766 | 2,948 / 3,014 / 3,132 | geometric mean +13.6% |
+| Cold 100K, time to first token | 36.76 s | 32.43 s | -11.8% |
+| Cold ~2.6K, time to first token | 1.430 s | 1.371 s | -4.1% |
+| Decode, C1 prose / code / JSON, C2, C4 | 77.1 / 79.2 / 90.5, 91.6, 111.6 | 75.2 / 81.0 / 83.0, 90.8, 110.5 | geometric mean -2.1% (JSON -8.3%) |
+| Coding-agent load, 4 x 1,024 / 1 x 4,096 (tok/s) | 228.1 / 64.3 | 237.1 / 70.9 | +3.9% / +10.3% |
+| Expert compute per half and MoE layer, 2,048 rows | 16.46 ms | 13.58 ms | 1.21x |
+| AEON-30 | — | 23 of 30 | — |
+
+- Deterministic with them on: drafted replies equal plain ones (5 of 5), concurrent ones equal solo (22 of 22). Their
+  replies differ from B2's (they change the prompt arithmetic): against the reference log-probs, mean KL 0.002901, p99
+  0.0438 and 98.98% top-1 agreement, within the gate of 0.003, 0.05 and 98.5%.
+- Decode moves with the new texts, not the decode path: decode windows keep their kernels. JSON's 300-token reply took
+  85 verify rounds against 72 in an earlier session's measurement of the same kernels.
+- The expert compute row is from a GPU measurement of the same kernels (the per-half time of a 2,048-row prompt
+  window), byte-identical to glm53f-rank's own kernels at 1-4,096 rows.
+
+### Her v1.8 serving fixes (patches 0042, 0043, 0045)
+
+`TF_GLM_DECIDE_THEN_COPY=1 TF_GLM_CAPACITY_STATUS=1 TF_GLM_DELIVERY_ABORT=1`, against the same code without them:
+replies equal (greedy, concurrent, long prompts 5 of 5); spark-bench's geometric mean 87.67 -> 87.72 (+0.06%). With
+them, four requests past eight busy lanes waited and were served after 132-135 s (`TF_GLM_MAX_QUEUED` unset); with
+`TF_GLM_MAX_QUEUED=0` (patch 0044, not shipped) the same four were refused at once (0.01 s) with 429 and
+`Retry-After: 5`.
+
+### Measured and off in 2.1
+
+- **4,096-row prompt chunks (patch 0031, `TF_GLM_PREFILL_ROWS=4096`):** the boot came up, its short-prompt replies
+  equal the boot before, and the first prompt window over about 2,800 rows stopped both expert ranks (the EXL3
+  grouping kernel needs 141,372 bytes of shared memory there; GB10 allows 101,248). Every later request failed; no
+  speed was measured. Its pool would be 1,103,872 tokens (-30.1%).
+- **Her v1.7.1 kept-prompt five (patches 0036-0040), together**, against the same configuration without them:
+
+| Cell | Without | With the five | Change |
+| --- | ---: | ---: | ---: |
+| 65,535 x 10 | 1,211 / 63.9, 7.5 s, 12.9 | 1,112 / 63.3, 7.8 s, 13.5 | -8.1% / -0.8%, +4.3%, +4.5% |
+| 100,000 x 5 | 1,876 / 65.5, 4.0 s, 17.5 | 1,887 / 66.4, 4.0 s, 18.5 | +0.6% / +1.4%, -0.5%, +5.6% |
+
+  Replies equal; cache hits the same (49.2% and 49.5%); spark-bench -0.3%. A queued request whose client left was
+  dropped in 0.15 s with them, and after 100.3 s without (`TF_GLM_QUEUED_CANCEL`).
+
+## 2.0 as shipped
 
 One boot of `.env.example` on 2026-10-05: spark-bench's decode script (median of three runs), each fresh or cold
 prompt after a warm-up of the same size, a needle alone, the coding-agent load (median of three runs), three Spark
 Arena cells and AEON-30.
 
-| Metric | As shipped | Before patches 0028-0030: four streams, no shortest-first order | Mia's recipe v1.5, 2x DGX Spark |
+| Metric | 2.0 as shipped | Before patches 0028-0030: four streams, no shortest-first order | Mia's recipe v1.5, 2x DGX Spark |
 | --- | ---: | ---: | ---: |
 | Decode, C1 prose / code / JSON (tok/s) | 77.4 / 79.0 / 90.4 | 76.3 / 84.7 / 86.6 | 58.5 / 65.7 / 66.6 |
 | Decode, C4 aggregate (tok/s) | 111.6 | 112.8 | 101.5 |
@@ -64,7 +237,7 @@ Arena cells and AEON-30.
 | A needle in ~195K tokens, alone | found: 194,886 tokens, prefill 74.3 s | — | — |
 | Coding-agent load, 4 x 1,024 / 1 x 4,096 (tok/s) | 229.3 / 64.4 | 243.3 / — | — |
 | KV pool (tokens, all requests) | 727,040 | 966,656 | 1,740,800 |
-| Spark Arena | three cells: [below](#three-arena-cells-as-shipped) | four cells at eight streams: [below](#eight-streams-patch-0030) | [v1.4's grid](#spark-arena-grid-28-cells) |
+| Spark Arena | three cells: [below](#three-arena-cells-20-as-shipped) | four cells at eight streams: [below](#eight-streams-patch-0030) | [v1.4's grid](#spark-arena-grid-28-cells) |
 | AEON-30 (idle) | 23 of 30, 83.1 tok/s | — | 23 of 30, 66.3 tok/s |
 
 The middle column is the shipped configuration without shortest-first order and at four streams with an 8 GiB cache,
@@ -79,13 +252,13 @@ on the head before patches 0028-0030 (their switches unset); those patches chang
   cannot say which lever cost it.
 - Mia's KV pool is 2.4 times this one: her two Sparks hold the cache, where this recipe's 5090 does.
 
-### Three arena cells, as shipped
+### Three arena cells, 2.0 as shipped
 
 llama-benchy 0.4.0 with the Spark Arena v2 settings (a 2,048-token prompt after the context, 128 generated tokens,
 prefix caching on, three runs, thinking off), on the same boot. Each entry is prompt / generation t/s and the e2e time
 to the first token, then generation per request and the cache hits. Mia's recipe v1.4 ran on its own two Sparks.
 
-| Cell | As shipped | Mia's recipe v1.4 | Prompt / gen / first token |
+| Cell | 2.0 as shipped | Mia's recipe v1.4 | Prompt / gen / first token |
 | --- | --- | --- | ---: |
 | 32,768 x 10 | 848.5 / 45.5, 12.5 s; 11.5 a request; 48.4% | 657.6 / 39.3, 15.8 s; 16.7 a request; 48.4% | 1.29x / 1.16x / 0.79x |
 | 65,535 x 10 | 833.9 / 46.1, 13.4 s; 12.0 a request; 49.2% | 624.6 / 38.7, 16.9 s; 18.2 a request; 49.2% | 1.33x / 1.19x / 0.79x |
@@ -99,7 +272,7 @@ to the first token, then generation per request and the cache hits. Mia's recipe
   59.7 / 3.5 t/s and 151.7 s to 833.9 / 46.1 t/s and 13.4 s, 100,000 x 5 from 236.0 / 16.1 and 83.1 s to 1,047.6 /
   50.3 and 6.4 s, and 32,768 x 10 from 578 / 35.5 and 18.8 s to 848.5 / 45.5 and 12.5 s.
 
-## The levers, one at a time
+## 2.0's levers, one at a time
 
 ### Her EXL3 prompt kernel (patch 0024)
 
@@ -428,11 +601,16 @@ draft policy as well as in pairs.
 | Long context: a needle in ~195K tokens (one request) | found: 194,888 prompt tokens, prefill 185.2 s, before this update; 194,798 tokens in 103.5 s with her EXL3 prompt kernel; as shipped, 194,886 tokens in 74.3 s |
 | Long context: a needle at ~240K tokens under load | found: 239,873 tokens with eight requests running, prefill 113.8 s, 154.5 s in all |
 | AEON-30, idle (measured without `TF_GLM_KDA_CHUNKED`) | 23 of 30 at 87.2 tok/s; Mia's recipe v1.5: 23 of 30 at 66.3 tok/s |
-| AEON-30, as shipped (idle, one task at a time) | 23 of 30 at 83.1 tok/s, 1,498 s; Mia's recipe v1.5: 23 of 30 at 66.3 tok/s, 2,168 s |
+| AEON-30, 2.0 as shipped (idle, one task at a time) | 23 of 30 at 83.1 tok/s, 1,498 s; Mia's recipe v1.5: 23 of 30 at 66.3 tok/s, 2,168 s |
+| 2.1: Hugh Madden's expert prompt kernels against glm53f-rank's own | byte-identical at 1-4,096 rows (1, 2, 7, 16, 33, 64, 65, 128, 594, 2,048, 2,049 and 4,096 rows), FP32 SwiGLU and the intermediates included; a row's bits the same in every window size from 1 to 64 rows and in larger ones as in one 4,096-row call |
+| 2.1: the expert prompt kernels' log-probs against the reference (1,866 positions) | mean KL 0.002901, p99 0.0438, top-1 agreement 98.98%: within the gate (0.003, 0.05, 98.5%) |
+| 2.1: deterministic, drafted = undrafted, concurrent = solo | yes, on every lab boot of the adopted levers and on the combined boot: drafted equal plain, 22 of 22 concurrent requests equal their solo replies, 64 of 64 concurrent-bench replies equal; the host RAM tier, the fills during decode and her v1.8 fixes change no reply (greedy 5 of 5 twice, concurrent 11 of 11, long prompts 5 of 5 against the boot without each) |
+| 2.1: kept prompts back from host RAM | four prompts evicted for room came back from host RAM with their cold replies |
+| AEON-30, 2.1 (idle, one task at a time) | 23 of 30 at 83.4 tok/s, 1,469 s; Mia's recipe v1.8: 23 of 30 (its run overlapped another client's request: the score only) |
 
 ## Stability
 
-The shipped configuration, on the same boot as [its numbers](#the-release-configuration): a 1.58-hour run of mixed
+2.0's shipped configuration, on the same boot as [its numbers](#20-as-shipped): a 1.58-hour run of mixed
 load at up to eight requests at once (agentic, chat, coding and tool-calling requests, and long prompts of 16K to
 100K tokens). The load paused, 0.22 hours in all, for the quiet parts of the probe rounds (every 20 minutes) and for
 the decode checks at the start, middle and end, so 81.6 minutes were under load.
@@ -444,21 +622,27 @@ the decode checks at the start, middle and end, so 81.6 minutes were under load.
 | Decode drift, spark-bench at the start / middle / end (tok/s) | prose 77.4 / 77.1 / 77.2, code 79.2 / 79.6 / 79.4, JSON 91.4 / 90.9 / 90.6, C4 111.9 / 112.2 / 111.9; the largest change −0.9% |
 | Memory creep (GiB/h) | attention host +0.23 (its GPU 0.0); the two Sparks −0.02 and −0.07 |
 | A 100K-token prompt sent while seven other requests decode | first token after 117.6 s at the median and 155.4 s at p95 (alone: 36.8 s) |
-| Failure drills: restart one expert node, the attention node or the MCDMA daemons; cold start of the whole stack | not run for this release |
+| Failure drills: restart one expert node, the attention node or the MCDMA daemons; cold start of the whole stack | not run for 2.0 or 2.1 |
+
+2.1 has had no soak of its own: its configuration ran only the lab's benchmark boots above, each of which passed
+every gate.
 
 ## Memory
 
 | Node | Measured |
 | --- | --- |
-| Attention node: startup estimate at 262,144 | 17.92 GiB within the card's 28.80 GiB budget at eight streams with the 64-row window (16.27 GiB at four); one KV pool of 727,040 tokens (966,656 at four streams and 8 GiB) |
-| Attention node: peak while serving | as shipped, 24,884 MiB over its whole boot (three arena cells and the mixed load included); 26,926 MiB at eight streams (the boot's whole run, four arena cells included). v2.0 staging: 25.36 GiB over its arena grid |
-| Each Spark: available memory with the experts loaded | 28.8 and 29.5 GiB on v2.0 staging; as shipped, the lowest over the whole boot 28.44 and 29.21 GiB (28.66 and 29.49 GiB during the mixed load) |
+| Attention node: startup estimate at 262,144 | 17.92 GiB within the card's 28.80 GiB budget at eight streams with the 64-row window (16.27 GiB at four); one KV pool of 727,040 tokens (966,656 at four streams and 8 GiB). 2.1: one KV pool of 1,579,008 tokens at 8.5 GiB, the kept states in host RAM |
+| Attention node: peak while serving | as shipped, 24,884 MiB over its whole boot (three arena cells and the mixed load included); 26,926 MiB at eight streams (the boot's whole run, four arena cells included). v2.0 staging: 25.36 GiB over its arena grid. 2.1, the lab's combined boot: 26,426 MiB (25.81 GiB), within the 27.5 GiB gate |
+| Attention host: pinned RAM | 2.1 only: 33.35 GiB (24 GiB of pages of 2,048 tokens, 4,153,344 tokens' rows, and 53 state slots) |
+| Each Spark: available memory with the experts loaded | 28.8 and 29.5 GiB on v2.0 staging; as shipped, the lowest over the whole boot 28.44 and 29.21 GiB (28.66 and 29.49 GiB during the mixed load). 2.1, the lab's combined boot: the lowest 28.5 and 29.1 GiB |
 
 ## Comparisons, and what they are not
 
 The Mia columns are her own recipe on its own pair of Sparks, with the same checkpoint and drafter: someone choosing
-today has her recipe or this one. Her latest release is v1.5; the arena grid shows her v1.4 grid in full and her v1.5
-where a cell was re-measured, and on spark-bench the two releases measure the same. Her lane runs her draft policy at
+today has her recipe or this one. For 2.1 her latest release is v1.8 (`33b50fd`), measured in the same window as this
+version ([above](#21-in-the-same-window-as-mias-recipe-v18)). 2.0's tables ran her v1.5 and her v1.4 grid; the arena
+grid shows her v1.4 grid in full and her v1.5 where a cell was re-measured, and on spark-bench those two releases
+measure the same. Her lane runs her draft policy at
 `fnc7:0.3`, which this version runs at `fnc5:0.2` ([above](#the-draft-policy)). The stock column is unmodified
 TensorFold 0.6.5 at its largest admitted window on the same two Sparks this recipe uses for its experts. Each column
 names its harness; a number measured on a different harness or checkpoint is labelled as such, never mixed in. The

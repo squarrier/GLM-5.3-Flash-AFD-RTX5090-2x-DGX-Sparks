@@ -61,15 +61,22 @@ Also:
   pair, then `./stop.sh && ./start.sh up`. Mia's draft policy runs at `fnc5:0.2` in `.env.example`; put
   `TF_GLM_DFLASH_POLICY=fnc7:0.3` in its place to run her lane's policy.
 - **Out of memory on the attention node after raising `PARALLEL` or `CACHE_GIB`.** Past four streams the extra
-  streams' working memory comes out of the 5090's cache budget: at eight streams `CACHE_GIB=6.5` is the measured
-  setting (7.5 GiB, and 7 GiB with the 64-row window, went over the memory gate). For four streams use `PARALLEL=4`,
-  `CACHE_GIB=8` and drop `TF_GLM_MULTI_WINDOW`.
+  streams' working memory comes out of the 5090's cache budget: at eight streams `CACHE_GIB=8.5` with the kept states
+  in host RAM (`TF_GLM_KEPT_HOST=1`) is the measured setting, and 6.5 without them (7.5 GiB, and 7 GiB with the 64-row
+  window, went over the memory gate). 2.0 measured four streams at `PARALLEL=4`, `CACHE_GIB=8` without
+  `TF_GLM_MULTI_WINDOW` and without the host tier.
+- **The attention host runs out of RAM, or the start fails pinning host memory.** The host RAM tier pins 33.35 GiB as
+  shipped (`TF_GLM_HOST_CACHE_GIB=24` plus the kept states). Lower `TF_GLM_HOST_CACHE_GIB`, or remove it and
+  `TF_GLM_KEPT_HOST` together with `CACHE_GIB=6.5`, on a smaller host.
 - **`./start.sh up` stops at "the N links not up".** With `MCDMA_INFLIGHT=2` each Spark runs two listen daemons, on
   `MCDMA_CTRL_PORT` and the port after it (`x0`, `x0-1`; `x1`, `x1-1`); let both ports through the fabric firewall.
   `./start.sh status` lists every link, and `./start.sh logs` tails each daemon's log.
-- **Long first tokens at many deep contexts.** Deep contexts that together outgrow the 5090's KV pool (727,040 tokens
-  at eight streams, 966,656 at four with 8 GiB) evict kept prompt states, and prompts fill again. Fewer concurrent deep
-  contexts, or shorter ones, avoid it.
+- **Long first tokens at many deep contexts.** Deep contexts that together outgrow the 5090's KV pool (1,579,008 tokens
+  at eight streams) evict kept prompt states, and prompts fill again unless the evicted prompt parked its rows in host
+  RAM (`TF_GLM_HOST_CACHE_GIB`). Fewer concurrent deep contexts, or shorter ones, avoid it.
+- **A request whose client disconnected keeps a place in the queue.** It waits for a lane before it is dropped (100-127
+  s in the lab). Her `TF_GLM_QUEUED_CANCEL=1` (patch 0037, off as shipped) drops it at once
+  ([measured and off](DESIGN.md#measured-and-off)).
 - **Tool-call markup as text with `tool_choice: "none"`.** The server offers the model no tools, but the model can
   still write call markup into its text. That is TensorFold 0.6.5's behaviour ([Limits](DESIGN.md#limits)).
 

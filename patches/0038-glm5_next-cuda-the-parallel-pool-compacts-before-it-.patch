@@ -1,0 +1,643 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 20:02:25 -0400
+Subject: [PATCH] glm5_next/cuda: the --parallel pool compacts before it
+ evicts, TF_GLM_COMPACT_BEFORE_EVICT (MiaAI-Lab recipe patch 0074)
+
+A request, or a decoding stream's extent, that needed rows the pool had free but not in one range evicted kept
+prompts, least recently used first, until a free range opened, and compacted only after evicting every one, so two
+long conversations taking turns at a nearly full pool evicted each other's kept prompt (the recipe's issue #61).
+MiaAI-Lab's recipe v1.6 compacts as soon as the free rows cover the request, with patch 0074-glm-compact-before-evict:
+for a growing extent, the extents up to it slide down and the ones after it up, so the free rows follow it (each
+moves once at most), and it evicts only while the free rows fall short. Placement only: the same replies. This ports
+it behind a switch of this tree's own, off by default:
+
+- multi.py: MultiDecoder.compact_first (TF_GLM_COMPACT_BEFORE_EVICT); _compact(grow=None), verbatim (without grow,
+  the same moves as before); _room's and _grow's loops of the patch, run when the switch is on. TF_GLM_CACHE_ROOM=1,
+  this tree's own room rule (cache_room), still makes the room when it is set, with or without this switch.
+- engine.py: a startup line when the switch is on.
+- tests/glm_pool_room_check.py: the recipe's tools/pool_room_check.py (0074's checks, by ezoushen), verbatim.
+- THIRD_PARTY_NOTICES.md: "GLM compact before evict".
+
+Unset, _room and _grow take the same paths as before.
+
+Tests: tests/test_glm_compact_first.py (12, CPU): the switch; the recipe's checks on this tree's MultiDecoder: all pass
+with the switch on, and off the same five fail as on the recipe's tree just before 0074 (its tree at 68ebd67 passes
+all); two ranks over the fake model, off and on: a new prompt with the free rows in pieces (off: the two oldest kept
+prompts go; on: the extents move and all stay and resume), a kept prompt taken over in place that must grow into its
+neighbour's block (off: the neighbour's prompt goes; on: the extents after it move up, nothing is evicted, and the
+neighbour's next turn resumes), growing streams over a fragmented pool (every row survives the moves; on evicts no
+more than off), llama-benchy's runs in a scaled pool (on misses no more than off), and TF_GLM_CACHE_ROOM=1 with it
+(cache_room makes the room). Every reply equals the request served alone; both ranks hold the same pools.
+
+Credit: patch 0074 was written by ezoushen (https://github.com/ezoushen) in
+MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold pull request #62 (issue #61), and MiaAI-Lab applied it as
+contributed in recipe commit 5859365 (v1.6), Apache License 2.0, with tools/pool_room_check.py.
+
+Changed from the picked commit: tests/test_glm_cache_room.py's off cases run with TF_GLM_COMPACT_BEFORE_EVICT unset
+(they check the recipe's room rule as of patch 0030), and tests/test_glm_compact_first.py's tests run with
+TF_GLM_CACHE_ROOM unset unless a test sets it: each test checks one room rule with the other rule's switch unset.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patch 0074,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 68ebd67b5326974b8004009e202268b1fa7c551d (v1.7.1); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |  18 ++
+ .../families/glm5_next/cuda/engine.py         |   5 +
+ .../families/glm5_next/cuda/multi.py          |  52 ++++-
+ tests/glm_pool_room_check.py                  | 164 +++++++++++++
+ tests/test_glm_cache_room.py                  |   8 +
+ tests/test_glm_compact_first.py               | 219 ++++++++++++++++++
+ 6 files changed, 462 insertions(+), 4 deletions(-)
+ create mode 100755 tests/glm_pool_room_check.py
+ create mode 100644 tests/test_glm_compact_first.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index ff2a36c..7cd0f55 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -556,3 +556,21 @@ Changes in the port: the recipe always runs it, and here it is off unless `TF_GL
+ `_submit_polled`, which also stamps a request's arrival under `TF_GLM_PREFILL_ORDER=sjf`; the dropping also runs in
+ this tree's shortest-first admission (`_admit_sjf`), and `_cancel_waiting` leaves TensorFold v0.6.5's `close()` stop
+ entry in the queue.
++
++## GLM compact before evict (TF_GLM_COMPACT_BEFORE_EVICT)
++
++The `TF_GLM_COMPACT_BEFORE_EVICT=1` paths of `families/glm5_next/cuda/multi.py`'s `MultiDecoder._room` and `_grow`, and
++`_compact`'s `grow` argument (the `--parallel` pool moves extents together before it evicts kept prompts, and evicts
++only while its free rows fall short; a growing extent gets the free rows gathered right after it, each extent moving
++once at most) are MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/68ebd67)
++patch 0074-glm-compact-before-evict (v1.6, recipe commit
++[`5859365`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/commit/585936585de470a0b687a998f48b636bd22e440d)),
++written by [ezoushen](https://github.com/ezoushen) in
++[pull request #62](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/62) for
++[issue #61](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/61) and applied by MiaAI-Lab
++as contributed. `tests/glm_pool_room_check.py` is the recipe's `tools/pool_room_check.py` (0074's checks, by
++ezoushen), verbatim. Both are under the recipe's Apache License 2.0 (see [the license text](LICENSES/Apache-2.0.txt)).
++Changes in the port: the recipe always runs it, and here it is off unless `TF_GLM_COMPACT_BEFORE_EVICT=1`
++(`MultiDecoder.compact_first`); unset, `_room` and `_grow` run as before (`_compact()` without `grow` is unchanged).
++With `TF_GLM_CACHE_ROOM=1` also set, this tree's `cache_room` makes the room, as it does without this switch.
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 0edcba9..8189689 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -774,6 +774,11 @@ class GlmEngine:
+                     print("[tensorfold] TF_GLM_QUEUED_CANCEL=1: a waiting request whose client left is dropped at once, "
+                           "even while every lane is busy; a reply whose delivery fails ends after its round (MiaAI-Lab "
+                           "recipe patch 0073, by desy0305)", flush=True)
++                if self.multi.compact_first:
++                    print("[tensorfold] TF_GLM_COMPACT_BEFORE_EVICT=1: room in the pool comes from moving extents "
++                          "together before any kept prompt is evicted, and evictions only while the free rows fall "
++                          "short (MiaAI-Lab recipe patch 0074, by ezoushen)"
++                          + ("; TF_GLM_CACHE_ROOM=1 makes the room instead" if self.multi.room else ""), flush=True)
+ 
+     @staticmethod
+     def _cache_entries() -> int:
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index c1ed6d2..fc8c315 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -444,6 +444,7 @@ class MultiDecoder:
+     ordered = None
+     window = MAX_WINDOW                # rows of a round's windows together (TF_GLM_MULTI_WINDOW; set by __init__; 0069)
+     share_copy = False                 # TF_GLM_SHARED_PREFIX_COPY (``__init__`` reads it; MiaAI-Lab recipe patch 0071)
++    compact_first = False              # TF_GLM_COMPACT_BEFORE_EVICT (``__init__`` reads it; MiaAI-Lab recipe patch 0074)
+ 
+     def __init__(self, engine, streams: int, *, verify=None, drafts=None, draft_graphs: bool | None = None,
+                  tune: MultiSettings | None = None, row_ms: Sequence[float] | None = None, fill_costs=None,
+@@ -514,6 +515,10 @@ class MultiDecoder:
+         # TF_GLM_SHARED_PREFIX_COPY=1 (MiaAI-Lab recipe patch 0071, by ezoushen; off by default here): rank 0 copies a
+         # resumed shared prefix's rows into an extent of their own, so the conversation that wrote them keeps its state
+         self.share_copy = recipe_switch("TF_GLM_SHARED_PREFIX_COPY")
++        # TF_GLM_COMPACT_BEFORE_EVICT=1 (MiaAI-Lab recipe patch 0074, by ezoushen; off by default here): rank 0's _room
++        # and _grow move extents together before they evict, and evict only while the free rows fall short
++        # (TF_GLM_CACHE_ROOM=1, when also set, makes room its own way: ``cache_room``)
++        self.compact_first = recipe_switch("TF_GLM_COMPACT_BEFORE_EVICT")
+         self.laned = {"groups": 0, "chunks": 0, "rows": 0}               # groups of 3 or more lanes
+         # TF_GLM_PREFILL_ORDER=sjf (``prefill_order``, ours): rank 0 fills, and its scheduler admits, the waiting prompts
+         # fewest uncached tokens first, those that have waited TF_GLM_PREFILL_AGE_MS first by arrival
+@@ -1193,25 +1198,45 @@ class MultiDecoder:
+         keep = set(id(x) for x in protect)
+         return [c for c in self.kept if c.extent.owner is None and id(c.extent) not in keep]
+ 
+-    def _compact(self) -> None:
+-        """Rank 0: slide every extent down to the lowest free rows (MOVEs), so the free rows are one range."""
++    def _compact(self, grow=None) -> None:
++        """Rank 0: slide every extent down to the lowest free rows (MOVEs), so the free rows are one range; with
++        ``grow``, only the extents up to it slide down and the ones after it up to the pool's end, so that range
++        follows ``grow`` (each extent moves once at most). (``grow``: MiaAI-Lab recipe patch 0074, by ezoushen, for
++        ``_grow`` with TF_GLM_COMPACT_BEFORE_EVICT=1)"""
+ 
+         at = 0
+         for x in list(self.pool.extents):
++            if grow is not None and x.base > grow.base:
++                break
+             if x.base != at:
+                 self._emit(MOVE, [x.eid, at, x.size])
+                 self._move(x, at, x.size)
+             at += x.size
++        if grow is None:
++            return
++        top = self.pool.rows
++        for x in reversed(list(self.pool.extents)):
++            if x is grow:
++                break
++            top -= x.size
++            if x.base != top:
++                self._emit(MOVE, [x.eid, top, x.size])
++                self._move(x, top, x.size)
+ 
+     def _room(self, need: int, protect=()) -> int | None:
+         """Rank 0: a base with ``need`` free rows, evicting kept prompts (least recently used first, never
+         ``protect``'s extents) and compacting as needed; None if even that leaves too little. TF_GLM_CACHE_ROOM=1:
+-        ``cache_room.room``."""
++        ``cache_room.room``. TF_GLM_COMPACT_BEFORE_EVICT=1 (MiaAI-Lab recipe patch 0074, by ezoushen): evicting only
++        while the free rows fall short of ``need``, then compacting if they are not together: moving rows costs far
++        less than prefilling an evicted conversation again."""
+ 
+         if getattr(self, "room", False):
+             return cache_room.room(self, need, protect)
+         base = self.pool.place(need)
+         while base is None:
++            if self.compact_first and self.pool.free_rows() >= need:      # 0074
++                self._compact()
++                return self.pool.place(need)
+             victims = self._victims(protect)
+             if not victims:
+                 break
+@@ -1224,7 +1249,8 @@ class MultiDecoder:
+ 
+     def _grow(self, x, size: int, protect=()) -> bool:
+         """Rank 0: extent x to at least ``size`` rows, in place or moved (evicting and compacting as needed).
+-        TF_GLM_CACHE_ROOM=1: ``cache_room.grow``."""
++        TF_GLM_CACHE_ROOM=1: ``cache_room.grow``. TF_GLM_COMPACT_BEFORE_EVICT=1 (MiaAI-Lab recipe patch 0074, by
++        ezoushen): as in ``_room``, compacting before evicting more than the free rows fall short."""
+ 
+         size = align_up(size)
+         if size <= x.size:
+@@ -1232,6 +1258,24 @@ class MultiDecoder:
+         protect = list(protect) + [x]
+         if getattr(self, "room", False):
+             return cache_room.grow(self, x, size, protect)
++        if self.compact_first:                                             # 0074
++            while True:
++                if self.pool.room_after(x) >= size - x.size:
++                    self._emit(GROW, [x.eid, size])
++                    self._resize(x, size)
++                    return True
++                base = self.pool.place(size, ignore=[x])
++                if base is not None:
++                    self._emit(MOVE, [x.eid, base, size])
++                    self._move(x, base, size)
++                    return True
++                if self.pool.free_rows() + x.size >= size:
++                    self._compact(grow=x)            # the rows are free, just not together: gathered right after x
++                    continue
++                victims = self._victims(protect)
++                if not victims:
++                    return False
++                self._evict(victims[0])
+         while True:
+             if self.pool.room_after(x) >= size - x.size:
+                 self._emit(GROW, [x.eid, size])
+diff --git a/tests/glm_pool_room_check.py b/tests/glm_pool_room_check.py
+new file mode 100755
+index 0000000..06f6da4
+--- /dev/null
++++ b/tests/glm_pool_room_check.py
+@@ -0,0 +1,164 @@
++#!/usr/bin/env python3
++# The recipe's tools/pool_room_check.py, verbatim but for this comment block: MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX
++# Spark recipe @ 68ebd67 (github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold), patch 0074's checks, by
++# ezoushen (its pull request #62), Apache License 2.0. tests/test_glm_compact_first.py runs it on this tree's
++# MultiDecoder with TF_GLM_COMPACT_BEFORE_EVICT on (and off, where it shows the evictions before 0074).
++# ruff: noqa
++"""Checks for patch 0074 (the shared pool compacts before it evicts), run inside the image that scripts/prepare.sh
++built:
++
++    docker run --rm --entrypoint python -v "$PWD/tools/pool_room_check.py:/c.py" tensorfold-glm53:v0.6.0 /c.py
++
++MultiDecoder's room-making (_grow, _room) on the real Pool and a CPU arena, no GPU or model: a conversation whose
++extent cannot grow in place and a new request, each while the pool's free rows cover them in several ranges (nothing
++evicted, every kept prompt's rows intact, each extent moved once at most, rank 1 replaying the ops to the same
++extents and rows), the same for a decoding stream's extent, too few free rows (only the least recently used state it
++needs evicted), and protected extents. Exit code 1 when a check fails.
++"""
++from types import SimpleNamespace as NS
++
++import torch
++
++from tensorfold.families.glm5_next.cuda.multi import MOVE, MultiDecoder
++from tensorfold.families.glm5_next.cuda.pool import ALIGN, Arena, Plane, Pool, align_up
++
++B = ALIGN                                   # one block of rows
++failures = []
++
++
++def check(name, ok, detail=""):
++    print(("ok   " if ok else "FAIL ") + name + (f" ({detail})" if detail and not ok else ""))
++    if not ok:
++        failures.append(name)
++
++
++def decoder(blocks):
++    rows = blocks * B
++    m = object.__new__(MultiDecoder)
++    m.pool, m.kept, m.lanes, m.partial = Pool(rows), [], {}, None
++    m.arena = Arena(rows, [Plane(torch.zeros(rows, dtype=torch.int32)), Plane(torch.zeros(rows // 4, dtype=torch.int32), 4)])
++    m.ops = []
++    m._emit = lambda op, p: m.ops.append((op, list(p)))
++    return m
++
++
++def moves(m, x):
++    """How many times rank 0 moved extent x."""
++    return sum(1 for op, p in m.ops if op == MOVE and p[0] == x.eid)
++
++
++def replays(m, r):
++    """Rank 1 (``r``, built like ``m`` before the call) applies rank 0's ops and ends with the same extents and rows."""
++    msg = [v for op, p in m.ops for v in (op, len(p), *p)]
++    r.apply(msg)
++    same = [(x.eid, x.base, x.size) for x in r.pool.extents] == [(x.eid, x.base, x.size) for x in m.pool.extents]
++    return same and all(bool((a.tensor == b.tensor).all()) for a, b in zip(m.arena.planes, r.arena.planes))
++
++
++def keep(m, at_block, tokens, name):
++    """A kept prompt of ``tokens`` at block ``at_block``, its rows tagged with its own number; appended as the most
++    recently used."""
++    x = m.pool.add(at_block * B, align_up(tokens))
++    tag = len(m.kept) + 1
++    for p in m.arena.planes:
++        p.view(x.base, x.size)[:-(-tokens // p.div)] = tag
++    c = NS(ids=[0] * tokens, key=[0] * tokens, extent=x, kid=tag, shared=False, name=name, tag=tag,
++           rec=0, conv=0, tail=0, head=0, drafter_rows=0)
++    x.kept = [c]
++    m.kept.append(c)
++    return x
++
++
++def alive(m):
++    return [c.name for c in m.kept]
++
++
++def rows_intact(m):
++    """Every kept prompt's rows still hold its tag at its extent's current base."""
++    for c in m.kept:
++        for p in m.arena.planes:
++            got = p.view(c.extent.base, c.extent.size)[:-(-len(c.ids) // p.div)]
++            if not bool((got == c.tag).all()):
++                return False
++    return True
++
++
++# A conversation's next turn needs 2 more blocks; the rows right after it are another kept prompt and no free gap
++# holds the grown extent, but the pool's free rows (5 blocks in 4 holes) cover it. Least recently used: "other" (the
++# second agent's only state).
++def fragmented():
++    m = decoder(24)
++    keep(m, 0, 6 * B, "other")            # blocks 0-5
++    keep(m, 7, 2 * B, "old1")             # hole at 6
++    keep(m, 10, 2 * B, "old2")            # hole at 9
++    a = keep(m, 13, 6 * B, "agent")       # hole at 12
++    keep(m, 19, 3 * B, "neighbour")       # right after the agent; hole at 22-23
++    m.kept = [c for c in m.kept if c.name != "agent"] + [c for c in m.kept if c.name == "agent"]
++    return m, a
++
++
++m, a = fragmented()
++r, _ = fragmented()
++check("fragmented: the free rows cover the growth, no gap does",
++      m.pool.free_rows() >= 2 * B and m.pool.room_after(a) == 0 and m.pool.place(8 * B, ignore=[a]) is None)
++check("grow: succeeds", m._grow(a, 8 * B, protect=[a]))
++check("grow: compacts instead of evicting (every kept prompt stays)",
++      alive(m) == ["other", "old1", "old2", "neighbour", "agent"], alive(m))
++check("grow: the agent's extent has its rows", a.size >= 8 * B)
++check("grow: every kept prompt's rows moved intact", rows_intact(m))
++check("grow: the neighbour moves once (up, out of the agent's way), not down and back up",
++      moves(m, m.pool.extents[-1]) == 1, m.ops)
++check("grow: rank 1 replaying the ops ends with the same extents and rows", replays(m, r))
++
++# The same while the agent's extent is a decoding stream's (its rows up to the stream's position, rebound when moved).
++m, a = fragmented()
++bound = []
++m.kept = [c for c in m.kept if c.name != "agent"]
++a.kept, a.owner = [], 7
++for p in m.arena.planes:
++    p.view(a.base, a.size)[:] = 99
++m.lanes = {7: NS(st=NS(pos=6 * B - 5, bind=lambda base, size: bound.append((base, size))))}
++check("decoding grow: succeeds", m._grow(a, 8 * B, protect=[a]))
++check("decoding grow: compacts instead of evicting", alive(m) == ["other", "old1", "old2", "neighbour"], alive(m))
++check("decoding grow: the stream's rows moved intact",
++      all(bool((p.view(a.base, a.size)[:-(-(6 * B - 5) // p.div)] == 99).all()) for p in m.arena.planes))
++check("decoding grow: the stream is bound to where its extent is", not bound or bound[-1] == (a.base, a.size), bound)
++check("decoding grow: the other kept prompts' rows moved intact", rows_intact(m))
++
++# A new request needs 4 blocks: the free rows (4 holes) cover it, no gap does.
++def holes():
++    m = decoder(16)
++    keep(m, 0, 3 * B, "other")
++    keep(m, 4, 3 * B, "old1")
++    keep(m, 8, 3 * B, "old2")
++    keep(m, 12, 3 * B, "old3")
++    return m
++
++
++m, r = holes(), holes()
++base = m._room(4 * B)
++check("room: a base for the new extent", base is not None and m.pool.place(4 * B) == base)
++check("room: compacts instead of evicting", alive(m) == ["other", "old1", "old2", "old3"], alive(m))
++check("room: every kept prompt's rows moved intact", rows_intact(m))
++check("room: rank 1 replaying the ops ends with the same extents and rows", replays(m, r))
++
++# Too little free rows: evict least recently used, only until the free rows cover the request, then compact. Here the
++# oldest ("other", 3 blocks, not next to a hole big enough) is enough; evicting until a gap opens would also drop more.
++m = decoder(16)
++keep(m, 0, 3 * B, "other")            # hole at 3
++keep(m, 4, 5 * B, "old1")             # hole at 9
++keep(m, 10, 5 * B, "old2")            # hole at 15
++base = m._room(5 * B)
++check("room short: a base", base is not None)
++check("room short: evicts only the least recently used state it needs", alive(m) == ["old1", "old2"], alive(m))
++check("room short: the survivors' rows moved intact", rows_intact(m))
++
++# Protected extents are never evicted, compaction or not.
++m = decoder(10)
++p = keep(m, 0, 4 * B, "protected")
++keep(m, 5, 4 * B, "old")
++check("protect: room for 4 blocks evicts the unprotected one", m._room(4 * B, [p]) is not None and alive(m) == ["protected"],
++      alive(m))
++
++print(f"{'FAILED ' + str(len(failures)) if failures else 'all passed'}")
++raise SystemExit(1 if failures else 0)
+diff --git a/tests/test_glm_cache_room.py b/tests/test_glm_cache_room.py
+index bdeff46..8ce1e81 100644
+--- a/tests/test_glm_cache_room.py
++++ b/tests/test_glm_cache_room.py
+@@ -86,6 +86,8 @@ def test_a_new_prompt_takes_the_free_rows_before_any_kept_prompt(fake, monkeypat
+     from tensorfold.families.glm5_next.cuda.multi import EVICT
+ 
+     monkeypatch.setenv("TF_GLM_CACHE_ROOM", room)
++    if not room:          # off: the recipe's room rule (0030), without 0074's (tests/test_glm_compact_first.py)
++        monkeypatch.delenv("TF_GLM_COMPACT_BEFORE_EVICT", raising=False)
+     torch = fake
+     p = Pair(torch, streams=2, blocks=8, entries=16)
+     d = p.d[0]
+@@ -122,6 +124,8 @@ def test_a_kept_prompt_taken_over_in_place_grows_by_moving_its_neighbours(fake,
+     from tensorfold.families.glm5_next.cuda.multi import EVICT, GROW, MOVE
+ 
+     monkeypatch.setenv("TF_GLM_CACHE_ROOM", room)
++    if not room:          # off: the recipe's room rule (0030), without 0074's (tests/test_glm_compact_first.py)
++        monkeypatch.delenv("TF_GLM_COMPACT_BEFORE_EVICT", raising=False)
+     torch = fake
+     p = Pair(torch, streams=2, blocks=6, entries=16)
+     d = p.d[0]
+@@ -193,6 +197,8 @@ def test_growing_streams_keep_every_row_and_fewer_kept_prompts_go(fake, monkeypa
+     from tensorfold.families.glm5_next.cuda.multi import EVICT, MOVE
+ 
+     monkeypatch.setenv("TF_GLM_CACHE_ROOM", room)
++    if not room:          # off: the recipe's room rule (0030), without 0074's (tests/test_glm_compact_first.py)
++        monkeypatch.delenv("TF_GLM_COMPACT_BEFORE_EVICT", raising=False)
+     torch = fake
+     p = Pair(torch, streams=3, blocks=6, entries=8)
+     log = logged(p)
+@@ -270,6 +276,8 @@ def test_benchy_runs_resume_their_contexts(fake, monkeypatch, room):  # noqa: F8
+     from tensorfold.families.glm5_next.cuda import engine
+ 
+     monkeypatch.setenv("TF_GLM_CACHE_ROOM", room)
++    if not room:          # off: the recipe's room rule (0030), without 0074's (tests/test_glm_compact_first.py)
++        monkeypatch.delenv("TF_GLM_COMPACT_BEFORE_EVICT", raising=False)
+     monkeypatch.setattr(engine.GlmEngine, "grid", 64)
+     torch = fake
+     p = Pair(torch, streams=2, blocks=13, entries=32, prefill_rows=2048)
+diff --git a/tests/test_glm_compact_first.py b/tests/test_glm_compact_first.py
+new file mode 100644
+index 0000000..c750c36
+--- /dev/null
++++ b/tests/test_glm_compact_first.py
+@@ -0,0 +1,219 @@
++"""TF_GLM_COMPACT_BEFORE_EVICT (MiaAI-Lab recipe patch 0074, by ezoushen): the --parallel pool moves extents together
++before it evicts kept prompts, and evicts only while its free rows fall short, on the CPU.
++
++- The recipe's own checks for 0074 (``tools/pool_room_check.py``, vendored verbatim as ``tests/glm_pool_room_check.py``)
++  on this tree's ``MultiDecoder``: all pass with the switch on; off, the evictions before 0074 show.
++- Two ranks over tests/test_glm_multi.py's fake model (rank 1 applying rank 0's messages, every reply checked against
++  the request served alone), the patterns of tests/test_glm_cache_room.py: a new prompt with the free rows in pieces;
++  a kept prompt taken over in place that must grow into its neighbour's block; growing streams; llama-benchy's runs in
++  a scaled pool. With TF_GLM_CACHE_ROOM=1 also set, ``cache_room`` makes the room (this tree's own rule).
++"""
++
++from __future__ import annotations
++
++import runpy
++from pathlib import Path
++
++import pytest
++
++from tests.test_cuda_geometry import allocations  # noqa: F401  (fixture: fake triton, so decode imports)
++from tests.test_glm_cache_room import Queue, benchy, blocks, kept_ids, kept_one_block_each, logged, ops_of
++from tests.test_glm_multi import Pair, _ops, _prompt, _sampling, fake, solo  # noqa: F401
++
++pytestmark = pytest.mark.torch
++
++CHECK = Path(__file__).with_name("glm_pool_room_check.py")
++
++
++@pytest.fixture(autouse=True)
++def _room_rule_unset(monkeypatch):
++    """0074 against the recipe's room rule (0030): TF_GLM_CACHE_ROOM, this tree's own rule, unset unless a test
++    sets it (tests/test_glm_cache_room.py covers it)."""
++
++    monkeypatch.delenv("TF_GLM_CACHE_ROOM", raising=False)
++
++
++def test_the_switch(fake, monkeypatch):  # noqa: F811
++    from tensorfold.families.glm5_next.cuda.multi import recipe_switch
++
++    assert [recipe_switch("TF_GLM_COMPACT_BEFORE_EVICT", v) for v in ("", "0", "1")] == [False, False, True]
++    monkeypatch.delenv("TF_GLM_COMPACT_BEFORE_EVICT", raising=False)
++    assert not Pair(fake, streams=2, blocks=4).d[0].compact_first
++    monkeypatch.setenv("TF_GLM_COMPACT_BEFORE_EVICT", "1")
++    assert all(d.compact_first for d in Pair(fake, streams=2, blocks=4).d)
++    monkeypatch.setenv("TF_GLM_COMPACT_BEFORE_EVICT", "on")
++    with pytest.raises(ValueError, match="TF_GLM_COMPACT_BEFORE_EVICT"):
++        Pair(fake, streams=2, blocks=4)
++
++
++@pytest.mark.parametrize("on", [False, True], ids=["off", "on"])
++def test_the_recipe_pool_room_checks(monkeypatch, capsys, on):
++    """The recipe's checks: every one passes with the switch on; off, the ones that need compacting before evicting
++    fail (the evictions 0074 removes), and the rest pass."""
++    from tensorfold.families.glm5_next.cuda.multi import MultiDecoder
++
++    monkeypatch.setattr(MultiDecoder, "compact_first", on)
++    with pytest.raises(SystemExit) as end:
++        runpy.run_path(str(CHECK), run_name="__main__")
++    out = capsys.readouterr().out
++    failed = [line[5:].split(" (")[0] for line in out.splitlines() if line.startswith("FAIL ")]
++    if on:
++        assert end.value.code == 0 and "all passed" in out and not failed
++    else:
++        assert end.value.code == 1
++        assert failed == ["grow: compacts instead of evicting", "grow: the neighbour moves once",
++                          "decoding grow: compacts instead of evicting", "room: compacts instead of evicting",
++                          "room short: evicts only the least recently used state it needs"]
++
++
++@pytest.mark.parametrize("cf", ["", "1"], ids=["off", "on"])
++def test_a_new_prompt_takes_the_free_rows_before_any_kept_prompt(fake, monkeypatch, cf):  # noqa: F811
++    """Six kept prompts in blocks 0-5 of 8, two of them evicted: 4 free blocks, the widest gap 2. A prompt needing 3
++    blocks: off, the two oldest kept prompts go until a gap fits; on, the extents move together and every kept prompt
++    stays, then resumes."""
++
++    from tensorfold.families.glm5_next.cuda.multi import EVICT, MOVE
++
++    monkeypatch.setenv("TF_GLM_COMPACT_BEFORE_EVICT", cf)
++    torch = fake
++    p = Pair(torch, streams=2, blocks=8, entries=16)
++    d = p.d[0]
++    prompts = kept_one_block_each(p, 6, 50)
++    assert blocks(d) == [(k, 1) for k in range(6)]
++    kid = {k: next(c.kid for c in d.kept if c.ids == prompts[k][:999]) for k in range(6)}
++    log = logged(p)
++    for c in [c for c in d.kept if c.kid in (kid[1], kid[3])]:
++        d._evict(c)
++    big = _prompt(5000, 60)
++    s = p.submit(big, 6, None)
++    p.run()
++    assert s.got == solo(torch, big, 6, None) and s.cached == 0
++    left = [k for k in (0, 2, 4, 5) if prompts[k][:999] in kept_ids(d)]
++    evicted = [pl[0] for m in log for op, pl in _ops(m) if op == EVICT]
++    if cf:
++        assert left == [0, 2, 4, 5] and evicted == [kid[1], kid[3]] and MOVE in ops_of(log)
++    else:
++        assert left == [4, 5] and evicted == [kid[1], kid[3], kid[0], kid[2]]    # least recently used first
++    turn = prompts[0] + _prompt(40, 61)
++    again = p.submit(turn, 8, _sampling("topk", 3))
++    p.run()
++    assert again.cached == (999 if cf else 0)
++    assert again.got == solo(torch, turn, 8, _sampling("topk", 3))
++    p.check()
++
++
++@pytest.mark.parametrize("cf", ["", "1"], ids=["off", "on"])
++def test_a_kept_prompt_taken_over_in_place_grows_by_moving_its_neighbours(fake, monkeypatch, cf):  # noqa: F811
++    """Kept prompts A (blocks 0-1), B (2-3) and C (4) in 6 blocks: a request resuming A needs a third block, with B
++    right after A and one free block at the end. Off, B's kept prompt goes so that A grows in place; on, the extents
++    after A move up (``_compact(grow=A)``) and A grows into the freed block, and B's next turn still resumes."""
++
++    from tensorfold.families.glm5_next.cuda.multi import EVICT, GROW, MOVE
++
++    monkeypatch.setenv("TF_GLM_COMPACT_BEFORE_EVICT", cf)
++    torch = fake
++    p = Pair(torch, streams=2, blocks=6, entries=16)
++    d = p.d[0]
++    a, b, c = _prompt(3000, 70), _prompt(3000, 71), _prompt(1000, 72)
++    for pr in (a, b, c):
++        p.submit(pr, 4, None)
++        p.run()
++    assert blocks(d) == [(0, 2), (2, 2), (4, 1)]
++    log = logged(p)
++    turn = a + _prompt(1100, 73)
++    s = p.submit(turn, 10, None)
++    assert s.cached == 2999
++    p.run()
++    assert s.got == solo(torch, turn, 10, None)
++    ops = ops_of(log)
++    if cf:
++        assert b[:2999] in kept_ids(d) and c[:999] in kept_ids(d)
++        assert EVICT not in ops and MOVE in ops and GROW in ops
++    else:
++        assert b[:2999] not in kept_ids(d) and EVICT in ops
++    nxt = b + _prompt(30, 74)
++    again = p.submit(nxt, 8, None)
++    p.run()
++    assert again.cached == (2999 if cf else 0) and again.got == solo(torch, nxt, 8, None)
++    p.check()
++
++
++@pytest.mark.parametrize("cf", ["", "1"], ids=["off", "on"])
++def test_growing_streams_keep_every_row(fake, monkeypatch, cf):  # noqa: F811
++    """tests/test_glm_multi.py's fragmented pool with three long replies that grow past their blocks, both settings:
++    every reply equals its solo one (the moves copied the right rows on both ranks: ``Pair.check`` after every
++    iteration), and on evicts no more kept prompts than off."""
++
++    from tensorfold.families.glm5_next.cuda.multi import EVICT, MOVE
++
++    counts = {}
++    for setting in ("", cf):
++        monkeypatch.setenv("TF_GLM_COMPACT_BEFORE_EVICT", setting)
++        torch = fake
++        p = Pair(torch, streams=3, blocks=6, entries=8)
++        log = logged(p)
++        for seed in (20, 21, 22, 23):
++            p.submit(_prompt(100 + seed, seed), 10, None)
++            p.run()
++        reqs = [(_prompt(1900, 30), 400, None), (_prompt(1500, 31), 700, _sampling("topk", 5)),
++                (_prompt(1000, 32), 1200, _sampling("minp", 6))]
++        streams = [p.submit(pr, n, sp, stop_eos=False) for pr, n, sp in reqs]
++        p.run()
++        for s, (pr, n, sp) in zip(streams, reqs):
++            assert s.got == solo(torch, pr, n, sp, stop_eos=False)
++        ops = ops_of(log)
++        assert MOVE in ops
++        counts[setting] = ops.count(EVICT)
++    assert counts[cf] <= counts[""]
++
++
++@pytest.mark.parametrize("cf", ["", "1"], ids=["off", "on"])
++def test_benchy_runs_in_a_scaled_pool(fake, monkeypatch, cf):  # noqa: F811
++    """tests/test_glm_cache_room.py's scaled llama-benchy runs (13 blocks, 3-block loads, 4-block inference requests,
++    2 streams, c = 3, 4 runs; off: 3 of 12 inference requests miss): on misses no more than off. Every reply equals its
++    solo one."""
++
++    from tensorfold.families.glm5_next.cuda import engine
++
++    monkeypatch.setenv("TF_GLM_COMPACT_BEFORE_EVICT", cf)
++    monkeypatch.setattr(engine.GlmEngine, "grid", 64)
++    torch = fake
++    p = Pair(torch, streams=2, blocks=13, entries=32, prefill_rows=2048)
++    for g in p.g:
++        g.shared, g.opener = 256, 43 if g.rank == 0 else None
++    q = Queue(p, 2)
++    q.d.wanted = None
++    c, context = 3, 5000
++    at = (3 + context) // 64 * 64
++    cached, seed = [], 10_000
++    for run in range(4):
++        contexts = [_prompt(context, seed + 2 * i) for i in range(c)]
++        users = [_prompt(2048, seed + 2 * i + 1) for i in range(c)]
++        seed += 2 * c
++        loads = q.run([benchy(x, [44]) for x in contexts], 6)
++        infs = q.run([benchy(x, u) for x, u in zip(contexts, users)], 6)
++        for s in loads + infs:
++            assert s.got == solo(torch, s.prompt, 6, None, stop_eos=False)
++        cached += [s.cached for s in infs]
++    assert set(cached) <= {0, at}
++    assert cached.count(0) <= 3 and (cached.count(0) == 3 or cf)
++
++
++def test_cache_room_makes_the_room_when_both_are_set(fake, monkeypatch):  # noqa: F811
++    """TF_GLM_CACHE_ROOM=1 with TF_GLM_COMPACT_BEFORE_EVICT=1: ``cache_room`` makes the room (its counters move), the
++    kept prompts stay, as with either alone in this pattern."""
++
++    monkeypatch.setenv("TF_GLM_COMPACT_BEFORE_EVICT", "1")
++    monkeypatch.setenv("TF_GLM_CACHE_ROOM", "1")
++    torch = fake
++    p = Pair(torch, streams=2, blocks=8, entries=16)
++    d = p.d[0]
++    prompts = kept_one_block_each(p, 6, 50)
++    for c in [c for c in d.kept if c.ids in (prompts[1][:999], prompts[3][:999])]:
++        d._evict(c)
++    s = p.submit(_prompt(5000, 60), 6, None)
++    p.run()
++    assert s.got == solo(torch, s.prompt, 6, None)
++    assert [k for k in (0, 2, 4, 5) if prompts[k][:999] in kept_ids(d)] == [0, 2, 4, 5]
++    assert d.health()["cache_room"]["packs"] == 1 and d.health()["cache_room"]["evictions"] == 0
++    p.check()

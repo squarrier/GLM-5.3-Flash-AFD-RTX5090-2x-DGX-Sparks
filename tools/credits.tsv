@@ -16,14 +16,29 @@ pr	301	17f76b78a974d3d04d70cb270c8fbbdd2f0cb1ec	fix(glm cuda): a stopped request
 #   a ".../tree/<sha>" link the commit adds to THIRD_PARTY_NOTICES.md).
 recipe	cf28cc4	cf28cc4f8038be322cdeda220c6f1c8ace8f27d1	v1.4
 recipe	1576746	1576746a04983b6eded0551dbf22512ee9e95654	v1.5
+recipe	68ebd67	68ebd67b5326974b8004009e202268b1fa7c551d	v1.7.1
+recipe	33b50fd	33b50fde06fd7ea604cbc6a663880068ab1e2ee4	v1.8
 #
 # port <TAB> recipe short sha <TAB> commit subject, exactly
 #   A follow-up to a port (tests or comments only) that names her recipe patches in its subject but cites no recipe
 #   commit in its message or in THIRD_PARTY_NOTICES.md: the recipe commit of the port it follows.
 port	1576746	tests: the prompt-switch test clears the decode switches before its decode-window check (MiaAI-Lab recipe patches 0016, 0047)
+port	68ebd67	glm5_next/cuda tests: shared-prefix copy, compact before evict and the kept cap with the host RAM tier (MiaAI-Lab recipe patches 0071, 0074, 0077)
 #
 # extends <TAB> recipe short sha <TAB> her recipe patch numbers <TAB> commit subject, exactly
 #   A change of this recipe's own to code that came from her recipe (it keeps "Co-authored-by: MiaAI-Lab"): the notes
 #   name her patches and recipe commit, and say the change is this recipe's.
 extends	1576746	0030	glm5_next/cuda: room in the pool before kept prompts go, TF_GLM_CACHE_ROOM (default off)
 extends	1576746	0049	glm5_next/cuda: waiting prompts fill fewest uncached tokens first, with aging, TF_GLM_PREFILL_ORDER (extends MiaAI-Lab recipe patch 0049's shortest-first chunk)
+extends	1576746	0062	glm5_next/cuda: prompt chunks fill as pairs while streams decode, TF_GLM_FILL_PAIRS and TF_GLM_FILL_ROUNDS (extends MiaAI-Lab recipe patch 0062's sliced fills)
+#
+# reimpl <TAB> recipe short sha <TAB> her recipe patch numbers <TAB> the parts <TAB> commit subject, exactly
+#   Code of other authors (named in the message) with parts reimplemented from her recipe patches; it keeps
+#   "Co-authored-by: MiaAI-Lab", and the notes name the parts, her patches and the recipe commit.
+reimpl	1576746	0009, 0020	the one rotation a row for a layer whose experts share one gate/up suh, and the group order	glm5_next/cuda: glm53f-afd's expert prompt kernels for GLM's prompt chunks, TF_GLM_EXPERT_KERNEL=g53 (glm53f-afd @ 91db3cc; MiaAI-Lab recipe patches 0009, 0020 reimplemented)
+#
+# upstream <TAB> TensorFold commit (full sha) <TAB> release <TAB> its author, exactly as in the patch <TAB> subject, exactly
+#   TensorFold's own commits of a later release, carried on top of the pinned release with their authorship.
+upstream	dce62cfa3c6752c828c4a17338d3ae585e43e65a	v0.6.6	Philip Mossop <63354535+philip-pentatonic@users.noreply.github.com>	feat(cuda): --name-priority ID=background, a default priority by the model id a request asks for
+upstream	07f3777a4d1739534d04beaf9f14b1f6d3024472	v0.6.6	ashhart <71890694+ashhart@users.noreply.github.com>	--name-priority resolves a local model path before naming it
+upstream	cb2ebf0540f42604e2759b2ddef497861e928248	v0.6.6	ashhart <71890694+ashhart@users.noreply.github.com>	release: TensorFold 0.6.6

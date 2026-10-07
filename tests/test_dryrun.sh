@@ -68,27 +68,29 @@ check mailboxes "$LOG" 'test -e /dev/shm/mcdma-rpc.x1-1'
 a=$(grep -P '^10\.0\.0\.10\t' "$RUNS" | grep -F 'tensorfold serve' || true)
 for s in $'--restart=no\t--oom-score-adj=1000' $'--name\tglm-afd-attn' $'--gpus\tall\t--network\thost\t--ipc=host\t--device\t/dev/infiniband\t--ulimit\tmemlock=-1\t--cap-add\tIPC_LOCK' \
     $'-e\tTF_AFD_TRANSPORT=mcdma' $'-e\tTF_AFD_MCDMA_LINKS=x0,x1' $'-e\tTF_AFD_MCDMA_MODE=auto' $'-e\tTF_AFD_EAGER=1' $'-e\tTENSORFOLD_MEMORY_RESERVE_GIB=2' \
-    $'-e\tTF_GLM_DENSE=q4' $'-e\tTF_GLM_KV=fp8' $'-e\tTF_GLM_CACHE_GIB=6.5' $'-e\tTF_GLM_CACHE_ENTRIES=20' $'-e\tTF_GLM_MCDMA_INFLIGHT=2' \
+    $'-e\tTF_GLM_DENSE=q4' $'-e\tTF_GLM_KV=fp8' $'-e\tTF_GLM_CACHE_GIB=8.5' $'-e\tTF_GLM_CACHE_ENTRIES=20' $'-e\tTF_GLM_MCDMA_INFLIGHT=2' \
     $'-e\tTF_GLM_SHARED_PREFIX=1' $'-e\tTF_GLM_STREAM_SMOOTH_MS=400' \
     $'-e\tTF_GLM_TOOL_CALLS=1' $'-e\tTF_GLM_KDA_CHUNKED=1' $'-e\tTF_GLM_PREFILL_PAIRS=1' $'-e\tTF_GLM_DFLASH_POLICY=fnc5:0.2' \
     $'-e\tTF_GLM_CACHE_ROOM=1' $'-e\tTF_GLM_PREFILL_ORDER=sjf' $'-e\tTF_GLM_MULTI_WINDOW=64' \
+    $'-e\tTF_GLM_KEPT_HOST=1' $'-e\tTF_GLM_HOST_CACHE_GIB=24' $'-e\tTF_GLM_FILL_PAIRS=1' \
+    $'-e\tTF_GLM_DECIDE_THEN_COPY=1' $'-e\tTF_GLM_CAPACITY_STATUS=1' $'-e\tTF_GLM_DELIVERY_ABORT=1' \
     $'-v\t/srv/models/GLM-5.3-Flash-EXL3-4bpw-TensorFold:/srv/models/GLM-5.3-Flash-EXL3-4bpw-TensorFold:ro' \
     'tensorfold serve /srv/models/GLM-5.3-Flash-EXL3-4bpw-TensorFold --experts remote' '--master 10.10.1.10 --master-port 29551' \
     '--drafter /srv/models/GLM-5.3-Flash-DFlash2 --context 262144 --parallel 8 --max-tokens 32768' \
     '--host 0.0.0.0 --port 8000 --name GLM-5.3-Flash-EXL3 --alias glm-5.3-flash > /afd/logs/attn.log 2>&1'; do
   case "$a" in *"$s"*) ;; *) echo "dry run FAIL (attention): missing: $s"; fail=1 ;; esac
 done
-case "$a" in *TF_GLM_EXL3_*) echo "dry run FAIL (attention): an expert-node switch"; fail=1 ;; esac
-case "$a" in *fnc7:0.3*|*TF_GLM_PREFILL_LANES*|*TF_GLM_WIRE_FP8*) echo "dry run FAIL (attention): a switch .env.example leaves off"; fail=1 ;; esac
+case "$a" in *TF_GLM_EXL3_*|*TF_GLM_EXPERT_KERNEL*) echo "dry run FAIL (attention): an expert-node switch"; fail=1 ;; esac
+case "$a" in *fnc7:0.3*|*TF_GLM_PREFILL_LANES*|*TF_GLM_WIRE_FP8*|*TF_GLM_PREFILL_ROWS*|*TF_GLM_SHARED_PREFIX_COPY*|*TF_GLM_QUEUED_CANCEL*|*TF_GLM_COMPACT_BEFORE_EVICT*|*TF_GLM_ASSISTANT_ENDS*|*TF_GLM_CAP_SHARED_RECENCY*|*TF_GLM_MAX_QUEUED*) echo "dry run FAIL (attention): a switch .env.example leaves off"; fail=1 ;; esac
 # the expert nodes: their own link and socket, their decode and prompt kernel switches, no attention-only settings
 for h in 0 1; do
   x=$(grep -P "^10\.0\.0\.1$((h + 1))\t" "$RUNS" | grep -F 'tensorfold experts' || true)
   for s in $'--name\tglm-afd-x'$h $'-e\tTF_AFD_MCDMA_LINK=x'$h $'-e\tMCDMA_RPCD_SOCKET=/mcdma/x'$h'.sock' \
-      $'-e\tTF_GLM_EXL3_DEC=1' $'-e\tTF_GLM_EXL3_LOADS=nc' $'-e\tTF_GLM_EXL3_PROMPT=1' \
+      $'-e\tTF_GLM_EXL3_DEC=1' $'-e\tTF_GLM_EXL3_LOADS=nc' $'-e\tTF_GLM_EXL3_PROMPT=1' $'-e\tTF_GLM_EXPERT_KERNEL=g53' \
       "tensorfold experts /srv/models/GLM-5.3-Flash-EXL3-4bpw-TensorFold" "--rank $h --master 10.10.1.10 --master-port 29551" "/afd/logs/expert$h.log"; do
     case "$x" in *"$s"*) ;; *) echo "dry run FAIL (expert $h): missing: $s"; fail=1 ;; esac
   done
-  case "$x" in *TF_GLM_DENSE*|*TF_GLM_KV*|*--drafter*|*TF_GLM_KDA_CHUNKED*|*TF_GLM_DFLASH_POLICY*|*TF_GLM_PREFILL_PAIRS*|*TF_GLM_MCDMA_INFLIGHT*|*TF_GLM_CACHE_ROOM*|*TF_GLM_PREFILL_ORDER*|*TF_GLM_MULTI_WINDOW*) echo "dry run FAIL (expert $h): attention-only settings"; fail=1 ;; esac
+  case "$x" in *TF_GLM_DENSE*|*TF_GLM_KV*|*--drafter*|*TF_GLM_KDA_CHUNKED*|*TF_GLM_DFLASH_POLICY*|*TF_GLM_PREFILL_PAIRS*|*TF_GLM_MCDMA_INFLIGHT*|*TF_GLM_CACHE_ROOM*|*TF_GLM_PREFILL_ORDER*|*TF_GLM_MULTI_WINDOW*|*TF_GLM_KEPT_HOST*|*TF_GLM_HOST_CACHE_GIB*|*TF_GLM_FILL_PAIRS*|*TF_GLM_DECIDE_THEN_COPY*|*TF_GLM_CAPACITY_STATUS*|*TF_GLM_DELIVERY_ABORT*) echo "dry run FAIL (expert $h): attention-only settings"; fail=1 ;; esac
 done
 # order: listen daemons, connect daemon, attention container, expert containers
 first_serve=$(grep -nF -- '--name glm-afd-attn' "$LOG" | head -1 | cut -d: -f1 || true)

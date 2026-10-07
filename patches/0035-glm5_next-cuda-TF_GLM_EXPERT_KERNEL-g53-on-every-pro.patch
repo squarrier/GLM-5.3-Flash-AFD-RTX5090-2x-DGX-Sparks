@@ -1,0 +1,1012 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 20:17:39 -0400
+Subject: [PATCH] glm5_next/cuda: TF_GLM_EXPERT_KERNEL=g53 on every prompt
+ window, 1 row and up, so a prompt row's bits never depend on its window
+ (glm53f-afd @ 91db3cc)
+
+With TF_GLM_EXPERT_KERNEL=g53, only prompt chunk windows of 65 rows or more took glm53f-afd's expert kernels (expert
+prompt kernels from glm53f-afd, written by Hugh Madden (@dangerm00se, github.com/hughmadden), glm53f-afd @ 91db3cc);
+windows of 1-64 rows stayed on TensorFold's kernels, whose bits differ. A prompt row's window depends on how the
+attention node fills the prompt: alone or grouped with other prompts (TF_GLM_MULTI_PREFILL), whole or split at a kept
+point of the 64-row prompt grid (a drafted prompt keeps its state there), a cache resume's tail, a prefill pair's
+last chunk. So the same row got glm53f-afd's bits one way and TensorFold's the other, and replies depended on how
+they were served: a 70-row prompt whose drafted and plain runs differed fills as 64 + 6 rows drafted (every row on
+TensorFold's kernels) and as one 70-row window plain (every row on glm53f-afd's).
+
+Now every prompt chunk window of the expert node (MODE_CHUNK, MODE_SLICE, MODE_PAIR and MODE_LANES forwards), of any
+size from 1 row to the node's prompt rows, runs through the large-M kernels at the configuration they run up to 2,048
+rows (32-row groups, one K split each, BF16 SwiGLU). glm53f-rank's own header states that with the same K splits and
+SwiGLU a row gets the same bits whatever else is in the batch, the rows per group, the tilings and the row count
+included; its default runs the split kernels (sk 8, skd 2: other bits) below 65 rows, which the port does not use.
+So a prompt row's bits are the same in a window of 1 row as of 4,096. Decode and verify windows (MODE_EAGER) stay on
+TensorFold's decode kernels as before.
+
+- families/glm5_next/cuda/g53_experts.py: default_cfg takes 1..4,096 rows (the up-to-2,048-row setting below 65
+  too); TF_GLM_EXPERT_KERNEL_ROWS defaults to 1 (1..4,096; a higher floor is for measurements, and the node's startup
+  line then says a prompt row's bits depend on its window); Node.compute writes the reply rows it is given (the
+  link's own under TF_GLM_MCDMA_INFLIGHT, whose reply then goes out on the link's second stream as TensorFold's
+  kernels' does) or the node's own as before.
+- families/glm5_next/cuda/experts_node.py: compute passes its ``out`` to the g53 hook.
+- THIRD_PARTY_NOTICES.md: the glm53f-afd section states the window rule.
+No CUDA source changed (g53_rank.cu, .cpp and .h as before; the binding already takes 1..4,096 rows), so the
+prebuilt extension tensorfold_glm_g53_v1 is unchanged. TF_GLM_EXPERT_KERNEL unset (the default) is every call as
+before.
+
+Tests: tests/test_glm_g53_windows.py (new, CPU): the AFD attention node at world 1 on the fake model with the 64-row
+prompt grid, every prompt window rank 0 fills recorded against the wire's chunk forwards; four 40-row prompts alone
+and grouped, a 70-row prompt drafted (64 + 6), resumed from its kept 64 rows (a 6-row tail) and plain (70), a
+600-row prompt in prefill pairs drafted and plain: under the old 65-row floor some row of each pair of scenarios takes
+glm53f-afd's kernels one way and TensorFold's the other; under the default every prompt row of every scenario takes
+glm53f-afd's, and no decode window does. tests/test_glm_g53_kernel.py (CPU): the plan and its bound at 1-4,096 rows,
+the configuration below 65 rows, every window's bit fields (sk 1, skd 1, BF16 SwiGLU at 1..4,096 rows), the switch's
+new default and range, the dispatch of 1-row windows, the hook's output buffer. tests/cuda/test_glm_g53_kernel.py
+(GPU): byte equality with glm53f-rank's own large-M kernels at 1-4,096 rows (1, 2, 7, 16, 33 and 64 rows added), FP32
+SwiGLU and the intermediates at small windows too, a row's bits in every window size 1..64 and larger ones against
+one 4,096-row call, the schedules a small window could take keep every bit, faults at 1 row, the CPU reference at 1
+row, the node's dispatch of 1-row windows into the link's reply rows, and times at 1-64 rows beside the EXL3 prompt
+kernel's (TF_GLM_EXL3_PROMPT=1).
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+ THIRD_PARTY_NOTICES.md                        |  10 +-
+ .../families/glm5_next/cuda/experts_node.py   |   5 +-
+ .../families/glm5_next/cuda/g53_experts.py    |  78 +++--
+ tests/cuda/test_glm_g53_kernel.py             | 177 +++++++++--
+ tests/test_glm_g53_kernel.py                  |  89 ++++--
+ tests/test_glm_g53_windows.py                 | 274 ++++++++++++++++++
+ 6 files changed, 549 insertions(+), 84 deletions(-)
+ create mode 100644 tests/test_glm_g53_windows.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index 46ae8a6..034439a 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -231,10 +231,12 @@ rotation is theirs); the routes are the node's `pick`/`wts` rows (the 8 routed s
+ rows (glm53f-rank's `g53r_ffn_f32`); there is no host staging or sync, and an invalid route (glm53f-rank's fault)
+ empties the plan as there and fills the call's rows with NaN; only the large-M kernels at the two-rank width are
+ ported (the decode-size split kernels, the gate/up rotation warps and the dependent launch are not). `TF_GLM_EXPERT_KERNEL`
+-is unset by default: the expert node then runs every call as before. Set to `g53`, the node's prompt chunks
+-(`MODE_CHUNK`, `MODE_SLICE` and `MODE_PAIR` forwards) of at least `TF_GLM_EXPERT_KERNEL_ROWS` rows (default 65,
+-glm53f-rank's large-M boundary) run through these kernels, and a prompt row's routed-expert sum then has glm53f-rank's
+-arithmetic (outputs class); decode windows keep TensorFold's kernels.
++is unset by default: the expert node then runs every call as before. Set to `g53`, every prompt chunk window of the
++node (`MODE_CHUNK`, `MODE_SLICE`, `MODE_PAIR` and `MODE_LANES` forwards), of any size from 1 row up, runs through these
++kernels (below glm53f-rank's 65-row large-M boundary too, at the configuration it runs up to 2,048 rows, one K split
++each, so a prompt row's bits never depend on the window it is filled in; `TF_GLM_EXPERT_KERNEL_ROWS` can raise that
++floor for measurements), and a prompt row's routed-expert sum then has glm53f-rank's arithmetic (outputs class);
++decode windows keep TensorFold's kernels.
+ 
+ ## GLM multi-prompt prefill
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/experts_node.py b/src/tensorfold/families/glm5_next/cuda/experts_node.py
+index bda3696..1ede2b9 100644
+--- a/src/tensorfold/families/glm5_next/cuda/experts_node.py
++++ b/src/tensorfold/families/glm5_next/cuda/experts_node.py
+@@ -122,14 +122,15 @@ class ExpertNode:
+         ``x``: (normed, pick, wts) to read instead of the wire slots (where the link landed them). ``out``: the
+         ``[R, D]`` fp32 rows to write instead of the node's own ``routed`` (TF_GLM_MCDMA_INFLIGHT: the link's). A
+         prompt chunk's window (``self.prompt``) takes the prompt kernel under TF_GLM_EXL3_PROMPT=1
+-        (``exl3_generic.routed``)."""
++        (``exl3_generic.routed``), or glm53f-afd's kernels under TF_GLM_EXPERT_KERNEL=g53 (``g53_experts``: every
++        prompt window, into ``out`` too)."""
+ 
+         b = self.buf
+         if R > b.prefill_rows:
+             raise ValueError(f"{R} rows: buffers hold {b.prefill_rows}")
+         g53 = getattr(self, "g53", None)
+         if g53 is not None and g53.takes(layer_i, R, self.prompt):      # a prompt chunk through g53_experts
+-            return g53.compute(layer_i, R, x)
++            return g53.compute(layer_i, R, x, out)
+         normed, pick, wts = x if x is not None else (b.normed[:R], b.pick[:R], b.wts[:R])
+         exl3_generic.routed(normed, pick, self.by_layer[layer_i], b.scratch(R), R, self.cfg.limit, prompt=self.prompt)
+         b.ey(R)[:, b.top_k].zero_()                          # the shared slot: attention adds its own sy
+diff --git a/src/tensorfold/families/glm5_next/cuda/g53_experts.py b/src/tensorfold/families/glm5_next/cuda/g53_experts.py
+index 1fa6229..bb5b8cb 100644
+--- a/src/tensorfold/families/glm5_next/cuda/g53_experts.py
++++ b/src/tensorfold/families/glm5_next/cuda/g53_experts.py
+@@ -10,17 +10,27 @@ resident TP2 half. That file's EXL3 decoder, fragment MMA and Hadamard butterfly
+ 0009 (ROWROT/SHX). See g53_rank.cu's header and THIRD_PARTY_NOTICES.md.
+ 
+ The switch, on the expert containers: TF_GLM_EXPERT_KERNEL unset, empty or ``tf``: TensorFold's kernels, every call as
+-before. ``g53``: a prompt chunk's window (the node's MODE_CHUNK, MODE_SLICE and MODE_PAIR forwards) of at least
+-TF_GLM_EXPERT_KERNEL_ROWS rows (default 65: glm53f-rank's own large-M boundary; at most 4,096, its row cap) on a layer
+-in the kernels' scope (4-bit mcg, the TP2 half of GLM-5.3-Flash's 288 experts) runs through these kernels: BF16 rows
+-in, the half's FP32 rows out (glm53f-rank's g53r_ffn_f32), written straight into the node's reply buffer. Decode
+-windows (MODE_EAGER, batched or not) and anything out of scope stay on TensorFold's kernels. Anything else refuses at
+-the node's start, before the load.
++before. ``g53``: every prompt chunk's window (the node's MODE_CHUNK, MODE_SLICE, MODE_PAIR and MODE_LANES forwards), of
++any size from 1 row to the node's prompt rows (at most 4,096, glm53f-rank's row cap), on a layer in the kernels' scope
++(4-bit mcg, the TP2 half of GLM-5.3-Flash's 288 experts) runs through these kernels: BF16 rows in, the half's FP32
++rows out (glm53f-rank's g53r_ffn_f32), written straight into the reply buffer the node is given. Decode windows
++(MODE_EAGER, batched or not) and anything out of scope stay on TensorFold's kernels. Anything else refuses at the
++node's start, before the load.
++
++Every prompt window, small ones too: a prompt row's bits then never depend on the window the attention node filled it
++in (alone or grouped with other prompts by TF_GLM_MULTI_PREFILL, a whole prompt or split at a kept point of the
++64-row prompt grid, a cache resume's tail, a chunk pair's or lane's). glm53f-rank itself runs its split kernels below
++65 rows (sk 8, skd 2: other bits); here the large-M kernels run those windows too, at the configuration they run up to
++2,048 rows (one K split each), so a row gets the same bits in a window of 1 row as of 4,096. TF_GLM_EXPERT_KERNEL_ROWS
++(default 1) can raise the floor for measurements: windows below it then stay on TensorFold's kernels, and a prompt
++row's bits depend on its window again (a floor of 65, glm53f-rank's own boundary, made served replies depend on how the
++prompts were batched and split).
+ 
+ Bits: outputs class. A prompt row's routed-expert sum then has glm53f-rank's arithmetic (one K split each, sk 1 and
+ skd 1: one FP32 MMA chain a sum over ascending k tiles; its fused epilogue; the 8 slots reduced in slot order as
+ acc + w * (y * 1/sqrt(128) * svh), built with --fmad=false), not the grouped kernel's split-K sums and combine. The
+-rotation and order schedules keep every bit (glm53f-rank's own statement). It never becomes a default by itself.
++rotation and order schedules, the rows per group, the tilings and the row count keep every bit (glm53f-rank's own
++statement). It never becomes a default by itself.
+ """
+ 
+ from __future__ import annotations
+@@ -34,10 +44,11 @@ from pathlib import Path
+ import torch
+ 
+ ENV = "TF_GLM_EXPERT_KERNEL"
+-ROWS_ENV = "TF_GLM_EXPERT_KERNEL_ROWS"
++ROWS_ENV = "TF_GLM_EXPERT_KERNEL_ROWS"       # the smallest prompt window through the kernels (default 1: every one)
+ ROWROT_ENV = "TF_GLM_EXPERT_KERNEL_ROWROT"   # glm53f-rank's GLM53F_RANK_ROWROT (rot 2): on by default, as served
+ ORDER_ENV = "TF_GLM_EXPERT_KERNEL_ORDER"     # glm53f-rank's GLM53F_RANK_ORDER (gord 2): off by default, as served
+-LARGE_M = 65             # glm53f-rank runs its large-M kernels above 64 rows (g53r_default_cfg)
++LARGE_M = 65             # glm53f-rank's own large-M boundary (g53r_default_cfg: its split kernels below, other bits)
++MIN_ROWS = 1             # every prompt window takes the large-M kernels here: a row's bits whatever its window
+ MAX_ROWS = 4096          # glm53f-rank's MAX_ROWS (a wire lane's cap)
+ H, WID, E, TOPK = 4096, 1024, 288, 8
+ NVCC = ["-O3", "--fmad=false", "--ftz=false", "--prec-div=true"]   # glm53f-rank's build.rs flags (arch from build)
+@@ -70,12 +81,15 @@ class Cfg:
+ 
+ 
+ def default_cfg(rows: int, *, rowrot: bool = True, order: bool = False) -> Cfg:
+-    """glm53f-rank's g53r_default_cfg for its large-M regimes: up to 2,048 rows {mt 2, sk 1, skd 1, nt 2, gw 8, l2 2},
+-    above {mt 4, sk 1, skd 1, nt 4, gw 16, l2 1}, both fused with discard and BF16 SwiGLU; rot 2 when ``rowrot`` (its
+-    serving GLM53F_RANK_ROWROT=1), gord 2 when ``order`` (GLM53F_RANK_ORDER, off where it is served)."""
+-
+-    if not LARGE_M <= rows <= MAX_ROWS:
+-        raise ValueError(f"the large-M kernels take {LARGE_M}..{MAX_ROWS} rows, not {rows}")
++    """The kernels' configuration for a window of 1..4,096 rows: glm53f-rank's g53r_default_cfg for its large-M
++    regimes, up to 2,048 rows {mt 2, sk 1, skd 1, nt 2, gw 8, l2 2}, above {mt 4, sk 1, skd 1, nt 4, gw 16, l2 1}, both
++    fused with discard and BF16 SwiGLU; rot 2 when ``rowrot`` (its serving GLM53F_RANK_ROWROT=1), gord 2 when ``order``
++    (GLM53F_RANK_ORDER, off where it is served). Below glm53f-rank's large-M boundary (65 rows), where it runs its
++    split kernels with other K splits, the up-to-2,048-row setting runs too: every window has sk 1, skd 1 and BF16
++    SwiGLU, the only fields that change a bit, so a prompt row gets the same bits in a window of any size."""
++
++    if not MIN_ROWS <= rows <= MAX_ROWS:
++        raise ValueError(f"the kernels take {MIN_ROWS}..{MAX_ROWS} rows, not {rows}")
+     rot, gord = (2 if rowrot else 1), (2 if order else 1)
+     if rows <= 2048:
+         return Cfg(mt=2, sk=1, skd=1, nt=2, gw=8, l2=2, fuse=2, discard=2, swiglu=0, rot=rot, gord=gord)
+@@ -93,7 +107,8 @@ def _flag(name: str, default: bool) -> bool:
+ 
+ def switch() -> dict | None:
+     """TF_GLM_EXPERT_KERNEL, read once at the node's start: None (unset, empty or ``tf``: TensorFold's kernels) or the
+-    settings of ``g53``: min_rows (TF_GLM_EXPERT_KERNEL_ROWS, 65..4,096, default 65), rowrot
++    settings of ``g53``: min_rows (TF_GLM_EXPERT_KERNEL_ROWS, 1..4,096, default 1: every prompt window; above 1 the
++    smaller windows stay on TensorFold's kernels and a prompt row's bits depend on its window), rowrot
+     (TF_GLM_EXPERT_KERNEL_ROWROT, default 1) and order (TF_GLM_EXPERT_KERNEL_ORDER, default 0). Bad values refuse."""
+ 
+     v = os.environ.get(ENV, "").strip().lower()
+@@ -102,13 +117,14 @@ def switch() -> dict | None:
+     if v != "g53":
+         raise ValueError(f"{ENV} is g53 (glm53f-afd's expert kernels for prompt chunks) or tf (TensorFold's; the "
+                          f"default), not {v!r}")
+-    r = os.environ.get(ROWS_ENV, "").strip() or str(LARGE_M)
++    r = os.environ.get(ROWS_ENV, "").strip() or str(MIN_ROWS)
+     try:
+         rows = int(r)
+     except ValueError:
+         raise ValueError(f"{ROWS_ENV} is a row count, not {r!r}") from None
+-    if not LARGE_M <= rows <= MAX_ROWS:
+-        raise ValueError(f"{ROWS_ENV}: {LARGE_M}..{MAX_ROWS} (the large-M kernels' rows), not {rows}")
++    if not MIN_ROWS <= rows <= MAX_ROWS:
++        raise ValueError(f"{ROWS_ENV}: {MIN_ROWS}..{MAX_ROWS} (the smallest prompt window through the kernels), "
++                         f"not {rows}")
+     return {"min_rows": rows, "rowrot": _flag(ROWROT_ENV, True), "order": _flag(ORDER_ENV, False)}
+ 
+ 
+@@ -220,7 +236,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor, ex, s: Scratc
+ 
+ class Node:
+     """An expert node's hook (``ExpertNode.g53``, made only under TF_GLM_EXPERT_KERNEL=g53): ``takes`` a prompt chunk's
+-    window of an in-scope layer, ``compute`` runs it into the node's reply buffer."""
++    window of an in-scope layer (every one, 1 row and up, unless TF_GLM_EXPERT_KERNEL_ROWS raised the floor),
++    ``compute`` runs it into the reply buffer it is given (the link's own, TF_GLM_MCDMA_INFLIGHT) or the node's."""
+ 
+     def __init__(self, node, settings: dict) -> None:
+         b = node.buf
+@@ -233,22 +250,29 @@ class Node:
+             _ext()                  # loaded (prebuilt: tools/prebuild_ext.py) at the start, not in a prompt forward
+         shared = sum(1 for i, ok in self.ready.items()
+                      if ok and getattr(node.by_layer[i], "shared_suh", None) is not None)
++        floor = ("every prompt window: a row's bits whatever its window" if self.min_rows <= MIN_ROWS else
++                 f"{ROWS_ENV}={self.min_rows}: windows under {self.min_rows} rows stay on TensorFold's kernels, so a "
++                 f"prompt row's bits depend on its window")
+         print(f"[tensorfold] afd expert {node.half + 1}: {ENV}=g53: prompt chunks of {self.min_rows}-{self.max_rows} "
+-              f"rows through glm53f-afd's large-M expert kernels (Hugh Madden; outputs class; rowrot "
++              f"rows through glm53f-afd's large-M expert kernels (Hugh Madden; outputs class; {floor}; rowrot "
+               f"{'on' if self.rowrot else 'off'} ({shared} layers share one gate/up suh), order "
+               f"{'on' if self.order else 'off'}); {sum(self.ready.values())} of {len(self.ready)} MoE layers in scope",
+               flush=True)
+ 
+     def takes(self, layer_i: int, R: int, prompt: bool) -> bool:
+-        """A prompt chunk's window (``prompt``: the node's MODE_CHUNK, MODE_SLICE and MODE_PAIR forwards) of
+-        min_rows..max_rows rows, on a layer in the kernels' scope. Decode windows (MODE_EAGER) never."""
++        """A prompt chunk's window (``prompt``: the node's MODE_CHUNK, MODE_SLICE, MODE_PAIR and MODE_LANES forwards)
++        of min_rows (default 1) .. max_rows rows, on a layer in the kernels' scope. Decode windows (MODE_EAGER)
++        never."""
+ 
+         return bool(prompt) and self.min_rows <= R <= self.max_rows and self.ready.get(layer_i, False)
+ 
+-    def compute(self, layer_i: int, R: int, x: tuple | None = None) -> torch.Tensor:
+-        """``routed_half[:R]``, fp32, as ``ExpertNode.compute`` returns it (the shared slot not read)."""
++    def compute(self, layer_i: int, R: int, x: tuple | None = None, out: torch.Tensor | None = None) -> torch.Tensor:
++        """``routed_half[:R]``, fp32, as ``ExpertNode.compute`` returns it (the shared slot not read): into ``out``
++        ([R, D] fp32 rows: the link's own under TF_GLM_MCDMA_INFLIGHT, whose reply then goes out on its second
++        stream) when given, else the node's ``routed``."""
+ 
+         b = self.node.buf
+         normed, pick, wts = x if x is not None else (b.normed[:R], b.pick[:R], b.wts[:R])
+-        return routed(normed, pick, wts, self.node.by_layer[layer_i], self.scratch, b.routed[:R], R,
+-                      self.node.cfg.limit, rowrot=self.rowrot, order=self.order)
++        dst = b.routed[:R] if out is None else out
++        return routed(normed, pick, wts, self.node.by_layer[layer_i], self.scratch, dst, R, self.node.cfg.limit,
++                      rowrot=self.rowrot, order=self.order)
+diff --git a/tests/cuda/test_glm_g53_kernel.py b/tests/cuda/test_glm_g53_kernel.py
+index 3242b85..6cb1a46 100644
+--- a/tests/cuda/test_glm_g53_kernel.py
++++ b/tests/cuda/test_glm_g53_kernel.py
+@@ -6,18 +6,23 @@ node's GPU with no model server loaded.
+ - Against glm53f-rank's own kernels on the same tiles: its two-rank source (TF_G53_RANK_SRC: glm53f-afd @ 91db3cc with
+   the two-rank width and the row rotation patches applied, pinned by sha256) is built here with its build.rs flags and
+   -DG53R_WID=1024 and called through its C API (g53r_layer_new on an image cut from this layer's tensors, g53r_ffn_f32
+-  on FP8 rows whose values the port gets as BF16 rows). The half's FP32 rows must be byte-equal at 65-4,096 rows, both
+-  configurations (32- and 64-row groups), uniform and skewed routing, row rotation once a row and per (row, matrix),
+-  group order on and off, BF16 and FP32 SwiGLU; and, with discard off, the intermediates (gate/up sums, down inputs,
+-  down sums) byte-equal route by route.
+-- Its own properties: the same bytes twice; a row's bits whatever window it is in; invalid routes fault and poison
+-  the call's rows with NaN; the binding's refusals.
++  on FP8 rows whose values the port gets as BF16 rows), its large-M kernels named (big 2) at every row count. The
++  half's FP32 rows must be byte-equal at 1-4,096 rows (below 65 rows too, where glm53f-rank's own default would take
++  its split kernels and the port does not), both configurations (32- and 64-row groups), uniform and skewed routing,
++  row rotation once a row and per (row, matrix), group order on and off, BF16 and FP32 SwiGLU; and, with discard off,
++  the intermediates (gate/up sums, down inputs, down sums) byte-equal route by route.
++- Its own properties: the same bytes twice; a row's bits whatever window it is in, every window size 1..64 and larger
++  ones up to 4,096 rows against one 4,096-row call; the schedules a small window could take (16 MMA warps, 128-column
++  down chunks) keep every bit; invalid routes fault and poison the call's rows with NaN; the binding's refusals.
+ - Against TensorFold's kernels (the node's path before: exl3_generic.routed and glue.combine) on the same layer and
+   rows: an outputs-class distance, reported and bounded (rel. L2 <= 1e-3); and both against the CPU reference
+   (tests/glm_g53_reference.py) on a few rows.
+-- The expert node: a prompt chunk's window takes the kernels and a decode window does not.
+-- Times (report only): ms per call at 2,048 and 4,096 rows for the port, glm53f-rank and TensorFold's kernels
+-  (TF_G53_TIMES: a JSON file to write them to).
++- The expert node: every prompt chunk's window (1 row and up) takes the kernels, into the reply buffer it is given,
++  and a decode window does not.
++- Times (report only): ms per call at 1-64 rows (the windows under glm53f-rank's 65-row boundary) and at 2,048 and
++  4,096 rows for the port, glm53f-rank and TensorFold's kernels (the grouped kernel, up to 2,048 rows on a GPU without
++  the 147,456 B of shared memory it needs above that, GB10's case; and the EXL3 prompt kernel of TF_GLM_EXL3_PROMPT=1,
++  which ran those prompt windows before g53) (TF_G53_TIMES: a JSON file to write them to).
+ 
+ TF_GLM_MODEL_DIR (with TF_G53_LAYER, default the first MoE layer, and TF_G53_HALF, default 0): one MoE layer's half of
+ the real checkpoint instead of synthetic tiles.
+@@ -44,7 +49,9 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only
+ 
+ E, D, NI, TOPK, LIMIT, LAYER = 288, 4096, 1024, 8, 10.0, 3
+ REF_SHA256 = "59d8edd8a54f9a566d466ab5e23fb17510af2b4a8764ee90e488e9d95efc8566"   # glm53f-rank two-rank exl3_rank.cu
+-ROWS = [65, 128, 594, 2048, 2049, 4096]
++ROWS = [1, 2, 7, 16, 33, 64, 65, 128, 594, 2048, 2049, 4096]
++SMALL = [1, 2, 4, 8, 16, 32, 64]                  # the windows under glm53f-rank's 65-row boundary, timed
++GROUPED_SMEM = 147456                             # the grouped kernel's dynamic shared memory above 2,048 rows
+ 
+ 
+ # ------------------------------------------------------------------------------------------------- the two layers
+@@ -259,6 +266,35 @@ def _tf(ex, inp, R, s=None, sync=True):
+     return out
+ 
+ 
++def _exl3_prompt(ex, inp, R, s=None, sync=True):
++    """TF_GLM_EXL3_PROMPT=1's prompt windows: MiaAI-Lab's EXL3 prompt kernel (recipe patch 0004) through
++    exl3_generic.routed's ``prompt``, as ExpertNode.compute runs a prompt chunk, then the shared slot zeroed and
++    glue.combine. The caller sets TF_GLM_EXL3_PROMPT=1."""
++
++    from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
++    from tensorfold.families.glm5_next.cuda import exl3_generic, glue
++
++    s = s or Exl3Scratch(SimpleNamespace(dims=D, width=NI, count=E), R, TOPK + 1, device="cuda")
++    exl3_generic.routed(inp.x, inp.pick, ex, s, R, LIMIT, prompt=True)
++    ey = s.y.view(s.rows, TOPK + 1, D)[:R]
++    ey[:, TOPK].zero_()
++    out = torch.empty((R, D), dtype=torch.float32, device="cuda")
++    glue.combine(ey, inp.wts, out)
++    if sync:
++        torch.cuda.synchronize()
++    return out
++
++
++def _grouped_fits(R: int) -> bool:
++    """Whether TensorFold's grouped kernel can run R rows here: above 2,048 rows it needs GROUPED_SMEM bytes of dynamic
++    shared memory a block, which GB10 does not have (101,248 B)."""
++
++    if R <= 2048:
++        return True
++    p = torch.cuda.get_device_properties(torch.cuda.current_device())
++    return int(getattr(p, "shared_memory_per_block_optin", 0)) >= GROUPED_SMEM
++
++
+ def _bits_equal(a: torch.Tensor, b) -> bool:
+     b = torch.as_tensor(b, device=a.device)
+     return bool(torch.equal(a.contiguous().view(torch.int32), b.contiguous().view(torch.int32)))
+@@ -279,7 +315,7 @@ def test_outputs_byte_equal_glm53f_rank(layer, theirs, R, kind):
+         assert _bits_equal(got, want), f"{name} R{R} {kind} {kw}: max |diff| {(got.cpu() - want).abs().max():.3e}"
+ 
+ 
+-@pytest.mark.parametrize("R", [128, 2049])
++@pytest.mark.parametrize("R", [3, 128, 2049])
+ def test_fp32_swiglu_byte_equal_glm53f_rank(layer, theirs, R):
+     _, ex = layer
+     inp = _inputs(R, "skewed", 7 + R)
+@@ -287,7 +323,7 @@ def test_fp32_swiglu_byte_equal_glm53f_rank(layer, theirs, R):
+     assert _bits_equal(_ours(ex, inp, cfg), _their_ffn(theirs, inp.codes, inp.scales, inp.pick_np, inp.wts_np, cfg))
+ 
+ 
+-@pytest.mark.parametrize("R", [594, 4096])
++@pytest.mark.parametrize("R", [7, 594, 4096])
+ def test_intermediates_byte_equal_route_by_route(layer, theirs, R):
+     _, ex = layer
+     inp = _inputs(R, "uniform", 11 + R)
+@@ -319,30 +355,67 @@ def test_intermediates_byte_equal_route_by_route(layer, theirs, R):
+ 
+ # ---------------------------------------------------------------------------------------------- its own properties
+ 
++def _windows() -> list[tuple[int, int]]:
++    """[lo, hi) windows covering 4,096 rows: every size 1..64 once (the sizes glm53f-rank runs on its split kernels),
++    then 65..2,048-row ones (32-row groups) and a 31-row remainder; 4,096 rows in all."""
++
++    sizes = [*range(1, 65), 65, 127, 128, 129, 256, 257, 511, 512, 31]
++    assert sum(sizes) == 4096
++    out, lo = [], 0
++    for n in sizes:
++        out.append((lo, lo + n))
++        lo += n
++    return out
++
++
+ def test_same_bytes_twice_and_a_rows_bits_whatever_its_window(layer):
++    """One 4,096-row call (64-row groups), then the same rows again in windows of every size from 1 row to 2,049 rows
++    (32-row groups up to 2,048, 64-row groups above): every row's FP32 bits are the 4,096-row call's. Exact repeats
++    of a 1-row and a 7-row call too."""
++
+     _, ex = layer
+     inp = _inputs(4096, "skewed", 3)
+     full = _ours(ex, inp, _cfg(4096))                                        # 64-row groups
+     assert _bits_equal(_ours(ex, inp, _cfg(4096)), full)
+-    for lo, hi in ((0, 2048), (2048, 2113), (2113, 4096)):                  # 32-row groups, and 64 again
++    split = [(0, 2048), (2048, 2113), (2113, 4096), (0, 2049), (2049, 4096)]  # 32-row groups, 65 rows, 64 again
++    for lo, hi in split + _windows():
+         part = SimpleNamespace(x=inp.x[lo:hi], pick=inp.pick[lo:hi], wts=inp.wts[lo:hi])
+         assert _bits_equal(_ours(ex, part, _cfg(hi - lo)), full[lo:hi]), (lo, hi)
++    for n in (1, 7):
++        part = SimpleNamespace(x=inp.x[100:100 + n], pick=inp.pick[100:100 + n], wts=inp.wts[100:100 + n])
++        once = _ours(ex, part, _cfg(n))
++        assert _bits_equal(_ours(ex, part, _cfg(n)), once) and _bits_equal(once, full[100:100 + n])
++
+ 
++@pytest.mark.parametrize("R", [1, 7, 64, 594])
++def test_small_window_schedules_keep_every_bit(layer, R):
++    """The schedules a small-window path would use (16 MMA warps a block, 128- or 512-column down chunks, the 64-row
++    groups, plain L2 loads, the group order) give the default's bits: only sk, skd and the SwiGLU precision change a
++    bit, and every window has sk 1, skd 1, BF16."""
+ 
+-def test_invalid_routes_fault_and_poison_the_rows(layer):
++    _, ex = layer
++    inp = _inputs(R, "skewed", 91 + R)
++    want = _ours(ex, inp, _cfg(R))
++    for kw in ({"gw": 16}, {"nt": 1}, {"nt": 4}, {"gw": 16, "nt": 1}, {"mt": 4, "gw": 16, "nt": 4, "l2": 1},
++               {"l2": 1}, {"gord": 2}):
++        assert _bits_equal(_ours(ex, inp, _cfg(R, **kw)), want), (R, kw)
++
++
++@pytest.mark.parametrize("R", [1, 128])
++def test_invalid_routes_fault_and_poison_the_rows(layer, R):
+     from tensorfold.families.glm5_next.cuda import g53_experts
+ 
+     _, ex = layer
+-    R = 128
+     s = _scratch(R)
++    r = min(7, R - 1)
+     for bad in ("id", "duplicate", "weight"):
+         inp = _inputs(R, "uniform", 5)
+         if bad == "id":
+-            inp.pick[7, 3] = E
++            inp.pick[r, 3] = E
+         elif bad == "duplicate":
+-            inp.pick[7, 3] = inp.pick[7, 2]
++            inp.pick[r, 3] = inp.pick[r, 2]
+         else:
+-            inp.wts[7, 3] = -1.0
++            inp.wts[r, 3] = -1.0
+         out = torch.zeros((R, D), dtype=torch.float32, device="cuda")
+         g53_experts.routed(inp.x, inp.pick, inp.wts, ex, s, out, R, LIMIT)
+         torch.cuda.synchronize()
+@@ -385,14 +458,14 @@ def test_outputs_class_distance_from_tensorfolds_kernels(layer, R):
+     assert d["rel_l2"] <= 1e-3 and d["cos"] >= 0.999999, d
+ 
+ 
+-def test_both_near_the_cpu_reference(layer):
++@pytest.mark.parametrize("R", [1, 65])
++def test_both_near_the_cpu_reference(layer, R):
+     from tensorfold.cuda.exl3 import experts as generic
+ 
+     name, ex = layer
+-    R = 65
+     inp = _inputs(R, "uniform", 31)
+     got, tf = _ours(ex, inp, _cfg(R)), _tf(ex, inp, R)
+-    rows = [0, 1]
++    rows = [0, 1][:R]
+     used = sorted({int(e) for r in rows for e in inp.pick_np[r, :TOPK]})
+     keep = ex.keep
+     L = {}
+@@ -405,13 +478,18 @@ def test_both_near_the_cpu_reference(layer):
+     want = ref.ffn(x, inp.pick_np[rows], inp.wts_np[rows], L, LIMIT, rowrot=ex.shared_suh is not None)
+     want_t = torch.from_numpy(want)
+     dg, dt = _dist(got[rows].cpu(), want_t), _dist(tf[rows].cpu(), want_t)
+-    print(f"[vs the CPU reference] {name}: g53 {dg}, TensorFold {dt}")
++    print(f"[vs the CPU reference] {name} R{R}: g53 {dg}, TensorFold {dt}")
+     assert dg["rel_l2"] <= 5e-3 and dt["rel_l2"] <= 5e-3, (dg, dt)
+ 
+ 
+ # ------------------------------------------------------------------------------------------------- the expert node
+ 
+ def test_expert_node_takes_prompt_chunks_only(layer, capsys):
++    """The node's default (every prompt window): a prompt chunk of any size, 1 row too, gets the kernels' bits, into
++    the reply buffer it is given (TF_GLM_MCDMA_INFLIGHT's link rows) or the node's own; a decode window of the same
++    rows TensorFold's. Under a 65-row floor (TF_GLM_EXPERT_KERNEL_ROWS=65) a 64-row prompt chunk stays on TensorFold's
++    kernels."""
++
+     from tensorfold.families.glm5_next.cuda import g53_experts
+     from tensorfold.families.glm5_next.cuda.experts_node import ExpertBuffers, ExpertNode
+ 
+@@ -420,23 +498,32 @@ def test_expert_node_takes_prompt_chunks_only(layer, capsys):
+     node.cfg = SimpleNamespace(hidden=D, top_k=TOPK, moe_width=2 * NI, experts=E, limit=LIMIT)
+     node.half, node.layers, node.experts, node.by_layer = 0, [LAYER], [ex], {LAYER: ex}
+     node.buf = ExpertBuffers(node.cfg, rows=8, prefill_rows=2048)
+-    node.g53 = g53_experts.Node(node, {"min_rows": 65, "rowrot": True, "order": False})
+-    assert "TF_GLM_EXPERT_KERNEL=g53" in capsys.readouterr().out
++    node.g53 = g53_experts.Node(node, {"min_rows": 1, "rowrot": True, "order": False})
++    line = capsys.readouterr().out
++    assert "TF_GLM_EXPERT_KERNEL=g53: prompt chunks of 1-2048 rows" in line and "every prompt window" in line
+     assert node.g53.scratch.share is node.buf.pref
+-    for R in (64, 65, 2048):
++    link_rows = torch.full((2048, D), float("nan"), dtype=torch.float32, device="cuda")
++    for R in (1, 6, 64, 65, 2048):
+         inp = _inputs(R, "skewed", 41 + R)
+         x = (inp.x, inp.pick, inp.wts)
++        mine = _ours(ex, inp, _cfg(R))
+         node.prompt = True
+         got = node.compute(LAYER, R, x).clone()
++        into = node.compute(LAYER, R, x, out=link_rows[:R])
++        assert into.data_ptr() == link_rows.data_ptr()
++        into = into.clone()
+         node.prompt = False
+         dec = node.compute(LAYER, R, x).clone()
+         torch.cuda.synchronize()
+         tf = _tf(ex, inp, R)
+         assert _bits_equal(dec, tf)                                         # a decode window: TensorFold's bits
+-        if R >= 65:
+-            assert _bits_equal(got, _ours(ex, inp, _cfg(R)))                 # a prompt chunk: the kernels'
+-        else:
+-            assert _bits_equal(got, tf)                                     # under the threshold: as before
++        assert _bits_equal(got, mine) and _bits_equal(into, mine)            # a prompt chunk: the kernels', any R
++    node.g53.min_rows = 65                                                  # a 65-row floor (ROWS=65)
++    inp = _inputs(64, "skewed", 105)
++    node.prompt = True
++    got = node.compute(LAYER, 64, (inp.x, inp.pick, inp.wts)).clone()
++    torch.cuda.synchronize()
++    assert _bits_equal(got, _tf(ex, inp, 64))                               # under the floor: TensorFold's
+ 
+ 
+ # -------------------------------------------------------------------------------------------------------- times
+@@ -456,7 +543,12 @@ def _time(fn, n=10):
+     return float(np.median(ms))
+ 
+ 
+-def test_times_report(layer, request):
++def test_times_report(layer, request, monkeypatch):
++    """Information (TF_G53_TIMES): ms a call for the port at its default and, at the small windows, at the 16-warp /
++    128-column schedule (the same bits); glm53f-rank's own build (big 2); TensorFold's grouped kernel (``_tf``, where
++    it fits) and its EXL3 prompt kernel (``_exl3_prompt``, TF_GLM_EXL3_PROMPT=1), at 1-64 rows and at 2,048 and 4,096.
++    A kernel that raises is reported as its error, not failed."""
++
+     from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
+     from tensorfold.families.glm5_next.cuda import g53_experts
+ 
+@@ -465,7 +557,16 @@ def test_times_report(layer, request):
+     lib = None
+     if os.environ.get("TF_G53_RANK_SRC"):
+         lib = request.getfixturevalue("theirs")
+-    for R in (2048, 4096):
++    monkeypatch.setenv("TF_GLM_EXL3_PROMPT", "1")                   # _exl3_prompt: the prompt kernel (read each call)
++
++    def timed(fn):
++        try:
++            return _time(fn)
++        except Exception as exc:  # noqa: BLE001  information only: the error is the entry
++            torch.cuda.synchronize()
++            return f"error: {str(exc).splitlines()[0][:160]}"
++
++    for R in (*SMALL, 2048, 4096):
+         for kind in ("uniform", "skewed"):
+             inp = _inputs(R, kind, 61 + R)
+             s = _scratch(R)
+@@ -479,7 +580,19 @@ def test_times_report(layer, request):
+             def tfk(inp=inp, R=R, ts=ts):
+                 _tf(ex, inp, R, ts, sync=False)
+ 
+-            row = {"g53": _time(ours), "tensorfold": _time(tfk)}
++            def prompt_kernel(inp=inp, R=R, ts=ts):
++                _exl3_prompt(ex, inp, R, ts, sync=False)
++
++            row = {"g53": timed(ours), "tensorfold": timed(tfk) if _grouped_fits(R) else "n/a: shared memory"}
++            if R <= 2048:
++                row["exl3_prompt"] = timed(prompt_kernel)
++            if R in SMALL:
++                wide = _cfg(R, gw=16, nt=1)
++
++                def ours16(inp=inp, s=s, out=out, R=R, cfg=wide):
++                    g53_experts.routed(inp.x, inp.pick, inp.wts, ex, s, out, R, LIMIT, cfg)
++
++                row["g53_gw16_nt1"] = timed(ours16)
+             if lib is not None:
+                 ms = []
+                 for _ in range(5):
+diff --git a/tests/test_glm_g53_kernel.py b/tests/test_glm_g53_kernel.py
+index d5bbe75..f86ee1b 100644
+--- a/tests/test_glm_g53_kernel.py
++++ b/tests/test_glm_g53_kernel.py
+@@ -6,12 +6,14 @@ github.com/hughmadden), glm53f-afd @ 91db3cc, MIT, Copyright (c) 2026 Turquoise
+   the whole pipeline (row rotation, gate/up, epilogue, down, slot reduce) in float64 is the dense math of
+   diag(suh) H W_q H diag(svh) with GLM's clamped SwiGLU, and with the kernels' FP16 / BF16 / FP32 roundings stays
+   within their rounding error of it; FP8 test rows are exact BF16 values;
+-- glm53f-rank's plan and its group bound, its large-M default configuration, its two-rank image layout;
++- glm53f-rank's plan and its group bound at 1-4,096 rows, its large-M default configuration (and the same one below its
++  65-row boundary: one K split each, BF16 SwiGLU, at every row count), its two-rank image layout;
+ - the switch: names, defaults and refusals; unset, the expert node's every call is the one before (no hook, the same
+-  calls); set, only prompt chunks (MODE_CHUNK, MODE_SLICE, MODE_PAIR forwards) of at least the threshold's rows on
+-  in-scope layers take the kernels, decode windows never; the node refuses a bad value before the load; the scratch
+-  shares the node's prompt scratch.
+-The GPU test (tests/cuda/test_glm_g53_kernel.py) checks the CUDA kernels against glm53f-rank's own build.
++  calls); set, every prompt chunk (MODE_CHUNK, MODE_SLICE, MODE_PAIR, MODE_LANES forwards) of 1 row and up (or of
++  TF_GLM_EXPERT_KERNEL_ROWS rows and up) on in-scope layers takes the kernels, into the reply buffer it is given,
++  decode windows never; the node refuses a bad value before the load; the scratch shares the node's prompt scratch.
++The GPU test (tests/cuda/test_glm_g53_kernel.py) checks the CUDA kernels against glm53f-rank's own build;
++tests/test_glm_g53_windows.py the prompt windows the attention node fills.
+ """
+ 
+ from __future__ import annotations
+@@ -148,7 +150,7 @@ def _routes(rng, R, kind):
+     return np.tile(np.arange(8), (R, 1))                      # every row the same 8 experts
+ 
+ 
+-@pytest.mark.parametrize("R", [65, 594, 2048, 2049, 4096])
++@pytest.mark.parametrize("R", [1, 2, 7, 64, 65, 594, 2048, 2049, 4096])
+ @pytest.mark.parametrize("kind", ["uniform", "skewed", "same"])
+ def test_plan_groups_every_route_once_within_the_bound(R, kind):
+     rng = np.random.default_rng(R)
+@@ -172,20 +174,38 @@ def test_plan_groups_every_route_once_within_the_bound(R, kind):
+ def test_default_cfg_is_glm53f_ranks_large_m_defaults():
+     # exl3_rank.cu g53r_default_cfg (fields mt, sk, skd, fp32_swiglu, big, nt, fuse, discard, gw, gp, plan, l2, pf, ord,
+     # pdl): rows <= 2048 {2, 1, 1, 0, 2, 2, 2, 2, 8, 0, 1, 2, 1, 1, 1};
+-    # above {4, 1, 1, 0, 2, 4, 2, 2, 16, 0, 1, 1, 1, 1, 1}
++    # above {4, 1, 1, 0, 2, 4, 2, 2, 16, 0, 1, 1, 1, 1, 1}; under 65 rows glm53f-rank runs its split kernels
++    # ({1, 8, 2, ...}: other K splits, other bits), the port its large-M kernels at the up-to-2,048-row setting
+     small = g53_experts.Cfg(mt=2, sk=1, skd=1, nt=2, gw=8, l2=2, fuse=2, discard=2, swiglu=0, rot=2, gord=1)
+     large = g53_experts.Cfg(mt=4, sk=1, skd=1, nt=4, gw=16, l2=1, fuse=2, discard=2, swiglu=0, rot=2, gord=1)
+-    for R in (65, 594, 2048):
++    for R in (1, 2, 7, 63, 64, 65, 594, 2048):
+         assert g53_experts.default_cfg(R) == small
+     for R in (2049, 4096):
+         assert g53_experts.default_cfg(R) == large
+     assert g53_experts.default_cfg(100, rowrot=False, order=True).rot == 1
+     assert g53_experts.default_cfg(100, rowrot=False, order=True).gord == 2
+-    for R in (1, 64, 4097):
++    assert g53_experts.default_cfg(1, rowrot=False, order=True).rot == 1
++    for R in (0, -1, 4097):
+         with pytest.raises(ValueError):
+             g53_experts.default_cfg(R)
+ 
+ 
++def test_every_window_has_the_same_bit_fields():
++    """glm53f-rank: only sk, skd and the SwiGLU precision change a bit of the output (the rows per group, tilings,
++    plan, fusion, L2 policies, block order, rotation and group order are schedules). Every window size the node can
++    send, 1..4,096 rows, under every rowrot/order setting, gets sk 1, skd 1 and BF16 SwiGLU: a prompt row's bits never
++    depend on its window's size."""
++
++    bits = {(c.sk, c.skd, c.swiglu) for R in range(1, g53_experts.MAX_ROWS + 1)
++            for c in (g53_experts.default_cfg(R), g53_experts.default_cfg(R, rowrot=False, order=True))}
++    assert bits == {(1, 1, 0)}
++    for R in (1, 8, 64):                                     # the plan's buffers and bound hold the smallest windows
++        s = g53_experts.Scratch(R, "cpu")
++        assert s.rows == R and s.pair_row.numel() == R * 8 and s.rcnt.numel() == R * 32
++        assert s.gcnt.numel() == g53_experts.max_groups(R) == min(R * 8, R * 8 // 32 + min(R * 8, 288))
++    assert g53_experts.max_groups(1) == 8                    # one row: its 8 routes, a group each
++
++
+ def test_rank_image_layout():
+     assert ref.EXPERT_BYTES == 6322176                                           # exl3_rank.cu, TP2
+     rng = np.random.default_rng(6)
+@@ -216,12 +236,14 @@ def test_switch_names_defaults_and_refusals(monkeypatch):
+         monkeypatch.setenv(g53_experts.ENV, v)
+         assert g53_experts.switch() is None
+     monkeypatch.setenv(g53_experts.ENV, "g53")
+-    assert g53_experts.switch() == {"min_rows": 65, "rowrot": True, "order": False}
++    assert g53_experts.switch() == {"min_rows": 1, "rowrot": True, "order": False}       # every prompt window
++    monkeypatch.setenv(g53_experts.ROWS_ENV, "65")                                        # a 65-row floor
++    assert (g53_experts.switch() or {}).get("min_rows") == 65
+     monkeypatch.setenv(g53_experts.ROWS_ENV, "2048")
+     monkeypatch.setenv(g53_experts.ROWROT_ENV, "0")
+     monkeypatch.setenv(g53_experts.ORDER_ENV, "1")
+     assert g53_experts.switch() == {"min_rows": 2048, "rowrot": False, "order": True}
+-    for name, bad in ((g53_experts.ROWS_ENV, "64"), (g53_experts.ROWS_ENV, "4097"), (g53_experts.ROWS_ENV, "x"),
++    for name, bad in ((g53_experts.ROWS_ENV, "0"), (g53_experts.ROWS_ENV, "4097"), (g53_experts.ROWS_ENV, "x"),
+                       (g53_experts.ROWROT_ENV, "on"), (g53_experts.ORDER_ENV, "2")):
+         monkeypatch.setenv(name, bad)
+         with pytest.raises(ValueError):
+@@ -322,8 +344,8 @@ class _Hook:
+         self.seen.append((layer_i, R, prompt))
+         return self.take
+ 
+-    def compute(self, layer_i, R, x=None):
+-        return ("g53", layer_i, R, x)
++    def compute(self, layer_i, R, x=None, out=None):
++        return ("g53", layer_i, R, x, out)
+ 
+ 
+ def test_compute_dispatch(monkeypatch):
+@@ -337,18 +359,41 @@ def test_compute_dispatch(monkeypatch):
+         got = node.compute(4, 100, x="landed" if take else None)
+         assert hook.seen == [(4, 100, True)]
+         if take:
+-            assert got == ("g53", 4, 100, "landed") and calls == []
++            assert got == ("g53", 4, 100, "landed", None) and calls == []
++            mine = torch.empty((100, 4096))                      # TF_GLM_MCDMA_INFLIGHT: the link's own rows
++            assert node.compute(4, 100, x="landed", out=mine) == ("g53", 4, 100, "landed", mine)
+         else:
+             assert calls == ["routed"] and got.shape == (100, 4096)
+ 
+ 
++def test_g53_compute_writes_the_buffer_it_is_given(monkeypatch):
++    """``Node.compute``: the window's rows into ``out`` when given (the link's own under TF_GLM_MCDMA_INFLIGHT, so the
++    reply goes out on the link's second stream as TensorFold's kernels' does), else into the node's ``routed``."""
++
++    seen = []
++    monkeypatch.setattr(g53_experts, "routed", lambda x, pick, wts, ex, s, out, R, limit, **k: seen.append(
++        (out, R, limit, k)) or out[:R])
++    _, node = _node(monkeypatch)
++    h = g53_experts.Node(node, {"min_rows": 1, "rowrot": True, "order": False})
++    for R in (1, 6, 70):
++        mine = torch.empty((R, 4096))
++        got = h.compute(3, R, out=mine)
++        assert got.data_ptr() == mine.data_ptr() and seen[-1][0] is mine and seen[-1][1] == R
++        got = h.compute(3, R)
++        assert seen[-1][0].data_ptr() == node.buf.routed.data_ptr() and got.shape == (R, 4096)
++    assert seen[-1][3] == {"rowrot": True, "order": False} and seen[-1][2] == 10.0
++
++
+ def test_takes_prompt_chunks_of_in_scope_layers_only():
+     h = g53_experts.Node.__new__(g53_experts.Node)
+-    h.min_rows, h.max_rows, h.ready = 65, 2048, {3: True, 4: False}
+-    assert h.takes(3, 65, True) and h.takes(3, 2048, True)
+-    assert not h.takes(3, 2048, False)                         # a decode window, batched or not
+-    assert not h.takes(3, 64, True) and not h.takes(3, 2049, True)
+-    assert not h.takes(4, 512, True) and not h.takes(7, 512, True)
++    h.min_rows, h.max_rows, h.ready = 1, 2048, {3: True, 4: False}           # the default: every prompt window
++    for R in (1, 2, 6, 63, 64, 65, 2048):
++        assert h.takes(3, R, True)
++        assert not h.takes(3, R, False)                         # a decode window, batched or not
++    assert not h.takes(3, 0, True) and not h.takes(3, 2049, True)
++    assert not h.takes(4, 512, True) and not h.takes(7, 512, True) and not h.takes(4, 1, True)
++    h.min_rows = 65                                              # a 65-row floor: the small windows stay on TF's
++    assert h.takes(3, 65, True) and not h.takes(3, 64, True) and not h.takes(3, 1, True)
+ 
+ 
+ class _Done(Exception):
+@@ -425,6 +470,11 @@ def test_node_hook_unset_and_set(monkeypatch, capsys):
+     node = experts_node.ExpertNode("/nowhere", 1, [3, 4, 5], prefill_rows=256)
+     assert node.g53 is None and node.prompt is False
+     monkeypatch.setenv(g53_experts.ENV, "g53")
++    node = experts_node.ExpertNode("/nowhere", 1, [3, 4, 5], prefill_rows=256)
++    assert isinstance(node.g53, g53_experts.Node) and node.g53.min_rows == 1 and node.g53.max_rows == 256
++    line = capsys.readouterr().out
++    assert "afd expert 2: TF_GLM_EXPERT_KERNEL=g53: prompt chunks of 1-256 rows" in line
++    assert "every prompt window: a row's bits whatever its window" in line
+     monkeypatch.setenv(g53_experts.ROWS_ENV, "128")
+     node = experts_node.ExpertNode("/nowhere", 1, [3, 4, 5], prefill_rows=256)
+     assert isinstance(node.g53, g53_experts.Node) and node.g53.min_rows == 128 and node.g53.max_rows == 256
+@@ -432,5 +482,6 @@ def test_node_hook_unset_and_set(monkeypatch, capsys):
+     assert node.g53.scratch.share is node.buf.pref                  # the large buffers: the node's prompt scratch
+     line = capsys.readouterr().out
+     assert "afd expert 2: TF_GLM_EXPERT_KERNEL=g53: prompt chunks of 128-256 rows" in line
++    assert "windows under 128 rows stay on TensorFold's kernels, so a prompt row's bits depend on its window" in line
+     assert "2 of 3 MoE layers in scope" in line and "Hugh Madden" in line
+     assert "rowrot on (0 layers share one gate/up suh), order off" in line
+diff --git a/tests/test_glm_g53_windows.py b/tests/test_glm_g53_windows.py
+new file mode 100644
+index 0000000..6766bda
+--- /dev/null
++++ b/tests/test_glm_g53_windows.py
+@@ -0,0 +1,274 @@
++"""TF_GLM_EXPERT_KERNEL=g53 and the prompt windows the expert nodes see, on CPU: a prompt row's routed experts take
++glm53f-afd's kernels (expert prompt kernels from glm53f-afd, written by Hugh Madden (@dangerm00se,
++github.com/hughmadden), glm53f-afd @ 91db3cc) whatever window the attention node fills the row in.
++
++The AFD attention node at world 1 on tests/test_glm_multi.py's fake model with the AFD wire logged
++(tests/test_glm_multi_afd.py's World1), the 64-row prompt grid on (TF_GLM_KDA_CHUNKED's default). Every prompt window
++rank 0 fills (``MultiDecoder._fill``, ``_fill_many``, ``_fill_pair``: one forward the expert nodes see as R rows of a
++prompt chunk) is recorded with its pieces (request, first position, rows) and checked against the wire's chunk
++forwards, so each prompt row's window is known. The expert node's own dispatch (``g53_experts.Node.takes``, with the
++switch's settings) then gives the kernel that row's routed experts take. The scenarios, each against its counterpart:
++
++- four 40-row prompts filled alone (a 40-row window each) and grouped by TF_GLM_MULTI_PREFILL (one 160-row window);
++- a 70-row prompt drafted (kept on the grid: windows of 64 and 6 rows) and plain (one 70-row window);
++- the same drafted prompt again, resumed from its kept 64 rows (a 6-row tail; its first 64 rows are the kept ones);
++- a 600-row prompt in 256-row chunks filled in pairs (TF_GLM_PREFILL_PAIRS=1): drafted (256 + 256 + 64 to its grid
++  point, then a 24-row tail) and plain (256 + 256 + 88).
++
++Under the former 65-row floor (TF_GLM_EXPERT_KERNEL_ROWS=65: glm53f-rank's own large-M boundary, the switch's first
++default) the same row takes glm53f-afd's kernels in one scenario and TensorFold's in its counterpart, so a reply
++depended on how it was served (a drafted prompt against its plain run, concurrent replies against their alone runs).
++Under the switch's default (every prompt window, 1..4,096 rows) every prompt row takes glm53f-afd's kernels in every
++scenario; decode windows never do.
++"""
++
++from __future__ import annotations
++
++import os
++
++import pytest
++
++from tests import test_glm_multi as tm
++from tests import test_glm_multi_afd as ta
++from tests.test_cuda_geometry import allocations  # noqa: F401  (fixture: fake triton, so decode imports)
++
++pytestmark = pytest.mark.torch
++
++fake = tm.fake
++afd_fake = ta.afd_fake
++GRID, PREFILL_ROWS, LAYER = 64, 256, 3
++# (scenario, its counterpart): the same prompt's rows served two ways
++PAIRS = [*[(f"40-row prompt {k} alone", f"40-row prompt {k} grouped") for k in range(4)],
++         ("70-row prompt drafted", "70-row prompt plain"), ("70-row prompt resumed", "70-row prompt plain"),
++         ("600-row prompt drafted, paired", "600-row prompt plain, paired")]
++
++
++@pytest.fixture
++def grid(monkeypatch):
++    """TF_GLM_PROMPT_GRID=64 (TF_GLM_KDA_CHUNKED=1's grid) on every engine the test builds; every other TF_GLM_ and
++    TF_AFD_ switch unset (the scenarios set their own), so the windows are the same under any settings the run has."""
++
++    from tensorfold.families.glm5_next.cuda import engine
++
++    for k in list(os.environ):
++        if k.startswith(("TF_GLM_", "TF_AFD_")):
++            monkeypatch.delenv(k, raising=False)
++    monkeypatch.setattr(engine.GlmEngine, "grid", GRID)
++    return GRID
++
++
++class Windows:
++    """Every prompt window rank 0 fills, in order: (rows, [(request, first position, rows)]) per window."""
++
++    def __init__(self, monkeypatch) -> None:
++        from tensorfold.families.glm5_next.cuda.multi import MultiDecoder
++
++        self.windows: list[tuple[int, list]] = []
++        self.pairs = 0                                  # _fill_pair calls (prompt chunk pairs)
++        fill, many, pair = MultiDecoder._fill, MultiDecoder._fill_many, MultiDecoder._fill_pair
++
++        def _fill(d, lane, stop, *, layers=None):
++            if (layers is None or layers[0] == 0) and stop > lane.st.pos:     # a replay (0042) fills no rows
++                self.windows.append((stop - lane.st.pos, [(lane.s, lane.st.pos, stop - lane.st.pos)]))
++            return fill(d, lane, stop, layers=layers)
++
++        def _fill_many(d, group, *, layers=None):
++            if layers is None or layers[0] == 0:
++                pieces = [(lane.s, lane.st.pos, stop - lane.st.pos) for lane, stop in group]
++                self.windows.append((sum(p[2] for p in pieces), pieces))
++            return many(d, group, layers=layers)
++
++        def _fill_pair(d, *plans):
++            self.pairs += 1
++            ends: dict[int, int] = {}
++            for k, plan in enumerate(plans):            # as _fill_pair lays them out: a later chunk from the last end
++                pieces = []
++                for lane, stop in plan:
++                    start = ends.get(id(lane), lane.st.pos) if k else lane.st.pos
++                    pieces.append((lane.s, start, stop - start))
++                self.windows.append((sum(p[2] for p in pieces), pieces))
++                ends.update((id(lane), stop) for lane, stop in plan)
++            return pair(d, *plans)
++
++        monkeypatch.setattr(MultiDecoder, "_fill", _fill)
++        monkeypatch.setattr(MultiDecoder, "_fill_many", _fill_many)
++        monkeypatch.setattr(MultiDecoder, "_fill_pair", _fill_pair)
++
++    def rows(self, s) -> dict[int, int]:
++        """Request ``s``'s filled prompt rows: position -> the rows of the window it was filled in (each once)."""
++
++        out: dict[int, int] = {}
++        for R, pieces in self.windows:
++            for req, start, n in pieces:
++                if req is s:
++                    for q in range(start, start + n):
++                        assert q not in out, f"row {q} filled twice"
++                        out[q] = R
++        return out
++
++
++def _node(env, monkeypatch, *, multi: bool = False, pairs: bool = False) -> ta.World1:
++    for name, on in (("TF_GLM_MULTI_PREFILL", multi), ("TF_GLM_PREFILL_PAIRS", pairs)):
++        if on:
++            monkeypatch.setenv(name, "1")
++        else:
++            monkeypatch.delenv(name, raising=False)
++    n = ta.World1(env, streams=4, prefill_rows=PREFILL_ROWS)
++    assert n.d.grid == GRID and n.d.world == 1 and n.d.group == multi and n.d.pairs == pairs
++    return n
++
++
++def serve(env, monkeypatch) -> dict[str, list[int]]:
++    """Every scenario, each on a fresh node run to the end before the next (replies checked against their solo
++    ones, the recorded windows against the wire's chunk forwards): per request, each prompt row's window rows in
++    position order (a resumed request's kept rows: those of the windows its kept state was filled in)."""
++
++    torch = env.torch
++    w = Windows(monkeypatch)
++    out: dict[str, list[int]] = {}
++
++    def chunks(n) -> list[int]:
++        return [r for k, r in n.wire.pairs() if k == "chunk"]
++
++    def fresh(n) -> None:                               # the windows from here on: this node's next requests
++        w.windows.clear()
++        w.pairs = 0
++        n.mark = len(chunks(n))
++
++    def run(n, reqs) -> None:
++        n.run()
++        for s, (pr, cnt, sp) in reqs:
++            assert s.got == tm.solo(torch, pr, cnt, sp)
++        assert chunks(n)[n.mark:] == [R for R, _ in w.windows]
++        assert all(R <= PREFILL_ROWS for R, _ in w.windows)
++
++    def table(s, n_rows: int, kept: list[int] | tuple = ()) -> list[int]:
++        rows = w.rows(s)
++        assert set(rows) == set(range(len(kept), n_rows)), (sorted(rows)[:3], len(kept), n_rows)
++        return [*kept, *[rows[q] for q in range(len(kept), n_rows)]]
++
++    # four 40-row prompts: alone (one after another), then grouped (admitted together, TF_GLM_MULTI_PREFILL=1)
++    prompts = [(tm._prompt(40, 70 + k), 8, tm._sampling("topk", k)) for k in range(4)]
++    for mode, multi in (("alone", False), ("grouped", True)):
++        n = _node(env, monkeypatch, multi=multi)
++        fresh(n)
++        reqs = []
++        for req in prompts:
++            reqs.append((n.submit(*req), req))
++            if not multi:
++                run(n, reqs[-1:])
++        run(n, reqs)
++        for k, (s, _) in enumerate(reqs):
++            out[f"40-row prompt {k} {mode}"] = table(s, 40)
++        if multi:
++            assert len(w.windows) == 1 and w.windows[0][0] == 160
++    # a 70-row prompt: drafted (kept at its grid point 64), the same again (resumed there), and plain
++    p70 = (tm._prompt(70, 77), 8, None)
++    n = _node(env, monkeypatch)
++    fresh(n)
++    a = n.submit(*p70)
++    run(n, [(a, p70)])
++    out["70-row prompt drafted"] = table(a, 70)
++    assert [R for R, _ in w.windows] == [64, 6] and a.cached == 0
++    fresh(n)
++    b = n.submit(*p70)
++    run(n, [(b, p70)])
++    assert b.cached == 64 and [R for R, _ in w.windows] == [6]
++    out["70-row prompt resumed"] = table(b, 70, kept=out["70-row prompt drafted"][:64])
++    n = _node(env, monkeypatch)
++    fresh(n)
++    c = n.submit(*p70[:2], None, draft=False)
++    run(n, [(c, p70)])
++    assert [R for R, _ in w.windows] == [70]
++    out["70-row prompt plain"] = table(c, 70)
++    # a 600-row prompt in prompt chunk pairs: drafted (kept at 576) and plain
++    p600 = (tm._prompt(600, 78), 8, tm._sampling("greedy", 0))
++    for mode, draft in (("drafted", True), ("plain", False)):
++        n = _node(env, monkeypatch, pairs=True)
++        fresh(n)
++        s = n.submit(*p600, draft=draft)
++        run(n, [(s, p600)])
++        assert [R for R, _ in w.windows] == ([256, 256, 64, 24] if draft else [256, 256, 88])
++        assert w.pairs >= 1                                      # the chunks did run as pairs
++        out[f"600-row prompt {mode}, paired"] = table(s, 600)
++    return out
++
++
++def _hook(monkeypatch, rows: str | None):
++    """The expert node's dispatch (``g53_experts.Node.takes``) under TF_GLM_EXPERT_KERNEL=g53 and, if given,
++    TF_GLM_EXPERT_KERNEL_ROWS=rows; the experts' prompt buffers hold PREFILL_ROWS rows, every layer in scope."""
++
++    from tensorfold.families.glm5_next.cuda import g53_experts
++
++    monkeypatch.setenv(g53_experts.ENV, "g53")
++    if rows is None:
++        monkeypatch.delenv(g53_experts.ROWS_ENV, raising=False)
++    else:
++        monkeypatch.setenv(g53_experts.ROWS_ENV, rows)
++    settings = g53_experts.switch()
++    assert settings is not None
++    h = g53_experts.Node.__new__(g53_experts.Node)
++    h.min_rows, h.max_rows, h.ready = settings["min_rows"], min(g53_experts.MAX_ROWS, PREFILL_ROWS), {LAYER: True}
++    for k in (g53_experts.ENV, g53_experts.ROWS_ENV):
++        monkeypatch.delenv(k, raising=False)
++    return h
++
++
++def kernels(h, windows: list[int]) -> list[str]:
++    """Each prompt row's kernel: ``g53`` (glm53f-afd's) or ``tf`` (TensorFold's: TF_GLM_EXL3_PROMPT=1's prompt kernel,
++    or the grouped kernel), by its window's rows; and a decode window of the same rows never takes g53."""
++
++    assert not any(h.takes(LAYER, R, False) for R in set(windows))
++    return ["g53" if h.takes(LAYER, R, True) else "tf" for R in windows]
++
++
++def spans(windows: list[int], ks: list[str]) -> str:
++    """'rows a-b: an R-row window (kernel)' runs, for the printed table."""
++
++    out, lo = [], 0
++    for q in range(1, len(windows) + 1):
++        if q == len(windows) or (windows[q], ks[q]) != (windows[lo], ks[lo]):
++            out.append(f"rows {lo}-{q - 1}: {windows[lo]}-row window ({ks[lo]})")
++            lo = q
++    return "; ".join(out)
++
++
++def test_under_the_65_row_floor_a_rows_kernel_depends_on_its_window(afd_fake, grid, monkeypatch, capsys):
++    """The former 65-row floor (TF_GLM_EXPERT_KERNEL_ROWS=65): in each pair of scenarios some row takes glm53f-afd's
++    kernels one way and TensorFold's the other, which made a reply depend on how it was served."""
++
++    h = _hook(monkeypatch, "65")
++    served = serve(afd_fake, monkeypatch)
++    with capsys.disabled():
++        print("\n[g53 windows] TF_GLM_EXPERT_KERNEL=g53 TF_GLM_EXPERT_KERNEL_ROWS=65 (the former floor):")
++        for name, win in served.items():
++            print(f"  {name}: {spans(win, kernels(h, win))}")
++    for a, b in PAIRS:
++        ka, kb = kernels(h, served[a]), kernels(h, served[b])
++        differ = [q for q in range(len(ka)) if ka[q] != kb[q]]
++        assert differ, (a, b)
++    assert set(kernels(h, served["40-row prompt 0 alone"])) == {"tf"}
++    assert set(kernels(h, served["40-row prompt 0 grouped"])) == {"g53"}
++    assert set(kernels(h, served["70-row prompt drafted"])) == {"tf"}          # 64 + 6: both under 65
++    assert set(kernels(h, served["70-row prompt plain"])) == {"g53"}
++    assert kernels(h, served["600-row prompt drafted, paired"])[512:] == ["tf"] * 88
++
++
++def test_every_prompt_row_takes_the_kernels_whatever_its_window(afd_fake, grid, monkeypatch, capsys):
++    """The switch's default (every prompt window, TF_GLM_EXPERT_KERNEL_ROWS unset = 1): every prompt row of every
++    scenario takes glm53f-afd's kernels, so a row's kernel (and with it its bits) never depends on how it was
++    served."""
++
++    h = _hook(monkeypatch, None)
++    assert h.min_rows == 1
++    served = serve(afd_fake, monkeypatch)
++    with capsys.disabled():
++        print("\n[g53 windows] TF_GLM_EXPERT_KERNEL=g53 (default rows):")
++        for name, win in served.items():
++            print(f"  {name}: {spans(win, kernels(h, win))}")
++    for name, win in served.items():
++        assert set(kernels(h, win)) == {"g53"}, name
++    for a, b in PAIRS:
++        assert kernels(h, served[a]) == kernels(h, served[b])
++    for R in range(1, PREFILL_ROWS + 1):                            # every window size the experts' buffers hold
++        assert h.takes(LAYER, R, True) and not h.takes(LAYER, R, False)

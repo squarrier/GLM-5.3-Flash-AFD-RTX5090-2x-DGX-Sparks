@@ -1,0 +1,748 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 19:59:24 -0400
+Subject: [PATCH] glm5_next/cuda: waiting requests whose client left are
+ dropped at once, TF_GLM_QUEUED_CANCEL (MiaAI-Lab recipe patch 0073)
+
+With --parallel, a request waiting while every lane was busy kept waiting after its client left, until a lane freed,
+and a reply whose connection failed mid-stream decoded on. MiaAI-Lab's recipe v1.6 drops such requests at once, in
+queue order, with patch 0073-glm-queued-cancellation: each waiting caller polls its client about every 0.1 s, a
+disconnect latches, and only the scheduler removes the request (so rank 1 never sees it); a stream already admitted
+ends after its round and its caller raises RequestCancelled once the decoder let it go; a delivery failure stops the
+stream the same way and is raised after the decoder's cleanup. On the AFD split the scheduler is the attention node's
+(rank 0 of world 1). This ports it behind a switch of this tree's own, off by default:
+
+- multi.py: GlmScheduler.queued_cancel (TF_GLM_QUEUED_CANCEL, read with recipe_switch); _submit_polled (the patch's
+  submit body), _cancel_item and _cancel_waiting, verbatim; their calls in _admit and _iteration as in the patch, and
+  in this tree's _admit_sjf (TF_GLM_PREFILL_ORDER=sjf). Changes for this tree: _submit_polled stamps the arrival under
+  sjf as submit does; _cancel_waiting keeps TensorFold v0.6.5's close() stop entry (a None item) in the queue; _admit
+  skips the check for a None item.
+- engine.py: a startup line when the switch is on.
+- THIRD_PARTY_NOTICES.md: "GLM queued cancellation".
+
+Unset, submit, _admit, _admit_sjf and _iteration take the same paths as before.
+
+Tests: tests/test_glm_queued_cancel.py (3, CPU, no Torch): the recipe's tools/test_queued_cancellation.py checks (by
+desy0305), their bodies verbatim, on this tree's GlmScheduler loaded from the source as the recipe's tool loads it:
+all 21 pass with the switch on (the recipe's tree at 68ebd67 passes the same 21 with the tool itself); with the switch
+off, the tool's --expect-stock check reproduces the wait before 0073; the switch's values.
+
+Credit: patch 0073 was written by desy0305 (https://github.com/desy0305) in
+MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold pull request #51, with the delivery-failure handling from
+johnwhited's (https://github.com/johnwhited) pull request #48; MiaAI-Lab applied it as contributed in recipe commit
+5859365 (v1.6), Apache License 2.0, with tools/test_queued_cancellation.py.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patch 0073,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 68ebd67b5326974b8004009e202268b1fa7c551d (v1.7.1); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |  21 +
+ .../families/glm5_next/cuda/engine.py         |   4 +
+ .../families/glm5_next/cuda/multi.py          | 108 +++-
+ tests/test_glm_queued_cancel.py               | 489 ++++++++++++++++++
+ 4 files changed, 621 insertions(+), 1 deletion(-)
+ create mode 100644 tests/test_glm_queued_cancel.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index b6fb7ce..ff2a36c 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -535,3 +535,24 @@ as contributed, under the recipe's Apache License 2.0 (see [the license text](LI
+ port: the recipe always runs it, and here it is off unless `TF_GLM_SHARED_PREFIX_COPY=1` (`multi.recipe_switch`); unset,
+ `admit` overwrites the rows as before, with the same evictions in the same order. A longer state is told apart by its
+ token ids (`prompt`, `c.ids`, for the recipe's `key`, `c.key`), since this tree keys no images into its kept prompts.
++
++## GLM queued cancellation (TF_GLM_QUEUED_CANCEL)
++
++The `TF_GLM_QUEUED_CANCEL=1` paths of `families/glm5_next/cuda/multi.py`'s `GlmScheduler` (`_submit_polled`,
++`_cancel_item`, `_cancel_waiting`, and their calls in `submit`, `_admit`, `_admit_sjf` and `_iteration`: a request
++waiting while every lane is busy, whose client left, is dropped at once instead of when a lane frees, and a reply whose
++delivery fails ends after its round) are MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/68ebd67)
++patch 0073-glm-queued-cancellation (v1.6, recipe commit
++[`5859365`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/commit/585936585de470a0b687a998f48b636bd22e440d)),
++written by [desy0305](https://github.com/desy0305) in
++[pull request #51](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/51) and applied by
++MiaAI-Lab as contributed; its delivery-failure handling comes from [johnwhited](https://github.com/johnwhited)'s
++[pull request #48](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/48). The checks in
++`tests/test_glm_queued_cancel.py` are the recipe's `tools/test_queued_cancellation.py` (by desy0305), verbatim but for
++how they are run. Both are under the recipe's Apache License 2.0 (see [the license text](LICENSES/Apache-2.0.txt)).
++Changes in the port: the recipe always runs it, and here it is off unless `TF_GLM_QUEUED_CANCEL=1`
++(`GlmScheduler.queued_cancel`); unset, `submit`, `_admit` and `_iteration` run as before. The patch's `submit` body is
++`_submit_polled`, which also stamps a request's arrival under `TF_GLM_PREFILL_ORDER=sjf`; the dropping also runs in
++this tree's shortest-first admission (`_admit_sjf`), and `_cancel_waiting` leaves TensorFold v0.6.5's `close()` stop
++entry in the queue.
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 0e325e0..0edcba9 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -770,6 +770,10 @@ class GlmEngine:
+                     print("[tensorfold] TF_GLM_SHARED_PREFIX_COPY=1: a request resuming a shared prefix kept in another "
+                           "conversation's extent copies its rows into free rows of its own, so that conversation keeps "
+                           "its state (MiaAI-Lab recipe patch 0071, by ezoushen)", flush=True)
++                if getattr(self.scheduler, "queued_cancel", False):
++                    print("[tensorfold] TF_GLM_QUEUED_CANCEL=1: a waiting request whose client left is dropped at once, "
++                          "even while every lane is busy; a reply whose delivery fails ends after its round (MiaAI-Lab "
++                          "recipe patch 0073, by desy0305)", flush=True)
+ 
+     @staticmethod
+     def _cache_entries() -> int:
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index 5b6f74f..c1ed6d2 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -2172,6 +2172,9 @@ class GlmScheduler(Scheduler):
+             decoder.wanted = self._waiting_prompts
+         # TF_GLM_PREFILL_ORDER=sjf (``prefill_order``, ours): queued requests take free slots in the decoder's order
+         self.sjf = getattr(decoder, "order", "fifo") == "sjf"
++        # TF_GLM_QUEUED_CANCEL=1 (MiaAI-Lab recipe patch 0073, by desy0305; off by default here): a waiting request
++        # whose client left is dropped at once, even while every lane is busy (``_cancel_waiting``)
++        self.queued_cancel = recipe_switch("TF_GLM_QUEUED_CANCEL")
+         super().__init__(decoder, max_streams=max_streams)
+ 
+     def _waiting_prompts(self) -> list[list[int]]:
+@@ -2187,12 +2190,15 @@ class GlmScheduler(Scheduler):
+     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
+                emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
+                constraint: Any = None, background: bool = False, glm: dict | None = None) -> dict:
+-        """``Scheduler.submit`` with the request's GLM settings (``glm``: its policy code and spec)."""
++        """``Scheduler.submit`` with the request's GLM settings (``glm``: its policy code and spec).
++        TF_GLM_QUEUED_CANCEL=1: ``_submit_polled``."""
+ 
+         box: queue.Queue = queue.Queue()
+         stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
+                         constraint=constraint, background=background)
+         stream.glm = dict(glm or {})
++        if getattr(self, "queued_cancel", False):
++            return self._submit_polled(stream, box, emit)
+         cancel = [False]
+         stream.emit = lambda new: (box.put(("tokens", new)), cancel[0])[1]
+         # the server's client poll (``feed.cancelled``): a sliced fill ends a filling request whose client left (0062)
+@@ -2210,6 +2216,98 @@ class GlmScheduler(Scheduler):
+             else:
+                 return value
+ 
++    def _submit_polled(self, stream: Stream, box: queue.Queue, emit) -> dict:
++        """TF_GLM_QUEUED_CANCEL=1 (MiaAI-Lab recipe patch 0073, by desy0305): ``submit``'s wait with the caller polling
++        its client (``emit.cancelled``, the server's client poll) about every 0.1 s, before and after admission. A
++        disconnect latches (an older False poll never undoes another's True); the scheduler drops the request while it
++        still waits (``_cancel_waiting``, ``_cancel_item``), else the stream ends after its round and the caller raises
++        RequestCancelled once the decoder has let it go. A delivery failure (``emit`` raising) stops the stream the same
++        way and is raised after the decoder's cleanup (the delivery-failure handling of johnwhited's pull request #48 in
++        the recipe). A normal stop (``emit`` returning True: a stop string, a gate's cut) is not a cancellation."""
++
++        # Queued or memory-held GLM callers acknowledge disconnect before admission, even when all lanes are busy.
++        # The scheduler owns removal; active streams still finish through the decoder.
++        # The caller polls; only the scheduler removes cancelled queued requests.
++        stop, disconnected, cancel_error = [False], [False], [None]
++        poll = getattr(emit, "cancelled", None)
++
++        def cancelled() -> bool:
++            if not disconnected[0] and cancel_error[0] is None and poll is not None:
++                try:
++                    if poll():                      # sticky: an older False poll must never undo another's True
++                        disconnected[0] = stop[0] = True
++                except Exception as exc:  # noqa: BLE001  (the client poll's failure is reported: recipe 0073)
++                    cancel_error[0], stop[0] = exc, True
++            return disconnected[0] or cancel_error[0] is not None
++
++        stream.emit = lambda new: (box.put(("tokens", new)), stop[0])[1]
++        stream.emit.cancelled = cancelled
++        stream.emit.cancel_requested = lambda: disconnected[0] or cancel_error[0] is not None
++        stream.emit.cancel_error = lambda: cancel_error[0]
++        if getattr(self, "sjf", False):          # TF_GLM_PREFILL_ORDER=sjf: its wait counts from now
++            prefill_order.stamp(stream)
++        self.waiting.put((stream, box))
++        while True:
++            cancelled()
++            try:
++                kind, value = box.get(timeout=0.1)
++            except queue.Empty:
++                continue
++            if kind == "tokens":
++                if not stop[0]:
++                    try:
++                        if emit(value):
++                            stop[0] = True           # a normal stop/gate cut is not cancellation
++                    except Exception as exc:  # noqa: BLE001  (a delivery failure stops the stream: recipe 0073)
++                        cancel_error[0], stop[0] = exc, True
++            elif kind == "error":
++                raise value
++            else:
++                if cancel_error[0] is not None:      # report callback failures only after active decoder cleanup
++                    raise cancel_error[0]
++                if disconnected[0]:
++                    from tensorfold.server.cancellation import RequestCancelled
++                    raise RequestCancelled("the client left during the reply")
++                return value
++
++    def _cancel_item(self, item) -> bool:
++        """Scheduler-owned cancellation of a not-admitted request; no decoder/rank state exists yet.
++        (TF_GLM_QUEUED_CANCEL=1, MiaAI-Lab recipe patch 0073)"""
++        from tensorfold.server.cancellation import RequestCancelled
++
++        stream, box = item
++        poll = getattr(stream.emit, "cancelled", None)
++        if poll is None or not poll():
++            return False
++        error = getattr(stream.emit, "cancel_error", lambda: None)()
++        box.put(("error", error if error is not None else RequestCancelled("the client left before admission")))
++        return True
++
++    def _cancel_waiting(self) -> None:
++        """Reap waiting/held requests even when every lane is busy; retain exact queue priorities/order.
++        (TF_GLM_QUEUED_CANCEL=1, MiaAI-Lab recipe patch 0073; ``close``'s stop entry stays where it is)"""
++        import heapq
++
++        if self.held is not None and self._cancel_item(self.held):
++            self.held = None
++        removed = []
++        # Never call the socket callback while holding the queue lock: these are caller-latched flags.
++        with self.waiting.mutex:
++            kept = []
++            for entry in self.waiting.queue:
++                if entry[2] is None:                 # TensorFold v0.6.5's close(): the stop entry, not a request
++                    kept.append(entry)
++                    continue
++                stream, _ = entry[2]
++                flag = getattr(stream.emit, "cancel_requested", None)
++                (removed if flag is not None and flag() else kept).append(entry)
++            if removed:
++                self.waiting.queue[:] = kept
++                heapq.heapify(self.waiting.queue)
++                self.waiting.not_full.notify_all()
++        for entry in removed:
++            self._cancel_item(entry[2])
++
+     def _admit(self, first=None, until: float | None = None) -> list[Stream]:
+         """Waiting requests into free slots while they fit; ``until`` (a ``time.monotonic`` deadline): an empty queue
+         is waited on until then for more arrivals (TF_GLM_MULTI_PREFILL_WAIT_MS, MiaAI-Lab recipe patch 0049)."""
+@@ -2231,6 +2329,9 @@ class GlmScheduler(Scheduler):
+                 if item is None and until is not None:   # close() during the wait: its stop goes back for the idle get
+                     self.waiting.stop()
+                     break
++            # TF_GLM_QUEUED_CANCEL=1 (MiaAI-Lab recipe patch 0073): a request whose client left is dropped here
++            if getattr(self, "queued_cancel", False) and item is not None and self._cancel_item(item):
++                continue
+             stream, box = item
+             if not self.decoder.fits(stream):
+                 self.held = item                     # waits, first in line, for room
+@@ -2273,6 +2374,9 @@ class GlmScheduler(Scheduler):
+             item = self._next_waiting()
+             if item is None:
+                 break
++            # TF_GLM_QUEUED_CANCEL=1 (MiaAI-Lab recipe patch 0073): a request whose client left is dropped here
++            if getattr(self, "queued_cancel", False) and self._cancel_item(item):
++                continue
+             stream, box = item
+             if not self.decoder.fits(stream):
+                 self.held = item                     # waits for room, and is ordered with the queue again next time
+@@ -2368,6 +2472,8 @@ class GlmScheduler(Scheduler):
+     def _iteration(self) -> bool:
+         """One iteration; False once ``close`` asked the idle worker to stop."""
+ 
++        if getattr(self, "queued_cancel", False):
++            self._cancel_waiting()               # TF_GLM_QUEUED_CANCEL=1 (MiaAI-Lab recipe patch 0073)
+         self._yield()
+         idle = not self.decoder.live() and self.held is None
+         first = self.waiting.get() if idle else None                  # idle: wait for a request
+diff --git a/tests/test_glm_queued_cancel.py b/tests/test_glm_queued_cancel.py
+new file mode 100644
+index 0000000..21587bf
+--- /dev/null
++++ b/tests/test_glm_queued_cancel.py
+@@ -0,0 +1,489 @@
++"""TF_GLM_QUEUED_CANCEL (MiaAI-Lab recipe patch 0073, by desy0305): a request waiting while every lane is busy, whose
++client left, is dropped at once; a reply whose delivery fails ends after its round. The recipe's CPU checks for 0073
++(``tools/test_queued_cancellation.py`` at recipe commit 68ebd67, by desy0305, Apache License 2.0), run on this tree's
++GlmScheduler: their bodies are the recipe's, verbatim; this file only runs them as pytest, with the scheduler's
++switch on (``obj.queued_cancel``) and its ``--expect-stock`` check with the switch off. Like the recipe's, they load
++the real scheduler classes from the source (no Torch, CUDA or sockets).
++"""
++
++# ruff: noqa
++
++from __future__ import annotations
++
++import ast
++import hashlib
++import importlib.util
++import itertools
++import queue
++import sys
++import threading
++import time
++from types import SimpleNamespace
++from pathlib import Path
++from typing import Any, Callable
++
++import pytest
++
++
++def module(name, path):
++    spec = importlib.util.spec_from_file_location(name, path)
++    obj = importlib.util.module_from_spec(spec)
++    sys.modules[name] = obj
++    spec.loader.exec_module(obj)
++    return obj
++
++
++def classes(source, names, namespace):
++    nodes = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
++    nodes += [n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name in names]
++    assert len(nodes) == len(names) + 1, "missing or duplicate source class"
++    exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), "<scheduler>", "exec"), namespace)
++
++
++class Decoder:
++    watchdog = 0
++
++    def __init__(self):
++        self.streams, self.requeue, self.admitted, self.finished, self.fits_calls = {}, [], [], [], []
++        self.room = True
++
++    def live(self):
++        return len(self.streams)
++
++    def fits(self, stream):
++        self.fits_calls.append(stream)
++        return self.room
++
++    def admit(self, stream):
++        self.admitted.append(stream)
++        self.streams[id(stream)] = stream
++
++    def round(self):
++        return [s for s in self.streams.values() if s.done]
++
++    def finish(self, done):
++        self.finished.extend(done)
++        for stream in done:
++            self.streams.pop(id(stream), None)
++
++    def stats(self, stream):
++        return stream.stats()
++
++
++def wait(predicate):
++    deadline = time.monotonic() + 2
++    while not predicate():
++        assert time.monotonic() < deadline, "caller/scheduler did not make bounded progress"
++        time.sleep(0.002)
++
++
++
++
++def checks(source_root, expect_stock: bool = False, on: bool = True):
++    args = SimpleNamespace(expect_stock=expect_stock)
++    root = source_root / "tensorfold"
++    Stream = module("queue_streams", root / "cuda/streams.py").Stream
++    Cancelled = module("tensorfold.server.cancellation", root / "server/cancellation.py").RequestCancelled
++    ns = dict(queue=queue, threading=threading, itertools=itertools, Any=Any, Callable=Callable,
++              Stream=Stream, time=time, _unwatch=lambda _: None)
++    gate: dict = {}                              # this tree: multi.NoRoom subclasses cuda.memory_gate.NoRoom
++    classes((root / "cuda/memory_gate.py").read_text(encoding="utf-8"), {"NoRoom"}, gate)
++    ns["_NoRoom"] = gate["NoRoom"]
++    source = (root / "families/glm5_next/cuda/multi.py").read_text(encoding="utf-8")
++    classes(source, {"NoRoom"}, ns)
++    classes((root / "cuda/scheduler.py").read_text(encoding="utf-8"), {"Waiting", "Scheduler"}, ns)
++    classes(source, {"GlmScheduler"}, ns)
++
++    def scheduler(holders=0, capacity=4):
++        obj = object.__new__(ns["GlmScheduler"])
++        obj.decoder, obj.max_streams = Decoder(), capacity
++        obj.queued_cancel, obj.sjf = on, False       # this tree: TF_GLM_QUEUED_CANCEL (GlmScheduler.__init__), FIFO
++        obj.waiting, obj.held, obj.boxes, obj.yields, obj.gather_s = ns["Waiting"](), None, {}, 0, 0
++        for _ in range(holders):
++            stream = Stream([1], 100)
++            obj.decoder.streams[id(stream)] = stream
++        return obj
++
++    def ask(obj, poll, background=False, emit_hook=None):
++        reply = {}
++        def emit(tokens):
++            return False if emit_hook is None else emit_hook(tokens)
++        emit.cancelled = poll
++        def run():
++            try:
++                reply["stats"] = obj.submit([1], 100, None, False, emit, background=background)
++            except Exception as exc:
++                reply["error"] = exc
++        thread = threading.Thread(target=run, daemon=True)
++        thread.start()
++        wait(lambda: obj.waiting.qsize() == 1)
++        return thread, reply
++
++    def cancelled_reply(thread, reply, error=Cancelled):
++        thread.join(2)
++        assert not thread.is_alive() and isinstance(reply.get("error"), error)
++
++    checks = []
++    obj, event = scheduler(4), threading.Event()
++    thread, reply = ask(obj, event.is_set)
++    holders = tuple(obj.decoder.streams)
++    event.set()
++    if args.expect_stock:
++        time.sleep(0.12)
++        obj._iteration()
++        assert thread.is_alive() and obj.waiting.qsize() == 1 and not reply
++        _, box = obj.waiting.get_nowait()  # test cleanup, not stock cancellation behavior
++        box.put(("error", Cancelled("test cleanup")))
++        cancelled_reply(thread, reply)
++        return {"stock_gap_reproduced": True, "device_calls": 0}
++    wait(lambda: obj.waiting.queue[0][2][0].emit.cancel_requested())
++    obj._iteration()
++    cancelled_reply(thread, reply)
++    assert obj.waiting.empty() and tuple(obj.decoder.streams) == holders
++    assert not obj.decoder.admitted and not obj.decoder.fits_calls
++    checks.append("full lanes: caller acknowledged without admission or touching holders")
++
++    obj, event = scheduler(8, 8), threading.Event()
++    thread, reply = ask(obj, event.is_set)
++    holders = tuple(obj.decoder.streams)
++    event.set()
++    wait(lambda: obj.waiting.queue[0][2][0].emit.cancel_requested())
++    obj._iteration()
++    cancelled_reply(thread, reply)
++    assert obj.waiting.empty() and tuple(obj.decoder.streams) == holders and not obj.decoder.admitted
++    checks.append("eight full lanes: same pre-admission cancellation")
++
++    obj, event = scheduler(3), threading.Event()
++    thread, reply = ask(obj, event.is_set)
++    obj.decoder.room = False
++    obj._admit()
++    assert obj.held is not None
++    event.set()
++    obj._iteration()
++    cancelled_reply(thread, reply)
++    assert obj.held is None and not obj.decoder.admitted
++    checks.append("memory-held cancellation")
++
++    obj = scheduler()
++    thread, reply = ask(obj, lambda: True)
++    obj._admit(obj.waiting.get_nowait())
++    cancelled_reply(thread, reply)
++    assert not obj.decoder.fits_calls
++    checks.append("pre-cancelled idle admission")
++
++    obj, entries = scheduler(4), []
++    for n, (background, cancel) in enumerate([(False, False), (False, True), (True, False), (False, False)]):
++        stream, box = Stream([n], 100, background=background), queue.Queue()
++        stream.emit = lambda _: False
++        stream.emit.cancelled = lambda cancel=cancel: cancel
++        stream.emit.cancel_requested = stream.emit.cancelled
++        obj.waiting.put((stream, box))
++        entries.append((stream, box))
++    obj._cancel_waiting()
++    assert isinstance(entries[1][1].get_nowait()[1], Cancelled)
++    assert [obj.waiting.get_nowait()[0].prompt[0] for _ in range(3)] == [0, 3, 2]
++    obj._cancel_waiting()
++    assert entries[1][1].empty()
++    checks.append("foreground FIFO, background priority and exactly one acknowledgement")
++
++    obj, event = scheduler(), threading.Event()
++    thread, reply = ask(obj, event.is_set)
++    obj._admit()
++    stream = next(iter(obj.decoder.streams.values()))
++    event.set()
++    wait(stream.emit.cancel_requested)
++    obj._cancel_waiting()
++    assert thread.is_alive() and obj.decoder.live() == 1 and not reply
++    stream.take([2])
++    obj._iteration()
++    cancelled_reply(thread, reply)
++    assert obj.decoder.live() == 0 and obj.decoder.finished == [stream]
++    checks.append("active disconnect raises only after normal decoder finish")
++
++    for method in ("_yield", "_requeue"):
++        obj, event = scheduler(), threading.Event()
++        thread, reply = ask(obj, event.is_set, background=True)
++        obj._admit()
++        stream = next(iter(obj.decoder.streams.values()))
++        if method == "_yield":
++            obj.max_streams = 1
++            obj.waiting.put((Stream([99], 100), queue.Queue()))
++        else:
++            obj.decoder.streams.clear()  # decoder has already freed the lane before reporting requeue
++            obj.decoder.requeue = [stream]
++        getattr(obj, method)()
++        again = next(e[2][0] for e in obj.waiting.queue if e[2][0].background)
++        assert again.emit is stream.emit
++        event.set()
++        wait(again.emit.cancel_requested)
++        obj._cancel_waiting()
++        cancelled_reply(thread, reply)
++        assert id(stream) not in obj.boxes
++        checks.append(method + " preserves cancellation and reply ownership")
++
++    def broken_poll():
++        raise ValueError("callback failed")
++    obj = scheduler(4)
++    thread, reply = ask(obj, broken_poll)
++    wait(lambda: obj.waiting.queue[0][2][0].emit.cancel_requested())
++    obj._iteration()
++    cancelled_reply(thread, reply, ValueError)
++    assert obj.decoder.live() == 4
++    checks.append("poll failure is isolated to its caller")
++
++    class ObservedBox(queue.Queue):
++        def __init__(self):
++            super().__init__()
++            self.gets, self.first_get, self.next_get = 0, threading.Event(), threading.Event()
++        def get(self, *args, **kwargs):
++            self.gets += 1
++            (self.first_get if self.gets == 1 else self.next_get).set()
++            return super().get(*args, **kwargs)
++
++    # A caller's older False poll returns only after another poll has latched True.
++    entered, release = threading.Event(), threading.Event()
++    calls, calls_lock, box = [0], threading.Lock(), ObservedBox()
++    def overlap_poll():
++        with calls_lock:
++            calls[0] += 1
++            n = calls[0]
++        if n == 1:
++            entered.set()
++            assert release.wait(2)
++            return False
++        return True
++    obj = scheduler(4)
++    ns["queue"] = SimpleNamespace(Queue=lambda: box, Empty=queue.Empty)
++    thread, reply = ask(obj, overlap_poll)
++    try:
++        assert entered.wait(2)
++        stream = obj.waiting.queue[0][2][0]
++        assert stream.emit.cancelled()
++        release.set()
++        assert box.first_get.wait(2)  # the caller has consumed its older False result
++        assert stream.emit.cancel_requested(), "an older False poll unlatched disconnect"
++        obj._iteration()
++        cancelled_reply(thread, reply)
++    finally:
++        release.set()
++        box.put(("error", Cancelled("test cleanup")))
++        thread.join(2)
++        ns["queue"] = queue
++    checks.append("overlapping polls cannot undo a latched disconnect")
++
++    # Normal emit=True stop/gate cuts are not socket disconnects, including replay.
++    for method in ("_yield", "_requeue"):
++        permit, emitted, box = threading.Event(), threading.Event(), ObservedBox()
++        def normal_stop(tokens):
++            emitted.set()
++            assert permit.wait(2)
++            return True
++        obj = scheduler()
++        ns["queue"] = SimpleNamespace(Queue=lambda: box, Empty=queue.Empty)
++        thread, reply = ask(obj, lambda: False, background=True, emit_hook=normal_stop)
++        try:
++            obj._admit()
++            stream = next(iter(obj.decoder.streams.values()))
++            stream.take([2])
++            assert emitted.wait(2)
++            if method == "_yield":
++                obj.max_streams = 1
++                obj.waiting.put((Stream([99], 100), queue.Queue()))
++            else:
++                obj.decoder.streams.clear()
++                obj.decoder.requeue = [stream]
++            getattr(obj, method)()
++            if method == "_yield":
++                assert obj.waiting.get_nowait()[0].prompt == [99]  # dummy foreground test owner
++            permit.set()
++            assert box.next_get.wait(2)  # emit=True has been consumed by the caller
++            obj._cancel_waiting()
++            assert obj.waiting.qsize() == 1 and thread.is_alive() and not reply
++            again = obj.waiting.queue[0][2][0]
++            assert not again.emit.cancel_requested()
++            obj._admit()
++            again.take([2, 3])
++            obj._iteration()
++            thread.join(2)
++            assert not thread.is_alive() and "stats" in reply and "error" not in reply
++            assert obj.decoder.finished[-1] is again
++        finally:
++            permit.set()
++            box.put(("error", Cancelled("test cleanup")))
++            thread.join(2)
++            ns["queue"] = queue
++        checks.append(method + " retains normal stop/gate completion, not RequestCancelled")
++
++    obj, fail = scheduler(), threading.Event()
++    def active_poll():
++        if fail.is_set():
++            raise ValueError("active poll failed")
++        return False
++    thread, reply = ask(obj, active_poll)
++    obj._admit()
++    stream = next(iter(obj.decoder.streams.values()))
++    fail.set()
++    wait(stream.emit.cancel_requested)
++    obj._cancel_waiting()
++    assert thread.is_alive() and obj.decoder.live() == 1
++    stream.take([2])
++    obj._iteration()
++    cancelled_reply(thread, reply, ValueError)
++    assert obj.decoder.live() == 0 and obj.decoder.finished == [stream]
++    checks.append("active poll failure propagates only after decoder finish")
++
++    # Delivery failures latch an error, not a normal stop, and never let the
++    # caller return before active decoder cleanup. Preserve the original error.
++    failure = ValueError("delivery failed")
++    deliveries = []
++    def broken_emit(tokens):
++        deliveries.append(tokens)
++        raise failure
++    obj = scheduler()
++    thread, reply = ask(obj, lambda: False, emit_hook=broken_emit)
++    box = obj.waiting.queue[0][2][1]
++    try:
++        obj._admit()
++        stream = next(iter(obj.decoder.streams.values()))
++        stream.take([2])
++        wait(stream.emit.cancel_requested)
++        obj._cancel_waiting()
++        assert thread.is_alive() and not reply and obj.decoder.live() == 1
++        assert stream.emit.cancel_error() is failure and not stream.done
++        stream.take([2, 3])
++        obj._iteration()
++        cancelled_reply(thread, reply, ValueError)
++        assert reply["error"] is failure and len(deliveries) == 1
++        assert obj.decoder.finished == [stream] and obj.decoder.live() == 0 and not obj.boxes
++    finally:
++        box.put(("error", failure))
++        thread.join(2)
++    checks.append("delivery failure stops once and propagates after active decoder finish")
++
++    # A delivery callback can be in flight while the scheduler yields/requeues
++    # its stream. Test failure both before and after replay, including a
++    # memory-held replay; queue removal remains owned by the scheduler.
++    for method in ("_yield", "_requeue"):
++        for timing in ("before", "after", "held"):
++            permit, emitted, box = threading.Event(), threading.Event(), ObservedBox()
++            failure = ValueError(method + " delivery " + timing)
++            deliveries = []
++            def delayed_failure(tokens):
++                deliveries.append(tokens)
++                emitted.set()
++                assert permit.wait(2)
++                raise failure
++            obj = scheduler()
++            ns["queue"] = SimpleNamespace(Queue=lambda: box, Empty=queue.Empty)
++            thread, reply = ask(obj, lambda: False, background=True, emit_hook=delayed_failure)
++            try:
++                obj._admit()
++                stream = next(iter(obj.decoder.streams.values()))
++                stream.take([2])
++                assert emitted.wait(2)
++                if timing == "before":
++                    permit.set()
++                    assert box.next_get.wait(2)
++                    assert stream.emit.cancel_requested() and thread.is_alive() and not reply
++                if method == "_yield":
++                    obj.max_streams = 1
++                    obj.waiting.put((Stream([99], 100), queue.Queue()))
++                else:
++                    obj.decoder.streams.clear()  # decoder freed the lane before reporting requeue
++                    obj.decoder.requeue = [stream]
++                getattr(obj, method)()
++                if method == "_yield":
++                    assert obj.waiting.get_nowait()[0].prompt == [99]
++                again = obj.waiting.queue[0][2][0]
++                assert again.emit is stream.emit and id(stream) not in obj.boxes
++                if timing == "held":
++                    obj.decoder.room = False
++                    obj._admit()
++                    assert obj.held is not None and obj.held[0] is again
++                if timing != "before":
++                    assert not again.emit.cancel_requested() and thread.is_alive() and not reply
++                    permit.set()
++                    assert box.next_get.wait(2)
++                assert again.emit.cancel_requested() and again.emit.cancel_error() is failure
++                assert thread.is_alive() and not reply
++                obj._cancel_waiting()
++                cancelled_reply(thread, reply, ValueError)
++                assert reply["error"] is failure and len(deliveries) == 1
++                assert obj.waiting.empty() and obj.held is None and not obj.boxes
++                assert obj.decoder.admitted == [stream] and obj.decoder.live() == 0
++                obj._cancel_waiting()
++                assert box.empty()  # one terminal reply only
++            finally:
++                permit.set()
++                box.put(("error", failure))
++                thread.join(2)
++                ns["queue"] = queue
++            checks.append(method + " delivery failure " + timing + " replay keeps cleanup/error ownership")
++
++    # The decoder may already have finished while the caller is still inside
++    # delivery. Its queued terminal reply must not turn that failure into stats.
++    permit, emitted, box = threading.Event(), threading.Event(), ObservedBox()
++    failure = ValueError("delivery failed after finish")
++    def late_failure(tokens):
++        emitted.set()
++        assert permit.wait(2)
++        raise failure
++    obj = scheduler()
++    ns["queue"] = SimpleNamespace(Queue=lambda: box, Empty=queue.Empty)
++    thread, reply = ask(obj, lambda: False, emit_hook=late_failure)
++    try:
++        obj._admit()
++        stream = next(iter(obj.decoder.streams.values()))
++        stream.take([2])
++        assert emitted.wait(2)
++        stream.done = True
++        obj._iteration()
++        assert obj.decoder.finished == [stream] and obj.decoder.live() == 0 and not obj.boxes
++        assert thread.is_alive() and not reply
++        permit.set()
++        cancelled_reply(thread, reply, ValueError)
++        assert reply["error"] is failure and "stats" not in reply
++    finally:
++        permit.set()
++        box.put(("error", failure))
++        thread.join(2)
++        ns["queue"] = queue
++    checks.append("delivery failure after decoder finish is not swallowed by terminal stats")
++    return {"status": "PASS", "tests": len(checks), "checks": checks, "device_calls": 0,
++            "source_sha256": hashlib.sha256(source.replace("\r\n", "\n").encode()).hexdigest()}
++
++
++
++SRC = Path(__file__).resolve().parents[1] / "src"
++
++
++@pytest.fixture(autouse=True)
++def _modules_back():
++    """The checks load the scheduler's modules under their own names; the session's own come back after each."""
++    names = ("tensorfold.server.cancellation", "queue_streams")
++    saved = {name: sys.modules.get(name) for name in names}
++    yield
++    for name, mod in saved.items():
++        if mod is None:
++            sys.modules.pop(name, None)
++        else:
++            sys.modules[name] = mod
++
++
++def test_the_recipe_checks_pass_with_the_switch_on():
++    result = checks(SRC, on=True)
++    assert result["status"] == "PASS" and result["tests"] == 21 and result["device_calls"] == 0
++
++
++def test_off_keeps_the_wait_until_a_lane_frees():
++    """Unset (the default): a queued request whose client left still waits for a lane (the recipe's --expect-stock
++    check, the behaviour before 0073)."""
++    assert checks(SRC, expect_stock=True, on=False) == {"stock_gap_reproduced": True, "device_calls": 0}
++
++
++def test_the_switch(monkeypatch):
++    from tensorfold.families.glm5_next.cuda.multi import recipe_switch
++
++    assert [recipe_switch("TF_GLM_QUEUED_CANCEL", v) for v in ("", "0", "1")] == [False, False, True]
++    with pytest.raises(ValueError, match="TF_GLM_QUEUED_CANCEL"):
++        recipe_switch("TF_GLM_QUEUED_CANCEL", "yes")

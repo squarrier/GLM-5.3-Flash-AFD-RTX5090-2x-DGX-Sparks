@@ -24,6 +24,7 @@ MODS = [
     ("tensorfold.cuda.nvfp4.linear", "_ext"),
     ("tensorfold.cuda.kernels.gdn", "_ext"),
     ("tensorfold.families.glm5_next.cuda.kda_chunked", "_ext"),  # TF_GLM_KDA_CHUNKED's kda_chunk.cu (patch 0023)
+    ("tensorfold.families.glm5_next.cuda.g53_experts", "_ext"),  # TF_GLM_EXPERT_KERNEL=g53's g53_rank.cu (patch 0034)
 ]
 import torch  # noqa: E402
 

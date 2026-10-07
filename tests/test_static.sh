@@ -21,17 +21,18 @@ out=$(env -i PATH="$PATH" HOME="$HOME" bash -c ". '$tmp/scripts/lib.sh'
 exp="10.0.0.10 10.0.0.11 10.0.0.12|10.10.1.12|x0,x1|1|mlx5_0 rocep1s0f0|http://10.0.0.10:8000|12|/srv/glm-afd/ext|glm-afd-x1|2|x0 x1 x0-1 x1-1 "
 [ "$out" = "$exp" ] || { echo "topology FAIL: $out"; fail=1; }
 env_ok=$(env -i PATH="$PATH" HOME="$HOME" bash -c ". '$tmp/scripts/lib.sh'; envpairs ATTN_ENV \"\$ATTN_ENV\"")
-case "$env_ok" in *"-e TF_GLM_SHARED_PREFIX=1"*"-e TF_GLM_STREAM_SMOOTH_MS=400"*"-e TF_GLM_KDA_CHUNKED=1"*"-e TF_GLM_PREFILL_PAIRS=1"*"-e TF_GLM_DFLASH_POLICY=fnc5:0.2"*"-e TF_GLM_CACHE_ROOM=1"*) ;; *) echo "envpairs FAIL: $env_ok"; fail=1 ;; esac
+case "$env_ok" in *"-e TF_GLM_SHARED_PREFIX=1"*"-e TF_GLM_STREAM_SMOOTH_MS=400"*"-e TF_GLM_KDA_CHUNKED=1"*"-e TF_GLM_PREFILL_PAIRS=1"*"-e TF_GLM_DFLASH_POLICY=fnc5:0.2"*"-e TF_GLM_CACHE_ROOM=1"*"-e TF_GLM_KEPT_HOST=1"*"-e TF_GLM_HOST_CACHE_GIB=24"*"-e TF_GLM_FILL_PAIRS=1"*"-e TF_GLM_DECIDE_THEN_COPY=1"*"-e TF_GLM_CAPACITY_STATUS=1"*"-e TF_GLM_DELIVERY_ABORT=1"*) ;; *) echo "envpairs FAIL: $env_ok"; fail=1 ;; esac
 xenv=$(env -i PATH="$PATH" HOME="$HOME" bash -c ". '$tmp/scripts/lib.sh'; envpairs EXPERT_ENV \"\$EXPERT_ENV\"")
-case "$xenv" in *"-e TF_GLM_EXL3_DEC=1"*"-e TF_GLM_EXL3_LOADS=nc"*"-e TF_GLM_EXL3_PROMPT=1"*) ;; *) echo "envpairs FAIL (experts): $xenv"; fail=1 ;; esac
+case "$xenv" in *"-e TF_GLM_EXL3_DEC=1"*"-e TF_GLM_EXL3_LOADS=nc"*"-e TF_GLM_EXL3_PROMPT=1"*"-e TF_GLM_EXPERT_KERNEL=g53"*) ;; *) echo "envpairs FAIL (experts): $xenv"; fail=1 ;; esac
 for bad in 'TF_GLM_X=1;id' 'FOO=1' 'TF_GLM_X=$(id)' 'TF_GLM_X=1 PYTHONPATH=/x'; do
   if env -i PATH="$PATH" HOME="$HOME" bash -c ". '$tmp/scripts/lib.sh'; envpairs T '$bad'" >/dev/null 2>&1; then
     echo "envpairs FAIL: accepted '$bad'"; fail=1
   fi
 done
 
-# the patch series: numbered 0001..N with no gap; mail headers; credits on her commits, on the ports and on the
-# changes to her ported code; Hugh Madden and T.J. Purtell named in the patches that bring glm53f-afd's designs
+# the patch series: numbered 0001..N with no gap; mail headers; credits on her commits, on the ports, on the changes to
+# her ported code and on TensorFold's own later commits; Hugh Madden and T.J. Purtell named in the patches that bring
+# glm53f-afd's designs and code
 n=0
 for p in patches/*.patch; do
   n=$((n + 1)); b=$(basename "$p")
@@ -40,9 +41,11 @@ for p in patches/*.patch; do
   subj=$(awk '/^Subject: /{s=$0; while ((getline l) > 0 && l ~ /^ /) s = s l; print s; exit}' "$p")   # unfolded
   if grep -q '^From: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>' "$p"; then
     grep -q "^Credit: MiaAI-Lab's pull request ashhart/TensorFold#" "$p" || { echo "PR credit FAIL $b"; fail=1; }
+  elif grep -q "^Credit: TensorFold's own commit [0-9a-f]\{40\} (v" "$p"; then
+    grep -q '^From: Scott Quarrier ' "$p" && { echo "upstream author FAIL $b"; fail=1; }
   elif [[ "$subj" == *"MiaAI-Lab recipe patch"* ]] || grep -q "^Credit: this changes MiaAI-Lab's code" "$p"; then
     grep -qi '^Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>' "$p" || { echo "Co-authored-by FAIL $b"; fail=1; }
-    grep -qE "^Credit: (ported from MiaAI-Lab's|this changes MiaAI-Lab's code from her) GLM-5.3-Flash EXL3 2x DGX Sparks recipe" "$p" \
+    grep -qE "^Credit: (ported from MiaAI-Lab's|this changes MiaAI-Lab's code from her|parts reimplemented from MiaAI-Lab's) GLM-5.3-Flash EXL3 2x DGX Sparks recipe" "$p" \
       || { echo "port credit FAIL $b"; fail=1; }
   else
     grep -q '^From: Scott Quarrier <squarrier@users.noreply.github.com>' "$p" || { echo "author FAIL $b"; fail=1; }

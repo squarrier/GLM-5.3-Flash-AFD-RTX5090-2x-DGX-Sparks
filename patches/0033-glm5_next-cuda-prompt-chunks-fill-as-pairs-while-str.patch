@@ -1,0 +1,684 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 20:37:56 -0400
+Subject: [PATCH] glm5_next/cuda: prompt chunks fill as pairs while streams
+ decode, TF_GLM_FILL_PAIRS and TF_GLM_FILL_ROUNDS (extends MiaAI-Lab recipe
+ patch 0062's sliced fills)
+
+With TF_GLM_FILL_BUDGET_MS (MiaAI-Lab recipe patch 0062, ported) a prompt chunk started while other streams decode
+runs a few layers at a time, one decode round between two slices. On the attention/expert split such a chunk runs
+alone: the 5090 or the two Sparks idle while the other works, one exchange on the wire at a time. In the release
+configuration's arena cells a 2,105-row fill at 64K of context runs ~2,500 tok/s as a pair (TF_GLM_PREFILL_PAIRS,
+ours) and ~1,300 tok/s in slices, and a decode round with a slice due takes ~250 ms against ~75 ms without one: at
+10 requests x 64K each reply decodes at 12.0 tok/s, mostly because its rounds wait behind those slices.
+
+- TF_GLM_FILL_PAIRS=1 (fill_pairs.py): on the AFD attention node, while streams decode, a new prompt chunk and the
+  next one fill as one unsliced pair (MultiDecoder._pair_plan's rules, busy=True: the first chunk ends no prompt, no
+  stream drafts with the MTP head, at most two chunks of TF_GLM_FILL_ROWS rows), then the decode rounds due after a
+  slice; a chunk without a partner goes in slices as before. Acts with TF_GLM_PREFILL_PAIRS=1 (or LANES >= 2) and
+  TF_GLM_FILL_BUDGET_MS > 0 on the attention node, and does nothing elsewhere (as TF_GLM_PREFILL_PAIRS off the
+  node). /health: "fill_pairs" {pairs, rows}.
+- TF_GLM_FILL_ROUNDS=K (1 .. 8, default 1): the decode rounds due after each slice or such pair before the next fill
+  step (MultiDecoder.decode_due is that count; 1 is the ported behaviour), with TF_GLM_FILL_BUDGET_MS > 0, at any
+  world (rank 1 applies rank 0's ROUND and FILLPART messages as they come).
+
+Neither changes a reply: each chunk keeps its rows, row count and kernels (a pair only interleaves two chunks'
+kernels), and each decode round's streams get their solo tokens whichever forwards come between. Only the order of
+whole forwards changes; the expert nodes serve MODE_PAIR and decode forwards as they come (wire unchanged). With both
+unset the decoder, its messages, /health and the start line are as before. A timing model of the release
+configuration's 10 x 64K cell (fitted to two boots' arena cells): TF_GLM_FILL_PAIRS=1 per-request decode +28 to
++33 %, mean TTFT -38 %, prefill +40 %, aggregate +42 to +44 %; a reply's longest wait grows from ~0.2 s to ~0.9 s,
+once per pair.
+
+engine.py: afd_parallel_check reads both settings before the wire opens; the --parallel start line names them when
+set. THIRD_PARTY_NOTICES.md ("GLM sliced prompt fills") records the change to the ported _fill_turn and
+_part_iteration.
+
+Tests: tests/test_glm_fill_pairs.py (CPU): the layered fake model at world 1 over the checked slice wire with the fake
+pairs: prompts of 60 to 200 tokens arriving mid-decode, pairs between decode rounds and partner-less chunks sliced,
+the replies the solo ones and equal to the switch off with the same cached counts and kept states; the staggered six
+requests at 2 and 4 streams; grouped chunks with FP8 rings; a client leaving after a pair; K = 1, 2, 3 rounds between
+two slices, K rounds after each pair, and two ranks with K = 2 (both ranks equal after every message); the settings,
+their refusals of bad values, what they do where they cannot act (nothing), /health and the start line's words.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: this changes MiaAI-Lab's code from her GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patch 0062,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 1576746a04983b6eded0551dbf22512ee9e95654 (v1.5); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  The change is this recipe's; Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |   4 +
+ .../families/glm5_next/cuda/engine.py         |   8 +-
+ .../families/glm5_next/cuda/fill_pairs.py     |  77 ++++
+ .../families/glm5_next/cuda/multi.py          |  49 ++-
+ tests/test_glm_fill_pairs.py                  | 346 ++++++++++++++++++
+ 5 files changed, 474 insertions(+), 10 deletions(-)
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/fill_pairs.py
+ create mode 100644 tests/test_glm_fill_pairs.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index 423cf35..70305bf 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -255,6 +255,10 @@ slice is one forward of the AFD wire over the chunk's MoE layers in it (`afd.MOD
+ request header's word 6 carries a slice's layer count); that wire mode is this tree's own design, not part of the
+ recipe, and the startup layer timings run as whole prompt-chunk forwards with the expert nodes live.
+ `TF_GLM_FILL_BUDGET_MS` is off unless set (0: every prompt chunk one forward, as before).
++Later change (ours, `fill_pairs.py`): `_fill_turn`'s decode round between two slices is a count of rounds due
++(`TF_GLM_FILL_ROUNDS`, 1 unless set, so as ported), set by `_part_iteration` after each slice; with
++`TF_GLM_FILL_PAIRS=1` on the AFD attention node `_iterate` fills a new chunk and the next one as an unsliced pair
++(`prefill_pairs`, ours) instead of slicing it when the two pair, the same rounds due after the pair.
+ 
+ ## GLM decode kernels
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 6943a92..ad55edf 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -731,7 +731,7 @@ class GlmEngine:
+         self.live: list[int] = []
+         self.cache_entries = self.kept_cap or self._cache_entries()
+         if parallel > 1:
+-            from . import prefill_order
++            from . import fill_pairs, prefill_order
+             from .multi import GlmScheduler, MultiDecoder
+ 
+             self.multi = MultiDecoder(self, parallel)
+@@ -748,6 +748,7 @@ class GlmEngine:
+                       f"{self.multi.tune.describe()}"
+                       f"{f'; prompt layer slices target {self.multi.fill_budget:g} ms (TF_GLM_FILL_BUDGET_MS)' if self.multi.fill_budget else ''}"
+                       f"{'; ' + prefill_order.describe(self.multi.age_s) if self.multi.order == 'sjf' else ''}"
++                      f"{'; ' + paced if (paced := fill_pairs.describe(self.multi.fill_pairs, self.multi.fill_rounds)) else ''}"
+                       f"{f'; verify windows {self.multi.window} rows together (TF_GLM_MULTI_WINDOW)' if self.multi.window != MULTI_WINDOW else ''}",
+                       flush=True)
+                 if self.multi.row_ms is not None:
+@@ -1280,7 +1281,7 @@ def afd_parallel_check(env=None) -> None:
+     """--parallel on the AFD attention node runs eager batched windows: refuse the multi-stream settings
+     that need CUDA graphs across the AFD wire, before the wire opens and the weights load."""
+ 
+-    from . import multi_prefill, prefill_order, sliced_fill
++    from . import fill_pairs, multi_prefill, prefill_order, sliced_fill
+     from .multi_tune import MultiSettings
+ 
+     tune = MultiSettings.from_env(env)
+@@ -1290,6 +1291,9 @@ def afd_parallel_check(env=None) -> None:
+     # ... and the sliced fill's (0062): its slices are MODE_SLICE forwards of the wire, its costs timed over it
+     sliced_fill.budget_ms(None if env is None else env.get("TF_GLM_FILL_BUDGET_MS", ""))
+     sliced_fill.drafted_rounds(None if env is None else env.get("TF_GLM_FILL_DRAFTS", ""))
++    # ... and its pacing while streams decode (TF_GLM_FILL_PAIRS, TF_GLM_FILL_ROUNDS; ``fill_pairs``, ours)
++    fill_pairs.enabled(None if env is None else env.get(fill_pairs.PAIRS_ENV, ""))
++    fill_pairs.rounds(None if env is None else env.get(fill_pairs.ROUNDS_ENV, ""))
+     # ... and the prompts' order (TF_GLM_PREFILL_ORDER, TF_GLM_PREFILL_AGE_MS; ``prefill_order``, ours)
+     prefill_order.order(None if env is None else env.get(prefill_order.ENV, ""))
+     prefill_order.age_ms(None if env is None else env.get(prefill_order.AGE_ENV, ""))
+diff --git a/src/tensorfold/families/glm5_next/cuda/fill_pairs.py b/src/tensorfold/families/glm5_next/cuda/fill_pairs.py
+new file mode 100644
+index 0000000..9e3c4ad
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/fill_pairs.py
+@@ -0,0 +1,77 @@
++"""Prompt fills while other streams decode, on the AFD attention node (ours): TF_GLM_FILL_PAIRS and TF_GLM_FILL_ROUNDS.
++
++With TF_GLM_FILL_BUDGET_MS (MiaAI-Lab recipe patch 0062, ``sliced_fill``) a prompt chunk started while other streams
++decode runs a few layers at a time, one decode round between two slices. On the split such a chunk fills at about half
++the rate of the same rows as a pair (TF_GLM_PREFILL_PAIRS, ``prefill_pairs``): one chunk alone keeps either the 5090
++or the two Sparks idle while the other works, and the wire carries one exchange at a time. In the release
++configuration's arena cells a 2,105-row fill at 64K of context runs ~2,500 tok/s as a pair and ~1,300 tok/s
++sliced, and a decode round with a slice due costs ~250 ms against ~75 ms without one. At 10 requests x 64K each
++reply's decode rate is 12.0 tok/s, mostly because its rounds wait behind those slices.
++
++- ``TF_GLM_FILL_PAIRS=1``: while streams decode, a new chunk and the one after it fill as one unsliced pair
++  (``MultiDecoder._pair_plan``'s rules: the first chunk ends no prompt and no stream drafts with the MTP head; at most
++  two chunks, TF_GLM_PREFILL_LANES aside), the decode rounds due after it as after a slice; a chunk with no partner
++  goes in layer slices as before. A reply waits once per pair (~0.8 s of 2 x 1,024 rows) instead of ~250 ms a round
++  while the prompt fills; TF_GLM_FILL_ROWS sizes the pair's chunks. Acts on the AFD attention node with
++  TF_GLM_PREFILL_PAIRS=1 (or LANES >= 2) and TF_GLM_FILL_BUDGET_MS > 0, and does nothing elsewhere (``effective``).
++  Default 0: everything as before.
++- ``TF_GLM_FILL_ROUNDS=K`` (1 .. 8, default 1): decode rounds due after each slice (or such pair) before the next
++  fill step, while streams decode, with TF_GLM_FILL_BUDGET_MS > 0 (at any world: rank 1 follows rank 0's messages).
++  More decode per request during fills, a later first token for the filling ones.
++
++Neither changes a reply's bits: every chunk keeps its rows, row count and kernels (a pair only interleaves two
++chunks' kernels, ``prefill_pairs``), and a decode round's streams each get their solo tokens, whichever rounds and
++chunks come between. Only the order of whole forwards on the wire changes; the expert nodes serve MODE_PAIR forwards
++and decode forwards as they come (wire unchanged). This tree's own scheduling for the attention/expert split; not a
++MiaAI-Lab recipe patch.
++"""
++
++from __future__ import annotations
++
++import os
++
++PAIRS_ENV = "TF_GLM_FILL_PAIRS"
++ROUNDS_ENV = "TF_GLM_FILL_ROUNDS"
++MAX_ROUNDS = 8
++
++
++def enabled(value: str | None = None) -> bool:
++    """TF_GLM_FILL_PAIRS: 1 fills two prompt chunks as one unsliced pair while other streams decode; unset or 0
++    (the default) as before (layer slices)."""
++
++    raw = (os.environ.get(PAIRS_ENV, "") if value is None else value).strip() or "0"
++    if raw not in ("0", "1"):
++        raise ValueError(f"{PAIRS_ENV}: 0 or 1, not {raw!r}")
++    return raw == "1"
++
++
++def rounds(value: str | None = None) -> int:
++    """TF_GLM_FILL_ROUNDS: decode rounds due after each prompt slice (or TF_GLM_FILL_PAIRS pair) while streams
++    decode, 1 .. ``MAX_ROUNDS``; unset or empty: 1, as before."""
++
++    raw = (os.environ.get(ROUNDS_ENV, "") if value is None else value).strip() or "1"
++    if raw not in {str(k) for k in range(1, MAX_ROUNDS + 1)}:
++        raise ValueError(f"{ROUNDS_ENV}: 1 .. {MAX_ROUNDS} decode rounds, not {raw!r}")
++    return int(raw)
++
++
++def effective(*, pairs: bool, budget: float, on: bool, k: int) -> tuple[bool, int]:
++    """What the settings do on a decoder (``MultiDecoder.__init__``): ``pairs`` TF_GLM_PREFILL_PAIRS's (or LANES')
++    there, ``budget`` TF_GLM_FILL_BUDGET_MS, ``on`` TF_GLM_FILL_PAIRS, ``k`` TF_GLM_FILL_ROUNDS. TF_GLM_FILL_PAIRS
++    acts only where prompt chunk pairs run (the AFD attention node with TF_GLM_PREFILL_PAIRS=1 or LANES >= 2) and fills
++    are sliced (budget > 0), TF_GLM_FILL_ROUNDS only with sliced fills; elsewhere they do nothing, as
++    TF_GLM_PREFILL_PAIRS does off the attention node (two ranks, a rank-1 follower). Returns (pairs on, rounds)."""
++
++    sliced = budget > 0
++    return on and pairs and sliced, k if sliced else 1
++
++
++def describe(on: bool, k: int) -> str:
++    """The --parallel start line's words for the settings ('' when both are at their defaults)."""
++
++    words = []
++    if on:
++        words.append("prompt chunks fill as pairs while others decode (TF_GLM_FILL_PAIRS)")
++    if k != 1:
++        words.append(f"{k} decode rounds after each prompt slice or pair (TF_GLM_FILL_ROUNDS)")
++    return "; ".join(words)
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index ca11c84..9f93140 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -17,7 +17,9 @@ a few layers at a time (``sliced_fill``; MiaAI-Lab recipe patch 0062): each slic
+ about that many ms, a decode round between two slices (one token per stream, or drafted with TF_GLM_FILL_DRAFTS=1;
+ TF_GLM_FILL_SHARE applies to unsliced fills), the chunk's buffers kept in the engine's prompt buffers meanwhile and
+ its commit after its last layer; a request alone fills whole forwards. On the AFD attention node each slice is one
+-forward of the wire (``afd.MODE_SLICE``). With TF_GLM_PREFILL_ORDER=sjf (``prefill_order``, ours) the waiting prompts go
++forward of the wire (``afd.MODE_SLICE``); with TF_GLM_FILL_PAIRS=1 (``fill_pairs``, ours) a new chunk there and the
++one after it fill as one unsliced pair instead, and TF_GLM_FILL_ROUNDS sets the decode rounds due after each slice or
++such pair (1). With TF_GLM_PREFILL_ORDER=sjf (``prefill_order``, ours) the waiting prompts go
+ fewest uncached tokens first instead of oldest first, into free slots and into prompt chunks, and none is overtaken by
+ a later arrival once it has waited TF_GLM_PREFILL_AGE_MS. A round: each
+ decoding stream (admission order) proposes drafts under its own policy (DFlash2: every drafting stream's block in one
+@@ -57,7 +59,7 @@ from tensorfold.cuda.memory_gate import NoRoom as _NoRoom
+ from tensorfold.cuda.scheduler import Scheduler
+ from tensorfold.cuda.streams import Stream, next_fill
+ 
+-from . import cache_room, multi_prefill, prefill_order, prefill_pairs, sliced_fill
++from . import cache_room, fill_pairs, multi_prefill, prefill_order, prefill_pairs, sliced_fill
+ from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
+ from .pool import ALIGN, Pool, align_up
+ from .verify import BatchedVerify, Segment, SerialVerify, Verified
+@@ -421,6 +423,8 @@ class MultiDecoder:
+ 
+     fill_budget = 0.0                    # TF_GLM_FILL_BUDGET_MS (``__init__`` reads it; 0: unsliced fills)
+     fill_drafts = decode_due = short_round_due = False
++    fill_pairs = False                   # TF_GLM_FILL_PAIRS (``fill_pairs``, ours; ``__init__`` reads it)
++    fill_rounds = 1                      # TF_GLM_FILL_ROUNDS: decode rounds due after a slice or such pair
+     partial = fill_costs = None
+     grid = 0                           # TF_GLM_PROMPT_GRID (``engine.prompt_grid``; MiaAI-Lab recipe patch 0008): 0 off
+     order = "fifo"                     # TF_GLM_PREFILL_ORDER (``prefill_order``; ``__init__`` reads it): fifo or sjf
+@@ -484,6 +488,11 @@ class MultiDecoder:
+         self.n_lanes = prefill_pairs.lanes() if afd_node else 1
+         self.pairs = self.n_lanes >= 2
+         self.paired = {"pairs": 0, "rows": 0}
++        # TF_GLM_FILL_PAIRS (``fill_pairs``, ours): while streams decode, a new prompt chunk and the next one fill as
++        # one unsliced pair (else in slices, as before); TF_GLM_FILL_ROUNDS: decode rounds due after a slice or pair
++        self.fill_pairs, self.fill_rounds = fill_pairs.effective(pairs=self.pairs, budget=self.fill_budget,
++                                                                 on=fill_pairs.enabled(), k=fill_pairs.rounds())
++        self.busy_paired = {"pairs": 0, "rows": 0}       # rank 0's pairs while streams decoded, for /health
+         # TF_GLM_CACHE_ROOM (``cache_room``, ours): rank 0 makes room by moving extents before it evicts kept prompts,
+         # and evicts first what no waiting request resumes (``wanted``: the scheduler's waiting prompts, or None)
+         self.room = cache_room.enabled()
+@@ -577,6 +586,7 @@ class MultiDecoder:
+                 **({"multi_prefill": dict(self.grouped)} if getattr(self, "group", False) else {}),
+                 **({"sliced_fill": dict(self.sliced)} if getattr(self, "fill_budget", 0) else {}),
+                 **({"prefill_pairs": dict(self.paired)} if getattr(self, "pairs", False) else {}),
++                **({"fill_pairs": dict(self.busy_paired)} if getattr(self, "fill_pairs", False) else {}),
+                 **({"cache_room": dict(self.room_stats)} if getattr(self, "room", False) else {}),
+                 **({"kept_host": self.host.health()} if getattr(self, "host", None) is not None else {}),
+                 **({"prefill_lanes": dict(self.laned)} if getattr(self, "n_lanes", 1) >= 3 else {}),
+@@ -1242,7 +1252,7 @@ class MultiDecoder:
+             return None
+         decoding = [l for l in self.lanes.values() if l.decoding and not l.paused and not l.s.done]
+         if decoding and self.fill_budget and self.decode_due:      # a decode round between two slices (0062)
+-            self.decode_due = False
++            self.decode_due -= 1                                   # TF_GLM_FILL_ROUNDS of them (``fill_pairs``)
+             return None
+         if self.partial is not None:                               # the suspended chunk goes on
+             return self.partial.group[0][0]
+@@ -1275,6 +1285,10 @@ class MultiDecoder:
+         busy = any(x.decoding and not x.s.done and not x.paused for x in self.lanes.values())
+         # a new chunk while others decode: in layer slices; never a replay (TF_GLM_PROMPT_GRID, 0042: no rows)
+         if lane is not None and busy and self.fill_budget and lane.head is None:
++            # TF_GLM_FILL_PAIRS (``fill_pairs``, ours): this chunk and the next one as one unsliced pair, if they pair
++            pair = self._pair_plan(lane, group, busy=True) if self.fill_pairs else None
++            if pair is not None:
++                return self._busy_pair(pair, prof)
+             self.partial = sliced_fill.PendingFill(group if group is not None else [(lane, self._stop(lane))],
+                                                   many=group is not None)
+             self.sliced["chunks"] += 1
+@@ -1371,7 +1385,23 @@ class MultiDecoder:
+             self.fill_costs.observe(pending.rows, 0, hi, pending.layer_ms)
+         else:
+             self.fill_costs.observe_overhead(max(0.0, pending.slice_wall_ms - pending.slice_layer_ms))
+-        self.decode_due = True
++        self.decode_due = self.fill_rounds
++        self.short_round_due = not self.fill_drafts
++        return done
++
++    def _busy_pair(self, plans, prof) -> list[Stream]:
++        """Rank 0 at world 1, TF_GLM_FILL_PAIRS (``fill_pairs``, ours): a pair (``_pair_plan``) while other streams
++        decode, run as ``_fill_pair`` runs one (both chunks' whole forwards, no slices); then the decode rounds due
++        after a slice (TF_GLM_FILL_ROUNDS, short with TF_GLM_FILL_DRAFTS=0) before the next fill step."""
++
++        t = time.perf_counter()
++        rows = self.paired["rows"]
++        done = self._fill_pair(*plans)
++        if prof is not None:
++            prof.fill(time.perf_counter() - t)
++        self.busy_paired["pairs"] += 1                   # also counted in ``paired`` (all pairs)
++        self.busy_paired["rows"] += self.paired["rows"] - rows
++        self.decode_due = self.fill_rounds
+         self.short_round_due = not self.fill_drafts
+         return done
+ 
+@@ -1652,7 +1682,7 @@ class MultiDecoder:
+         return firsts
+ 
+     # -- TF_GLM_PREFILL_PAIRS: prompt chunk pairs on the AFD attention node (``prefill_pairs``; ours) --------------
+-    def _pair_plan(self, lane: Lane, group) -> tuple[list, ...] | None:
++    def _pair_plan(self, lane: Lane, group, *, busy: bool = False) -> tuple[list, ...] | None:
+         """Rank 0 at world 1: this iteration's prompt chunk and the one the next iteration would fill, as
+         [(lane, stop)] each, when they can run as a pair, else None. Only while no stream decodes (a decode round
+         would come between them; the sliced fills and the decode rounds run as before), when the first chunk ends
+@@ -1660,19 +1690,22 @@ class MultiDecoder:
+         layer-sliced chunk (TF_GLM_FILL_BUDGET_MS) is suspended: that chunk goes on alone, slice by slice. The second
+         is what ``_iterate`` picks next (``_fill_turn``, ``_group``, ``_stop``) with the first's streams at their
+         stops. TF_GLM_PREFILL_LANES=N: up to N chunks, each the next as the second is to the first, the same rules
+-        for each; a chunk that ends a prompt is the last (2 chunks run as a pair, 3 or more as lanes)."""
++        for each; a chunk that ends a prompt is the last (2 chunks run as a pair, 3 or more as lanes).
++        ``busy`` (TF_GLM_FILL_PAIRS, ``fill_pairs``, ours): while streams decode, under the same rules, two chunks
++        of at most TF_GLM_FILL_ROWS rows each (``_stop``, ``_group``), never more: the decode rounds wait for it."""
+ 
+         if getattr(self, "partial", None) is not None:
+             return None
+-        if any(x.decoding and not x.s.done for x in self.lanes.values()):
++        if not busy and any(x.decoding and not x.s.done for x in self.lanes.values()):
+             return None
+         first = list(group) if group is not None else [(lane, self._stop(lane))]
+         if any(x.mtp or stop >= len(x.s.prompt) for x, stop in first):
+             return None
+         plans = [first]
+         saved: dict[int, tuple] = {}
++        most = 2 if busy else max(2, getattr(self, "n_lanes", 2))
+         try:
+-            while len(plans) < max(2, getattr(self, "n_lanes", 2)):
++            while len(plans) < most:
+                 for x, stop in plans[-1]:         # host positions only, for the plan: no state or cache moves
+                     saved.setdefault(id(x.st), (x.st, x.st.pos))
+                     x.st.pos = stop
+diff --git a/tests/test_glm_fill_pairs.py b/tests/test_glm_fill_pairs.py
+new file mode 100644
+index 0000000..80edcc1
+--- /dev/null
++++ b/tests/test_glm_fill_pairs.py
+@@ -0,0 +1,346 @@
++"""TF_GLM_FILL_PAIRS and TF_GLM_FILL_ROUNDS (``fill_pairs``, ours) on CPU: prompt fills paced while other streams
++decode on the AFD attention node.
++
++The model is tests/test_glm_sliced_fill.py's layered fake (six layers of 1-ms startup timings, TF_GLM_FILL_BUDGET_MS
++2.5: slices of two layers) at world 1 over its checked slice wire (``SlicedWorld1``: the real ``afd.AfdWire.begin``
++and exchanges over the real MCDMA header writer, read back as the expert reads them), with
++tests/test_glm_multi_afd.py's fake pairs (the real ``prefill_pairs.run_pair`` and ``finish``; each chunk of a pair a
++forward of its own after the pair's begin, logged as ("pair", rows, rows)). Every reply is checked against the
++request served alone (``solo``), and each run against the same run with the switches unset: replies, cached counts,
++kept states and their pool rows. Covered:
++
++- TF_GLM_FILL_PAIRS=1: a long prompt arriving while a stream decodes fills as pairs between decode rounds
++  (``_fill_pair`` called while a stream decodes, every pair over the checked wire), with fewer layer slices; a
++  chunk without a partner (its prompt's last) still goes in slices; the staggered six requests at 2 and 4 streams;
++  TF_GLM_MULTI_PREFILL's grouped chunks with TF_GLM_KV=fp8's rings; a client leaving after a pair;
++- TF_GLM_FILL_ROUNDS=K: K batched forwards between two slices of one chunk while streams decode (1 as before), at
++  world 1 and at two ranks (rank 1 applying rank 0's ROUND and FILLPART messages, both ranks equal);
++- the settings: their values and refusals, what they do where they cannot act (nothing: no pairs, no budget, two
++  ranks), /health and the start line's words only with a switch set.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from tests import test_glm_kv8_multi as tk
++from tests import test_glm_multi as tm
++from tests import test_glm_multi_prefill as tmp
++from tests import test_glm_sliced_fill as tsf
++from tests.test_cuda_geometry import allocations  # noqa: F401  (fixture: fake triton, so decode imports)
++from tests.test_glm_multi import fake  # noqa: F401
++from tests.test_glm_multi_afd import afd_fake  # noqa: F401
++
++pytestmark = pytest.mark.torch
++rings = tk.rings                                              # fixture: TF_GLM_KV=fp8's per-slot indexer rings
++
++PAIRS, ROUNDS = "TF_GLM_FILL_PAIRS", "TF_GLM_FILL_ROUNDS"
++
++
++def _env(monkeypatch, name: str, value: str | None) -> None:
++    if value is None:
++        monkeypatch.delenv(name, raising=False)
++    else:
++        monkeypatch.setenv(name, value)
++
++
++def _world(env, monkeypatch, *, on: bool, rounds: str | None = None, group: bool = False, streams: int = 2,
++           blocks: int = 24, **kw):
++    """``SlicedWorld1`` (budget 2.5 ms) with TF_GLM_PREFILL_PAIRS=1, TF_GLM_FILL_PAIRS on or unset and
++    TF_GLM_FILL_ROUNDS, its pool large enough that no stream waits for room; ``fills`` records each pair's plans, its
++    rows and whether a stream decoded when it ran."""
++
++    monkeypatch.delenv("TF_GLM_PREFILL_LANES", raising=False)
++    monkeypatch.setenv("TF_GLM_PREFILL_PAIRS", "1")
++    _env(monkeypatch, PAIRS, "1" if on else None)
++    _env(monkeypatch, ROUNDS, rounds)
++    tmp._mode(monkeypatch, group)
++    tsf.layered(monkeypatch, "2.5")
++    n1 = tsf.SlicedWorld1(env, streams=streams, blocks=blocks, **kw)
++    d = n1.d
++    assert d.pairs and d.fill_budget == 2.5 and d.fill_pairs == on and d.fill_rounds == int(rounds or 1)
++    fills, real = [], d._fill_pair
++
++    def logged(*plans):
++        assert d.partial is None and len(plans) == 2
++        busy = any(x.decoding and not x.s.done and not x.paused for x in d.lanes.values())
++        ends: dict[int, int] = {}
++        rows = 0
++        for plan in plans:
++            for x, stop in plan:
++                rows += stop - ends.get(x.sid, x.st.pos)
++                ends[x.sid] = stop
++        fills.append((busy, [[(x.sid, stop) for x, stop in plan] for plan in plans], rows))
++        return real(*plans)
++
++    d._fill_pair = logged
++    return n1, d, fills
++
++
++def _trace(d) -> list[tuple[str, int]]:
++    """The decoder's fill steps and decode rounds in order: ("slice", the layer it starts at), ("round", 0)."""
++
++    seq: list[tuple[str, int]] = []
++    part, rnd = d._part_iteration, d._round
++
++    def sliced():
++        seq.append(("slice", d.partial.layer if d.partial is not None else 0))
++        return part()
++
++    def rounds(*a, **k):
++        seq.append(("round", 0))
++        return rnd(*a, **k)
++
++    d._part_iteration, d._round = sliced, rounds
++    return seq
++
++
++def _rounds_between_slices(seq) -> list[int]:
++    """For every two consecutive slices of one chunk (the second resuming past layer 0), the decode rounds between."""
++
++    out, n, open_ = [], 0, False
++    for kind, layer in seq:
++        if kind == "slice":
++            if open_ and layer > 0:
++                out.append(n)
++            open_, n = True, 0
++        else:
++            n += 1
++    return out
++
++
++def _mid_decode(n1, d, reqs):
++    """The first request decodes (no stop at EOS: it decodes all its tokens, through the second's fill), then the
++    second arrives; both run to the end, each reply its solo one."""
++
++    a = n1.submit(*reqs[0], stop_eos=False)
++    while not (a.sid in d.lanes and d.lanes[a.sid].decoding):
++        n1.step()
++    b = n1.submit(*reqs[1])
++    n1.run()
++    assert a.got == tm.solo(n1.torch, *reqs[0], stop_eos=False) and len(a.got) == reqs[0][1]
++    assert b.got == tm.solo(n1.torch, *reqs[1])
++    return [a.got, b.got], [a.cached, b.cached]
++
++
++REQS = [(tm._prompt(300, 51), 200, tm._sampling("greedy", 51)), (tm._prompt(200, 52), 12, tm._sampling("topk", 52))]
++
++
++# -- TF_GLM_FILL_PAIRS ------------------------------------------------------------------------------------------------
++# (n, pairs mid-decode, their rows, chunks still sliced): 64-row chunks up to the kept point before the prompt's last
++# token, then that token's own chunk (``lane.stops``); a chunk ending the prompt is no pair's first
++CHUNKS = [(200, 2, 199, 1), (150, 2, 150, 0), (129, 1, 128, 1), (60, 1, 60, 0)]
++
++
++@pytest.mark.parametrize("n,pairs,rows,sliced", CHUNKS, ids=["64x3+7+1", "64x2+21+1", "64x2+1", "59+1"])
++def test_a_prompt_arriving_mid_decode_fills_in_pairs(afd_fake, monkeypatch, n, pairs, rows, sliced):  # noqa: F811
++    """A 300-token prompt decodes when an ``n``-token one arrives (64-row chunks): with the switch unset each of that
++    one's chunks goes in layer slices; with it on, a chunk and the next fill as one pair between two decode rounds
++    wherever the first ends no prompt, and a chunk without a partner (the last token's, after a pair) goes in
++    slices. The same replies (the solo ones), cached counts and kept states either way."""
++
++    from tensorfold.families.glm5_next.cuda.afd import MODE_SLICE
++
++    reqs = [REQS[0], (tm._prompt(n, 52), 12, tm._sampling("topk", 52))]
++    runs = {}
++    for on in (False, True):
++        n1, d, fills = _world(afd_fake, monkeypatch, on=on)
++        got, cached = _mid_decode(n1, d, reqs)
++        runs[on] = (n1, d, fills, got, cached, tmp.kept_view(d))
++    (_, d0, f0, g0, c0, k0), (n1, d1, f1, g1, c1, k1) = runs[False], runs[True]
++    assert g0 == g1 and c0 == c1 and k0 == k1
++    assert not [f for f in f0 if f[0]] and d0.busy_paired == {"pairs": 0, "rows": 0}     # off: no pair mid-decode
++    busy = [f for f in f1 if f[0]]
++    assert len(busy) == d1.busy_paired["pairs"] == pairs and d1.busy_paired["rows"] == sum(f[2] for f in busy) == rows
++    assert d1.paired["pairs"] == len(f1) and [e for e in n1.wire.events if e[0] == "pair"]
++    assert d0.sliced["chunks"] == -(-(n - 1) // 64) + 1 and d1.sliced["chunks"] == sliced
++    assert d1.sliced["slices"] < d0.sliced["slices"]
++    assert any(b[2] == MODE_SLICE for b in n1.begins()) == (sliced > 0)
++    assert d1.partial is None and n1.wire.tr.next is None
++    assert d1.health()["fill_pairs"] == d1.busy_paired and "fill_pairs" not in d0.health()
++
++
++@pytest.mark.parametrize("streams", [2, 4])
++def test_the_staggered_requests(afd_fake, monkeypatch, streams):  # noqa: F811
++    """tests/test_glm_multi.py's six staggered requests: the same replies (each its solo one) and kept states with
++    the switch on as unset, and pairs ran while streams decoded."""
++
++    runs = {}
++    for on in (False, True):
++        n1, d, fills = _world(afd_fake, monkeypatch, on=on, streams=streams)
++        runs[on] = (tsf.staggered(n1, d, streams), tmp.kept_view(d), fills, d)
++    (g0, k0, _, _), (g1, k1, f1, d1) = runs[False], runs[True]
++    assert g0 == g1 and k0 == k1
++    assert [f for f in f1 if f[0]] and d1.busy_paired["pairs"] > 0 and d1.partial is None
++
++
++def test_grouped_chunks_and_fp8_rings_pair_mid_decode(afd_fake, rings, monkeypatch):  # noqa: F811
++    """TF_GLM_MULTI_PREFILL=1 (grouped chunks) with TF_GLM_KV=fp8's rings: a burst of three short prompts and a long
++    one while a stream decodes, the switch on as unset: the same replies and kept states; a pair ran mid-decode."""
++
++    tk._ringed(afd_fake.torch)
++    first = (tm._prompt(30, 41), 120, tm._sampling("topk", 9))
++    burst = [(tm._prompt(300, 71), 12, tm._sampling("greedy", 71)), (tm._prompt(200, 72), 12, tm._sampling("minp", 72)),
++             (tm._prompt(40, 73), 12, tm._sampling("nucleus", 73))]
++    runs = {}
++    for on in (False, True):
++        n1, d, fills = _world(afd_fake, monkeypatch, on=on, group=True, streams=4, prefill_rows=256)
++        a = n1.submit(*first)
++        while not (a.sid in d.lanes and d.lanes[a.sid].decoding):
++            n1.step()
++        streams = [n1.submit(*r) for r in burst]
++        n1.run()
++        for s, (pr, cnt, sp) in zip([a, *streams], [first, *burst]):
++            assert s.got == tm.solo(afd_fake.torch, pr, cnt, sp)
++        runs[on] = ([s.got for s in (a, *streams)], tmp.kept_view(d), fills, d)
++    (g0, k0, _, _), (g1, k1, f1, d1) = runs[False], runs[True]
++    assert g0 == g1 and k0 == k1 and d1.grouped["chunks"] > 0
++    busy = [f for f in f1 if f[0]]
++    assert busy and d1.busy_paired["pairs"] == len(busy) and any(len(plan) > 1 for f in busy for plan in f[1])
++
++
++def test_a_client_leaving_after_a_mid_decode_pair(afd_fake, monkeypatch):  # noqa: F811
++    """The arriving prompt's client leaves right after its first pair: the pair completes, the stream leaves at the
++    next iteration, its extent goes back to the pool; the decoding stream's reply is its solo one."""
++
++    n1, d, fills = _world(afd_fake, monkeypatch, on=True)
++    a = n1.submit(*REQS[0], stop_eos=False)
++    while not (a.sid in d.lanes and d.lanes[a.sid].decoding):
++        n1.step()
++    b = n1.submit(*REQS[1])
++    gone = [False]
++    b.emit.cancelled = lambda: gone[0]
++    for _ in range(200):
++        n1.step()
++        if fills and fills[-1][0]:
++            break
++    assert fills and fills[-1][0] and b.sid in d.lanes
++    x = d.lanes[b.sid].extent
++    gone[0] = True
++    for _ in range(5):
++        if b.done:
++            break
++        n1.step()
++    assert b.done and b.sid not in d.lanes and d.partial is None
++    assert all(e is not x for e in d.pool.extents)
++    n1.run()
++    assert a.got == tm.solo(afd_fake.torch, *REQS[0], stop_eos=False) and n1.wire.tr.next is None
++
++
++# -- TF_GLM_FILL_ROUNDS --------------------------------------------------------------------------------------------
++@pytest.mark.parametrize("rounds", [None, "2", "3"])
++def test_decode_rounds_between_two_slices(afd_fake, monkeypatch, rounds):  # noqa: F811
++    """TF_GLM_FILL_ROUNDS=K (unset: 1): between two slices of one chunk while streams decode, K batched forwards
++    (fewer only where the last decoding stream ended between them); the replies are the solo ones and the kept
++    states those of K=1."""
++
++    k = int(rounds or 1)
++    runs = {}
++    for r in (None, rounds):
++        n1, d, _ = _world(afd_fake, monkeypatch, on=False, rounds=r)
++        seq = _trace(d)
++        got, cached = _mid_decode(n1, d, REQS)
++        runs[r] = (got, cached, tmp.kept_view(d), _rounds_between_slices(seq), d)
++    g0, c0, k0, between0, _ = runs[None]
++    g1, c1, k1, between, d1 = runs[rounds]
++    assert g0 == g1 and c0 == c1 and k0 == k1
++    assert between0 and set(between0) == {1}
++    assert between and set(between) == {k}               # REQS[0] decodes past the second prompt's fill
++    assert d1.sliced["rounds"] >= k * (d1.sliced["slices"] - d1.sliced["chunks"])
++
++
++def test_rounds_with_pairs_on(afd_fake, monkeypatch):  # noqa: F811
++    """Both switches: K=2 rounds after each slice and each mid-decode pair; the same replies and kept states."""
++
++    runs = {}
++    for on, r in ((False, None), (True, "2")):
++        n1, d, fills = _world(afd_fake, monkeypatch, on=on, rounds=r)
++        seq = _trace(d)
++        real = d._busy_pair
++
++        def paired(plans, prof, seq=seq, real=real):
++            seq.append(("pair", 0))
++            return real(plans, prof)
++
++        d._busy_pair = paired
++        got, cached = _mid_decode(n1, d, REQS)
++        runs[on] = (got, cached, tmp.kept_view(d), fills, seq)
++    assert runs[False][:3] == runs[True][:3] and [f for f in runs[True][3] if f[0]]
++    seq = [k for k, _ in runs[True][4]]
++    after = [seq[i + 1:i + 3] for i, k in enumerate(seq) if k == "pair"]
++    assert after and all(a == ["round", "round"] for a in after)        # two rounds after each mid-decode pair
++
++
++def test_two_ranks_rounds(fake, monkeypatch):  # noqa: F811
++    """TF_GLM_FILL_ROUNDS=2 at two ranks (rank 1 applying rank 0's messages, both ranks equal after every message):
++    the staggered requests' replies and kept states as with 1, two ROUNDs after each FILLPART while streams decode."""
++
++    from tensorfold.families.glm5_next.cuda.multi import FILLPART, ROUND
++
++    runs = {}
++    for r in (None, "2"):
++        _env(monkeypatch, PAIRS, None)
++        _env(monkeypatch, ROUNDS, r)
++        tsf.layered(monkeypatch, "2.5")
++        p = tsf.LoggedPair(fake, streams=4)
++        runs[r] = (tsf.staggered(p, p.d[0], 4), tmp.kept_view(p.d[0]), p)
++    (g0, k0, _), (g1, k1, p1) = runs[None], runs["2"]
++    assert g0 == g1 and k0 == k1 == tmp.kept_view(p1.d[1])
++    ops = [op for m in p1.log for op, _ in tm._ops(m)]
++    runs_after = []
++    for i, op in enumerate(ops):
++        if op == FILLPART:
++            n = 0
++            for nxt in ops[i + 1:]:
++                if nxt == ROUND:
++                    n += 1
++                elif nxt in (FILLPART,):
++                    break
++            runs_after.append(n)
++    assert runs_after and max(runs_after) >= 2
++    assert p1.d[1].partial is None and p1.d[1].idle
++
++
++# -- the settings --------------------------------------------------------------------------------------------------
++def test_the_settings_and_the_afd_check():
++    from tensorfold.families.glm5_next.cuda import fill_pairs
++    from tensorfold.families.glm5_next.cuda.engine import afd_parallel_check
++
++    assert fill_pairs.enabled("") is False and fill_pairs.enabled("0") is False and fill_pairs.enabled("1") is True
++    assert fill_pairs.rounds("") == 1 and fill_pairs.rounds("1") == 1 and fill_pairs.rounds("8") == 8
++    for bad in ("2", "yes", "-1"):
++        with pytest.raises(ValueError, match=PAIRS):
++            fill_pairs.enabled(bad)
++    for bad in ("0", "9", "x", "1.5"):
++        with pytest.raises(ValueError, match=ROUNDS):
++            fill_pairs.rounds(bad)
++    assert fill_pairs.effective(pairs=True, budget=200.0, on=True, k=3) == (True, 3)
++    assert fill_pairs.effective(pairs=False, budget=200.0, on=True, k=2) == (False, 2)    # rounds at any world
++    assert fill_pairs.effective(pairs=True, budget=0.0, on=True, k=2) == (False, 1)       # nothing to pace
++    assert fill_pairs.effective(pairs=True, budget=200.0, on=False, k=1) == (False, 1)
++    assert fill_pairs.describe(False, 1) == ""
++    assert PAIRS in fill_pairs.describe(True, 1) and ROUNDS in fill_pairs.describe(False, 2)
++    afd_parallel_check({PAIRS: "1", ROUNDS: "2", "TF_GLM_FILL_BUDGET_MS": "200"})
++    with pytest.raises(ValueError, match=PAIRS):
++        afd_parallel_check({PAIRS: "on"})
++    with pytest.raises(ValueError, match=ROUNDS):
++        afd_parallel_check({ROUNDS: "0"})
++
++
++def test_inert_without_pairs_or_budget(afd_fake, fake, monkeypatch):  # noqa: F811
++    """TF_GLM_FILL_PAIRS=1 does nothing without TF_GLM_PREFILL_PAIRS (or off the attention node: two ranks), and both
++    settings nothing without TF_GLM_FILL_BUDGET_MS: the decoder takes them as unset (no "fill_pairs" in /health)."""
++
++    monkeypatch.delenv("TF_GLM_PREFILL_LANES", raising=False)
++    monkeypatch.delenv("TF_GLM_PREFILL_PAIRS", raising=False)
++    _env(monkeypatch, PAIRS, "1")
++    _env(monkeypatch, ROUNDS, "2")
++    tsf.layered(monkeypatch, "2.5")
++    d = tsf.SlicedWorld1(afd_fake, streams=2).d
++    assert (d.pairs, d.fill_pairs, d.fill_rounds) == (False, False, 2) and "fill_pairs" not in d.health()
++    p = tsf.LoggedPair(fake, streams=2)
++    assert [(x.fill_pairs, x.fill_rounds) for x in p.d] == [(False, 2), (False, 2)]
++    monkeypatch.setenv("TF_GLM_PREFILL_PAIRS", "1")
++    tsf.layered(monkeypatch, None)
++    d = tsf.SlicedWorld1(afd_fake, streams=2).d
++    assert (d.pairs, d.fill_budget, d.fill_pairs, d.fill_rounds) == (True, 0.0, False, 1)

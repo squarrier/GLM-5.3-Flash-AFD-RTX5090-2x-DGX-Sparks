@@ -1,0 +1,301 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Philip Mossop <63354535+philip-pentatonic@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 07:04:37 +0100
+Subject: [PATCH] feat(cuda): --name-priority ID=background, a default priority
+ by the model id a request asks for
+
+Many OpenAI-compatible clients can pick a model id but cannot add a field to the request body.
+--name-priority ID=background lets a deployment give such a client its own id (--name or an
+--alias) whose requests default to priority "background", so they yield to the server's other
+requests through the existing priority path. A request's own `priority` field always wins, and
+a session-title request stays background either way.
+
+The id is checked before any download: it must be --name or an --alias, the value must be
+"background", and the option is refused on the MLX server, which has its own background rule.
+App.reply_model already resolves the id a request asked for, so it is reused.
+
+---
+Credit: TensorFold's own commit dce62cfa3c6752c828c4a17338d3ae585e43e65a (v0.6.6), by Philip Mossop,
+  https://github.com/ashhart/TensorFold/commit/dce62cfa3c6752c828c4a17338d3ae585e43e65a
+  (Apache-2.0, as TensorFold); carried with its authorship.
+
+ docs/api.md                      |   5 ++
+ src/tensorfold/cli.py            |   5 +-
+ src/tensorfold/cli_args.py       |   3 +
+ src/tensorfold/cuda/server.py    |  10 ++-
+ src/tensorfold/serve_options.py  |  34 +++++++++
+ tests/test_cuda_name_priority.py | 122 +++++++++++++++++++++++++++++++
+ 6 files changed, 174 insertions(+), 5 deletions(-)
+ create mode 100644 tests/test_cuda_name_priority.py
+
+diff --git a/docs/api.md b/docs/api.md
+index 566e037..1c6950b 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -143,6 +143,11 @@ a background prompt's ~1 s prefill waited 0.57 s on Qwen3.6, against 0.70 s with
+ background prompt's prefill once it has started. Two-rank engines serving one request at a time
+ only order the queue.
+ 
++`--name-priority ID=background` gives one served id (`--name` or an `--alias`) a default priority: a request that
++asks for it and sends no `priority` of its own is treated as `priority: "background"`. The request's own `priority`
++field always wins over the default. This lets one CUDA server answer to several ids at their usual priority while a
++background-only client (a batch extractor, say) gets one id that always yields, without sending the field itself.
++
+ ## Messages and tools
+ 
+ Developer messages use system-message semantics. Only leading system and developer messages merge, in order,
+diff --git a/src/tensorfold/cli.py b/src/tensorfold/cli.py
+index 1c615af..e5a10f3 100644
+--- a/src/tensorfold/cli.py
++++ b/src/tensorfold/cli.py
+@@ -16,7 +16,8 @@ from tensorfold import __version__
+ from tensorfold import cli_args
+ from tensorfold.server import stacks, thinking_notes
+ from tensorfold.server.memory_budget import MEMORY_FRACTION
+-from tensorfold.serve_options import check as _check_serve_options, vision_options as _vision_options
++from tensorfold.serve_options import check as _check_serve_options, name_priority as _name_priority
++from tensorfold.serve_options import vision_options as _vision_options
+ 
+ COMMANDS = ("serve", "experts", "pull", "models", "info", "update", "service", "tui", "plan")
+ 
+@@ -334,7 +335,7 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
+                     vision_max_images=getattr(args, "vision_max_images", None),
+                     **({"vision_image_tokens": args.vision_image_tokens}
+                        if getattr(args, "vision_image_tokens", None) is not None else {}),
+-                    aliases=list(args.alias))
++                    aliases=list(args.alias), background_ids=frozenset(_name_priority(args)))
+     shown = "greedy" if float(sampling.get("temperature", 1.0)) <= 0 else ", ".join(
+         f"{k} {v}" for k, v in sampling.items())
+     effective_context = app.effective_context_window
+diff --git a/src/tensorfold/cli_args.py b/src/tensorfold/cli_args.py
+index e6eae6c..b9fa118 100644
+--- a/src/tensorfold/cli_args.py
++++ b/src/tensorfold/cli_args.py
+@@ -28,6 +28,9 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
+     endpoint.add_argument("--port", type=int, default=8080)
+     endpoint.add_argument("--name", default="", help="model id clients ask for (default: the model's name)")
+     endpoint.add_argument("--alias", action="append", default=[], help="another model id to answer to")
++    endpoint.add_argument("--name-priority", action="append", default=[], metavar="ID=background",
++                          help="a request naming ID (--name or --alias) with no priority of its own is treated as "
++                               "priority: background; CUDA only, repeatable")
+     endpoint.add_argument("--api-key", action="append", default=[], help="require this API key; repeat for more keys")
+     endpoint.add_argument("--api-key-file", help="restricted key file, one key or label: key per line; # comments")
+     endpoint.add_argument("--metrics-open", action="store_true", help="allow metrics without an API key")
+diff --git a/src/tensorfold/cuda/server.py b/src/tensorfold/cuda/server.py
+index c2fd05c..f0e4453 100644
+--- a/src/tensorfold/cuda/server.py
++++ b/src/tensorfold/cuda/server.py
+@@ -81,7 +81,8 @@ class App:
+                  sampling: dict[str, Any] | None = None, max_tokens: int = 4096,
+                  context_window: int | None = None, reasoning_effort: str | None = None, thinking_budget: int = 0,
+                  aliases: tuple[str, ...] | list[str] = (), vision_max_images: int | None = None,
+-                 vision_image_tokens: int | None = None):
++                 vision_image_tokens: int | None = None,
++                 background_ids: tuple[str, ...] | frozenset[str] = ()):
+         from tokenizers import Tokenizer
+ 
+         self.engine = engine
+@@ -91,6 +92,7 @@ class App:
+                         **({} if vision_image_tokens is None else {"max_visual_tokens": vision_image_tokens}))
+         self.served = served
+         self.aliases = tuple(str(alias).strip() for alias in aliases if str(alias).strip())
++        self.background_ids = frozenset(background_ids)   # --name-priority ID=background: a default for this id
+         self.model_dir = Path(model_dir)
+         self.tok = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
+         self.template = ChatTemplate(model_dir)
+@@ -565,8 +567,10 @@ class App:
+         shaped = prepared.grammar is not None or prepared.think_budget > 0
+         think_end = self.tok.token_to_id("</think>") if chat and thinking and shaped else None
+         budget = self._think_budget(prepared, think_end)
+-        # priority "background" (or a session-title request): after the others, as on the Mac
+-        background = body.get("priority") == "background" or (chat and is_title_request(body.get("messages"), tools))
++        # priority "background": the request's own field, else --name-priority's default for the id it asked for
++        # (a request's own priority wins over the default); a session-title request is background either way
++        by_name = "priority" not in body and self.reply_model(body) in getattr(self, "background_ids", ())
++        background = body.get("priority") == "background" or by_name or (chat and is_title_request(body.get("messages"), tools))
+         concurrent = getattr(self.engine, "concurrent", False)
+         turns = None if concurrent else self._turns()
+         if concurrent and background and "background" in inspect.signature(self.engine.generate).parameters:
+diff --git a/src/tensorfold/serve_options.py b/src/tensorfold/serve_options.py
+index db35baf..a46e66b 100644
+--- a/src/tensorfold/serve_options.py
++++ b/src/tensorfold/serve_options.py
+@@ -4,9 +4,33 @@ from __future__ import annotations
+ 
+ import argparse
+ import inspect
++from pathlib import Path
+ from typing import Any
+ 
+ 
++def _served_name(args: argparse.Namespace) -> str:
++    """``--name``, else a repo id's last segment or the model path's name; no I/O (matches ``cli._serve_cuda``)."""
++
++    if getattr(args, "name", ""):
++        return args.name
++    from tensorfold import hub
++
++    model = str(args.model).rstrip("/")
++    return model.split("/")[-1] if hub.is_repo_id(str(args.model)) else Path(model).name
++
++
++def name_priority(args: argparse.Namespace) -> dict[str, str]:
++    """``--name-priority ID=background`` parsed: the id and the priority word it defaults to. No I/O."""
++
++    parsed: dict[str, str] = {}
++    for entry in getattr(args, "name_priority", None) or []:
++        model_id, sep, priority = str(entry).partition("=")
++        if not sep or not model_id.strip() or priority.strip().lower() != "background":
++            raise ValueError(f"--name-priority takes ID=background, not {entry!r}")
++        parsed[model_id.strip()] = "background"
++    return parsed
++
++
+ def check(args: argparse.Namespace, family: Any, backend: str, config_dir: Any = None) -> None:
+     """Refuse KV cache, draft rule, image, share, slot and precision options the backend or family can't serve."""
+ 
+@@ -64,6 +88,16 @@ def check(args: argparse.Namespace, family: Any, backend: str, config_dir: Any =
+     if getattr(args, "prefill_fp8", None) and not fp8:              # asked for by name, not a default
+         raise ValueError(f"--prefill-fp8 picks FP8 prompt kernels on CUDA; {family.title} on "
+                          f"{'CUDA' if backend == 'cuda' else 'MLX'} has none (its prompts run bf16 activations)")
++    priorities = name_priority(args)
++    if priorities and backend != "cuda":
++        raise ValueError("--name-priority is a CUDA server option: the MLX server has its own background rule")
++    if priorities:
++        served = _served_name(args)
++        ids = {served, *(str(a).strip() for a in getattr(args, "alias", None) or () if str(a).strip())}
++        bad = sorted(set(priorities) - ids)
++        if bad:
++            raise ValueError(f"--name-priority names {', '.join(bad)}, not --name or an --alias "
++                             f"({', '.join(sorted(ids))})")
+     confidence = getattr(args, "mtp_confidence", None)
+     if confidence is None:
+         return
+diff --git a/tests/test_cuda_name_priority.py b/tests/test_cuda_name_priority.py
+new file mode 100644
+index 0000000..377a790
+--- /dev/null
++++ b/tests/test_cuda_name_priority.py
+@@ -0,0 +1,122 @@
++"""``--name-priority ID=background``: a request naming that id with no priority of its own is treated as background;
++the request's own ``priority`` field always wins. CPU only (a stand-in concurrent engine, no GPU work)."""
++
++import json
++from types import SimpleNamespace
++
++import pytest
++
++pytest.importorskip("jinja2")
++
++from tensorfold import cli
++from tensorfold.serve_options import check as _check_serve_options
++from tensorfold.serve_options import name_priority
++from tests.test_cuda_admission import http_server
++from tests.test_cuda_server_errors import HI, app_for
++
++
++class BgEngine:
++    """A concurrent stand-in: it records the ``background`` flag ``App.run`` computed for each request."""
++
++    eos = (0,)
++    concurrent = True
++
++    def __init__(self):
++        self.calls = []
++
++    def generate(self, prompt, max_tokens, sampling, on_tokens, draft=True, background=False):
++        self.calls.append(background)
++        on_tokens([self.eos[0]])
++        return {}
++
++
++def _app(tmp_path):
++    app = app_for(tmp_path)
++    app.engine = BgEngine()
++    app.aliases = ("qwen3.6-bg",)
++    app.background_ids = frozenset({"qwen3.6-bg"})
++    return app
++
++
++def _post(port, body):
++    import http.client
++
++    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
++    try:
++        connection.request("POST", "/v1/chat/completions", json.dumps(body), {"Content-Type": "application/json"})
++        return connection.getresponse().status
++    finally:
++        connection.close()
++
++
++@pytest.mark.parametrize("model, priority, expected", [
++    ("qwen3.6-bg", None, True),                 # named id, no priority of its own: the default applies
++    ("fake-cuda", None, False),                 # a different id: no default
++    ("qwen3.6-bg", "background", True),         # explicit background, redundant with the default
++    ("qwen3.6-bg", "not-background", False),    # the request's own (non-background) priority wins over the default
++    ("fake-cuda", "background", True),          # explicit background reaches a plain id too
++])
++def test_the_named_ids_default_priority_applies_unless_the_request_sets_its_own(tmp_path, model, priority, expected):
++    app = _app(tmp_path)
++    body = {"model": model, "messages": HI, "max_tokens": 4, **({"priority": priority} if priority else {})}
++    with http_server(app) as port:
++        assert _post(port, body) == 200
++    assert app.engine.calls == [expected]
++
++
++def test_name_priority_parses_id_equals_background():
++    args = SimpleNamespace(name_priority=["qwen3.6-bg=background"])
++    assert name_priority(args) == {"qwen3.6-bg": "background"}
++    assert name_priority(SimpleNamespace(name_priority=[])) == {}
++    assert name_priority(SimpleNamespace()) == {}
++
++
++@pytest.mark.parametrize("entry", ["qwen3.6-bg", "qwen3.6-bg=foreground", "=background", ""])
++def test_name_priority_refuses_anything_but_id_equals_background(entry):
++    with pytest.raises(ValueError, match="ID=background"):
++        name_priority(SimpleNamespace(name_priority=[entry]))
++
++
++def test_name_priority_is_case_and_whitespace_insensitive_on_the_word():
++    assert name_priority(SimpleNamespace(name_priority=["qwen3.6-bg=Background "])) == {"qwen3.6-bg": "background"}
++
++
++def test_serve_options_refuses_an_id_that_is_not_the_name_or_an_alias(tmp_path):
++    family = SimpleNamespace(title="Test family", package=SimpleNamespace(cuda_engine=lambda *a, **k: None),
++                             model_type="test")
++    args = SimpleNamespace(name="qwen3.6", alias=["qwen3.6-bg"], model=str(tmp_path),
++                           name_priority=["someone-else=background"])
++    with pytest.raises(ValueError, match="not --name or an --alias"):
++        _check_serve_options(args, family, "cuda")
++
++
++def test_serve_options_refuses_name_priority_on_mlx(tmp_path):
++    family = SimpleNamespace(title="Test family", package=SimpleNamespace(cuda_engine=lambda *a, **k: None),
++                             model_type="test")
++    args = SimpleNamespace(name="qwen3.6", alias=["qwen3.6-bg"], model=str(tmp_path),
++                           name_priority=["qwen3.6-bg=background"])
++    with pytest.raises(ValueError, match="CUDA server option"):
++        _check_serve_options(args, family, "mlx")
++
++
++def test_serve_options_accepts_a_valid_id(tmp_path):
++    family = SimpleNamespace(title="Test family", package=SimpleNamespace(cuda_engine=lambda *a, **k: None),
++                             model_type="test")
++    args = SimpleNamespace(name="qwen3.6", alias=["qwen3.6-bg"], model=str(tmp_path),
++                           name_priority=["qwen3.6-bg=background"])
++    assert _check_serve_options(args, family, "cuda") is None
++
++
++def test_serve_hands_the_background_ids_to_the_cuda_app(tmp_path, monkeypatch):
++    from tensorfold.cuda import server
++
++    made = []
++    family = SimpleNamespace(title="Test family", model_type="test",
++                             package=SimpleNamespace(cuda_engine=lambda *a, **k: SimpleNamespace(max_len=8192)))
++    monkeypatch.setattr(server, "App", lambda *a, **k: made.append(k) or SimpleNamespace(effective_context_window=8192))
++    monkeypatch.setattr(server, "serve", lambda *a: None)
++    args = cli.build_parser().parse_args(["serve", str(tmp_path), "--backend", "cuda", "--no-drafts",
++                                          "--name", "qwen3.6", "--alias", "qwen3.6-bg",
++                                          "--name-priority", "qwen3.6-bg=background"])
++    assert cli._serve_cuda(args, family, tmp_path, 8192) == 0
++    assert made[0]["background_ids"] == frozenset({"qwen3.6-bg"})

@@ -1,0 +1,491 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 08:31:25 -0400
+Subject: [PATCH] server: capacity refusals answer 429 with Retry-After,
+ TF_GLM_CAPACITY_STATUS (MiaAI-Lab recipe patch 0081)
+
+A request refused for capacity (CapacityError) got a bare 503 from the CUDA server's handler, which tells a client
+nothing about when to come back, and a 400 on the generic server's generate path. MiaAI-Lab's recipe v1.8 renders
+every capacity refusal the same way, with patch 0081-tfcap-capacity-status (by johnwhited): 429 with Retry-After: 5,
+so the same client backs off instead of stacking (a deliberate deviation from vLLM, whose 503 lets a load balancer
+route elsewhere: a single-instance LAN deployment has no other instance). On the AFD split this is the attention
+node's HTTP side; with patch 0082's admission cap (TF_GLM_MAX_QUEUED) it is how a request past the cap is refused.
+This ports it behind a switch of this tree's own, off by default:
+
+- server/errors.py: admission_response (the patch's), capacity_status() / capacity_status_on() reading
+  TF_GLM_CAPACITY_STATUS (0 or unset: off, 1: on; the GLM engine refuses anything else at start, and a refusal never
+  fails on it). Unset, admission_response gives TensorFold v0.6.5's 503 without a header.
+- cuda/http.py: _json takes headers; the prepare and non-streamed run sites use admission_response, as the patch, and
+  so does the tokenizer route (a third site this tree's handler has, which v0.6.5 renders as 503). A streamed request's
+  refusal stays the stream's error event: its 200 is sent before the engine runs, in the recipe too.
+- server/http.py (the generic handler): _send_json takes headers; its prepare and tokenizer sites use
+  admission_response; the generate path's CapacityError branch, as the patch, answers 400 unset (v0.6.5's).
+- engine.py: a startup line when the switch is on, and the check of its value.
+- THIRD_PARTY_NOTICES.md: "Capacity refusals as 429 with Retry-After".
+
+Not changed: the Anthropic route keeps its own rendering (503, overloaded_error); the recipe has no Anthropic route.
+CapacityError is no longer named in cuda/http.py, so its import there goes (the patch keeps it, unused).
+
+Unset, every site answers as before, byte for byte.
+
+Tests (CPU): tests/test_cuda_capacity_status.py (17), each with the switch unset and on: the switch's values;
+admission_response; the CUDA server's prepare, non-streamed run and tokenizer sites (503 without Retry-After unset,
+429 with Retry-After: 5 on, the same error body); other refusals stay 400 without the header; a streamed refusal is
+the stream's error event either way; a served reply is unchanged; the generic handler's tokenizer route.
+
+Credit: patch 0081 was written by johnwhited (https://github.com/johnwhited) in
+MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold pull request #48 (commits 2eaf324, 9d2fd5e), with vLLM v1's
+admission check as its reference; MiaAI-Lab applied it as contributed (merge 0cbe026, renumbered in e6bc3e0, v1.8 at
+33b50fd), Apache License 2.0.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patch 0081,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 33b50fde06fd7ea604cbc6a663880068ab1e2ee4 (v1.8); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |  19 ++
+ src/tensorfold/cuda/http.py                   |  17 +-
+ .../families/glm5_next/cuda/engine.py         |   5 +
+ src/tensorfold/server/errors.py               |  39 +++-
+ src/tensorfold/server/http.py                 |  18 +-
+ tests/test_cuda_capacity_status.py            | 207 ++++++++++++++++++
+ 6 files changed, 292 insertions(+), 13 deletions(-)
+ create mode 100644 tests/test_cuda_capacity_status.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index 1ac276f..cbe324e 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -623,3 +623,22 @@ it sits beside it as `_take_over_decided`, used only with `TF_GLM_DECIDE_THEN_CO
+ each take-over; unset or 0: the walk as before); its calls pass the drafter only when there is one, as this tree's
+ `_take_over` does (the patch passes `drafter=drafter`). It acts on the one-stream path (`--parallel 1`) and the
+ label scores' prefill; under `--parallel` the pool keeps prompts in place and `_take_over` is not called.
++
++## Capacity refusals as 429 with Retry-After (TF_GLM_CAPACITY_STATUS)
++
++`server/errors.py`'s `admission_response`, and its use in `cuda/http.py`'s and `server/http.py`'s handlers (`_json` /
++`_send_json` with a `headers` argument; every capacity refusal answers 429 with `Retry-After: 5` instead of a bare 503,
++or a 400 on the generic server's generate path, so a client backs off instead of stacking) are MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/33b50fde06fd7ea604cbc6a663880068ab1e2ee4)
++patch 0081-tfcap-capacity-status (v1.8), written by [johnwhited](https://github.com/johnwhited) in
++[pull request #48](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/48) (commits
++[`2eaf324`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/commit/2eaf32413addd3805f33dea9581dda5a0a5024b6)
++and
++[`9d2fd5e`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/commit/9d2fd5e32e2f9cf83a05f51a08ca4f440d9cf6f9))
++and applied by MiaAI-Lab as contributed; the recipe credits [vLLM](https://github.com/vllm-project/vllm) v1's
++admission check (Apache 2.0) as its reference. Under the recipe's Apache License 2.0 (see
++[the license text](LICENSES/Apache-2.0.txt)). Changes in the port: the recipe always renders 429, and here
++`admission_response` does only with `TF_GLM_CAPACITY_STATUS=1` (`capacity_status`; unset or 0: 503 without the header,
++and 400 on the generic server's generate path, as TensorFold v0.6.5); the same rule also covers the tokenizer routes'
++refusals of both handlers, which TensorFold v0.6.5 renders as 503; the Anthropic route keeps its own (503,
++`overloaded_error`).
+diff --git a/src/tensorfold/cuda/http.py b/src/tensorfold/cuda/http.py
+index 6cde8e2..17903e5 100644
+--- a/src/tensorfold/cuda/http.py
++++ b/src/tensorfold/cuda/http.py
+@@ -11,7 +11,7 @@ from tensorfold.cuda import health
+ from tensorfold.server import anthropic, metrics, responses, token_routes
+ from tensorfold.server.cancellation import RequestCancelled, socket_cancellation
+ from tensorfold.server.decisions import DecisionError
+-from tensorfold.server.errors import CapacityError, RequestError, error_body
++from tensorfold.server.errors import RequestError, admission_response, error_body
+ from tensorfold.server.http import Server, wants_usage_chunk
+ from tensorfold.server.request_body import read_body
+ from tensorfold.server.stacks import Rearming
+@@ -53,10 +53,12 @@ def make_handler(app: App):
+             if not (self.command == "GET" and self.path.split("?", 1)[0].rstrip("/") in POLLED and code == 200):
+                 super().log_request(code, size)
+ 
+-        def _json(self, code: int, payload: dict[str, Any]) -> None:
++        def _json(self, code: int, payload: dict[str, Any], headers: dict[str, str] | None = None) -> None:
+             data = json.dumps(payload).encode()
+             try:
+                 self.send_response(code)
++                for _k, _v in (headers or {}).items():   # TFCAP-0074
++                    self.send_header(_k, _v)
+                 self.send_header("Content-Type", "application/json")
+                 self.send_header("Content-Length", str(len(data)))
+                 if self.close_connection:                # so a pooling client does not reuse the socket
+@@ -125,7 +127,8 @@ def make_handler(app: App):
+                 try:
+                     reply = app.detokenize(body) if path.endswith("/detokenize") else app.tokenize(body)
+                 except RequestError as exc:
+-                    return self._json(503 if isinstance(exc, CapacityError) else 400, {"error": error_body(exc)})
++                    code, _hd = admission_response(exc)      # TFCAP-0074
++                    return self._json(code, {"error": error_body(exc)}, headers=_hd)
+                 except Exception as exc:
+                     _log_error(exc)
+                     return self._json(400, {"error": {"message": _error_message(exc)}})
+@@ -134,8 +137,8 @@ def make_handler(app: App):
+             try:
+                 prepared = app.prepare(body, chat)
+             except RequestError as exc:
+-                return self._json(503 if isinstance(exc, CapacityError) else 400,
+-                                  {"error": error_body(exc, field)})
++                code, _hd = admission_response(exc)      # TFCAP-0074
++                return self._json(code, {"error": error_body(exc, field)}, headers=_hd)
+             except Exception as exc:        # any other failure to read the request is refused too, as on MLX
+                 _log_error(exc)
+                 return self._json(400, {"error": {"message": _error_message(exc)}})
+@@ -217,8 +220,8 @@ def make_handler(app: App):
+                 self.close_connection = True
+                 return
+             except RequestError as exc:
+-                return self._json(503 if isinstance(exc, CapacityError) else 400,
+-                                  {"error": error_body(exc, field)})
++                code, _hd = admission_response(exc)      # TFCAP-0074
++                return self._json(code, {"error": error_body(exc, field)}, headers=_hd)
+             except Exception as exc:
+                 _log_error(exc)
+                 try:
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 926b486..3710994 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -761,6 +761,11 @@ class GlmEngine:
+             print("[tensorfold] TF_GLM_DECIDE_THEN_COPY=1: a request that takes the caches over works out which kept "
+                   "prompts stay before it copies any, and copies only those (one stream at a time; under --parallel "
+                   "the pool keeps prompts in place) (MiaAI-Lab recipe patch 0078, by m-naoki-m)", flush=True)
++        from tensorfold.server.errors import capacity_status
++
++        if capacity_status() and rank == 0:      # TF_GLM_CAPACITY_STATUS (recipe 0081): a bad value refuses here
++            print("[tensorfold] TF_GLM_CAPACITY_STATUS=1: a capacity refusal answers 429 with Retry-After: 5 instead of "
++                  "503 (MiaAI-Lab recipe patch 0081, by johnwhited)", flush=True)
+         if parallel > 1:
+             from . import fill_pairs, prefill_order
+             from .multi import GlmScheduler, MultiDecoder
+diff --git a/src/tensorfold/server/errors.py b/src/tensorfold/server/errors.py
+index 74f40b2..9a1ff2b 100644
+--- a/src/tensorfold/server/errors.py
++++ b/src/tensorfold/server/errors.py
+@@ -1,9 +1,13 @@
++import os
++
++
+ class RequestError(ValueError):
+     """A request refusal: HTTP 400, or a named error after a stream starts."""
+ 
+ 
+ class CapacityError(RequestError):
+-    """A transient capacity refusal: HTTP 503, retry shortly."""
++    """A transient capacity refusal: HTTP 503, retry shortly; with TF_GLM_CAPACITY_STATUS=1, HTTP 429 + Retry-After
++    (see admission_response)."""
+ 
+ 
+ class RoundError(RuntimeError):
+@@ -23,6 +27,39 @@ class ContextLengthError(RequestError):
+ CONTEXT_LIMIT = "This server's maximum context length is"      # OpenAI's wording, which clients match to compact
+ 
+ 
++def capacity_status(value: str | None = None) -> bool:
++    """TF_GLM_CAPACITY_STATUS (MiaAI-Lab recipe patch 0081, by johnwhited; off by default here): 1, every API layer
++    renders a capacity refusal as 429 with ``Retry-After: 5`` (``admission_response``); 0 or unset, TensorFold v0.6.5's
++    503 without the header (400 on the generate path of tensorfold.server.http); anything else is refused (the GLM
++    engine checks it at start)."""
++
++    raw = os.environ.get("TF_GLM_CAPACITY_STATUS", "") if value is None else value
++    if raw.strip() in ("", "0"):
++        return False
++    if raw.strip() == "1":
++        return True
++    raise ValueError(f"TF_GLM_CAPACITY_STATUS: 0 (off, the default) or 1 (on), not {raw!r}")
++
++
++def capacity_status_on() -> bool:
++    """``capacity_status`` while a request is refused: never raises (a bad value is refused at start)."""
++
++    try:
++        return capacity_status()
++    except ValueError:
++        return False
++
++
++def admission_response(exc: Exception) -> tuple[int, dict[str, str] | None]:
++    # TFCAP-0074: how every API layer renders a capacity refusal: a real 429 with a retry hint
++    # (not a bare 503), so the same client backs off instead of stacking invisibly. Deliberate
++    # deviation from vLLM, whose refusals are 503 for a load balancer to route to another
++    # instance: a single-instance LAN deployment has no other instance to route to.
++    if not capacity_status_on():         # TF_GLM_CAPACITY_STATUS unset: TensorFold v0.6.5's 503, no header
++        return (503 if isinstance(exc, CapacityError) else 400), None
++    return (429, {"Retry-After": "5"}) if isinstance(exc, CapacityError) else (400, None)
++
++
+ def refusal(problem: str) -> RequestError:
+     """A refusal string as its error: a context-window one carries OpenAI's code."""
+ 
+diff --git a/src/tensorfold/server/http.py b/src/tensorfold/server/http.py
+index 1772d2f..e4093c7 100644
+--- a/src/tensorfold/server/http.py
++++ b/src/tensorfold/server/http.py
+@@ -15,7 +15,7 @@ from tensorfold.server import anthropic, live, responses, token_routes
+ from tensorfold.server.tools import (active_tool_specs, parse_tool_calls_from_content, stream_tool_call_deltas,
+                                      tool_choice_requires_call)
+ from tensorfold.server.decisions import DecisionError
+-from tensorfold.server.errors import CapacityError, RequestError, error_body
++from tensorfold.server.errors import CapacityError, RequestError, admission_response, capacity_status_on, error_body
+ from tensorfold.server.request_options import parse_numbers, thinking_fields
+ from tensorfold.server.probabilities import probability_options
+ from tensorfold.server.messages import normalize_messages, validate_modalities
+@@ -96,9 +96,12 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
+         def log_message(self, format: str, *args: Any) -> None:
+             print(f"[tensorfold] {self.address_string()} {format % args}")
+ 
+-        def _send_json(self, payload: dict[str, Any], status: int = 200) -> None:
++        def _send_json(self, payload: dict[str, Any], status: int = 200,
++                       headers: dict[str, str] | None = None) -> None:
+             body = json.dumps(payload).encode("utf-8")
+             self.send_response(status)
++            for _k, _v in (headers or {}).items():   # TFCAP-0074
++                self.send_header(_k, _v)
+             self.send_header("Content-Type", "application/json")
+             self.send_header("Content-Length", str(len(body)))
+             if self.close_connection:                    # so a pooling client does not reuse the socket
+@@ -251,8 +254,8 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
+                 separate_usage = wants_usage_chunk(body)      # usage then rides its own chunk before [DONE]
+                 tool_policy = ToolCallPolicy(body)
+             except RequestError as exc:
+-                self._send_json({"error": error_body(exc, field)},
+-                                status=503 if isinstance(exc, CapacityError) else 400)
++                status, _hd = admission_response(exc)    # TFCAP-0074
++                self._send_json({"error": error_body(exc, field)}, status=status, headers=_hd)
+                 return
+             except Exception as exc:
+                 self._send_json({"error": {"message": str(exc)}}, status=400)
+@@ -507,6 +510,10 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
+                 )
+             except (BrokenPipeError, ConnectionResetError, RequestCancelled):
+                 pass
++            except CapacityError as exc:  # TFCAP-0074 (order: before RequestError — a CapacityError is one)
++                # TF_GLM_CAPACITY_STATUS unset: TensorFold v0.6.5's 400 on this path
++                status, _hd = admission_response(exc) if capacity_status_on() else (400, None)
++                self._send_json({"error": error_body(exc, field)}, status=status, headers=_hd)
+             except RequestError as exc:
+                 self._send_json({"error": error_body(exc, field)}, status=400)
+             except Exception as exc:  # surface runner errors to the client
+@@ -523,7 +530,8 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
+                 body = json.loads(read_body(self) or b"{}")
+                 reply = token_routes.detokenize(app, body) if detokenize else token_routes.tokenize(app, body)
+             except RequestError as exc:
+-                self._send_json({"error": error_body(exc)}, status=503 if isinstance(exc, CapacityError) else 400)
++                status, _hd = admission_response(exc)    # TFCAP-0074
++                self._send_json({"error": error_body(exc)}, status=status, headers=_hd)
+                 return
+             except Exception as exc:  # noqa: BLE001 - a body the tokenizer cannot read is a client error
+                 self._send_json({"error": {"message": str(exc), "type": "invalid_request_error"}}, status=400)
+diff --git a/tests/test_cuda_capacity_status.py b/tests/test_cuda_capacity_status.py
+new file mode 100644
+index 0000000..930b05a
+--- /dev/null
++++ b/tests/test_cuda_capacity_status.py
+@@ -0,0 +1,207 @@
++"""MiaAI-Lab recipe patch 0081 (by johnwhited), ``TF_GLM_CAPACITY_STATUS``: every API layer renders a capacity refusal
++as 429 with ``Retry-After: 5``; unset or 0, TensorFold v0.6.5's 503 without the header. CPU only: the CUDA server's
++handler over a stand-in app (tests/test_cuda_server_errors.py's, without the tokenizers package), and the generic
++server's handler on its tokenizer route."""
++
++from __future__ import annotations
++
++import http.client
++import json
++import threading
++from contextlib import contextmanager
++from http.server import ThreadingHTTPServer
++from types import SimpleNamespace
++
++import pytest
++
++from tensorfold.cuda import server
++from tensorfold.server.errors import (
++    CapacityError,
++    RequestError,
++    admission_response,
++    capacity_status,
++    capacity_status_on,
++)
++
++pytest.importorskip("jinja2")                    # the chat template
++
++TEMPLATE = "{%- for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}assistant:"
++HI = [{"role": "user", "content": "Hi"}]
++EOS = 0
++BUSY = "all serving lanes are busy; retry shortly"
++
++
++class Tok:
++    def encode(self, text, **kwargs):
++        return SimpleNamespace(ids=[ord(c) for c in text])
++
++    def decode(self, ids, **kwargs):
++        return "".join(chr(c) for c in ids)
++
++
++class Engine:
++    eos = (EOS,)
++
++    def __init__(self):
++        self.fail = None          # an exception generate raises (a scheduler's refusal reaches the server this way)
++
++    def generate(self, prompt, max_tokens, sampling, on_tokens, draft=True):
++        if self.fail is not None:
++            raise self.fail
++        on_tokens([ord(c) for c in "Hello"] + [EOS])
++        return {"generated": 6}
++
++
++def make_app(tmp_path):
++    (tmp_path / "tokenizer_config.json").write_text(json.dumps({"chat_template": TEMPLATE}))
++    app = server.App.__new__(server.App)
++    app.engine = Engine()
++    app.served = "fake-cuda"
++    app.tok = Tok()
++    app.template = server.ChatTemplate(tmp_path)
++    app.default_thinking = False
++    app.sampling = {"temperature": 1.0, "top_k": 20, "top_p": 0.95}
++    app.max_tokens = 64
++    app.native_context_window = app.context_window = 0
++    app.lock = threading.Lock()
++    return app
++
++
++@contextmanager
++def http_server(app):
++    class QuietServer(ThreadingHTTPServer):
++        def handle_error(self, request, client_address):
++            pass
++    httpd = QuietServer(("127.0.0.1", 0), server.make_handler(app))
++    worker = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
++    worker.start()
++    try:
++        yield httpd.server_port
++    finally:
++        httpd.shutdown()
++        httpd.server_close()
++        worker.join()
++
++
++def post(port, body, path="/v1/chat/completions"):
++    """(status, Retry-After or None, body text)."""
++
++    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
++    try:
++        connection.request("POST", path, json.dumps(body), {"Content-Type": "application/json"})
++        response = connection.getresponse()
++        return response.status, response.getheader("Retry-After"), response.read().decode()
++    finally:
++        connection.close()
++
++
++@pytest.fixture(params=["", "1"], ids=["unset", "on"])
++def status(monkeypatch, request):
++    """TF_GLM_CAPACITY_STATUS's value, and the (status, Retry-After) a capacity refusal must get with it."""
++
++    monkeypatch.setenv("TF_GLM_CAPACITY_STATUS", request.param)
++    return (429, "5") if request.param == "1" else (503, None)
++
++
++def test_the_switch_reads_0_or_1(monkeypatch):
++    assert capacity_status("") is False and capacity_status("0") is False and capacity_status(" 1") is True
++    with pytest.raises(ValueError, match="TF_GLM_CAPACITY_STATUS"):
++        capacity_status("429")
++    monkeypatch.setenv("TF_GLM_CAPACITY_STATUS", "429")
++    assert capacity_status_on() is False            # a refusal never fails on the setting (refused at start)
++
++
++def test_admission_response(status):
++    assert admission_response(CapacityError(BUSY)) == (status[0], {"Retry-After": "5"} if status[1] else None)
++    assert admission_response(RequestError("bad")) == (400, None)
++
++
++@pytest.mark.parametrize("site", ["prepare", "run"])
++def test_a_capacity_refusal_of_a_non_streamed_request(tmp_path, monkeypatch, status, site):
++    app = make_app(tmp_path)
++    if site == "prepare":
++        monkeypatch.setattr(app, "prepare", lambda body, chat: (_ for _ in ()).throw(CapacityError(BUSY)),
++                            raising=False)
++    else:
++        app.engine.fail = CapacityError(BUSY)
++    with http_server(app) as port:
++        code, retry, text = post(port, {"messages": HI, "max_tokens": 4})
++    assert (code, retry) == status
++    assert json.loads(text)["error"]["message"] == BUSY
++
++
++def test_a_capacity_refusal_on_the_tokenizer_route(tmp_path, monkeypatch, status):
++    app = make_app(tmp_path)
++    monkeypatch.setattr(app, "tokenize", lambda body: (_ for _ in ()).throw(CapacityError(BUSY)), raising=False)
++    with http_server(app) as port:
++        code, retry, text = post(port, {"prompt": "hi"}, "/tokenize")
++    assert (code, retry) == status and json.loads(text)["error"]["message"] == BUSY
++
++
++def test_other_refusals_stay_400_without_a_retry_hint(tmp_path, status):
++    app = make_app(tmp_path)
++    app.engine.fail = RequestError("not this one")
++    with http_server(app) as port:
++        assert post(port, {"messages": HI, "max_tokens": 4})[:2] == (400, None)
++
++
++def test_a_streamed_refusal_is_still_an_error_event_after_the_headers(tmp_path, status):
++    """The 200 and the event stream's headers go out before the engine runs (as in the recipe): a refusal there is
++    the stream's error event either way."""
++
++    app = make_app(tmp_path)
++    app.engine.fail = CapacityError(BUSY)
++    with http_server(app) as port:
++        code, retry, text = post(port, {"messages": HI, "max_tokens": 4, "stream": True})
++    assert (code, retry) == (200, None)
++    assert BUSY in text and text.rstrip().endswith("data: [DONE]")
++
++
++def test_a_served_request_is_unchanged(tmp_path, status):
++    app = make_app(tmp_path)
++    with http_server(app) as port:
++        code, retry, text = post(port, {"messages": HI, "max_tokens": 8})
++    assert (code, retry) == (200, None) and json.loads(text)["choices"][0]["message"]["content"] == "Hello"
++
++
++def test_the_generic_servers_tokenizer_route(monkeypatch, status):
++    """tensorfold.server.http's handler (the Mac server's) renders its capacity refusals the same way."""
++
++    import socket
++    from io import BytesIO
++
++    from tensorfold.server import http as generic
++    from tensorfold.server import token_routes
++
++    monkeypatch.setattr(token_routes, "tokenize", lambda app, body: (_ for _ in ()).throw(CapacityError(BUSY)))
++    payload = json.dumps({"prompt": "hi"}).encode()
++    incoming = (f"POST /tokenize HTTP/1.0\r\nContent-Type: application/json\r\n"
++                f"Content-Length: {len(payload)}\r\n\r\n").encode() + payload
++
++    class Connection:
++        def __init__(self):
++            self.output = bytearray()
++
++        def makefile(self, *args):
++            return BytesIO(incoming)
++
++        def sendall(self, data):
++            self.output.extend(data)
++
++        def fileno(self):
++            return connected.fileno()
++
++        def recv(self, *args):
++            return connected.recv(*args)
++
++    connection = Connection()
++    connected, peer = socket.socketpair()
++    try:
++        generic.make_handler(SimpleNamespace())(connection, ("127.0.0.1", 0), None)
++    finally:
++        connected.close()
++        peer.close()
++    head, body = bytes(connection.output).split(b"\r\n\r\n", 1)
++    lines = head.decode().split("\r\n")
++    retry = next((line.split(":", 1)[1].strip() for line in lines if line.lower().startswith("retry-after:")), None)
++    assert (int(lines[0].split()[1]), retry) == status and json.loads(body)["error"]["message"] == BUSY

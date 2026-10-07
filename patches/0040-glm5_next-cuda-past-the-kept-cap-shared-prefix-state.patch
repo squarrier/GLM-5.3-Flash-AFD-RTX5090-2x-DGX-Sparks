@@ -1,0 +1,317 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 20:12:49 -0400
+Subject: [PATCH] glm5_next/cuda: past the kept cap, shared-prefix states go by
+ recency, TF_GLM_CAP_SHARED_RECENCY (MiaAI-Lab recipe patch 0077)
+
+Past TF_GLM_CACHE_ENTRIES the multi-stream decoder drops a superseded kept prompt first (a state shorter than another
+in its extent: recipe patch 0063). A run of an agent keeps its system block's shared-prefix state and its own longer
+state in one extent, so once every other kept prompt is some conversation's latest state, the new run's system-block
+state is the only superseded entry and goes at its next kept state, and the agent's next run reads its whole prompt
+again (first token 14 s -> 40 s in the recipe's issue #75; a larger cap only delays it). MiaAI-Lab's recipe v1.7.1
+drops a conversation's earlier non-shared states first, then the least recently used of any, with patch
+0077-glm-kept-cap-shared-by-recency (the diagnosis and the fix proposed by meleesciony, issue #75). Which state is kept
+only: the same replies. 2.0's configuration keeps up to 20 (TF_GLM_CACHE_ENTRIES=20), so its cap can fill the same
+way (shown on the CPU below, with and without 0071's copy; not measured on the Sparks). This ports it behind a switch
+of this tree's own, off by default:
+
+- multi.py: cap_victim_recency, 0077's cap_victim verbatim (the tree's cap_victim stays, unchanged);
+  MultiDecoder.cap_recency (TF_GLM_CAP_SHARED_RECENCY) picks it in _keep.
+- engine.py: with --parallel, the switch in the ranks' startup row and in its refusal (both ranks drop the same kept
+  prompt); a startup line when it is on.
+- THIRD_PARTY_NOTICES.md: "GLM kept cap, shared by recency".
+
+Unset, _keep drops cap_victim's choice, as before.
+
+Tests: tests/test_glm_cap_recency.py (8, CPU): the switch; the order (0063's choice is the run's system-block state,
+0077's the least recently used; a conversation's earlier non-shared state goes first under both); an agent's next run
+with the cap at 3 and four kept states, two ranks over the fake model with and without TF_GLM_SHARED_PREFIX_COPY=1
+(patch 0071) and the AFD attention node at world 1: off, the system-block state is dropped and the next run reads its
+whole prompt; on, it is kept and the next run resumes the system block. Every reply equals the request served alone.
+
+Credit: patch 0077 was written by MiaAI-Lab (https://github.com/MiaAI-Lab) in recipe commit 742a2cc (v1.7.1, pull
+request #77), Apache License 2.0; the diagnosis and the fix were proposed by meleesciony
+(https://github.com/meleesciony) in MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold issue #75.
+
+Changed from the picked commit: tests/test_glm_shared_prefix.py's cap test (patch 0063's cap_victim against the
+oldest-first rule) runs with TF_GLM_CAP_SHARED_RECENCY unset, since 0077's rule replaces 0063's when it is set.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patch 0077,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 68ebd67b5326974b8004009e202268b1fa7c551d (v1.7.1); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |  15 +++
+ .../families/glm5_next/cuda/engine.py         |  11 +-
+ .../families/glm5_next/cuda/multi.py          |  28 +++-
+ tests/test_glm_cap_recency.py                 | 120 ++++++++++++++++++
+ tests/test_glm_shared_prefix.py               |   4 +-
+ 5 files changed, 175 insertions(+), 3 deletions(-)
+ create mode 100644 tests/test_glm_cap_recency.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index b04dfae..e2ca0b8 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -589,3 +589,18 @@ written by MiaAI-Lab for
+ [the license text](LICENSES/Apache-2.0.txt)). Changes in the port: the recipe's `TF_GLM_ASSISTANT_ENDS` defaults to 1,
+ and here to 0 (unset or 0: the checkpoint's end tokens only, as before; 1: the recipe's behaviour); a startup line
+ when it is on.
++
++## GLM kept cap, shared by recency (TF_GLM_CAP_SHARED_RECENCY)
++
++`families/glm5_next/cuda/multi.py`'s `cap_victim_recency` (past `TF_GLM_CACHE_ENTRIES`, a shared-prefix state goes by
++recency only, never as superseded by its writer's longer state) is MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/68ebd67)
++patch 0077-glm-kept-cap-shared-by-recency's `cap_victim` (v1.7.1, recipe commit
++[`742a2cc`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/commit/742a2cc7064c732f07e87d19f53e8f7baab1f860),
++[pull request #77](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/77)), written by
++MiaAI-Lab; the diagnosis and the fix were proposed by [meleesciony](https://github.com/meleesciony) in
++[issue #75](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/75). Under the recipe's
++Apache License 2.0 (see [the license text](LICENSES/Apache-2.0.txt)). Changes in the port: the recipe replaces
++`cap_victim`, and here it sits beside it as `cap_victim_recency`, used only with `TF_GLM_CAP_SHARED_RECENCY=1`
++(`MultiDecoder.cap_recency`; unset or 0: `cap_victim`, as before); with `--parallel` the ranks' startup comparison
++carries the switch, since both ranks drop the same kept prompt.
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index fda57ec..f2760ab 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -594,6 +594,10 @@ class GlmEngine:
+                 KV_KINDS.index(kv)]
+         mine += [len(cfg.eos), sum(cfg.eos)]              # the end tokens: TF_GLM_ASSISTANT_ENDS (recipe 0075)
+         mine += [self.grid, int(kda_chunked_on())]        # TF_GLM_PROMPT_GRID, TF_GLM_KDA_CHUNKED (recipe 0008, 0039)
++        if parallel > 1:                      # TF_GLM_CAP_SHARED_RECENCY (recipe 0077): both drop the same kept prompt
++            from .multi import recipe_switch
++
++            mine += [int(recipe_switch("TF_GLM_CAP_SHARED_RECENCY"))]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -604,7 +608,8 @@ class GlmEngine:
+                                "TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING, --parallel, TF_GLM_MULTI_VERIFY, "
+                                "TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
+                                "TF_GLM_KV, TF_GLM_ASSISTANT_ENDS, "
+-                               "TF_GLM_SHARED_PREFIX, TF_GLM_PROMPT_GRID, TF_GLM_KDA_CHUNKED): "
++                               "TF_GLM_SHARED_PREFIX, TF_GLM_PROMPT_GRID, TF_GLM_KDA_CHUNKED, "
++                               "TF_GLM_CAP_SHARED_RECENCY): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+                                "(or pass --drafter none to both) and give both the same flags")
+         self.cache_bytes = (min(both[0][-1], both[1][-1]) if len(both) > 1 else both[0][-1]) << 20
+@@ -787,6 +792,10 @@ class GlmEngine:
+                           "together before any kept prompt is evicted, and evictions only while the free rows fall "
+                           "short (MiaAI-Lab recipe patch 0074, by ezoushen)"
+                           + ("; TF_GLM_CACHE_ROOM=1 makes the room instead" if self.multi.room else ""), flush=True)
++                if self.multi.cap_recency:
++                    print("[tensorfold] TF_GLM_CAP_SHARED_RECENCY=1: past the kept-prompt cap, shared-prefix states go "
++                          "by recency only, never as superseded by their writer's longer state (MiaAI-Lab recipe patch "
++                          "0077; the diagnosis and the fix proposed by meleesciony)", flush=True)
+ 
+     @staticmethod
+     def _cache_entries() -> int:
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index fc8c315..3a2beae 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -426,6 +426,26 @@ def cap_victim(kept: list):
+     return superseded[0] if superseded else kept[0]
+ 
+ 
++def cap_victim_recency(kept: list):
++    """The kept prompt to drop past TF_GLM_CACHE_ENTRIES (``kept``: least recently used first). An extent's kept
++    prompts are prefixes of its rows, so one shorter than another in its extent is an earlier point of that
++    conversation, superseded by the longer one: the oldest of those goes first, then the least recently used of any.
++    A conversation taking many turns thus drops its own earlier turns instead of the only state of a conversation
++    that is waiting on a long reply. A shared-prefix state (a system block, where prompts stop sharing) is never
++    dropped as superseded: it is what the next conversation or run with that prefix resumes from, and its writer's
++    longer state cannot serve them, so it goes by recency only, with the other conversations' latest states.
++    Deterministic in ``kept``'s order and extents, so both ranks drop the same one. (MiaAI-Lab recipe patch 0077's
++    ``cap_victim``, with TF_GLM_CAP_SHARED_RECENCY=1: the diagnosis and the fix proposed by meleesciony, issue #75)"""
++
++    longest: dict[int, int] = {}
++    for c in kept:
++        longest[id(c.extent)] = max(longest.get(id(c.extent), 0), len(c.ids))
++    for c in kept:
++        if len(c.ids) < longest[id(c.extent)] and not getattr(c, "shared", False):
++            return c
++    return kept[0]
++
++
+ class NoRoom(_NoRoom):
+     """The pool cannot place a stream now (it waits for others to finish)."""
+ 
+@@ -445,6 +465,7 @@ class MultiDecoder:
+     window = MAX_WINDOW                # rows of a round's windows together (TF_GLM_MULTI_WINDOW; set by __init__; 0069)
+     share_copy = False                 # TF_GLM_SHARED_PREFIX_COPY (``__init__`` reads it; MiaAI-Lab recipe patch 0071)
+     compact_first = False              # TF_GLM_COMPACT_BEFORE_EVICT (``__init__`` reads it; MiaAI-Lab recipe patch 0074)
++    cap_recency = False                # TF_GLM_CAP_SHARED_RECENCY (``__init__`` reads it; MiaAI-Lab recipe patch 0077)
+ 
+     def __init__(self, engine, streams: int, *, verify=None, drafts=None, draft_graphs: bool | None = None,
+                  tune: MultiSettings | None = None, row_ms: Sequence[float] | None = None, fill_costs=None,
+@@ -519,6 +540,9 @@ class MultiDecoder:
+         # and _grow move extents together before they evict, and evict only while the free rows fall short
+         # (TF_GLM_CACHE_ROOM=1, when also set, makes room its own way: ``cache_room``)
+         self.compact_first = recipe_switch("TF_GLM_COMPACT_BEFORE_EVICT")
++        # TF_GLM_CAP_SHARED_RECENCY=1 (MiaAI-Lab recipe patch 0077; off by default here): past TF_GLM_CACHE_ENTRIES,
++        # shared-prefix states go by recency only, never as superseded (``cap_victim_recency``); both ranks compare it
++        self.cap_recency = recipe_switch("TF_GLM_CAP_SHARED_RECENCY")
+         self.laned = {"groups": 0, "chunks": 0, "rows": 0}               # groups of 3 or more lanes
+         # TF_GLM_PREFILL_ORDER=sjf (``prefill_order``, ours): rank 0 fills, and its scheduler admits, the waiting prompts
+         # fewest uncached tokens first, those that have waited TF_GLM_PREFILL_AGE_MS first by arrival
+@@ -1132,7 +1156,9 @@ class MultiDecoder:
+         lane.extent.kept.append(snap)
+         self.kept.append(snap)
+         while len(self.kept) > max(1, self.g.cache_entries):
+-            self._drop(cap_victim(self.kept))             # superseded states first (MiaAI-Lab recipe patch 0063)
++            # superseded states first (MiaAI-Lab recipe patch 0063); TF_GLM_CAP_SHARED_RECENCY=1: shared-prefix states
++            # by recency only (0077)
++            self._drop((cap_victim_recency if self.cap_recency else cap_victim)(self.kept))
+ 
+     def _drop(self, c) -> None:
+         """Forget a kept prompt; its extent goes when nothing else holds it, else shrinks to what is kept."""
+diff --git a/tests/test_glm_cap_recency.py b/tests/test_glm_cap_recency.py
+new file mode 100644
+index 0000000..f06a59b
+--- /dev/null
++++ b/tests/test_glm_cap_recency.py
+@@ -0,0 +1,120 @@
++"""TF_GLM_CAP_SHARED_RECENCY (MiaAI-Lab recipe patch 0077; the diagnosis and the fix proposed by meleesciony, the
++recipe's issue #75): past TF_GLM_CACHE_ENTRIES, a shared-prefix state goes by recency only, never as superseded by its
++writer's longer state, on the CPU.
++
++Recipe patch 0063's ``cap_victim`` drops superseded states first: a state shorter than another in its extent. A run of
++an agent keeps its system block's shared-prefix state and its own longer state in one extent, so once every other kept
++prompt is some conversation's latest state, the new run's system-block state is the only superseded entry and goes at
++its next kept state, and the agent's next run reads its whole prompt again. 0077's ``cap_victim`` (here
++``cap_victim_recency``) still drops a conversation's earlier non-shared states first, then the least recently used of
++any. Covered: the order (the recipe's own function and this tree's, on the same kept lists), and the agent's next run
++at two ranks and at world 1 over the fake AFD wire (every reply checked against the request served alone).
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from tests import test_glm_multi as tm
++from tests import test_glm_multi_afd as ta
++from tests.test_cuda_geometry import allocations  # noqa: F401  (fixture: fake triton, so decode imports)
++
++pytestmark = pytest.mark.torch
++
++fake = tm.fake
++afd_fake = ta.afd_fake
++
++HEAD, USER, TAIL = [40, 41, 42], 43, [45, 46, 39]      # [gMASK]<sop><|system|>, <|user|>, the tail
++LEAST = 256                                            # TF_GLM_SHARED_PREFIX=1
++
++
++def benchy(context, user):
++    return HEAD + list(context) + [USER] + list(user) + TAIL
++
++
++def test_the_switch(fake, monkeypatch):
++    from tensorfold.families.glm5_next.cuda.multi import recipe_switch
++
++    assert [recipe_switch("TF_GLM_CAP_SHARED_RECENCY", v) for v in ("", "0", "1")] == [False, False, True]
++    monkeypatch.delenv("TF_GLM_CAP_SHARED_RECENCY", raising=False)
++    assert not tm.Pair(fake, streams=2, blocks=4).d[0].cap_recency
++    monkeypatch.setenv("TF_GLM_CAP_SHARED_RECENCY", "1")
++    assert all(d.cap_recency for d in tm.Pair(fake, streams=2, blocks=4).d)
++    monkeypatch.setenv("TF_GLM_CAP_SHARED_RECENCY", "true")
++    with pytest.raises(ValueError, match="TF_GLM_CAP_SHARED_RECENCY"):
++        tm.Pair(fake, streams=2, blocks=4)
++
++
++def _kept(n, extent, shared=False):
++    from types import SimpleNamespace
++
++    return SimpleNamespace(ids=[0] * n, extent=extent, shared=shared)
++
++
++def test_the_order():
++    """0063 drops the system-block state its writer's longer state supersedes; 0077 keeps it (by recency) and drops
++    the least recently used entry; a conversation's earlier non-shared state still goes first under both."""
++    from tensorfold.families.glm5_next.cuda.multi import cap_victim, cap_victim_recency
++
++    x1, x2, run = object(), object(), object()
++    other1, other2 = _kept(900, x1), _kept(700, x2)
++    system, own = _kept(600, run, shared=True), _kept(650, run)
++    kept = [other1, other2, system, own]                 # least recently used first
++    assert cap_victim(kept) is system
++    assert cap_victim_recency(kept) is other1
++    earlier = _kept(300, x2)                             # conversation 2's earlier turn: superseded, not shared
++    kept = [other1, system, earlier, other2, own]
++    assert cap_victim(kept) is earlier and cap_victim_recency(kept) is earlier
++    assert cap_victim([other1]) is other1 and cap_victim_recency([other1]) is other1
++
++
++def agent_runs(torch, node, gs, d) -> dict:
++    """Two conversations keep one state each; an agent's run keeps its system block's state and its own (4 kept,
++    the cap 3); then the agent's next run, with the same system prompt and a new user turn."""
++
++    for g in gs:
++        g.shared, g.opener = LEAST, USER if g.rank == 0 else None
++    for seed in (600, 601):
++        s = node.submit(tm._prompt(700, seed), 4, None)
++        node.run()
++        assert s.got == tm.solo(torch, s.prompt, 4, None)
++    context = tm._prompt(600, 610)
++    at = len(HEAD) + 600
++    first = benchy(context, tm._prompt(40, 611))
++    s = node.submit(first, 8, None)
++    node.run()
++    assert s.cached == 0 and s.got == tm.solo(torch, first, 8, None)
++    kept = sorted(len(k.ids) for k in d.kept)
++    second = benchy(context, tm._prompt(50, 612))
++    nxt = node.submit(second, 8, tm._sampling("topk", 3))
++    node.run()
++    assert nxt.got == tm.solo(torch, second, 8, tm._sampling("topk", 3))
++    return {"kept": kept, "at": at, "cached": nxt.cached}
++
++
++@pytest.mark.parametrize("copy", ["", "1"], ids=["takeover", "copy"])
++@pytest.mark.parametrize("recency", ["", "1"], ids=["off", "on"])
++def test_the_agents_next_run_resumes_its_system_prompt(fake, monkeypatch, recency, copy):
++    """Two ranks, the cap at 3: off, the run's system-block state is dropped as superseded, and the next run reads its
++    whole prompt again; on, it stays and the next run resumes the system block. With TF_GLM_SHARED_PREFIX_COPY=1
++    (patch 0071, which made this common in the recipe) the same."""
++
++    monkeypatch.setenv("TF_GLM_CAP_SHARED_RECENCY", recency)
++    monkeypatch.setenv("TF_GLM_SHARED_PREFIX_COPY", copy)
++    p = tm.Pair(fake, streams=2, blocks=8, entries=3)
++    out = agent_runs(fake, p, p.g, p.d[0])
++    p.check()
++    if recency:
++        assert out["at"] in out["kept"] and out["cached"] == out["at"]
++    else:
++        assert out["at"] not in out["kept"] and out["cached"] == 0
++
++
++@pytest.mark.parametrize("recency", ["", "1"], ids=["off", "on"])
++def test_world1_afd(afd_fake, monkeypatch, recency):
++    """The AFD attention node (world 1 over the fake AFD wire): the same as two ranks."""
++
++    monkeypatch.setenv("TF_GLM_CAP_SHARED_RECENCY", recency)
++    n1 = ta.World1(afd_fake, streams=2, entries=3)
++    out = agent_runs(afd_fake.torch, n1, [n1.g], n1.d)
++    assert out["cached"] == (out["at"] if recency else 0)
+diff --git a/tests/test_glm_shared_prefix.py b/tests/test_glm_shared_prefix.py
+index e427c1a..f1ce2cc 100644
+--- a/tests/test_glm_shared_prefix.py
++++ b/tests/test_glm_shared_prefix.py
+@@ -480,9 +480,11 @@ def test_off_keeps_the_states_as_before(fake):
+ def test_the_cap_drops_a_conversations_superseded_states_first(fake, monkeypatch, rule):
+     """TF_GLM_CACHE_ENTRIES=3 (recipe patch 0063): a conversation that takes turns drops its own earlier turns, not the
+     only state of another conversation (the oldest), which then still resumes; both ranks drop the same ones. The
+-    oldest-first rule before it dropped the other conversation's state."""
++    oldest-first rule before it dropped the other conversation's state. TF_GLM_CAP_SHARED_RECENCY unset: 0077's
++    rule replaces 0063's (tests/test_glm_cap_recency.py)."""
+     from tensorfold.families.glm5_next.cuda import multi
+ 
++    monkeypatch.delenv("TF_GLM_CAP_SHARED_RECENCY", raising=False)
+     if rule == "oldest":
+         monkeypatch.setattr(multi, "cap_victim", lambda kept: kept[0])
+     p = tm.Pair(fake, streams=2, blocks=8, entries=3)

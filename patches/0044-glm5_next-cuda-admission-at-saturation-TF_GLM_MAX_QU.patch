@@ -1,0 +1,402 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 08:33:53 -0400
+Subject: [PATCH] glm5_next/cuda: admission at saturation, TF_GLM_MAX_QUEUED
+ (MiaAI-Lab recipe patch 0082)
+
+With every lane busy, a new request waited in an invisible queue for as long as the running ones took, with nothing
+to tell its client to come back later. MiaAI-Lab's recipe v1.8 adds admission at saturation with patch
+0082-tfcap-admission-cap (by johnwhited, after vLLM v1's check_admission): TF_GLM_MAX_QUEUED unset queues as every
+scheduler always has (the recipe's default: its scripts/config.sh exports it empty); a number N refuses a foreground
+request past the lanes plus N waiting ones at once with a CapacityError (patch 0081 renders it as 429 with
+Retry-After: 5), while background requests bypass the cap and queue. On the AFD split the scheduler is the attention
+node's (GlmScheduler, rank 0 of world 1). This ports it under the recipe's own switch name; unset is the default here
+too:
+
+- cuda/scheduler.py: Waiting.foreground_count, Scheduler's max_in_system and _check_admission, its call in submit,
+  verbatim; foreground_count also skips TensorFold v0.6.5's close() stop entry (a None item), which the recipe's
+  v0.6.0 queue never holds; the CapacityError import sits with the absolute imports (ruff's import order).
+- multi.py: GlmScheduler reads TF_GLM_MAX_QUEUED into max_in_system (lanes + N) and submit runs the check first,
+  before this tree's TF_GLM_QUEUED_CANCEL branch, as the patch runs it first in 0073's submit; the patch's unused
+  CapacityError import in multi.py is left out (ruff).
+- engine.py: a startup line naming the cap when TF_GLM_MAX_QUEUED is set.
+- tests/test_glm_queued_cancel.py: the recipe's 0073 checks build their GlmScheduler without __init__, so the harness
+  now also sets max_in_system = None (TF_GLM_MAX_QUEUED unset), as it sets queued_cancel. The recipe's own
+  tools/test_queued_cancellation.py, unchanged since v1.6, stops at its first check on the recipe's v1.8 tree for this
+  reason (AttributeError in the caller thread: "caller/scheduler did not make bounded progress"); at v1.7.1 it passes
+  21/21.
+- THIRD_PARTY_NOTICES.md: "Admission at saturation".
+
+Unset (or empty), max_in_system is None and _check_admission returns at once: every request queues as before.
+
+Tests (CPU): tests/test_glm_admission_cap.py (16, with TF_GLM_QUEUED_CANCEL unset and set): the cap is the lanes plus
+TF_GLM_MAX_QUEUED (unset and empty: none); unset, a request past two busy lanes waits and is served; 0, it is refused
+at once with no token sent, a background request still queues, and the busy replies finish; 1, one waits and the next
+is refused, and a request after the lanes free is served; foreground_count skips background requests and the stop
+entry; the base Scheduler never refuses without a cap.
+
+Credit: patch 0082 was written by johnwhited (https://github.com/johnwhited) in
+MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold pull request #48 (commit 9d2fd5e), with vLLM v1's
+check_admission as its reference; MiaAI-Lab applied it as contributed (merge 0cbe026, renumbered in e6bc3e0, v1.8 at
+33b50fd), Apache License 2.0.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patch 0082,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 33b50fde06fd7ea604cbc6a663880068ab1e2ee4 (v1.8); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |  17 ++
+ src/tensorfold/cuda/scheduler.py              |  25 ++-
+ .../families/glm5_next/cuda/engine.py         |   7 +
+ .../families/glm5_next/cuda/multi.py          |  13 +-
+ tests/test_glm_admission_cap.py               | 187 ++++++++++++++++++
+ tests/test_glm_queued_cancel.py               |   1 +
+ 6 files changed, 247 insertions(+), 3 deletions(-)
+ create mode 100644 tests/test_glm_admission_cap.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index cbe324e..22de6c7 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -642,3 +642,20 @@ admission check (Apache 2.0) as its reference. Under the recipe's Apache License
+ and 400 on the generic server's generate path, as TensorFold v0.6.5); the same rule also covers the tokenizer routes'
+ refusals of both handlers, which TensorFold v0.6.5 renders as 503; the Anthropic route keeps its own (503,
+ `overloaded_error`).
++
++## Admission at saturation (TF_GLM_MAX_QUEUED)
++
++`cuda/scheduler.py`'s `Scheduler._check_admission`, `Scheduler`'s `max_in_system` and `Waiting.foreground_count`, and
++`families/glm5_next/cuda/multi.py`'s `GlmScheduler` reading `TF_GLM_MAX_QUEUED` (unset, a request past the lanes
++queues as every scheduler always has; a number N, a foreground request past the lanes plus N waiting ones is refused at
++once with a `CapacityError`, while background requests still queue) are MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/33b50fde06fd7ea604cbc6a663880068ab1e2ee4)
++patch 0082-tfcap-admission-cap (v1.8), written by [johnwhited](https://github.com/johnwhited) in
++[pull request #48](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/48) (commit
++[`9d2fd5e`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/commit/9d2fd5e32e2f9cf83a05f51a08ca4f440d9cf6f9))
++and applied by MiaAI-Lab as contributed; the recipe credits [vLLM](https://github.com/vllm-project/vllm) v1's
++`check_admission` (Apache 2.0) as its reference. Under the recipe's Apache License 2.0 (see
++[the license text](LICENSES/Apache-2.0.txt)). The switch is the recipe's own (`TF_GLM_MAX_QUEUED`, unset by default in
++its `scripts/config.sh`). Changes in the port: `Waiting.foreground_count` skips TensorFold v0.6.5's `close()` stop
++entry, which the recipe's queue never holds; the patch's unused `CapacityError` import in `multi.py` is left out;
++`GlmScheduler.submit` runs the check before this tree's `TF_GLM_QUEUED_CANCEL` branch; a startup line names the cap.
+diff --git a/src/tensorfold/cuda/scheduler.py b/src/tensorfold/cuda/scheduler.py
+index 7fece6a..fda83ac 100644
+--- a/src/tensorfold/cuda/scheduler.py
++++ b/src/tensorfold/cuda/scheduler.py
+@@ -8,6 +8,8 @@ import queue
+ import threading
+ from typing import Any, Callable
+ 
++from tensorfold.server.errors import CapacityError  # TFCAP-0075
++
+ from .memory_gate import NoRoom
+ from .streams import Stream
+ 
+@@ -39,6 +41,12 @@ class Waiting(queue.PriorityQueue):
+ 
+         super().put((2, next(self._order), None))
+ 
++    def foreground_count(self) -> int:
++        # TFCAP-0075: queued background streams never consume admission slots; scheduling prefers
++        # foreground, so only foreground waiters count against the cap.
++        with self.mutex:
++            return sum(1 for _p, _o, item in self.queue if item is not None and not item[0].background)
++
+     def foreground(self) -> bool:
+         """Whether a foreground request waits."""
+ 
+@@ -47,9 +55,16 @@ class Waiting(queue.PriorityQueue):
+ 
+ 
+ class Scheduler:
+-    def __init__(self, decoder: Any, *, max_streams: int = 4) -> None:
++    def __init__(self, decoder: Any, *, max_streams: int = 4,
++                 max_in_system: int | None = None) -> None:
+         self.decoder = decoder
+         self.max_streams = max_streams
++        # TFCAP-0075: the mechanism is unconditional; the limit is configuration, as in vLLM — its
++        # check_admission runs on every request while max_num_queued_reqs/max_num_queued_tokens
++        # default to None ("bounds vLLM's otherwise unbounded request queue", "a coarse capacity
++        # valve"). None queues, as every scheduler always has; a cap turns saturation into a
++        # refusal with a retry hint instead of invisible stacking.
++        self.max_in_system = max_in_system
+         self.waiting = Waiting()
+         self.held: tuple | None = None               # a request waiting for memory, admitted before any other
+         self.boxes: dict[int, queue.Queue] = {}
+@@ -66,10 +81,18 @@ class Scheduler:
+         self.thread.join()
+         self.decoder = None
+ 
++    def _check_admission(self, background: bool) -> None:
++        # TFCAP-0075: refusal at saturation. Background requests bypass: they yield and queue by design.
++        if background or self.max_in_system is None:
++            return
++        if self.decoder.live() + self.waiting.foreground_count() >= self.max_in_system:
++            raise CapacityError("all serving lanes are busy; retry shortly")
++
+     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
+                emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
+                constraint: Any = None, background: bool = False, probabilities: Any = None) -> dict:
+         """Decode one request; ``emit`` runs on the calling thread and returns True to stop. Returns its stats."""
++        self._check_admission(background)
+ 
+         box: queue.Queue = queue.Queue()
+         stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 3710994..bb4a0e3 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -810,6 +810,13 @@ class GlmEngine:
+                     print("[tensorfold] TF_GLM_QUEUED_CANCEL=1: a waiting request whose client left is dropped at once, "
+                           "even while every lane is busy; a reply whose delivery fails ends after its round (MiaAI-Lab "
+                           "recipe patch 0073, by desy0305)", flush=True)
++                if getattr(self.scheduler, "max_in_system", None) is not None:
++                    lanes = self.scheduler.max_streams
++                    queued = self.scheduler.max_in_system - lanes
++                    print(f"[tensorfold] TF_GLM_MAX_QUEUED={queued}: past the {lanes} lanes plus {queued} waiting, a "
++                          "foreground request is refused instead of queueing (429 with Retry-After: 5 under "
++                          "TF_GLM_CAPACITY_STATUS=1, else 503; a streamed one gets the stream's error event); background "
++                          "requests still queue (MiaAI-Lab recipe patch 0082, by johnwhited)", flush=True)
+                 if self.multi.compact_first:
+                     print("[tensorfold] TF_GLM_COMPACT_BEFORE_EVICT=1: room in the pool comes from moving extents "
+                           "together before any kept prompt is evicted, and evictions only while the free rows fall "
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index 3a2beae..5075b57 100644
+--- a/src/tensorfold/families/glm5_next/cuda/multi.py
++++ b/src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -2245,7 +2245,14 @@ class GlmScheduler(Scheduler):
+         # TF_GLM_QUEUED_CANCEL=1 (MiaAI-Lab recipe patch 0073, by desy0305; off by default here): a waiting request
+         # whose client left is dropped at once, even while every lane is busy (``_cancel_waiting``)
+         self.queued_cancel = recipe_switch("TF_GLM_QUEUED_CANCEL")
+-        super().__init__(decoder, max_streams=max_streams)
++        # TFCAP-0075: the cap is operator configuration (TF_GLM_MAX_QUEUED, exported by scripts/config.sh):
++        # unset queues as every scheduler always has; N refuses past the lanes plus N. vLLM's default is
++        # likewise no limit — its own words, the cap "bounds vLLM's otherwise unbounded request queue".
++        # A single-instance LAN deployment has no load balancer to shed load ahead of the server, so an
++        # exposed one should set a small cap (ours: 0 — nothing waits past the lanes).
++        queued = os.environ.get("TF_GLM_MAX_QUEUED")
++        super().__init__(decoder, max_streams=max_streams,
++                         max_in_system=max_streams + int(queued) if queued else None)
+ 
+     def _waiting_prompts(self) -> list[list[int]]:
+         """The waiting requests' prompts in admission order, the held one first (TF_GLM_CACHE_ROOM's
+@@ -2261,7 +2268,9 @@ class GlmScheduler(Scheduler):
+                emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
+                constraint: Any = None, background: bool = False, glm: dict | None = None) -> dict:
+         """``Scheduler.submit`` with the request's GLM settings (``glm``: its policy code and spec).
+-        TF_GLM_QUEUED_CANCEL=1: ``_submit_polled``."""
++        TF_GLM_QUEUED_CANCEL=1: ``_submit_polled``. TF_GLM_MAX_QUEUED (MiaAI-Lab recipe patch 0082): a foreground
++        request past the lanes plus that many waiting is refused here (``Scheduler._check_admission``)."""
++        self._check_admission(background)
+ 
+         box: queue.Queue = queue.Queue()
+         stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
+diff --git a/tests/test_glm_admission_cap.py b/tests/test_glm_admission_cap.py
+new file mode 100644
+index 0000000..f9617f0
+--- /dev/null
++++ b/tests/test_glm_admission_cap.py
+@@ -0,0 +1,187 @@
++"""MiaAI-Lab recipe patch 0082 (by johnwhited), ``TF_GLM_MAX_QUEUED``: admission at saturation. Unset (the recipe's
++default), a request past the lanes queues as every scheduler always has; N, a foreground request past the lanes plus
++N waiting ones is refused at once (``CapacityError``: 429 with Retry-After under TF_GLM_CAPACITY_STATUS=1, else 503),
++while background requests still queue. CPU only: GlmScheduler over a stand-in decoder whose lanes stay busy until the
++test lets them go; with TF_GLM_QUEUED_CANCEL unset and set (0073's submit runs the same check first)."""
++
++from __future__ import annotations
++
++import threading
++import time
++
++import pytest
++
++from tensorfold.cuda.scheduler import Scheduler, Waiting
++from tensorfold.cuda.streams import Stream
++from tensorfold.families.glm5_next.cuda.multi import GlmScheduler
++from tensorfold.server.errors import CapacityError
++
++LANES = 2
++COUNT = 3
++
++
++class Lanes:
++    """A stand-in MultiDecoder: an admitted stream holds a lane; while ``go`` is set every live stream takes one token
++    a round and ends at its count."""
++
++    def __init__(self):
++        self.streams = {}
++        self.requeue = []
++        self.go = threading.Event()
++
++    def live(self):
++        return len(self.streams)
++
++    def fits(self, stream):
++        return True
++
++    def admit(self, stream):
++        stream.started = time.perf_counter()
++        self.streams[id(stream)] = stream
++
++    def round(self):
++        time.sleep(0.001)
++        if not self.go.is_set():
++            return []
++        done = []
++        for s in list(self.streams.values()):
++            s.take([7])
++            if s.done:
++                done.append(s)
++        return done
++
++    def finish(self, done):
++        for s in done:
++            self.streams.pop(id(s), None)
++
++    def drop(self):
++        out = list(self.streams.values())
++        self.streams.clear()
++        return out
++
++    def stats(self, s):
++        return s.stats()
++
++
++def until(cond, seconds=5.0):
++    end = time.monotonic() + seconds
++    while not cond():
++        if time.monotonic() > end:
++            raise AssertionError("timed out")
++        time.sleep(0.002)
++
++
++class Client(threading.Thread):
++    """One request: ``submit`` on its own thread, as the server's handler thread calls it."""
++
++    def __init__(self, scheduler, background=False):
++        super().__init__(daemon=True)
++        self.scheduler, self.background, self.tokens, self.result, self.error = scheduler, background, [], None, None
++        self.start()
++
++    def run(self):
++        try:
++            self.result = self.scheduler.submit([1, 2, 3], COUNT, None, True, self.emit, background=self.background)
++        except Exception as exc:  # noqa: BLE001  the test reads it
++            self.error = exc
++
++    def emit(self, new):
++        self.tokens.extend(new)
++        return False
++
++
++@pytest.fixture(params=["", "1"], ids=["submit", "queued-cancel"])
++def scheduler(monkeypatch, request):
++    """A factory: GlmScheduler over ``Lanes`` with TF_GLM_MAX_QUEUED set to the given value (None: unset)."""
++
++    monkeypatch.setenv("TF_GLM_QUEUED_CANCEL", request.param)
++    made = []
++
++    def make(queued):
++        if queued is None:
++            monkeypatch.delenv("TF_GLM_MAX_QUEUED", raising=False)
++        else:
++            monkeypatch.setenv("TF_GLM_MAX_QUEUED", queued)
++        s = GlmScheduler(Lanes(), max_streams=LANES)
++        made.append(s)
++        return s
++    yield make
++    for s in made:                                        # close() stops an idle worker: let streams end first
++        s.decoder.go.set()
++        deadline = time.monotonic() + 5
++        while (s.decoder.live() or s.waiting.qsize()) and time.monotonic() < deadline:
++            time.sleep(0.005)
++        s.close()
++
++
++@pytest.mark.parametrize("queued, cap", [(None, None), ("", None), ("0", LANES), ("3", LANES + 3)])
++def test_the_cap_is_the_lanes_plus_max_queued(scheduler, queued, cap):
++    assert scheduler(queued).max_in_system == cap        # "" is what the recipe's config.sh exports when unset
++
++
++def test_unset_a_request_past_the_lanes_queues_as_before(scheduler):
++    s = scheduler(None)
++    busy = [Client(s) for _ in range(LANES)]
++    until(lambda: s.decoder.live() == LANES)
++    extra = Client(s)
++    until(lambda: s.waiting.foreground_count() == 1)
++    s.decoder.go.set()
++    for c in [*busy, extra]:
++        c.join(5)
++        assert c.error is None and c.tokens == [7] * COUNT
++
++
++def test_max_queued_0_refuses_the_request_past_the_lanes_at_once(scheduler):
++    s = scheduler("0")
++    busy = [Client(s) for _ in range(LANES)]
++    until(lambda: s.decoder.live() == LANES)
++    t0 = time.monotonic()
++    refused = Client(s)
++    refused.join(5)
++    assert isinstance(refused.error, CapacityError) and "retry shortly" in str(refused.error)
++    assert time.monotonic() - t0 < 1.0 and refused.tokens == []
++    background = Client(s, background=True)             # background requests bypass the cap and queue
++    until(lambda: s.waiting.qsize() == 1)
++    s.decoder.go.set()
++    for c in [*busy, background]:
++        c.join(5)
++        assert c.error is None and c.tokens == [7] * COUNT
++
++
++def test_max_queued_1_lets_one_wait_and_refuses_the_next(scheduler):
++    s = scheduler("1")
++    busy = [Client(s) for _ in range(LANES)]
++    until(lambda: s.decoder.live() == LANES)
++    waits = Client(s)
++    until(lambda: s.waiting.foreground_count() == 1)
++    refused = Client(s)
++    refused.join(5)
++    assert isinstance(refused.error, CapacityError)
++    s.decoder.go.set()
++    for c in [*busy, waits]:
++        c.join(5)
++        assert c.error is None and c.tokens == [7] * COUNT
++    after = Client(s)                                     # room again once the lanes free
++    after.join(5)
++    assert after.error is None and after.tokens == [7] * COUNT
++
++
++def test_foreground_count_skips_background_and_the_stop_entry():
++    w = Waiting()
++    w.put((Stream([1], 1), None))
++    w.put((Stream([1], 1, background=True), None))
++    w.stop()                                              # TensorFold v0.6.5's close() entry: not a request
++    assert w.foreground_count() == 1
++
++
++def test_the_base_scheduler_never_refuses_without_a_cap():
++    s = Scheduler(Lanes(), max_streams=1)
++    try:
++        assert s.max_in_system is None
++        s._check_admission(False)
++        s.max_in_system = 0
++        with pytest.raises(CapacityError):
++            s._check_admission(False)
++        s._check_admission(True)                          # background bypasses
++    finally:
++        s.close()
+diff --git a/tests/test_glm_queued_cancel.py b/tests/test_glm_queued_cancel.py
+index 21587bf..521d5d1 100644
+--- a/tests/test_glm_queued_cancel.py
++++ b/tests/test_glm_queued_cancel.py
+@@ -98,6 +98,7 @@ def checks(source_root, expect_stock: bool = False, on: bool = True):
+         obj = object.__new__(ns["GlmScheduler"])
+         obj.decoder, obj.max_streams = Decoder(), capacity
+         obj.queued_cancel, obj.sjf = on, False       # this tree: TF_GLM_QUEUED_CANCEL (GlmScheduler.__init__), FIFO
++        obj.max_in_system = None                     # TF_GLM_MAX_QUEUED unset (Scheduler.__init__; recipe 0082)
+         obj.waiting, obj.held, obj.boxes, obj.yields, obj.gather_s = ns["Waiting"](), None, {}, 0, 0
+         for _ in range(holders):
+             stream = Stream([1], 100)

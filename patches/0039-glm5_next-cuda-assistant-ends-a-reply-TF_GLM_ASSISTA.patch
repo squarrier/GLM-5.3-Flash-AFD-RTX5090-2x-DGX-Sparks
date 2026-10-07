@@ -1,0 +1,387 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 20:11:20 -0400
+Subject: [PATCH] glm5_next/cuda: <|assistant|> ends a reply,
+ TF_GLM_ASSISTANT_ENDS (MiaAI-Lab recipe patch 0075)
+
+At high reasoning effort GLM-5.3 sometimes wrote its <|assistant|> role token inside its answer and began a second
+one, and the raw token reached the reply's text, which agents then fed back into the conversation (the recipe's
+issue #60, reported by Lukas-tek-no-logic). MiaAI-Lab's recipe v1.6 ends the reply there, like the checkpoint's end
+tokens (<|endoftext|>, <|user|>, <|observation|>), with patch 0075-glm-assistant-ends: the token's id is read from the
+checkpoint's tokenizer.json and joins Config.eos, which every decode loop, the multi-stream decoder, the grammar and
+the server's text use on every rank, and the startup comparison checks the ranks agree. This ports it with the
+recipe's own switch, TF_GLM_ASSISTANT_ENDS, but off by default here (the recipe's default is 1):
+
+- weights.py: assistant_end, verbatim but for the default (unset or 0: None; 1: the token's id; anything else is
+  refused); Config.read adds the token to eos when it is on, verbatim.
+- engine.py: the end tokens' count and sum in the ranks' startup row and TF_GLM_ASSISTANT_ENDS in its refusal, as in
+  the patch (the row has them whatever the switch; with it off they are the checkpoint's own, so both ranks agree as
+  before), on a line of their own after the KV kind's, so that line reads as before (tests/test_glm_kv8.py checks its
+  source); a startup line when the token ends replies.
+- tests/test_cuda_capacity.py: its fake GLM Config has end tokens, as Config does (the startup row now reads them).
+- THIRD_PARTY_NOTICES.md: "GLM assistant ends".
+
+Unset, Config.eos is the checkpoint's end tokens, as before.
+
+Tests: tests/test_glm_assistant_ends.py (8, CPU): the switch's values (unset, empty and 0 off; 1 on; others refused);
+only the special <|assistant|> of a readable tokenizer.json is added, once; GlmEngine's start up to the ranks'
+comparison with no device or weights: the row differs only in the end tokens' count and sum, and a rank on with one
+off refuses to start, naming the switch; a reply through the single-stream engine and two ranks' multi-stream
+decoders over the fake model, with one of its tokens standing for <|assistant|>: off it runs past the token, on it
+ends there, and a second stream decoding beside it is unchanged.
+
+Credit: patch 0075 was written by MiaAI-Lab (https://github.com/MiaAI-Lab) for
+MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold issue #60, reported by Lukas-tek-no-logic
+(https://github.com/Lukas-tek-no-logic), in recipe commit 5859365 (v1.6), Apache License 2.0.
+
+Changed from the picked commit: the end tokens join the startup row with a line of their own (mine += [...]) instead
+of inside the KV kind's line; the row is the same, in the same order.
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patch 0075,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 68ebd67b5326974b8004009e202268b1fa7c551d (v1.7.1); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ THIRD_PARTY_NOTICES.md                        |  15 ++
+ .../families/glm5_next/cuda/engine.py         |  10 +-
+ .../families/glm5_next/cuda/weights.py        |  27 +++
+ tests/test_cuda_capacity.py                   |   4 +-
+ tests/test_glm_assistant_ends.py              | 192 ++++++++++++++++++
+ 5 files changed, 245 insertions(+), 3 deletions(-)
+ create mode 100644 tests/test_glm_assistant_ends.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index 7cd0f55..b04dfae 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -574,3 +574,18 @@ ezoushen), verbatim. Both are under the recipe's Apache License 2.0 (see [the li
+ Changes in the port: the recipe always runs it, and here it is off unless `TF_GLM_COMPACT_BEFORE_EVICT=1`
+ (`MultiDecoder.compact_first`); unset, `_room` and `_grow` run as before (`_compact()` without `grow` is unchanged).
+ With `TF_GLM_CACHE_ROOM=1` also set, this tree's `cache_room` makes the room, as it does without this switch.
++
++## GLM assistant ends (TF_GLM_ASSISTANT_ENDS)
++
++`families/glm5_next/cuda/weights.py`'s `assistant_end` and its use in `Config.read` (GLM's `<|assistant|>` role token
++ends a reply, like the checkpoint's end tokens), and the end tokens in the ranks' startup comparison in
++`families/glm5_next/cuda/engine.py`, are MiaAI-Lab's
++[GLM-5.3-Flash EXL3 2x DGX Spark recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/68ebd67)
++patch 0075-glm-assistant-ends (v1.6, recipe commit
++[`5859365`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/commit/585936585de470a0b687a998f48b636bd22e440d)),
++written by MiaAI-Lab for
++[issue #60](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/issues/60), reported by
++[Lukas-tek-no-logic](https://github.com/Lukas-tek-no-logic), under the recipe's Apache License 2.0 (see
++[the license text](LICENSES/Apache-2.0.txt)). Changes in the port: the recipe's `TF_GLM_ASSISTANT_ENDS` defaults to 1,
++and here to 0 (unset or 0: the checkpoint's end tokens only, as before; 1: the recipe's behaviour); a startup line
++when it is on.
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 8189689..fda57ec 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -592,6 +592,7 @@ class GlmEngine:
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
+                 prefill_rows, int(self.mtp_on), int(DRAFT_RING), parallel, *multi_code, self.shared,
+                 KV_KINDS.index(kv)]
++        mine += [len(cfg.eos), sum(cfg.eos)]              # the end tokens: TF_GLM_ASSISTANT_ENDS (recipe 0075)
+         mine += [self.grid, int(kda_chunked_on())]        # TF_GLM_PROMPT_GRID, TF_GLM_KDA_CHUNKED (recipe 0008, 0039)
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+@@ -602,7 +603,7 @@ class GlmEngine:
+             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
+                                "TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING, --parallel, TF_GLM_MULTI_VERIFY, "
+                                "TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
+-                               "TF_GLM_KV, "
++                               "TF_GLM_KV, TF_GLM_ASSISTANT_ENDS, "
+                                "TF_GLM_SHARED_PREFIX, TF_GLM_PROMPT_GRID, TF_GLM_KDA_CHUNKED): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+                                "(or pass --drafter none to both) and give both the same flags")
+@@ -724,6 +725,13 @@ class GlmEngine:
+             print("[tensorfold] drafter costs (ms): verify " + " ".join(f"{v:.1f}" for v in c["verify"]) + mtp +
+                   f"; DFlash2 block {c['block']:.2f} (+{c['taps_row']:.3f} a tap row)", flush=True)
+         self.eos = tuple(w.cfg.eos)
++        from .weights import assistant_end
++
++        role_end = assistant_end(str(Path(model_dir)))       # TF_GLM_ASSISTANT_ENDS=1 (recipe 0075): in self.eos
++        if rank == 0 and role_end is not None:
++            print(f"[tensorfold] TF_GLM_ASSISTANT_ENDS=1: <|assistant|> ({role_end}) ends a reply, like the "
++                  "checkpoint's end tokens (MiaAI-Lab recipe patch 0075, issue #60 reported by Lukas-tek-no-logic)",
++                  flush=True)
+         self.model_dir = Path(model_dir)
+         self.request = threading.local()    # the calling request's policy and stop-at-EOS (``app.GlmApp``)
+         # kept conversations (decode.Snapshot, least recently used first) and the live caches' ids; states and saved rows stay within cache_bytes
+diff --git a/src/tensorfold/families/glm5_next/cuda/weights.py b/src/tensorfold/families/glm5_next/cuda/weights.py
+index 5573367..3eb51ab 100644
+--- a/src/tensorfold/families/glm5_next/cuda/weights.py
++++ b/src/tensorfold/families/glm5_next/cuda/weights.py
+@@ -3,7 +3,9 @@
+ from __future__ import annotations
+ 
+ import json
++import os
+ from dataclasses import dataclass, field
++from functools import lru_cache
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -19,6 +21,28 @@ from .qmm import (B16, F8, Q4, as_i32, dense_kind, make_b16, make_dense_q4, make
+ PREFIX = "model.language_model."
+ 
+ 
++@lru_cache(maxsize=None)  # noqa: UP033  (recipe patch 0075's line, verbatim)
++def assistant_end(model_dir: str) -> int | None:
++    """The id of GLM's ``<|assistant|>`` role token when it ends a reply (TF_GLM_ASSISTANT_ENDS=1; unset or 0: it
++    doesn't), or None without one in the checkpoint's tokenizer. The checkpoint's end tokens are ``<|endoftext|>``,
++    ``<|user|>`` and ``<|observation|>``; at high reasoning effort the model sometimes writes ``<|assistant|>``
++    inside its answer and starts a second one, which reached the client with the token in its text (issue #60). A new
++    assistant turn inside an assistant turn ends it: the reply stops there, as at the other role tokens. (MiaAI-Lab
++    recipe patch 0075, reported by Lukas-tek-no-logic; the recipe's default is 1, this tree's 0)"""
++
++    on = (os.environ.get("TF_GLM_ASSISTANT_ENDS", "") or "0").strip()
++    if on not in ("0", "1"):
++        raise ValueError(f"TF_GLM_ASSISTANT_ENDS: 0 or 1, not {on!r}")
++    path = Path(model_dir) / "tokenizer.json"
++    if on == "0" or not path.is_file():
++        return None
++    try:
++        added = json.loads(path.read_text()).get("added_tokens", [])
++    except (OSError, ValueError):
++        return None
++    return next((int(t["id"]) for t in added if t.get("content") == "<|assistant|>" and t.get("special")), None)
++
++
+ def bits_of(quant: dict) -> int:
+     """The checkpoint's one bit width; a mixed-bit encode (bits such as "mixed_k34_per_tensor") is refused by name."""
+ 
+@@ -80,6 +104,9 @@ class Config:
+         quant = raw.get("quantization") or raw.get("quantization_config") or {}
+         eos = t.get("eos_token_id", raw.get("eos_token_id"))
+         eos = tuple(int(e) for e in eos) if isinstance(eos, list) else (int(eos),)
++        end = assistant_end(str(Path(model_dir)))
++        if end is not None and end not in eos:
++            eos += (end,)                     # issue #60: a new assistant turn ends the reply (TF_GLM_ASSISTANT_ENDS)
+         n = int(t["num_hidden_layers"])
+         kinds = ["kda" if k == "linear_attention" else "dsa" for k in t["layer_types"]]
+         dense = int(t.get("first_k_dense_replace", 3))
+diff --git a/tests/test_cuda_capacity.py b/tests/test_cuda_capacity.py
+index 6de7ed9..3c988db 100644
+--- a/tests/test_cuda_capacity.py
++++ b/tests/test_cuda_capacity.py
+@@ -44,7 +44,7 @@ def test_glm_nonfit_refuses_before_weight_load(tmp_path, monkeypatch):
+     from tensorfold.families.glm5_next.cuda import engine
+     import sys
+ 
+-    glm = SimpleNamespace(dense_limit=2051, mtp_layers=1, layers=4)
++    glm = SimpleNamespace(dense_limit=2051, mtp_layers=1, layers=4, eos=(154820, 154827, 154829))
+     weights = SimpleNamespace(Config=SimpleNamespace(read=lambda *a: glm), load=None)
+     monkeypatch.setitem(sys.modules, "tensorfold.families.glm5_next.cuda.weights", weights)
+     monkeypatch.setitem(sys.modules, "tensorfold.families.glm5_next.cuda.decode", SimpleNamespace(Engine=None))
+@@ -140,7 +140,7 @@ def fake_runtime(monkeypatch):
+         prefix = f"tensorfold.families.{family}.cuda"
+         weights = SimpleNamespace(load=load, draft_token_ids=lambda *a: None,
+                                   Config=SimpleNamespace(read=lambda *a: SimpleNamespace(dense_limit=2051, mtp_layers=1,
+-                                                                                         layers=4)))
++                                                                                         layers=4, eos=(154820,))))
+         monkeypatch.setitem(sys.modules, prefix + ".weights", weights)
+         monkeypatch.setitem(sys.modules, prefix + ".decode", SimpleNamespace(Engine=None))
+     import torch.distributed as dist
+diff --git a/tests/test_glm_assistant_ends.py b/tests/test_glm_assistant_ends.py
+new file mode 100644
+index 0000000..606bd6f
+--- /dev/null
++++ b/tests/test_glm_assistant_ends.py
+@@ -0,0 +1,192 @@
++"""TF_GLM_ASSISTANT_ENDS (MiaAI-Lab recipe patch 0075; issue #60, reported by Lukas-tek-no-logic): GLM's
++``<|assistant|>`` role token ends a reply like the checkpoint's end tokens, on the CPU.
++
++At high reasoning effort the model sometimes wrote ``<|assistant|>`` inside its answer and began a second one, and the
++raw token reached the reply's text. With the switch on, ``weights.assistant_end`` reads the token's id from the
++checkpoint's tokenizer.json and ``Config.read`` adds it to ``Config.eos``, which every decode loop, the multi-stream
++decoder, the grammar and the server's text use; the startup comparison checks the ranks agree. Unset or 0 (this tree's
++default; the recipe's is 1): the checkpoint's end tokens only, as before. Covered: the token's lookup; ``Config.read``;
++the startup row and the refusal of ranks that differ; a reply through the single-stream engine and through two ranks'
++multi-stream decoders over tests/test_glm_multi.py's fake model, ending at the token with the switch on.
++"""
++
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from tests import test_glm_multi as tm
++from tests.test_cuda_geometry import allocations  # noqa: F401  (fixture: fake triton, so decode imports)
++
++fake = tm.fake
++
++ENDS = [154820, 154827, 154829]            # GLM-5.3's <|endoftext|>, <|user|>, <|observation|>
++ASSISTANT = 154828                         # <|assistant|>
++
++
++@pytest.fixture(autouse=True)
++def _fresh_lookup():
++    """``assistant_end`` reads the switch once per checkpoint (``lru_cache``, as in the recipe): each test reads anew."""
++    from tensorfold.families.glm5_next.cuda.weights import assistant_end
++
++    assistant_end.cache_clear()
++    yield
++    assistant_end.cache_clear()
++
++
++def checkpoint(path, *, eos=ENDS, assistant=ASSISTANT, special=True, tokenizer=True):
++    """A GLM-5.3 checkpoint directory's config.json and tokenizer.json (no tensors: Config.read reads neither)."""
++
++    config = {"hidden_size": 64, "num_hidden_layers": 4, "layer_types": ["linear_attention", "full_attention"] * 2,
++              "vocab_size": 154880, "rms_norm_eps": 1e-5, "num_attention_heads": 4, "q_lora_rank": 32,
++              "kv_lora_rank": 16, "qk_nope_head_dim": 16, "qk_rope_head_dim": 8, "v_head_dim": 16,
++              "n_routed_experts": 8, "num_experts_per_tok": 2, "moe_intermediate_size": 32, "intermediate_size": 64,
++              "routed_scaling_factor": 2.5, "eos_token_id": list(eos), "max_position_embeddings": 8192}
++    (path / "config.json").write_text(json.dumps(config))
++    if tokenizer:
++        added = [{"id": e, "content": c, "special": True}
++                 for e, c in zip(ENDS, ("<|endoftext|>", "<|user|>", "<|observation|>"))]
++        added.append({"id": assistant, "content": "<|assistant|>", "special": special})
++        (path / "tokenizer.json").write_text(json.dumps({"added_tokens": added}))
++    return path
++
++
++def eos_of(path, monkeypatch, value):
++    from tensorfold.families.glm5_next.cuda.weights import Config, assistant_end
++
++    if value is None:
++        monkeypatch.delenv("TF_GLM_ASSISTANT_ENDS", raising=False)
++    else:
++        monkeypatch.setenv("TF_GLM_ASSISTANT_ENDS", value)
++    assistant_end.cache_clear()
++    return Config.read(path).eos
++
++
++def test_off_unless_set(tmp_path, monkeypatch):
++    """Unset and 0: the checkpoint's end tokens only (this tree's default); 1: <|assistant|> joins them, last."""
++    checkpoint(tmp_path)
++    assert eos_of(tmp_path, monkeypatch, None) == tuple(ENDS)
++    assert eos_of(tmp_path, monkeypatch, "") == tuple(ENDS)
++    assert eos_of(tmp_path, monkeypatch, "0") == tuple(ENDS)
++    assert eos_of(tmp_path, monkeypatch, "1") == tuple(ENDS) + (ASSISTANT,)
++    assert eos_of(tmp_path, monkeypatch, " 1 ") == tuple(ENDS) + (ASSISTANT,)
++
++
++@pytest.mark.parametrize("value", ["2", "yes", "on", "true"])
++def test_anything_else_is_refused(tmp_path, monkeypatch, value):
++    checkpoint(tmp_path)
++    with pytest.raises(ValueError, match="TF_GLM_ASSISTANT_ENDS: 0 or 1"):
++        eos_of(tmp_path, monkeypatch, value)
++
++
++def test_only_the_special_role_token_ends(tmp_path, monkeypatch):
++    """No tokenizer.json, an unreadable one, a plain-text ``<|assistant|>``, or an id already among the end tokens:
++    the end tokens stay as the checkpoint has them."""
++    from tensorfold.families.glm5_next.cuda.weights import assistant_end
++
++    for kw in ({"tokenizer": False}, {"special": False}):
++        d = tmp_path / json.dumps(kw).strip("{}").replace('"', "").replace(": ", "-")
++        d.mkdir()
++        assert eos_of(checkpoint(d, **kw), monkeypatch, "1") == tuple(ENDS)
++    bad = tmp_path / "bad"
++    bad.mkdir()
++    checkpoint(bad)
++    (bad / "tokenizer.json").write_text("{not json")
++    assert eos_of(bad, monkeypatch, "1") == tuple(ENDS)
++    has = tmp_path / "has"
++    has.mkdir()
++    assert eos_of(checkpoint(has, eos=ENDS + [ASSISTANT]), monkeypatch, "1") == tuple(ENDS) + (ASSISTANT,)
++    monkeypatch.setenv("TF_GLM_ASSISTANT_ENDS", "1")
++    assistant_end.cache_clear()
++    assert assistant_end(str(has)) == ASSISTANT
++
++
++def startup(tmp_path, monkeypatch, value, peer=None):
++    """GlmEngine's start on rank 0 up to the ranks' comparison (``_gather_ints``), with no device and no weights:
++    the row rank 0 sends, and (``peer``: the other rank's row) what the comparison does with it."""
++    torch = pytest.importorskip("torch")
++    from tensorfold.cuda import capacity
++    from tensorfold.families.glm5_next.cuda import engine, weights
++
++    class Sent(Exception):
++        pass
++
++    rows: list = []
++
++    def gather(self, values):
++        rows.append(list(values))
++        if peer is None:
++            raise Sent
++        return [list(values), list(peer)]
++
++    if value is None:
++        monkeypatch.delenv("TF_GLM_ASSISTANT_ENDS", raising=False)
++    else:
++        monkeypatch.setenv("TF_GLM_ASSISTANT_ENDS", value)
++    weights.assistant_end.cache_clear()
++    monkeypatch.setattr(torch.cuda, "set_device", lambda *a: None)
++    monkeypatch.setattr(capacity, "admit", lambda *a, **kw: {"context_window": 8192, "cache_slots": 4,
++                                                              "budget_bytes": 8 << 30,
++                                                              "total_bytes_estimate": 4 << 30})
++    monkeypatch.setattr(engine.GlmEngine, "_gather_ints", gather)
++    monkeypatch.setattr(weights, "load", lambda *a, **kw: pytest.fail("weights were loaded"))
++    comm = SimpleNamespace(barrier=lambda: None, ready=lambda *a, **kw: None)
++    with pytest.raises(Sent if peer is None else RuntimeError) as got:
++        engine.GlmEngine(tmp_path, rank=0, master="example", port=29551, comm=comm)
++    return rows[0], got.value
++
++
++@pytest.mark.torch
++def test_the_ranks_compare_their_end_tokens(tmp_path, allocations, monkeypatch):  # noqa: F811
++    """The start row carries the end tokens (their count and sum, as in the recipe): a rank with the switch on and
++    one with it off refuse to start, naming TF_GLM_ASSISTANT_ENDS; two alike start."""
++    checkpoint(tmp_path)
++    off, _ = startup(tmp_path, monkeypatch, None)
++    on, _ = startup(tmp_path, monkeypatch, "1")
++    assert len(off) == len(on)
++    differ = [i for i, (a, b) in enumerate(zip(off, on)) if a != b]
++    assert [(off[i], on[i]) for i in differ] == [(3, 4), (sum(ENDS), sum(ENDS) + ASSISTANT)]
++    _, refused = startup(tmp_path, monkeypatch, "1", peer=off)
++    assert "different settings" in str(refused) and "TF_GLM_ASSISTANT_ENDS" in str(refused)
++
++
++PLAIN_SHELL = tm.shell
++
++
++def _with_eos(monkeypatch, eos):
++    """tests/test_glm_multi.py's shells with ``eos`` as their checkpoint's end tokens (``Config.eos``)."""
++
++    def shell(*a, **kw):
++        g = PLAIN_SHELL(*a, **kw)
++        g.e.w.cfg.eos = g.eos = tuple(eos)
++        return g
++
++    monkeypatch.setattr(tm, "shell", shell)
++
++
++@pytest.mark.torch
++def test_a_reply_ends_at_the_role_token(tmp_path, fake, monkeypatch):
++    """The fake model's reply to a prompt, with one of its tokens standing for <|assistant|> in the checkpoint's
++    tokenizer: off, the reply runs past it, as before; on, it ends there, through the single-stream engine and two
++    ranks' multi-stream decoders alike (the token is the reply's last, as the checkpoint's end tokens are)."""
++    torch = fake
++    prompt, count = tm._prompt(80, 31), 48
++    plain = tm.solo(torch, prompt, count, None, stop_eos=True)
++    k = next(i for i in range(4, len(plain)) if plain[i] not in plain[:i] and plain[i] != tm.EOS)
++    assert k + 1 < len(plain)                      # the reply runs on past the token without the switch
++    role = plain[k]
++    checkpoint(tmp_path, eos=[tm.EOS], assistant=role)
++    for value, want in ((None, plain), ("1", plain[:k + 1])):
++        eos = eos_of(tmp_path, monkeypatch, value)
++        assert eos == ((tm.EOS,) if value is None else (tm.EOS, role))
++        _with_eos(monkeypatch, eos)
++        assert tm.solo(torch, prompt, count, None) == want
++        p = tm.Pair(torch, streams=2, blocks=4)
++        s = p.submit(prompt, count, None)
++        other = p.submit(tm._prompt(60, 32), 20, tm._sampling("topk", 3), stop_eos=False)
++        p.run()
++        assert s.got == want
++        assert other.got == tm.solo(torch, other.prompt, 20, tm._sampling("topk", 3), stop_eos=False)
++        p.check()

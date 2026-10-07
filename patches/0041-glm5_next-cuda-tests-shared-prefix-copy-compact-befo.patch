@@ -1,0 +1,188 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 07:31:52 -0400
+Subject: [PATCH] glm5_next/cuda tests: shared-prefix copy, compact before
+ evict and the kept cap with the host RAM tier (MiaAI-Lab recipe patches 0071,
+ 0074, 0077)
+
+The host RAM tier (TF_GLM_KEPT_HOST, TF_GLM_HOST_CACHE_GIB: kept_host) parks only the kept prompts that rank 0 evicts,
+for room or when a request takes their extent over; the kept cap's drops (TF_GLM_CACHE_ENTRIES) go without parking.
+The recipe's patches 0071, 0074 and 0077 change which kept prompts are evicted or dropped, so these tests run them with
+the tier on the AFD attention node's decoder (world 1 over the fake AFD wire, every reply checked against the request
+served alone):
+
+- 0071 (TF_GLM_SHARED_PREFIX_COPY): unset, a sub-agent resuming the writer's system block takes the writer's extent
+  over and evicts the writer's own state, which parks and comes back from host RAM at the writer's next turn; set,
+  the shared rows are copied, nothing parks, and the next turn resumes on the GPU. The same cached count either way.
+- 0074 (TF_GLM_COMPACT_BEFORE_EVICT), TF_GLM_CACHE_ROOM unset: a prompt that needs rows the free rows hold in pieces
+  evicts and parks the two oldest kept prompts unset, none set (the extents move together); the oldest prompt's next
+  turn resumes from host RAM or from the GPU. With TF_GLM_CACHE_ROOM=1, 0074 changes nothing: the same kept prompts,
+  extents, parks and cached counts.
+- 0077 (TF_GLM_CAP_SHARED_RECENCY): past the cap the run's system-block state goes unset and stays set; no state the
+  cap drops parks, so the agent's next run resumes the system block only with 0077 (and its takeover of the first
+  run's extent, without 0071, parks the first run's own state).
+
+Tests: tests/test_glm_recipe_host_tier.py (9, CPU).
+
+Credit: patches 0071 and 0074 were written by ezoushen (https://github.com/ezoushen) and patch 0077 by MiaAI-Lab
+(https://github.com/MiaAI-Lab), with the diagnosis and the fix proposed by meleesciony
+(https://github.com/meleesciony), for MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold (Apache License 2.0).
+
+Co-authored-by: MiaAI-Lab <MiaAI-Lab@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+Credit: ported from MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe, patches 0071, 0074, 0077,
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  at commit 68ebd67b5326974b8004009e202268b1fa7c551d (v1.7.1); Apache License 2.0, Copyright 2026 MiaAI-Lab.
+  Co-authored-by: MiaAI-Lab is kept in the message.
+
+ tests/test_glm_recipe_host_tier.py | 139 +++++++++++++++++++++++++++++
+ 1 file changed, 139 insertions(+)
+ create mode 100644 tests/test_glm_recipe_host_tier.py
+
+diff --git a/tests/test_glm_recipe_host_tier.py b/tests/test_glm_recipe_host_tier.py
+new file mode 100644
+index 0000000..8b379e1
+--- /dev/null
++++ b/tests/test_glm_recipe_host_tier.py
+@@ -0,0 +1,139 @@
++"""MiaAI-Lab recipe patches 0071, 0074 and 0077 (TF_GLM_SHARED_PREFIX_COPY, TF_GLM_COMPACT_BEFORE_EVICT,
++TF_GLM_CAP_SHARED_RECENCY) with the kept prompts' host RAM tier (TF_GLM_KEPT_HOST, TF_GLM_HOST_CACHE_GIB: ``kept_host``),
++on the CPU: the AFD attention node's decoder (tests/test_glm_multi_afd.py's ``World1`` on tests/test_glm_multi.py's
++fake model), every reply checked against the request served alone.
++
++The tier parks only the kept prompts that rank 0 evicts (``MultiDecoder._evict``: for room, or when a request takes
++their extent over); the kept cap's drops (``_keep``, TF_GLM_CACHE_ENTRIES) go without parking, under either cap rule.
++Covered:
++
++- 0071: unset, a sub-agent resuming the writer's system block takes the writer's extent over and evicts the writer's
++  own state, which parks and comes back from host RAM at the writer's next turn; set, the shared rows are copied into
++  free rows, nothing parks, and the next turn resumes on the GPU. The same cached count either way;
++- 0074 (TF_GLM_CACHE_ROOM unset): a prompt that needs rows the free rows hold in pieces evicts, and parks, the oldest
++  kept prompts unset; set, the extents move together and none is evicted; with TF_GLM_CACHE_ROOM=1 the room rule makes
++  the room and 0074 changes nothing (the same kept prompts, extents, parks and cached counts);
++- 0077: past the cap the run's system-block state goes (unset) or stays (set); a cap drop never parks, so the agent's
++  next run resumes the system block only with 0077 (its takeover of the first run's extent, without 0071, then parks
++  the first run's own state).
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from tests import test_glm_cache_room as tcr
++from tests import test_glm_cap_recency as tcap
++from tests import test_glm_multi as tm
++from tests import test_glm_multi_afd as ta
++from tests import test_glm_shared_prefix_copy as tsc
++from tests.test_cuda_geometry import allocations  # noqa: F401  (fixture: fake triton, so decode imports)
++
++pytestmark = pytest.mark.torch
++
++fake = tm.fake
++afd_fake = ta.afd_fake
++
++
++def _tier(monkeypatch, **switches) -> None:
++    """The tier with parked rows (``kept_host``'s CPU tests' setting), and the given recipe switches ('' = unset)."""
++
++    monkeypatch.setenv("TF_GLM_KEPT_HOST", "1")
++    monkeypatch.setenv("TF_GLM_HOST_CACHE_GIB", "0.01")
++    monkeypatch.delenv("TF_GLM_HOST_CACHE_ENTRIES", raising=False)
++    for name, value in switches.items():
++        if value:
++            monkeypatch.setenv(name, value)
++        else:
++            monkeypatch.delenv(name, raising=False)
++
++
++@pytest.mark.parametrize("copy", ["", "1"], ids=["takeover", "copy"])
++def test_0071_the_writers_state_parks_or_stays(afd_fake, monkeypatch, copy):
++    _tier(monkeypatch, TF_GLM_SHARED_PREFIX_COPY=copy, TF_GLM_CACHE_ROOM="", TF_GLM_COMPACT_BEFORE_EVICT="")
++    n1 = ta.World1(afd_fake, streams=2)
++    out = tsc.agent_and_subagent(afd_fake.torch, n1, n1.g, copy=bool(copy))
++    h = n1.d.host
++    assert h is not None and h.pages is not None
++    assert out["turn_cached"] == out["a"]                 # the writer's next turn resumes its whole first turn
++    if copy:
++        assert out["a"] in out["kept"] and (h.stats["parks"], h.stats["unparks"]) == (0, 0)
++    else:
++        assert out["a"] not in out["kept"] and (h.stats["parks"], h.stats["unparks"]) == (1, 1)
++
++
++def _fragmented(w, monkeypatch) -> tuple[list, dict]:
++    """``tests/test_glm_cache_room.py``'s fragmented pool at world 1: six kept prompts in blocks 0-5 of 8, the second
++    and the fourth evicted (with the tier: parked); 4 free blocks, the widest gap 2."""
++
++    d = w.d
++    prompts = tcr.kept_one_block_each(w, 6, 50)
++    assert tcr.blocks(d) == [(k, 1) for k in range(6)]
++    kid = {k: next(c.kid for c in d.kept if c.ids == prompts[k][:999]) for k in range(6)}
++    for c in [c for c in d.kept if c.kid in (kid[1], kid[3])]:
++        d._evict(c)
++    return prompts, kid
++
++
++def _then(w, prompts) -> dict:
++    """A prompt needing 3 blocks, then the oldest kept prompt's next turn."""
++
++    torch, d = w.torch, w.d
++    big = tm._prompt(5000, 60)
++    s = w.submit(big, 6)
++    w.run()
++    assert s.got == tm.solo(torch, big, 6, None) and s.cached == 0
++    on_gpu = [k for k in range(6) if prompts[k][:999] in tcr.kept_ids(d)]
++    turn = prompts[0] + tm._prompt(40, 61)
++    again = w.submit(turn, 8, tm._sampling("topk", 3))
++    w.run()
++    assert again.got == tm.solo(torch, turn, 8, tm._sampling("topk", 3))
++    return {"on_gpu": on_gpu, "cached": again.cached, "parks": d.host.stats["parks"],
++            "unparks": d.host.stats["unparks"], "extents": tcr.blocks(d), "kept": tcr.kept_ids(d),
++            "parked": [c.ids for c in d.host.parked]}
++
++
++@pytest.mark.parametrize("cf", ["", "1"], ids=["off", "on"])
++def test_0074_compacting_first_parks_fewer(afd_fake, monkeypatch, cf):
++    _tier(monkeypatch, TF_GLM_COMPACT_BEFORE_EVICT=cf, TF_GLM_CACHE_ROOM="", TF_GLM_SHARED_PREFIX_COPY="")
++    w = ta.World1(afd_fake, streams=2, blocks=8, entries=16)
++    prompts, _ = _fragmented(w, monkeypatch)
++    assert w.d.host.stats["parks"] == 2
++    out = _then(w, prompts)
++    assert out["cached"] == 999                          # from host RAM (off) or from the GPU (on)
++    if cf:
++        assert out["on_gpu"] == [0, 2, 4, 5] and (out["parks"], out["unparks"]) == (2, 0)
++    else:
++        assert out["on_gpu"] == [4, 5] and (out["parks"], out["unparks"]) == (4, 1)
++
++
++def test_0074_changes_nothing_under_the_room_rule(afd_fake, monkeypatch):
++    runs = []
++    for cf in ("", "1"):
++        _tier(monkeypatch, TF_GLM_COMPACT_BEFORE_EVICT=cf, TF_GLM_CACHE_ROOM="1", TF_GLM_SHARED_PREFIX_COPY="")
++        w = ta.World1(afd_fake, streams=2, blocks=8, entries=16)
++        assert w.d.room and w.d.compact_first == bool(cf)
++        prompts, _ = _fragmented(w, monkeypatch)
++        runs.append(_then(w, prompts))
++    assert runs[0] == runs[1]
++    assert runs[0]["on_gpu"] == [0, 2, 4, 5] and runs[0]["cached"] == 999 and runs[0]["parks"] == 2
++
++
++@pytest.mark.parametrize("copy", ["", "1"], ids=["takeover", "copy"])
++@pytest.mark.parametrize("recency", ["", "1"], ids=["off", "on"])
++def test_0077_cap_drops_never_park(afd_fake, monkeypatch, recency, copy):
++    _tier(monkeypatch, TF_GLM_CAP_SHARED_RECENCY=recency, TF_GLM_SHARED_PREFIX_COPY=copy, TF_GLM_CACHE_ROOM="",
++          TF_GLM_COMPACT_BEFORE_EVICT="")
++    n1 = ta.World1(afd_fake, streams=2, entries=3)
++    dropped = []
++    real = n1.d._drop
++    n1.d._drop = lambda c: (dropped.append(c), real(c))[1]
++    out = tcap.agent_runs(afd_fake.torch, n1, [n1.g], n1.d)
++    h = n1.d.host
++    assert out["cached"] == (out["at"] if recency else 0)
++    assert dropped and not any(h.holds(c) for c in dropped)      # a kept prompt the cap drops never parks
++    system = any(len(c.ids) == out["at"] and getattr(c, "shared", False) for c in dropped)
++    assert system == (not recency)                    # the cap took the system-block state only without 0077
++    # parks: only the takeover's eviction of the first run's own state (0077 on, 0071 unset); never a cap drop
++    assert h.stats["parks"] == (1 if recency and not copy else 0)
++    assert len(h.states.free) == h.states.count - len(n1.d.kept) - len(h.parked)
