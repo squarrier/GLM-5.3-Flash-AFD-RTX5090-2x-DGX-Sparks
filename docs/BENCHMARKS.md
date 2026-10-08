@@ -1,8 +1,12 @@
 # Benchmarks
 
 Everything below was measured on the hardware this recipe targets. Each table says which configuration it measured.
-**2.1** is this `.env.example`: [2.1 in the same window as Mia's recipe v1.8](#21-in-the-same-window-as-mias-recipe-v18)
-is the published comparison, [2.1 in the lab](#21-in-the-lab) its lab boot against 2.0 as shipped, and
+**2.15** is this `.env.example`: [2.15 in the lab](#215-in-the-lab) is its lab boot against 2.1 as published (lab, the
+same harnesses as 2.1's numbers), [2.15's soak and failure drills](#215s-soak-and-failure-drills) its soak, and
+[2.15's levers](#215s-levers-one-at-a-time) each lever 2.15 adds against the configuration without it; 2.15 had no
+same-window run against Mia's recipe. **2.1** is 2.1's
+`.env.example`: [2.1 in the same window as Mia's recipe v1.8](#21-in-the-same-window-as-mias-recipe-v18)
+was its published comparison, [2.1 in the lab](#21-in-the-lab) its lab boot against 2.0 as shipped, and
 [2.1's levers](#21s-levers-one-at-a-time) each lever 2.1 adds against the configuration without it. **2.0 as shipped**
 is 2.0's `.env.example`, on one boot of 2026-10-05 ([2.0 as shipped](#20-as-shipped)); [2.0's levers](#20s-levers-one-at-a-time)
 compare each lever 2.0 added with the same configuration without it, and [v2.0's first staging](#v20s-first-staging)
@@ -14,10 +18,14 @@ is the configuration before them, kept for the record.
   DGX Sparks (GB10, 128 GB each) as the expert nodes; ConnectX-7 RoCE v2 between them, 200 Gb/s links (4X HDR) at
   MTU 9000.
   Mia's recipe ran on its own two DGX Sparks (TP2), with the SM clock cap of 2,200 MHz her recipe sets.
-- **Software.** TensorFold v0.6.5 plus `patches/` at this repository's commit (2.0: 30 patches; 2.1: 48); the
+- **Software.** TensorFold v0.6.5 plus `patches/` at this repository's commit (2.0: 30 patches; 2.1: 48; 2.15: 51); the
   checkpoint at revision `078455ff` (its safetensors are byte-identical to `76c0b517`, the revision `.env.example`
   pins) and the drafter at `bf582e4e`.
 - **Configurations.**
+  - *2.15*: 2.1 plus four exchanges in flight to each Spark with four prompt lanes, a 32-row verify window, BF16
+    partial sums on the return wire for prompt windows and glm53f-rank's big-window schedule on the Sparks' prompt
+    windows of 1,536 rows and more, on the 51 patches;
+  - *2.15's levers*: as 2.1's, each lab boot adds one lever to the boot before it and names it;
   - *2.1*: 2.0 as shipped plus kept prompts in host RAM with an 8.5 GiB cache budget, prompt chunks filled as pairs
     while streams decode, Hugh Madden's expert prompt kernels on the Sparks and her v1.8 serving fixes, on the 48
     patches;
@@ -50,11 +58,145 @@ is the configuration before them, kept for the record.
 - **Agentic quality.** AEON-30: 30 agentic tasks, one at a time, thinking on.
 - **Prompt processing.** Fresh 8K, 31K and 62K prompts (nothing cached), and a cold 100K-token prompt's time to
   first token. Where a table says so, each prompt size was warmed up once first.
-- **Stability.** Mixed load on the shipped configuration at up to eight requests for 1.58 hours, with probe rounds and
-  a decode check at the start, middle and end ([below](#stability)). Failure drills were not run for this release.
+- **Stability.** 2.0: mixed load on the shipped configuration at up to eight requests for 1.58 hours, with probe
+  rounds and a decode check at the start, middle and end ([below](#stability)). 2.15: the same kind of load for a
+  4.11-hour window with the watcher on, probe rounds every 30 minutes, AEON-30 and a ~240K needle under the load,
+  then four failure drills ([below](#215s-soak-and-failure-drills)).
 
 Every run of a comparison went through the same runner, with the endpoint otherwise idle; a run that saw any other
 client's request was discarded and repeated.
+
+## 2.15 in the lab
+
+The lab's final check of 2.15's configuration on these 51 patches: one boot on 2026-10-07 (each arena cell the mean of
+two runs), with the harnesses of 2.1's numbers. The first column is 2.1's same-window run
+([below](#21-in-the-same-window-as-mias-recipe-v18)), the second the lab's boot of 2.1 on 2026-10-06
+([below](#21-in-the-lab)). Different days and boots.
+
+| Metric | 2.1, same window | 2.1, lab | 2.15, lab | 2.15 / 2.1 (same window) |
+| --- | ---: | ---: | ---: | ---: |
+| Decode, C1 prose / code / JSON (tok/s) | 75.7 / 81.5 / 83.2 | 75.0 / 80.8 / 83.1 | 71.3 / 86.1 / 91.4 | 0.94x / 1.06x / 1.10x\* |
+| Decode, C2 / C4 aggregate (tok/s) | — / 110.6 | 92.5 / 109.0 | 94.1 / 114.1 | — / 1.03x\* |
+| Decode, geometric mean of the five cells | — | 87.32 | 90.4 | (1.04x the lab's)\* |
+| spark-bench's ~2.6K-token prompt (tok/s) | 1,953 | 1,953 | 2,420 | 1.24x |
+| Cold ~2.6K, time to first token | 1.313 s | 1.325 s | 1.058 s | 0.81x |
+| Fresh 8K / 31K / 62K (tok/s) | 2,946 / 3,030 / 3,138 | 2,890 / 2,992 / 3,145 | 3,374 / 3,642 / 3,707 | 1.15x / 1.20x / 1.18x |
+| Cold 100K, time to first token | 32.4 s | 32.3 s | 27.1 s | 0.84x |
+| Coding-agent load, 4 x 1,024 / 8 x 1,024 (tok/s) | 236.2 / — | 237.4 / — | 255.8 / 421.7 | 1.08x\* / — |
+| Arena 65,535 x 10: prompt / gen t/s, e2e first token, gen a request | 1,198 / 64.2, 7.70 s, 12.7 | 1,147 / 63.9, 7.8 s, 13.2 | 1,151 / 64.5, 7.67 s, 13.9 | 0.96x / 1.01x, 1.00x, 1.09x |
+| Arena 100,000 x 5: the same | 1,872 / 65.8, 4.00 s, 18.6 | 1,904 / 68.4, 3.9 s, 18.9 | 1,935 / 68.0, 3.85 s, 18.2 | 1.03x / 1.03x, 0.96x, 0.98x |
+| Two cold 200K prompts at once: first tokens (one run) | — | 68.0 s and 135.3 s | 56.0 s and 113.6 s | (0.82x and 0.84x the lab's) |
+| KV pool (tokens, all requests) | 1,579,008 | 1,579,008 | 1,585,152 | 1.00x |
+| AEON-30 (idle) | — | 23 of 30 | 22 of 30 | one fewer |
+
+\* With the BF16 partial sums the replies differ from 2.1's, so the decode benchmarks generate other text, which the
+drafter accepts at another rate; decode itself runs as in 2.1 (its windows keep fp32 replies). In the coding-agent
+load the 2.15 boot took 2,832 and 7,224 verify rounds at four and eight requests, with 67% and 80% of the drafted rows
+accepted, where the same configuration without the BF16 sums took 3,084 and 7,800 at 61% and 72%. Measured with the
+same replies, the 32-row window is the decode lever of 2.15 ([below](#a-32-row-verify-window)); on 2.1's configuration
+the eight-request load ran at 360.3 tok/s with the 64-row window.
+
+- The boot passed every gate: deterministic replies (drafted equal plain, concurrent equal solo), its greedy,
+  concurrent and long-prompt replies equal to the lab's boot of the same configuration without the tiered schedule
+  (whose AEON-30 the table gives), the 5090's peak at 25.95 GiB within its 27.5 GiB gate, and each Spark's free memory
+  at least 28.2 GiB (the floor is 12).
+- The two cold 200K prompts share the four prompt lanes for a while: under the four lanes without the tiered schedule
+  the first was answered after about 90 s; the schedule brought it to 56.0 s.
+
+## 2.15's levers, one at a time
+
+Each lever was measured in the lab on 2026-10-06 and 2026-10-07 against the boot before it with the same code, and
+kept only if its gates passed: the replies against the base (equal, or for a lever that changes them the KL gate and
+AEON-30 at 21 of 30 or more), determinism, the 5090's memory gate, and no other measure worse than its noise band plus
+one point. The base was 2.1's configuration; three exchanges in flight (adopted, then replaced) and the 32-row window
+were measured first, then four exchanges in flight and the BF16 partial sums, then the tiered schedule.
+
+### A 32-row verify window
+
+Against 2.1's configuration (the base pooled from two boots), with the same replies:
+
+| Measure | Base (64 rows) | 32 rows | Change |
+| --- | ---: | ---: | ---: |
+| Coding-agent load, 8 x 1,024, aggregate (a stream) | 360.3 (45.7) | 394.8 (50.0) | **+9.6%** |
+| Coding-agent load, 4 x 1,024 | 237.4 | 237.2 | -0.1% |
+| Fresh 8K / 31K / 62K (tok/s) | 2,894 / 3,006 / 3,140 | 2,911 / 3,019 / 3,142 | +0.6 / +0.4 / +0.1% |
+| Cold 100K / ~2.6K, first token | 32.39 / 1.327 s | 32.31 / 1.369 s | 0.2% sooner / 3.1% later (noise) |
+| Arena 65,535 x 10: prompt / gen / first token | 1,161 / 63.3 / 7.78 s | 1,160 / 63.2 / 7.70 s | -0.1% / -0.3% / 0.9% sooner |
+| Arena 100,000 x 5: the same | 1,896 / 67.0 / 3.94 s | 1,898 / 64.8 / 3.92 s | +0.1% / -3.4% / 0.4% sooner |
+| KV pool (tokens) | 1,579,008 | 1,585,152 | +0.4% |
+
+At eight streams the 64-row window let each stream draft 4.93 rows a round, of which 61% were accepted; at 32 rows
+the cap binds (3.99 rows a stream and round, 72% accepted), so there are 26% more rounds, each 28% shorter. At four
+streams nothing changes (23.7 rows a round either way). The 5090 peaked at 25.15 GiB.
+
+### Four exchanges in flight and four prompt lanes
+
+Against the same configuration with three in flight and three lanes (itself 2.1's with the 32-row window and three in
+flight, adopted the night before as a trade: fresh 31K / 62K +11.0% / +7.4% and a cold 100K first token 7.2% sooner,
+for fresh 8K -3.0%), with the same replies:
+
+| Measure | Three in flight | Four | Change |
+| --- | ---: | ---: | ---: |
+| Fresh 8K / 31K / 62K (tok/s) | 2,814 / 3,336 / 3,373 | 3,124 / 3,328 / 3,384 | **+11.0** / -0.2 / +0.3% |
+| Cold 100K / ~2.6K, first token | 30.00 / 1.251 s | 29.74 / 1.202 s | 0.9% / **3.9%** sooner |
+| Decode, geometric mean of the five cells | 87.6 | 87.4 | -0.2% |
+| Coding-agent load, 4 x 1,024 / 8 x 1,024 | 236.4 / 394.7 | 236.9 / 394.2 | +0.2 / -0.1% |
+| Arena 65,535 x 10: prompt / gen / first token / gen a request | 1,154 / 64.3 / 7.78 s / 13.4 | 1,158 / 65.0 / 7.75 s / 13.5 | +0.4% / +1.1% / 0.4% sooner / +0.7% |
+| Arena 100,000 x 5: the same | 1,888 / 67.0 / 3.95 s / 18.9 | 1,904 / 67.9 / 3.91 s / 18.7 | +0.9% / +1.4% / 1.0% sooner / -0.8% |
+
+The 5090 peaked at 25.93 GiB (gate 27.5). Two cold 200K prompts sent together: under three lanes the first was
+answered at about 60 s (its prefill alone) and the second at about 120 s; under four, after about 90 s and 120 s, the
+two sharing the lanes for about 30 s (one run each; the tiered schedule below changed this).
+
+### BF16 partial sums on the return wire (patch 0050)
+
+Against four in flight without them; this lever changes the replies:
+
+| Measure | Without | With (boot 2; boot 1) | Change |
+| --- | ---: | ---: | ---: |
+| Fresh 8K / 31K / 62K (tok/s) | 3,124 / 3,328 / 3,384 | 3,178 / 3,429 / 3,475 (3,194 / 3,414 / 3,466) | +1.7 / **+3.1** / **+2.7%** |
+| Cold 100K, first token | 29.74 s | 28.92 s (28.98) | **2.7%** sooner |
+| Cold ~2.6K, first token | 1.202 s | 1.102 s (1.090) | **8.3%** sooner |
+| Arena 65,535 x 10: prompt / first token | 1,158 / 7.75 s | 1,241 / 7.30 s | +7.1% / 5.8% sooner |
+| Arena 100,000 x 5: prompt / first token | 1,904 / 3.91 s | 1,957 / 3.80 s | +2.8% / 2.9% sooner |
+
+- Replies: mean KL 0.00218 against the same configuration without it over 1,866 forced positions (gate 0.003), p99
+  0.0351 (0.05), top-1 99.04% (98.5%); deterministic within the boot, drafted equal plain, concurrent equal solo.
+  AEON-30 22 of 30 (23 without it: 7 empty answers and 1 wrong, against 4 and 3).
+- The wire check (`AFD_CHECK=1`): 0 mismatches in 256 forwards at 1 to 2,048 rows, 20 of them in prompt chunk pairs
+  and 3 in a lane group.
+- Decode numbers moved with the new texts only (one stream prose -5%, JSON +10%, the coding-agent load +8.3% and
+  +7.0%): the drafter accepted 67% and 80% of its drafts at four and eight requests, against 61% and 72%.
+
+### glm53f-rank's schedule on the big prompt windows (patches 0049, 0051)
+
+Against the same configuration with the default schedule (two boots of the same session pooled), with the same
+replies:
+
+| Measure | Default schedule | Tiered at 1,536 rows | Change |
+| --- | ---: | ---: | ---: |
+| Fresh 8K / 31K / 62K (tok/s) | 3,183 / 3,418 / 3,471 | 3,374 / 3,642 / 3,707 | +6.0 / +6.5 / **+6.8%** |
+| Cold 100K / ~2.6K, first token | 29.03 / 1.098 s | 27.09 / 1.058 s | **6.7%** / 3.6% sooner |
+| Decode, geometric mean of the five cells | 90.4 | 90.4 | -0.1% |
+| Coding-agent load, 4 x 1,024 / 8 x 1,024 | 256.5 / 421.7 | 255.8 / 421.7 | -0.3 / +0.0% |
+| Arena 65,535 x 10: prompt / gen / first token / gen a request | 1,192 / 63.5 / 7.51 s / 13.0 | 1,151 / 64.5 / 7.67 s / 13.9 | -3.4% / +1.6% / 2.2% later / +6.6% |
+| Arena 100,000 x 5: the same | 1,947 / 66.8 / 3.83 s / 17.9 | 1,935 / 68.0 / 3.85 s / 18.2 | -0.6% / +1.9% / 0.6% later / +1.7% |
+
+Against its same-session base run alone, the ten-client cell's prompt rate was +0.7% and its first token 0.5% sooner;
+the whole difference against the pooled base sits in the two requests of each run that queue behind the eight lanes.
+On every window (without the tier) the same schedule gave fresh 31K / 62K +5.2% and a cold 100K first token 4.6%
+sooner, but the ten-client cell's first token 3.5% later and its prompt rate 4.5% lower.
+
+### Measured and off in 2.15
+
+| Lever | Gain | Cost | |
+| --- | --- | --- | --- |
+| Her draft policy at `fnc7:0.3` (her lane's) | spark-bench decode +3.7% (geometric mean of the five cells) | the coding-agent load -5.2% | off: [the draft policy](#the-draft-policy) |
+| The draft policy at `fnc6:0.25` | spark-bench decode +2.5% | the coding-agent load -3.2% | off |
+| Her queued-cancel fix alone (`TF_GLM_QUEUED_CANCEL=1`, patch 0037) | a waiting request whose client left is dropped in 0.10 s, not 100.3 s; replies unchanged | the ten-client cell's prompt rate -5.6%, first token +2.2% | off |
+| Her copy drafts (her recipe patches 0007, 0013, 0032; a lab build, not ported) | edit-heavy requests +24% to +50% | quoting a tool's JSON result -27% (-36% at four requests); the coding-agent load -1.2 to -1.7% | not ported |
+| Her L2 prefetch (same build) | none (+0.0%) | — | not ported |
+| The big-window schedule on every window | fresh 31K / 62K +5.2%, cold 100K 4.6% sooner | the ten-client cell's first token +3.5%, prompt rate -4.5% | tiered instead |
 
 ## 2.1 in the same window as Mia's recipe v1.8
 
@@ -109,7 +251,7 @@ Where arm B leads:
 
 The lab's final check of 2.1's configuration on these 48 patches: one boot on 2026-10-06, with the harnesses of 2.0's
 numbers, against 2.0 as shipped (one boot on 2026-10-05). Different days and boots; the same-window run above is the
-comparison this release publishes.
+comparison 2.1 published.
 
 | Metric | 2.0 as shipped | 2.1 (lab) | 2.1 / 2.0 |
 | --- | ---: | ---: | ---: |
@@ -624,23 +766,68 @@ the decode checks at the start, middle and end, so 81.6 minutes were under load.
 | A 100K-token prompt sent while seven other requests decode | first token after 117.6 s at the median and 155.4 s at p95 (alone: 36.8 s) |
 | Failure drills: restart one expert node, the attention node or the MCDMA daemons; cold start of the whole stack | not run for 2.0 or 2.1 |
 
-2.1 has had no soak of its own: its configuration ran only the lab's benchmark boots above, each of which passed
-every gate.
+2.1 had no soak of its own: its configuration ran only the lab's benchmark boots above, each of which passed every
+gate.
+
+### 2.15's soak and failure drills
+
+This `.env.example` on 2026-10-07, with the watcher on: a 4.11-hour window of mixed load at up to eight requests at
+once (agentic, chat, coding and tool-calling requests, and long prompts of 16K to 100K tokens). The load paused, 0.52
+hours in all, for the quiet parts of the probe rounds (every 30 minutes) and the middle decode check, so 3.59 hours
+were under load. AEON-30 and a ~240K needle ran under the load; the four failure drills followed.
+
+| Item | Result |
+| --- | --- |
+| Time under load; requests; 5xx responses; restarts | 3.59 hours in a 4.11-hour window; 4,071 requests, each answered 200; 0; 0 |
+| Probe rounds | 13 rounds, 58 of 60 checked replies correct. **The probe check failed:** the two misses were the long streamed tool call in two of the nine rounds under load, which paused 6.28 and 6.97 s between stream events against the probe's 6 s limit; both calls finished with HTTP 200 and the right tool call. The other loaded rounds peaked at 2.72-5.01 s, the quiet ones at 2.02-2.04 s. The coverage rule missed too: largest gap between rounds 60.0 min (<= 45.0), while AEON-30 ran under the load. The `tool_choice: "none"` probe, information only, passed 0 of 20 |
+| Decode drift, spark-bench at the start / middle / end (tok/s) | prose 71.5 / 71.3 / 71.4, code 86.1 / 86.2 / 86.3, JSON 91.8 / 91.9 / 91.9, C4 114.8 / 112.6 / 114.5; the largest change −1.9% |
+| Memory creep (GiB/h) | attention host +0.23 (its GPU +0.09); the two Sparks −0.07 and −0.03 |
+| A 100K-token prompt sent while the others decode | first token after 45.8 s at the median and 75.9 s at p95 (alone: 27.0 s) |
+| A needle at ~240K tokens under load | found: 239,864 tokens with eight requests running, prefill 80.6 s, 112.7 s in all |
+| AEON-30 under the soak's load | 22 of 30, the same per-task scores as the idle run of the same replies |
+| The watcher, in the load window | 213 runs: 0 failed, 0 recovers |
+| After the soak and the drills: fresh 8K / 31K / 62K (tok/s); cold 100K, first token | 3,290 / 3,647 / 3,709; 27.0 s (the lab's boot: 3,374 / 3,642 / 3,707; 27.1 s) |
+
+The server sends a keepalive at most every 2 s while it holds a streamed tool call, but only when one of the stream's
+own decode rounds comes back, so a quiet stream shows 2.0 s and a stalled one shows its stall. What held the two
+streams for over 4 s is not established: other loaded rounds overlapped the same kinds of long prompts and stayed
+under 6 s.
+
+Every drill's fault was a `SIGTERM` (a stop, not a kill), sent under the control lock with the watcher running. Times
+are from the fault.
+
+| Drill | What happened | Recovery (through the watcher) |
+| --- | --- | --- |
+| An expert node's process stopped (TensorFold#214) | the streamed request in flight got an error event ("the AFD expert nodes are gone ...") and `[DONE]` after 23.3 s, when the attention node's 20 s heartbeat watchdog fired; requests sent in between got HTTP 429 with `Retry-After: 5` at that moment, and every later one HTTP 500 in about 5 ms; `/health` answered 200 throughout | serving again after 308.7 s (`recover` rc 0 in 198.6 s); probes correct at 339.3 s |
+| The attention node's process stopped | connections refused until the recover | serving again after 309.9 s (`recover` rc 0 in 197.0 s); probes correct at 338.5 s |
+| All three containers, then the MCDMA link daemons, stopped (in MCDMA's order) | the streamed request in flight was cut after 11.5 s, with no `[DONE]` and no error event; new connections refused from 5 s | serving again after 384.2 s (`recover` rc 0 in 215.2 s, the daemons restarted too); probes correct at 414.8 s |
+| A cold start of the whole stack by hand | the watcher held off while it ran | serving after 317.4 s; probes correct at 387.9 s |
+
+- An MCDMA daemon dying under live containers was not drilled.
+- The soak ran on the lab's own control scripts, not on `./start.sh`: the watcher ran with lab settings, and its
+  `recover` was the lab's equivalent of `./start.sh recover`, with the same steps (`SIGTERM` to all three containers,
+  the MCDMA daemons too when a link or a daemon is down, then a boot).
+- The 429s come from `TF_GLM_CAPACITY_STATUS=1` (her v1.8's patch 0081, on in `.env.example`); without it those
+  requests get 503. The 500s come from the broken pair: after the watchdog, every new request fails until the restart.
+  `/health` answers from a snapshot, so it does not show the failure.
+- Every `SIGTERM` ended its container without help. The attention node exited in about 3 s with code 0, except once
+  in five stops (the third drill): after about 23 s, with `SIGABRT` (`terminate called without an active exception`).
+  The recover then ran as in the other drills.
 
 ## Memory
 
 | Node | Measured |
 | --- | --- |
-| Attention node: startup estimate at 262,144 | 17.92 GiB within the card's 28.80 GiB budget at eight streams with the 64-row window (16.27 GiB at four); one KV pool of 727,040 tokens (966,656 at four streams and 8 GiB). 2.1: one KV pool of 1,579,008 tokens at 8.5 GiB, the kept states in host RAM |
-| Attention node: peak while serving | as shipped, 24,884 MiB over its whole boot (three arena cells and the mixed load included); 26,926 MiB at eight streams (the boot's whole run, four arena cells included). v2.0 staging: 25.36 GiB over its arena grid. 2.1, the lab's combined boot: 26,426 MiB (25.81 GiB), within the 27.5 GiB gate |
-| Attention host: pinned RAM | 2.1 only: 33.35 GiB (24 GiB of pages of 2,048 tokens, 4,153,344 tokens' rows, and 53 state slots) |
-| Each Spark: available memory with the experts loaded | 28.8 and 29.5 GiB on v2.0 staging; as shipped, the lowest over the whole boot 28.44 and 29.21 GiB (28.66 and 29.49 GiB during the mixed load). 2.1, the lab's combined boot: the lowest 28.5 and 29.1 GiB |
+| Attention node: startup estimate at 262,144 | 17.92 GiB within the card's 28.80 GiB budget at eight streams with the 64-row window (16.27 GiB at four); one KV pool of 727,040 tokens (966,656 at four streams and 8 GiB). 2.1: one KV pool of 1,579,008 tokens at 8.5 GiB, the kept states in host RAM. 2.15: 17.72 GiB with the 32-row window, one KV pool of 1,585,152 tokens |
+| Attention node: peak while serving | as shipped, 24,884 MiB over its whole boot (three arena cells and the mixed load included); 26,926 MiB at eight streams (the boot's whole run, four arena cells included). v2.0 staging: 25.36 GiB over its arena grid. 2.1, the lab's combined boot: 26,426 MiB (25.81 GiB), within the 27.5 GiB gate. 2.15, the lab's combined boot: 25.95 GiB, with the four lanes |
+| Attention host: pinned RAM | 2.1 and 2.15: 33.35 GiB (24 GiB of pages of 2,048 tokens, 4,153,344 tokens' rows, and 53 state slots) |
+| Each Spark: available memory with the experts loaded | 28.8 and 29.5 GiB on v2.0 staging; as shipped, the lowest over the whole boot 28.44 and 29.21 GiB (28.66 and 29.49 GiB during the mixed load). 2.1, the lab's combined boot: the lowest 28.5 and 29.1 GiB. 2.15, the lab's combined boot: the lowest 28.9 and 28.2 GiB |
 
 ## Comparisons, and what they are not
 
 The Mia columns are her own recipe on its own pair of Sparks, with the same checkpoint and drafter: someone choosing
-today has her recipe or this one. For 2.1 her latest release is v1.8 (`33b50fd`), measured in the same window as this
-version ([above](#21-in-the-same-window-as-mias-recipe-v18)). 2.0's tables ran her v1.5 and her v1.4 grid; the arena
+today has her recipe or this one. 2.15 was not measured against her lane. For 2.1 her latest release was v1.8
+(`33b50fd`), measured in the same window as 2.1 ([above](#21-in-the-same-window-as-mias-recipe-v18)). 2.0's tables ran her v1.5 and her v1.4 grid; the arena
 grid shows her v1.4 grid in full and her v1.5 where a cell was re-measured, and on spark-bench those two releases
 measure the same. Her lane runs her draft policy at
 `fnc7:0.3`, which this version runs at `fnc5:0.2` ([above](#the-draft-policy)). The stock column is unmodified

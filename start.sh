@@ -1,8 +1,9 @@
 #!/bin/bash
 # start.sh — bring the stack up and check it; also a read-only check, status, logs and a smoke reply.
 #   up      check; the CUDA extensions prebuilt with no model loaded (./build.sh ext); the MCDMA link daemons
-#           (listen ends on the Sparks, MCDMA_INFLIGHT links each, then the connect end on the attention host, every
-#           link up); the attention node, then the two expert nodes; the health wait (fails fast when a container
+#           (listen ends on the Sparks, MCDMA_INFLIGHT links each, then the connect end on the attention host: one
+#           daemon for links 0-2 and, at four in flight, a second for link 3; every link up); the attention node, then
+#           the two expert nodes; the health wait (fails fast when a container
 #           exits or the start goes quiet); the startup lines (the MCDMA wire must be named); one real reply. Any
 #           failure after the daemons start takes the whole stack down again (./stop.sh).
 #   check   read-only preflight: image, tree, MCDMA build, checkpoint and drafter, RDMA ports, no GPU tenant,
@@ -12,7 +13,12 @@
 #   status  containers, /health, the MCDMA links
 #   logs    the tails of the three node logs and the daemons' logs
 #   smoke   one real completion, thinking off
-#   ./start.sh [up|check|probe|status|logs|smoke]
+#   recover after failed checks (extras/watch runs it): the attention/expert split cannot take a node back, so every
+#           container is stopped (SIGTERM only, never SIGKILL) and started again; the MCDMA daemons are restarted
+#           too when a link or a daemon is down. Healthy: nothing is done. rc 3 = it needs you (a container still
+#           runs after SIGTERM, or a Spark's memory did not come back), 4 = up but the smoke reply failed
+#   up, recover and probe take a lock on this controller (rc 75 while another of them or ./stop.sh runs)
+#   ./start.sh [up|check|probe|status|logs|smoke|recover]
 set -euo pipefail
 . "$(dirname "$0")/scripts/lib.sh"
 
@@ -27,13 +33,16 @@ case "$KV" in ""|bf16|fp8) ;; *) die "KV must be empty, bf16 or fp8 (got '$KV')"
 ATTN_ENV_E=$(envpairs ATTN_ENV "${ATTN_ENV:-}") || exit 2
 EXPERT_ENV_E=$(envpairs EXPERT_ENV "${EXPERT_ENV:-}") || exit 2
 case " ${ATTN_ENV:-} " in *" TF_GLM_MCDMA_INFLIGHT="*) die "set MCDMA_INFLIGHT, not TF_GLM_MCDMA_INFLIGHT in ATTN_ENV: the link daemons follow it" ;; esac
+bf16() { local v=0 p; for p in $1; do case $p in TF_GLM_PARTIALS_BF16=*) v=${p#*=} ;; esac; done; echo "$v"; }
+[ "$(bf16 "${ATTN_ENV:-}")" = "$(bf16 "${EXPERT_ENV:-}")" ] \
+  || die "TF_GLM_PARTIALS_BF16 is '$(bf16 "${ATTN_ENV:-}")' in ATTN_ENV but '$(bf16 "${EXPERT_ENV:-}")' in EXPERT_ENV: all three nodes must agree (the expert nodes refuse to start otherwise)"
 PAR_ARG=""; [ -n "$PARALLEL" ] && PAR_ARG="--parallel $PARALLEL"
 MAXTOK_ARG=""; [ -n "$MAX_TOKENS" ] && MAXTOK_ARG="--max-tokens $MAX_TOKENS"
 
 fail() {  # after the daemons start: the logs, then the whole stack down, then stop
   cmd_logs || true
   log "taking the stack down after the failure"
-  "$ROOT/stop.sh" all >/dev/null 2>&1 || true
+  GLM_AFD_INTERNAL=1 "$ROOT/stop.sh" all >/dev/null 2>&1 || log "WARN: the stop after the failure did not finish (./start.sh status)"
   die "$*"
 }
 
@@ -59,7 +68,7 @@ cmd_check() {
 }
 
 daemons_up() {
-  local h n t j peers=""
+  local h n t j c peers
   for h in "${EXPERTS[@]}"; do
     for j in $(seq 0 $((MCDMA_INFLIGHT - 1))); do   # one listen daemon per link: link j's control port is MCDMA_CTRL_PORT + j
       n=$(lname "${LINK[$h]}" "$j")
@@ -70,15 +79,18 @@ daemons_up() {
       log "listen daemon $n up on $h ($MCDMA_REQ_MIB+$MCDMA_REP_MIB MiB, control ${FABRIC_IP[$h]}:$((MCDMA_CTRL_PORT + j)))"
     done
   done
-  for j in $(seq 0 $((MCDMA_INFLIGHT - 1))); do   # link j to each expert node, all on one connect daemon (six peers at most)
-    peers="$peers $(lname "$MCDMA_LINK0" "$j"),$EXPERT0_FABRIC_IP,$((MCDMA_CTRL_PORT + j)),$ATTN_RDMA_DEV,$RDMA_GID_INDEX,$RDMA_MTU,$MCDMA_REQ_MIB,$MCDMA_REP_MIB"
-    peers="$peers $(lname "$MCDMA_LINK1" "$j"),$EXPERT1_FABRIC_IP,$((MCDMA_CTRL_PORT + j)),$ATTN_RDMA_DEV,$RDMA_GID_INDEX,$RDMA_MTU,$MCDMA_REQ_MIB,$MCDMA_REP_MIB"
+  for c in $(connects); do   # link j to each expert node; links 0-2 on `connect`, link 3 on `connect2` (six peers a daemon)
+    peers=""
+    for j in $(cpeers "$c"); do
+      peers="$peers $(lname "$MCDMA_LINK0" "$j"),$EXPERT0_FABRIC_IP,$((MCDMA_CTRL_PORT + j)),$ATTN_RDMA_DEV,$RDMA_GID_INDEX,$RDMA_MTU,$MCDMA_REQ_MIB,$MCDMA_REP_MIB"
+      peers="$peers $(lname "$MCDMA_LINK1" "$j"),$EXPERT1_FABRIC_IP,$((MCDMA_CTRL_PORT + j)),$ATTN_RDMA_DEV,$RDMA_GID_INDEX,$RDMA_MTU,$MCDMA_REQ_MIB,$MCDMA_REP_MIB"
+    done
+    rsh attn "cd $AFD_HOME/mcdma || exit 1; MCDMA_RPCD_SOCKET=$AFD_HOME/mcdma/$c.sock nohup ./mcdma-rpcd connect$peers > $c.log 2>&1 < /dev/null &"
   done
-  rsh attn "cd $AFD_HOME/mcdma || exit 1; MCDMA_RPCD_SOCKET=$AFD_HOME/mcdma/connect.sock nohup ./mcdma-rpcd connect$peers > connect.log 2>&1 < /dev/null &"
   t=0
   until [ "$(links_up)" = $((2 * MCDMA_INFLIGHT)) ]; do
     sleep 2; t=$((t + 2))
-    [ $t -ge 60 ] && { status_connect || true; rsh attn "tail -8 $AFD_HOME/mcdma/connect.log" || true; fail "the $((2 * MCDMA_INFLIGHT)) links not up 60 s after the connect daemon started"; }
+    [ $t -ge 60 ] && { status_connect || true; rsh attn "tail -8 $AFD_HOME/mcdma/connect*.log" || true; fail "the $((2 * MCDMA_INFLIGHT)) links not up 60 s after the connect daemons started"; }
   done
   log "MCDMA: $((2 * MCDMA_INFLIGHT)) links up ($(links | tr '\n' ' '); $MCDMA_INFLIGHT to each expert half: $MCDMA_LINK0... to half 0, $MCDMA_LINK1... to half 1)"
 }
@@ -155,13 +167,15 @@ startup_lines() {
   grep -q "afd transport mcdma" <<< "$out" || fail "healthy, but no 'afd transport mcdma' line: not the MCDMA wire"
 }
 
-cmd_smoke() {
+smoke() {  # one real completion, thinking off: 0 with the reply logged, 1 with the reason (never exits)
   local body out
   body=$(printf '{"model":"%s","messages":[{"role":"user","content":"Reply with the single word OK."}],"max_tokens":16,"temperature":0,"chat_template_kwargs":{"enable_thinking":false}}' "$MODEL_NAME")
-  out=$(curl -sS -m 300 "$BASE_URL/v1/chat/completions" -H 'Content-Type: application/json' -d "$body") || die "smoke: no reply from $BASE_URL"
-  grep -q '"content"' <<< "$out" || die "smoke: unexpected reply: ${out:0:300}"
+  out=$(curl -sS -m 300 "$BASE_URL/v1/chat/completions" -H 'Content-Type: application/json' -d "$body") \
+    || { log "smoke: no reply from $BASE_URL"; return 1; }
+  grep -q '"content"' <<< "$out" || { log "smoke: unexpected reply: ${out:0:300}"; return 1; }
   log "smoke OK: ${out:0:200}"
 }
+cmd_smoke() { smoke || die "the smoke reply failed"; }
 
 cmd_up() {
   cmd_check
@@ -171,7 +185,7 @@ cmd_up() {
   boot
   wait_health
   startup_lines
-  cmd_smoke || fail "the smoke reply failed"
+  smoke || fail "the smoke reply failed"
   log "up: $BASE_URL/v1 serves $MODEL_NAME (alias $MODEL_ALIAS)"
 }
 
@@ -179,13 +193,15 @@ cmd_probe() {  # one host at a time, no model, nothing else running
   local h
   for h in "${NODES[@]}"; do
     wait_mem "$h"
-    rsh "$h" "docker rm -f glm-afd-probe >/dev/null 2>&1; mkdir -p $AFD_HOME/logs" || true
+    drm "$h" glm-afd-probe || die "$h: an earlier probe container still runs"
+    rsh "$h" "mkdir -p $AFD_HOME/logs" || true
     drun "$h" glm-afd-probe --gpus all --network none --ipc=host --ulimit memlock=-1 --cap-add IPC_LOCK \
       -v "$AFD_HOME:/afd" -v "$AFD_HOME/tree:/tf:ro" -v "$AFD_HOME/mcdma:/mcdma" -e PYTHONPATH=/tf/src \
       -e TF_AFD_MCDMA_LIB=/mcdma/libmcdma-rpc.so "$IMAGE" python /tf/tools/mcdma_streamops_probe.py --out /afd/logs/probe.json \
       || die "$h: the probe container did not start"
-    RSH_TIMEOUT=660 rsh "$h" "timeout 600 docker wait glm-afd-probe >/dev/null; docker logs glm-afd-probe 2>&1 | grep -E '^STREAMOPS' || echo 'no verdict line'; docker rm -f glm-afd-probe >/dev/null" \
+    RSH_TIMEOUT=660 rsh "$h" "timeout 600 docker wait glm-afd-probe >/dev/null; docker logs glm-afd-probe 2>&1 | grep -E '^STREAMOPS' || echo 'no verdict line'" \
       | sed "s#^#$h: #"
+    drm "$h" glm-afd-probe || die "$h: the probe container still runs after 600 s and a SIGTERM"
   done
 }
 
@@ -203,7 +219,7 @@ cmd_logs() {
   rsh attn "tail -40 $AFD_HOME/logs/attn.log" 2>/dev/null || true
   for h in "${EXPERTS[@]}"; do rsh "$h" "tail -20 $AFD_HOME/logs/${NODE_LOG[$h]}.log" 2>/dev/null || true; done
   echo "== daemons"
-  rsh attn "tail -8 $AFD_HOME/mcdma/connect.log" 2>/dev/null || true
+  for n in $(connects); do rsh attn "tail -8 $AFD_HOME/mcdma/$n.log" 2>/dev/null || true; done
   for h in "${EXPERTS[@]}"; do
     for n in $(links); do
       case $n in "${LINK[$h]}"|"${LINK[$h]}"-[0-9]) rsh "$h" "tail -8 $AFD_HOME/mcdma/listen-$n.log" 2>/dev/null || true ;; esac
@@ -211,7 +227,67 @@ cmd_logs() {
   done
 }
 
+cstate() {  # NODE: its container's state (running, exited, created, ...) or "absent"
+  local s
+  s=$(rsh "$1" "docker ps -a --filter name=^${CONTAINER[$1]}\$ --format '{{.State}}'" 2>/dev/null || true)
+  s=${s%%$'\n'*}
+  echo "${s:-absent}"
+}
+dcount() {  # NODE: how many mcdma-rpcd run there
+  local n
+  n=$(rsh "$1" 'pgrep -xc mcdma-rpcd' 2>/dev/null || true)
+  n=${n%%$'\n'*}
+  echo "${n:-0}"
+}
+health_ok() { rsh attn "curl -fsS -m 4 http://127.0.0.1:$API_PORT/health" >/dev/null 2>&1; }
+
+# After failed checks. An attention/expert split cannot take a node back: an expert that dies leaves the attention's
+# watchdog dead (requests fail, 429 then 500, while /health still answers), and experts cannot join a new attention
+# node's rendezvous. So any failure restarts all three containers, SIGTERM only. The MCDMA daemons stay up when every
+# link is up and every daemon runs (a container restart reuses them); otherwise they are restarted too.
+cmd_recover() {
+  local t0 h n st="" links want=$((2 * MCDMA_INFLIGHT)) daemons_ok=1 hc=down what="containers" dn=""
+  t0=$(date +%s)
+  if [ "${GLM_AFD_CALLER:-}" = watch ] && [ -e "$CTL_STATE/stopped" ]; then
+    log "recover: stopped by hand ($(cat "$CTL_STATE/stopped")): not starting it; ./start.sh up does"; return 2
+  fi
+  rm -f "$CTL_STATE/stopped"
+  if health_ok; then hc=ok; fi
+  for h in "${NODES[@]}"; do st="$st $h=$(cstate "$h")"; done
+  [ "$(dcount attn)" -ge "$(connects | wc -l)" ] 2>/dev/null || daemons_ok=0   # the connect daemons on the attention host
+  for h in "${EXPERTS[@]}"; do                                              # one listen daemon a link on each Spark
+    n=$(dcount "$h"); dn="$dn $h=$n"
+    [ "$n" = "$MCDMA_INFLIGHT" ] || daemons_ok=0
+  done
+  links=$(links_up)
+  log "recover: health $hc; containers${st}; links $links/$want up; mcdma-rpcd attn=$(dcount attn)${dn}"
+  if [ $hc = ok ] && [ "$st" = " attn=running x0=running x1=running" ] && [ "$links" = "$want" ] \
+     && [ $daemons_ok = 1 ] && smoke; then
+    log "recover: healthy, nothing to do"; return 0
+  fi
+  for h in "${NODES[@]}"; do      # the attention node first (MCDMA's order); a container that stays up stops it all
+    dstop "$h" || { log "recover: a container on $h still runs after SIGTERM: not killing it, not restarting (needs you)"; return 3; }
+  done
+  if [ "$links" != "$want" ] || [ $daemons_ok = 0 ]; then
+    stop_all_daemons || { log "recover: an mcdma-rpcd did not stop on SHUTDOWN + SIGTERM (needs you)"; return 3; }
+    what="containers, MCDMA daemons"
+  fi
+  for h in "${EXPERTS[@]}"; do
+    wait_mem "$h" soft || { log "recover: $h's memory did not come back after its expert node exited: stranded GB10 memory, a reboot of $h is your call (needs you)"; return 3; }
+  done
+  "$ROOT/build.sh" ext || die "recover: the no-model prebuild failed: nothing started"   # also clears stale build locks
+  [ "$what" = containers ] || daemons_up
+  boot
+  wait_health
+  startup_lines
+  smoke || { log "recover: up, but the smoke reply failed"; return 4; }
+  log "RECOVERED in $(( $(date +%s) - t0 )) s (restarted: $what): $BASE_URL/v1 serves $MODEL_NAME"
+}
+
 case ${1:-up} in
-  up) cmd_up ;; check) cmd_check ;; probe) cmd_probe ;; status) cmd_status ;; logs) cmd_logs ;; smoke) cmd_smoke ;;
-  *) echo "usage: $0 [up|check|probe|status|logs|smoke]"; exit 2 ;;
+  up) ctl_lock; rm -f "$CTL_STATE/stopped"; cmd_up ;;
+  probe) ctl_lock; cmd_probe ;;
+  recover) ctl_lock; cmd_recover ;;
+  check) cmd_check ;; status) cmd_status ;; logs) cmd_logs ;; smoke) cmd_smoke ;;
+  *) echo "usage: $0 [up|check|probe|status|logs|smoke|recover]"; exit 2 ;;
 esac

@@ -1,0 +1,1678 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 00:37:45 -0400
+Subject: [PATCH] glm5_next/cuda: BF16 partial sums on the AFD return wire for
+ prompt windows, TF_GLM_PARTIALS_BF16 (glm53f-afd's BF16 return planes)
+
+Hugh Madden (@dangerm00se, github.com/hughmadden) authored the BF16 return path of glm53f-afd (@ 91db3cc,
+crates/glm53f-rank/README.md: the large-M path's reduce step and the return-path table, "Four BF16 planes, added in
+FP32 by the coordinator"): each expert rank sums its routed slots in FP32, rounds the sum to BF16 and returns it, and
+the coordinator adds the planes in FP32. MIT, Copyright (c) 2026 Turquoise Bay AI Pty Ltd. Written here for this
+tree's MCDMA wire; no code is copied.
+
+Per row and MoE layer a prompt window sends each expert node its bf16 FFN input row (8,192 bytes at hidden 4,096,
+plus the routing) and gets back each node's fp32 partial sum (16,384 bytes). TF_GLM_PARTIALS_BF16=1 (the same on the
+attention node and on both expert nodes; unset or 0: every call, header, buffer and byte as before) halves the
+replies of prompt windows (MODE_CHUNK, MODE_SLICE, MODE_PAIR, MODE_LANES) to 8,192 bytes a row; decode windows
+(MODE_EAGER, 1 .. 128 rows) keep fp32 replies and their bits. It changes outputs (one rounding of each half's sum),
+so it is off by default:
+- partials_bf16.py: the switch (0 or 1; anything else refuses), a reply row's bytes, the startup refusal, and the
+  tests' oracle (round to nearest even from the fp32 bits).
+- mcdma.py: Layout(bf16=): rep(rows, prompt) is a prompt window's bf16 reply; room(rows), the reply half the
+  mailboxes must hold, is the larger of the bf16 prompt reply and a decode window's fp32 reply of up to EAGER_MOST
+  (128) rows, so at 2,048 rows on GLM-5.3-Flash the reply half needs 20 MiB instead of 36 (mib, check_room).
+- afd_mcdma.py: McdmaTransport sizes its layout with "partials_bf16", waits for a prompt window's replies at their
+  bf16 length and refuses a decode window wider than the reply room; McdmaExpertLink rounds a prompt window's partial
+  (fp32, the experts' slot-order sum, unchanged) into its link's own bf16 rows with torch's conversion (to nearest,
+  ties to even) and replies with their bytes, on the reply stream after the compute's event over N links
+  (TF_GLM_MCDMA_INFLIGHT), else on the compute stream or blocking, as the fp32 reply goes; open_expert_link sizes the
+  room with it; sent() gives the wire check the rows the attention adds.
+- afd.py: settings_for(partials_bf16=) adds "partials_bf16": 1, which an expert node of an older tree refuses;
+  AfdWire.collect lands a prompt window's two bf16 replies in the shared expert's plane of afd_recv, widens them into
+  planes 0 and 1 (exact, one kernel) and writes the shared expert's rows after them, so hc_post adds the same three
+  fp32 planes in the same order (rank 1's, rank 2's, the shared expert's).
+- experts_node.py: serve() reads the node's own TF_GLM_PARTIALS_BF16 before the handshake and refuses to start when
+  it differs from the attention node's, naming both settings, under its error key (the attention's watchdog stops
+  with it), before its link opens or its weights load; the wire check hashes the rows sent.
+- engine.py: the attention node reads the switch before the wire opens, announces it and names it at startup.
+- afd_transport.py: the protocol's recv and reply docstrings.
+- THIRD_PARTY_NOTICES.md: "GLM BF16 partial sums on the return wire".
+
+The rounding is row-local (each value alone), so a prompt row's reply is the same in any window: alone or grouped
+(TF_GLM_MULTI_PREFILL), in a pair or lanes, at any number of exchanges in flight.
+
+Tests (CPU): tests/test_glm_partials_bf16.py (24 with the Triton interpreter, 23 without): the setting, the handshake
+(an older expert refuses) and the sizes at GLM-5.3-Flash's shapes; the rounding bit for bit against a plain-Python
+round to nearest even over every class of value (ties both ways, overflow to infinity, subnormals, signed zeros,
+NaN), the widening exact for all 65,536 bf16 patterns, the error within half a bf16 step, the rounding row-local; the
+real AfdWire, McdmaTransport and both experts' loops over the fake MCDMA pair, CPU-, GPU-driven and mixed: prompt
+chunks, a layer slice, a pair and lanes of 3 and 4 come back as the bf16 rounding of each expert's partial and decode
+windows as the partial itself, each reply word 2 or 4 bytes a value, the mailbox holding the bf16 bytes; a row's
+reply the same in any window; the planes equal to the switch-off planes with the halves rounded, and glue.hc_post
+(interpreted) adding them in rank order in fp32; lanes at 1 to 4 exchanges in flight equal to each lane alone; the
+wire check with 0 mismatches; the expert's reply stream with bf16 rows (faked streams and events); the mailbox room at
+20 + 36 and 20 + 20 MiB on both ends; the startup refusals (a switch that differs on either side, a bad value) and
+serve() with both on; the switch off giving today's sizes, replies and reply lengths.
+
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+ THIRD_PARTY_NOTICES.md                        |  15 +
+ src/tensorfold/families/glm5_next/cuda/afd.py |  24 +-
+ .../families/glm5_next/cuda/afd_mcdma.py      |  99 +-
+ .../families/glm5_next/cuda/afd_transport.py  |   6 +-
+ .../families/glm5_next/cuda/engine.py         |  16 +-
+ .../families/glm5_next/cuda/experts_node.py   |  28 +-
+ .../families/glm5_next/cuda/mcdma.py          |  28 +-
+ .../families/glm5_next/cuda/partials_bf16.py  |  76 ++
+ tests/test_glm_partials_bf16.py               | 972 ++++++++++++++++++
+ 9 files changed, 1232 insertions(+), 32 deletions(-)
+ create mode 100644 src/tensorfold/families/glm5_next/cuda/partials_bf16.py
+ create mode 100644 tests/test_glm_partials_bf16.py
+
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index d878952..390476e 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -453,6 +453,21 @@ opens N links to each expert node (`NAME`, `NAME-1`, ...) and sends the run's k-
+ MCDMA's protocol and daemons unchanged (installed separately, as above). No code is copied. Off unless set
+ (`TF_GLM_MCDMA_INFLIGHT` 1 .. 4; unset or 1: one link to each expert node, as before).
+ 
++## GLM BF16 partial sums on the return wire (TF_GLM_PARTIALS_BF16)
++
++Hugh Madden ([@dangerm00se](https://x.com/dangerm00se), [hughmadden](https://github.com/hughmadden)) authored the
++BF16 return path of the AFD design that `families/glm5_next/cuda/partials_bf16.py`, `mcdma.py`, `afd_mcdma.py` and
++`afd.py` bring to this tree's attention/expert split: in
++[glm53f-afd](https://github.com/hughmadden/glm53f-afd/tree/91db3cc6fe672e2724efa3464f63bd31493f63f6)
++(`crates/glm53f-rank/README.md`: the large-M path's reduce step and the return-path table, "Four BF16 planes, added in
++FP32 by the coordinator") each expert rank reduces its routed slots in FP32, rounds the sum to BF16 and returns it,
++and the coordinator adds the planes in FP32. MIT License, Copyright (c) 2026 Turquoise Bay AI Pty Ltd (the MIT text
++above). No code is copied: here each expert node rounds its half's fp32 partial with torch's float-to-bf16 conversion
++(to nearest, ties to even) for prompt windows only (decode windows keep fp32 replies), the reply's place in the MCDMA
++mailbox is this tree's, and the attention node widens the rows into the fp32 planes `glue.hc_post` adds as before.
++Off unless set (`TF_GLM_PARTIALS_BF16=1`, the same on the attention node and on both expert nodes; it changes
++outputs).
++
+ ## GLM attention-side prompt kernels (TF_GLM_LATENT_MMA, TF_GLM_HC_MMA, TF_GLM_SEQ_ROWS, TF_GLM_SPARSE_ONEPASS, TF_GLM_PROMPT_DSA)
+ 
+ `families/glm5_next/cuda/latent.py`'s `_absorb_mma`, `_expand_mma`, `MMA_TILE`, `MMA_LAUNCH` and the `prompt` paths
+diff --git a/src/tensorfold/families/glm5_next/cuda/afd.py b/src/tensorfold/families/glm5_next/cuda/afd.py
+index f43f89b..2f72d13 100644
+--- a/src/tensorfold/families/glm5_next/cuda/afd.py
++++ b/src/tensorfold/families/glm5_next/cuda/afd.py
+@@ -20,6 +20,10 @@ lanes (MODE_LANES, TF_GLM_PREFILL_LANES of 3 or 4, ``begin_lanes``) open N such
+ 
+ TF_GLM_WIRE_FP8=1 sends each exchange's FFN input rows as FP8 E4M3 rows with one UE8M0 scale per 32 values
+ (``wire_fp8``, the transport's codec); the expert nodes decode them to the same bf16 values before their experts.
++
++TF_GLM_PARTIALS_BF16=1 (``partials_bf16``, on every node) has the expert nodes send a prompt window's partial sums back
++rounded to bf16; ``collect`` lands both in the shared expert's plane of ``afd_recv``, widens them into the first two
++planes (exact) and then writes the shared expert there, so ``hc_post`` adds the same three fp32 planes in the same order.
+ """
+ 
+ from __future__ import annotations
+@@ -63,11 +67,13 @@ def moe_layers(cfg) -> list[int]:
+ 
+ 
+ def settings_for(model_dir, cfg, *, prefill_rows: int, pairs: bool = False, lanes: int = 0,
+-                 wire_fp8: bool = False) -> dict:
++                 wire_fp8: bool = False, partials_bf16: bool = False) -> dict:
+     """Everything both sides must agree on before the first forward; a mismatch refuses to start. ``pairs``
+     (TF_GLM_PREFILL_PAIRS on the attention node) adds ``"pairs": 1``: expert nodes of a tree without MODE_PAIR refuse
+     it here; without it the settings are unchanged. ``lanes`` (TF_GLM_PREFILL_LANES of 3 or more) adds ``"lanes": N``
+-    and ``wire_fp8`` (TF_GLM_WIRE_FP8) ``"wire_fp8": 1`` the same way (an expert node of a tree without them refuses)."""
++    and ``wire_fp8`` (TF_GLM_WIRE_FP8) ``"wire_fp8": 1`` the same way (an expert node of a tree without them refuses).
++    ``partials_bf16`` (TF_GLM_PARTIALS_BF16) adds ``"partials_bf16": 1``, which each expert node also checks against
++    its own switch (``experts_node.serve``)."""
+ 
+     from pathlib import Path
+ 
+@@ -81,6 +87,8 @@ def settings_for(model_dir, cfg, *, prefill_rows: int, pairs: bool = False, lane
+         out["lanes"] = int(lanes)
+     if wire_fp8:
+         out["wire_fp8"] = 1
++    if partials_bf16:
++        out["partials_bf16"] = 1
+     return out
+ 
+ 
+@@ -236,6 +244,7 @@ class AfdWire:
+     _sliced = 0
+     depth = 1                                    # exchanges in flight at once: one request on each link (protocol 1);
+     # TF_GLM_MCDMA_INFLIGHT=N: the transport's N link pairs, one request on each (``afd_mcdma.McdmaTransport.depth``)
++    bf16 = False                                 # TF_GLM_PARTIALS_BF16: prompt windows' partials come as bf16 (announce)
+     # TF_GLM_PREFILL_PAIRS (``begin_pair``): an open pair's two windows (the inactive one's fields saved there), the
+     # active one, its offset among the check's forwards, the requests on the wire ((window, layer), the oldest first,
+     # at most ``depth``), the checked paired forwards' seqs, TF_AFD_TIME's pair events (per window and MoE layer:
+@@ -305,6 +314,7 @@ class AfdWire:
+         """The settings both sides must agree on, plus the wire's own; the experts size off them."""
+ 
+         self.nlayers = len(settings["layers"])
++        self.bf16 = settings.get("partials_bf16") == 1
+         self.store.set("afd_settings", json.dumps(dict(settings, **self.tr.publish(settings))).encode())
+ 
+     def wait_loaded(self, seconds: float = 3600.0) -> None:
+@@ -550,7 +560,15 @@ class AfdWire:
+         n = rows * d
+         flat = b.afd_recv.view(-1)
+         try:
+-            self.tr.recv(flat[:n].view(rows, d), flat[n:2 * n].view(rows, d), self.layer - 1)
++            if self.bf16 and self.mode != MODE_EAGER:
++                # TF_GLM_PARTIALS_BF16: a prompt window's halves come as bf16 rows. Both land in the shared expert's
++                # plane (its 4n bytes hold the two 2n-byte replies), are widened into planes 0 and 1 (exact: one
++                # kernel), and the shared expert's rows then overwrite the landing, below, as before
++                land = flat[2 * n:3 * n].view(self.torch.bfloat16)
++                self.tr.recv(land[:n].view(rows, d), land[n:].view(rows, d), self.layer - 1)
++                flat[:2 * n].copy_(land)
++            else:
++                self.tr.recv(flat[:n].view(rows, d), flat[n:2 * n].view(rows, d), self.layer - 1)
+         except WireError as exc:
+             self._fail(exc)
+         if self._pair is not None:
+diff --git a/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py b/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py
+index 6460bbc..0c11bd8 100644
+--- a/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py
++++ b/src/tensorfold/families/glm5_next/cuda/afd_mcdma.py
+@@ -1,7 +1,8 @@
+ """The AFD wire over MCDMA link daemons: eager windows.
+ 
+ The attention node is the connect end of both links (``McdmaTransport``): per MoE layer one packed request
+-``[header | normed | pick | pad | wts]`` into both mailboxes, then both fp32 replies back, as stream memory
++``[header | normed | pick | pad | wts]`` into both mailboxes, then both fp32 replies back (a prompt window's as bf16
++rows under TF_GLM_PARTIALS_BF16, ``partials_bf16``), as stream memory
+ operations where the probe passes (``mcdma_cuda``). Each expert node is the listen end of its own link
+ (``McdmaExpertLink``), opened before its weights load; the first request of a forward is its doorbell. The
+ three-rank TCPStore (``StoreComm``) is the rendezvous; the handshake, the heartbeats and error keys, and the wire
+@@ -119,6 +120,9 @@ class McdmaTransport:
+         self._tabs = None                                  # a prompt chunk pair's / lanes' windows' header tables
+         self.fp8 = False                                   # TF_GLM_WIRE_FP8 (the handshake's ``wire_fp8``)
+         self.codes = self.scales = None                    # fp8: the encoded rows, before they are packed
++        self.bf16 = False                                  # TF_GLM_PARTIALS_BF16 (the handshake's ``partials_bf16``)
++        self.prompt = False                                # the current forward is a prompt window's (bf16: bf16 replies)
++        self.rows_max = 0                                  # the widest window's rows (``publish``)
+         self.down = False                                  # aborted: the forward in flight runs on without the wire
+         # rank 0 hosts the store and waits for both experts' clients
+         self.comm = comm if comm is not None else StoreComm(0, 3, master, port, links)
+@@ -133,7 +137,9 @@ class McdmaTransport:
+         layers = len(settings["layers"])
+         rows = max(int(settings["prefill_rows"]), int(settings["max_rows"]))
+         self.fp8 = settings.get("wire_fp8") == 1
+-        self.layout = mcdma.Layout(self.hidden, int(settings["top_k"]) + 1, fp8=self.fp8)
++        self.bf16 = settings.get("partials_bf16") == 1
++        self.layout = mcdma.Layout(self.hidden, int(settings["top_k"]) + 1, fp8=self.fp8, bf16=self.bf16)
++        self.rows_max = rows
+         self.mc.check_room(self.layout, rows)
+         dev = self.device
+         tab = torch.zeros((layers, mcdma.HDR_INTS), dtype=torch.int32, pin_memory=dev != "cpu")
+@@ -164,6 +170,7 @@ class McdmaTransport:
+         request, carries n; every other forward leaves words 6-63 zero."""
+ 
+         tab = self.hdr_tab_cpu
++        self.prompt = mode != MODE_EAGER         # TF_GLM_PARTIALS_BF16: a prompt window's replies come as bf16
+         tab[:, 1] = seq & 0x7FFFFFFF
+         tab[:, 2] = rows
+         tab[:, 4] = mode
+@@ -191,6 +198,7 @@ class McdmaTransport:
+     def _windows(self, seqs, rows, mode: int) -> None:
+         torch = self.torch
+         n = len(rows)
++        self.prompt = True                       # TF_GLM_PARTIALS_BF16: pairs and lanes are prompt windows
+         if self._tabs is None:
+             self._tabs = [(self.hdr_tab, self.hdr_tab_cpu)]
+         while len(self._tabs) < n:
+@@ -246,12 +254,17 @@ class McdmaTransport:
+         parts.append(_bytes(b.wts[:rows]))
+         req = self.req_dev[:n]
+         torch.cat(parts, out=req)            # one kernel: the request contiguous for one copy per link
++        rep = lay.rep(rows, prompt=self.prompt)   # TF_GLM_PARTIALS_BF16 (the layout's bf16): a prompt's are bf16 rows
++        if self.bf16 and rep > lay.room(self.rows_max):
++            raise WireError("a reply wider than the mailboxes", f"a {rows}-row decode window's fp32 reply ({rep} bytes) "
++                            f"does not fit the reply room sized for TF_GLM_PARTIALS_BF16 ({lay.room(self.rows_max)} "
++                            f"bytes: bf16 prompt windows, decode windows of at most {mcdma.EAGER_MOST} rows)")
+         j = self._next                       # TF_GLM_MCDMA_INFLIGHT: this request's link pair (one slot: every link)
+         try:
+             if self.depth == 1:
+-                self.mc.issue(req, n, lay.rep(rows))
++                self.mc.issue(req, n, rep)
+             else:
+-                self.mc.issue(req, n, lay.rep(rows), self._slots[j])
++                self.mc.issue(req, n, rep, self._slots[j])
+         except mcdma.LinkError as exc:
+             raise WireError(str(exc), f"MCDMA {exc}") from exc
+         self._next = (j + 1) % self.depth
+@@ -259,10 +272,15 @@ class McdmaTransport:
+ 
+     def recv(self, dst1, dst2, layer: int) -> None:
+         """Rank 1's then rank 2's partial straight from the mailboxes (TF_GLM_MCDMA_INFLIGHT: the oldest unanswered
+-        request's link pair; replies are collected in request order)."""
++        request's link pair; replies are collected in request order). TF_GLM_PARTIALS_BF16: a prompt window's are bf16
++        rows (``AfdWire.collect`` passes bf16 views and widens them)."""
+ 
+         if self.down:
+             return
++        if self.bf16 and (dst1.element_size() == 2) != self.prompt:
++            raise WireError("a reply of the other format", f"layer {layer}'s reply rows are "
++                            f"{dst1.dtype} but this forward's replies are {'bf16' if self.prompt else 'fp32'} "
++                            "(TF_GLM_PARTIALS_BF16: prompt windows bf16, decode windows fp32)")
+         j = self._flight.popleft() if self._flight else 0
+         try:
+             if self.depth == 1:
+@@ -327,12 +345,14 @@ def open_expert_link(theirs: dict, rank: int, cfg, store, device: str = "cuda",
+     flags = mcdma_cuda.flush_flag(driver, ordinal) if mode == "gpu" else 0
+     rows = int(theirs["prefill_rows"])
+     fp8 = theirs.get("wire_fp8") == 1
++    bf16 = theirs.get("partials_bf16") == 1       # TF_GLM_PARTIALS_BF16 (serve checked this node's own agrees)
+     links: list = []
+     for j, nm in enumerate(names[rank - 1::2]):    # this node's links: rank r's of every exchange slot, link 0 first
+         more: dict = {} if j == 0 else {"socket_path": mcdma.socket_for(nm, j)}   # link 0's socket: as one link's
+         link = mcdma.ExpertLink(nm, driver=driver, mode=mode, flags=flags, log=log, **more)
+         links.append(link)
+-        link.check_room(mcdma.Layout(cfg.hidden, cfg.top_k + 1, fp8=fp8), max(rows, int(theirs["max_rows"])))
++        link.check_room(mcdma.Layout(cfg.hidden, cfg.top_k + 1, fp8=fp8, bf16=bf16),
++                        max(rows, int(theirs["max_rows"])))
+         raw = get_store(store, f"afd_mcdma/base/{rank}" if j == 0 else f"afd_mcdma/base/{rank}/{j}", 60.0)
+         if raw is None:
+             for lk in links:
+@@ -344,7 +364,8 @@ def open_expert_link(theirs: dict, rank: int, cfg, store, device: str = "cuda",
+             f"{link.box.req >> 20}+{link.box.rep >> 20} MiB, socket {link.socket_path}, first sequence {link.base}"
+             + ("" if n == 1 else f" (exchange slot {j} of {n})"), flush=True)
+     return McdmaExpertLink(links[0] if n == 1 else links, cfg.hidden, cfg.top_k + 1, len(theirs["layers"]), rows,
+-                           device, pairs=theirs.get("pairs") == 1, lanes=int(theirs.get("lanes", 0)), fp8=fp8)
++                           device, pairs=theirs.get("pairs") == 1, lanes=int(theirs.get("lanes", 0)), fp8=fp8,
++                           bf16=bf16)
+ 
+ 
+ class McdmaExpertLink:
+@@ -355,7 +376,9 @@ class McdmaExpertLink:
+     a time, their layers alternating (``next_partner``, ``use``); the link still carries one request at a time.
+     ``lanes`` (the handshake's, 3 or more): MODE_LANES forwards come N at a time (the header's word 10), their layers
+     in lane order, as a pair's. ``fp8`` (the handshake's ``wire_fp8``): the request's rows are FP8 wire rows, decoded
+-    to bf16 after each landing (``wire_fp8.decode``).
++    to bf16 after each landing (``wire_fp8.decode``). ``bf16`` (the handshake's ``partials_bf16``, which this node's
++    TF_GLM_PARTIALS_BF16 matched): a prompt window's partial goes back rounded to bf16 (``reply``), a decode window's
++    as fp32.
+ 
+     ``link`` may be a list of N links (the handshake's ``inflight``, TF_GLM_MCDMA_INFLIGHT; link 0 first): the run's
+     k-th request comes on link k mod N, the order the attention issued them in, so the node lands and computes them in
+@@ -365,11 +388,11 @@ class McdmaExpertLink:
+     reply was copied out."""
+ 
+     def __init__(self, link, hidden: int, slots: int, layers: int, prefill_rows: int, device: str = "cuda", *,
+-                 pairs: bool = False, lanes: int = 0, fp8: bool = False) -> None:
++                 pairs: bool = False, lanes: int = 0, fp8: bool = False, bf16: bool = False) -> None:
+         self.links = list(link) if isinstance(link, (list, tuple)) else [link]
+         self.at = 0                              # the link the next request comes on (the run's k-th: k mod N)
+         self.seqs = [lk.base for lk in self.links]   # each link's next request's sequence
+-        self.lay = mcdma.Layout(hidden, slots, fp8=fp8)
++        self.lay = mcdma.Layout(hidden, slots, fp8=fp8, bf16=bf16)
+         self.hidden = hidden
+         self.layers, self.prefill_rows, self.device = layers, prefill_rows, device
+         self.gpu = self.links[0].mode == "gpu"
+@@ -396,6 +419,13 @@ class McdmaExpertLink:
+             self._computed = [torch.cuda.Event() for _ in self.links]
+             self._sent = [torch.cuda.Event() for _ in self.links]
+             self._used = [False] * len(self.links)
++        # TF_GLM_PARTIALS_BF16: each link's bf16 rows, the rounded partial its reply carries (``_reply_bf16``)
++        self.bf16, self.bf16_rep, self.halves = bool(bf16), False, None
++        if self.bf16:
++            import torch
++
++            self.halves = [torch.empty((prefill_rows, hidden), dtype=torch.bfloat16, device=device)
++                           for _ in self.links]
+ 
+     @property
+     def link(self):
+@@ -459,6 +489,7 @@ class McdmaExpertLink:
+             self.partner, self.wmode, self.n_windows = h[PAIR_OTHER], MODE_LANES, h[LANE_COUNT]
+         elif mode not in (MODE_EAGER, MODE_CHUNK, MODE_SLICE):
+             raise mcdma.LinkError(f"link {link.name}: forward mode {mode}: the MCDMA wire carries eager windows only")
++        self.bf16_rep = self.bf16 and mode != MODE_EAGER   # TF_GLM_PARTIALS_BF16: a prompt window's replies are bf16
+         self._open(fseq, rows, first, count)
+         if mode in (MODE_PAIR, MODE_LANES):
+             self.slot, self._wins = 0, [self._win()] + [None] * (self.n_windows - 1)
+@@ -468,7 +499,7 @@ class McdmaExpertLink:
+         lay, link = self.lay, self.link
+         self.fseq, self.rows = fseq, rows
+         self.first, self.count = first, self.layers if count is None else count
+-        self.n_req, self.n_rep = lay.req(rows), lay.rep(rows)
++        self.n_req, self.n_rep = lay.req(rows), lay.rep(rows, prompt=self.bf16_rep)
+         self.x = lay.views(self.landing, rows)
+         self.src, self.dst = link.box.req_bytes[mcdma.HDR_BYTES:self.n_req], self.landing[:self.n_req - mcdma.HDR_BYTES]
+         self.rep = link.box.rep_bytes[:self.n_rep]
+@@ -558,6 +589,9 @@ class McdmaExpertLink:
+         return self.outs[j][:rows]
+ 
+     def reply(self, layer: int, routed) -> None:
++        if self.bf16_rep:                                   # TF_GLM_PARTIALS_BF16: a prompt window's partial as bf16
++            self._reply_bf16(routed)
++            return
+         if routed is not self._routed:
+             self._routed, self._out = routed, _bytes(routed)
+         link, multi = self.link, len(self.links) > 1
+@@ -591,6 +625,49 @@ class McdmaExpertLink:
+         self._sent[j].record(self.side)
+         self._used[j] = True
+ 
++    def _reply_bf16(self, routed) -> None:
++        """TF_GLM_PARTIALS_BF16: the partial (fp32 [rows, D], the experts' slot-order sum as before) rounded to bf16, to
++        nearest with ties to even, into the current link's own bf16 rows, whose bytes the reply carries: half the fp32
++        reply's. Staged as the fp32 reply is: on the reply stream after the compute's event when the rows are ``out``'s
++        (GPU-driven over N links; the compute waits for that link's ``_sent`` before it writes the rows again), else on
++        the compute stream (GPU-driven) or blocking (CPU-driven)."""
++
++        import torch
++
++        j, link, multi = self.at, self.link, len(self.links) > 1
++        rep = self.rep if not multi else link.box.rep_bytes[:self.n_rep]
++        half = self.halves[j][:routed.shape[0]]
++        if self.gpu and self.side is not None and routed.data_ptr() == self.outs[j].data_ptr():
++            self._computed[j].record(torch.cuda.current_stream())
++            self.side.wait_event(self._computed[j])
++            with torch.cuda.stream(self.side):
++                half.copy_(routed)                          # the rounding, on the reply stream
++                rep.copy_(_bytes(half), non_blocking=True)
++            link.stage_gpu(self.seq, self.n_rep, stream=self.side.cuda_stream)   # fenced: the partial lands first
++            self._sent[j].record(self.side)
++            self._used[j] = True
++        elif self.gpu:
++            half.copy_(routed)
++            rep.copy_(_bytes(half), non_blocking=True)
++            link.stage_gpu(self.seq, self.n_rep)            # write-value's fence: the partial lands before the word
++        else:
++            half.copy_(routed)
++            rep.copy_(_bytes(half))                         # blocking: the rounding, then these bytes, before the word
++            link.stage(self.seq, self.n_rep)
++        self.seq = mcdma.next_seq(self.seq)
++        if multi:                                           # the run's next request comes on the next link
++            self.at = (self.at + 1) % len(self.links)
++
++    def sent(self, routed):
++        """The rows the attention receives for ``routed`` (what the wire check hashes): ``routed`` itself, or on a
++        prompt window under TF_GLM_PARTIALS_BF16 its bf16 rounding, widened back to fp32 as the attention widens it."""
++
++        if not self.bf16_rep:
++            return routed
++        import torch
++
++        return routed.to(torch.bfloat16).to(torch.float32)
++
+     def health(self) -> str | None:
+         if len(self.links) == 1:
+             return self.link.alive() or None
+diff --git a/src/tensorfold/families/glm5_next/cuda/afd_transport.py b/src/tensorfold/families/glm5_next/cuda/afd_transport.py
+index 62e2e9a..f392800 100644
+--- a/src/tensorfold/families/glm5_next/cuda/afd_transport.py
++++ b/src/tensorfold/families/glm5_next/cuda/afd_transport.py
+@@ -47,7 +47,8 @@ class ExpertTransport(Protocol):
+         ...
+ 
+     def recv(self, dst1, dst2, layer: int) -> None:
+-        """Both halves' fp32 partials for this layer into ``dst1`` (expert 1) and ``dst2`` (expert 2)."""
++        """Both halves' fp32 partials for this layer into ``dst1`` (expert 1) and ``dst2`` (expert 2); under
++        TF_GLM_PARTIALS_BF16 (``partials_bf16``) a prompt window's as bf16 rows (``dst1``/``dst2`` are bf16 then)."""
+         ...
+ 
+     def health(self) -> str | None:
+@@ -81,7 +82,8 @@ class ExpertLink(Protocol):
+         ...
+ 
+     def reply(self, layer: int, routed) -> None:
+-        """This layer's fp32 partial back to the attention node."""
++        """This layer's fp32 partial back to the attention node (TF_GLM_PARTIALS_BF16: a prompt window's rounded to
++        bf16 by the link)."""
+         ...
+ 
+     def health(self) -> str | None:
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 7a94e66..46a7bae 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -578,18 +578,25 @@ class GlmEngine:
+         # on multiples of G and kept prompt states sit on them. Read before anything reaches the AFD wire
+         self.grid = prompt_grid(prefill_rows)
+         if afd is not None:
+-            from . import prefill_pairs, wire_fp8
++            from . import partials_bf16, prefill_pairs, wire_fp8
+             from .afd import settings_for
+ 
+             # the experts size off this; TF_GLM_PREFILL_PAIRS adds "pairs" (expert nodes without MODE_PAIR refuse it),
+-            # TF_GLM_PREFILL_LANES of 3 or 4 "lanes" too (without MODE_LANES: refused), TF_GLM_WIRE_FP8 "wire_fp8"
++            # TF_GLM_PREFILL_LANES of 3 or 4 "lanes" too (without MODE_LANES: refused), TF_GLM_WIRE_FP8 "wire_fp8",
++            # TF_GLM_PARTIALS_BF16 "partials_bf16" (each expert node refuses one that differs from its own)
+             lanes = prefill_pairs.lanes()
+             afd.announce(settings_for(model_dir, cfg, prefill_rows=prefill_rows, pairs=lanes >= 2,
+-                                      lanes=lanes if lanes >= 3 else 0, wire_fp8=wire_fp8.enabled()))
++                                      lanes=lanes if lanes >= 3 else 0, wire_fp8=wire_fp8.enabled(),
++                                      partials_bf16=partials_bf16.enabled()))
+             if wire_fp8.enabled():
+                 print(f"[tensorfold] TF_GLM_WIRE_FP8=1: the MoE exchanges' FFN input rows go as FP8 E4M3 rows, one "
+                       f"UE8M0 scale per {wire_fp8.BLOCK} values ({wire_fp8.row_bytes(cfg.hidden)} bytes a row instead of "
+                       f"{2 * cfg.hidden}); the expert nodes decode them to bf16", flush=True)
++            if partials_bf16.enabled():
++                print(f"[tensorfold] TF_GLM_PARTIALS_BF16=1: the expert nodes send prompt windows' partial sums back as "
++                      f"bf16 ({partials_bf16.row_bytes(cfg.hidden, True)} bytes a row each instead of "
++                      f"{partials_bf16.row_bytes(cfg.hidden, False)}), widened to fp32 here and added in fp32 as before; "
++                      "decode windows' stay fp32", flush=True)
+         multi_code = [0]
+         if parallel > 1:                      # serial and batched verify windows make different collectives
+             from .multi import verify_kind
+@@ -1393,11 +1400,12 @@ class AfdEngine(GlmEngine):
+             multi_window()                        # TF_GLM_MULTI_WINDOW read now: a typo fails before the wire opens
+         shared_prefix()                           # TF_GLM_SHARED_PREFIX read now: a typo fails before the wire opens
+         dflash_policy_check()                     # and TF_GLM_DFLASH_POLICY (0021)
+-        from . import prefill_pairs, wire_fp8
++        from . import partials_bf16, prefill_pairs, wire_fp8
+ 
+         prefill_pairs.enabled()                   # TF_GLM_PREFILL_PAIRS read now: a typo fails before the wire opens
+         prefill_pairs.lanes()                     # TF_GLM_PREFILL_LANES too
+         wire_fp8.enabled()                        # and TF_GLM_WIRE_FP8
++        partials_bf16.enabled()                   # and TF_GLM_PARTIALS_BF16
+         prompt_grid(prefill_rows_from_env())      # TF_GLM_PREFILL_ROWS, TF_GLM_PROMPT_GRID / TF_GLM_KDA_CHUNKED too
+         afd = make_afd(master, port, model_dir)   # AFD rank 0: the store lives here; the experts join
+         super().__init__(model_dir, rank=0, master=master, port=port, policy=policy, drafter=drafter,
+diff --git a/src/tensorfold/families/glm5_next/cuda/experts_node.py b/src/tensorfold/families/glm5_next/cuda/experts_node.py
+index 1ede2b9..1266416 100644
+--- a/src/tensorfold/families/glm5_next/cuda/experts_node.py
++++ b/src/tensorfold/families/glm5_next/cuda/experts_node.py
+@@ -168,10 +168,18 @@ def _window(node: ExpertNode, link, R: int, collect: tuple[list, list] | None =
+         else:
+             got = node.compute(i, R, x, out=dst)
+         if collect is not None:
+-            collect[1].append(sha(got))
++            collect[1].append(sha(_sent(link, got)))
+         link.reply(pos, got)
+ 
+ 
++def _sent(link, routed):
++    """The rows the attention receives for ``routed`` (the wire check's hash): TF_GLM_PARTIALS_BF16 rounds a prompt
++    window's to bf16 (``McdmaExpertLink.sent``); otherwise ``routed`` itself."""
++
++    sent = getattr(link, "sent", None)
++    return sent(routed) if sent is not None else routed
++
++
+ def _pair(node: ExpertNode, link, collect: list) -> int:
+     """A prompt chunk pair's device body (MODE_PAIR, TF_GLM_PREFILL_PAIRS): the two windows' layers in the order
+     their requests come, window 0's layer, window 1's, the next layer's ...; the second window's first request is
+@@ -201,7 +209,7 @@ def _lanes(node: ExpertNode, link, collect: list) -> list[int]:
+             dst = _out(link, R)
+             routed = node.compute(i, R, x) if dst is None else node.compute(i, R, x, out=dst)
+             if collect[slot] is not None:
+-                collect[slot][1].append(sha(routed))
++                collect[slot][1].append(sha(_sent(link, routed)))
+             link.reply(pos, routed)
+     return seqs
+ 
+@@ -252,7 +260,7 @@ def serve(model_dir, half: int, master: str, port: int, *, device: str = "cuda")
+     import threading
+     import time
+ 
+-    from . import afd_mcdma
++    from . import afd_mcdma, partials_bf16
+ 
+     cfg = Config.read(model_dir)
+     rank = half + 1
+@@ -272,16 +280,22 @@ def serve(model_dir, half: int, master: str, port: int, *, device: str = "cuda")
+     threading.Thread(target=beat, daemon=True, name=f"afd-beat-{rank}").start()
+     link = None
+     try:
++        own_bf16 = partials_bf16.enabled()       # TF_GLM_PARTIALS_BF16: a bad value refuses before the handshake
+         theirs = None
+         while theirs is None:                            # the attention publishes before its own load
+             raw = get_store(store, "afd_settings", 3600.0)
+             theirs = json.loads(bytes(raw).decode()) if raw else None
++        # TF_GLM_PARTIALS_BF16 is read on every node: the reply format must be the same at both ends of the wire
++        if (theirs.get("partials_bf16") == 1) != own_bf16:
++            why = partials_bf16.refusal(theirs.get("partials_bf16") == 1, own_bf16, rank)
++            store.set(f"afd_error/{rank}", why.encode())    # the attention's watchdog prints it and stops
++            raise SystemExit(f"[tensorfold] afd: {why}")
+         # the attention's wire must be this one; its link map is checked by open_expert_link; this tree serves
+         # prompt chunk pairs (MODE_PAIR), lanes (MODE_LANES) and FP8 wire rows when the attention asks for them
+         mine: dict = dict(settings_for(model_dir, cfg, prefill_rows=int(theirs["prefill_rows"]),
+                                        pairs=theirs.get("pairs") == 1, lanes=_lanes_asked(theirs),
+-                                       wire_fp8=theirs.get("wire_fp8") == 1), transport="mcdma",
+-                          mcdma_links=theirs.get("mcdma_links"))
++                                       wire_fp8=theirs.get("wire_fp8") == 1, partials_bf16=own_bf16),
++                          transport="mcdma", mcdma_links=theirs.get("mcdma_links"))
+         if "inflight" in theirs:                         # TF_GLM_MCDMA_INFLIGHT: N links each way, echoed (1 .. 4)
+             mine["inflight"] = afd_mcdma.inflight_asked(theirs)
+         bad = settings_mismatch(mine, theirs)
+@@ -298,6 +312,10 @@ def serve(model_dir, half: int, master: str, port: int, *, device: str = "cuda")
+             print(f"[tensorfold] afd expert {rank}: TF_GLM_EXL3_PROMPT=1: prompt chunks' routed experts through "
+                   f"MiaAI-Lab's prompt kernel (recipe patch 0004; pass {pk['prompt_pass']}, order "
+                   f"{'on' if pk['order'] else 'off'}, rowrot {'on' if pk['rowrot'] else 'off'})", flush=True)
++        if own_bf16:
++            print(f"[tensorfold] afd expert {rank}: TF_GLM_PARTIALS_BF16=1: prompt windows' partial sums go back as bf16 "
++                  f"(rounded to nearest even; {partials_bf16.row_bytes(cfg.hidden, True)} bytes a row instead of "
++                  f"{partials_bf16.row_bytes(cfg.hidden, False)}); decode windows' stay fp32", flush=True)
+         store.set(f"afd_loaded/{rank}", b"1")
+         forwards(node, link, store, rank, check_on=os.environ.get(CHECK_ENV, "").strip() == "1")
+     except Exception as exc:  # noqa: BLE001   the attention's watchdog reads this; the process exits for the lane
+diff --git a/src/tensorfold/families/glm5_next/cuda/mcdma.py b/src/tensorfold/families/glm5_next/cuda/mcdma.py
+index 394f68c..092eca1 100644
+--- a/src/tensorfold/families/glm5_next/cuda/mcdma.py
++++ b/src/tensorfold/families/glm5_next/cuda/mcdma.py
+@@ -70,6 +70,8 @@ CU_STREAM_WRITE_VALUE_DEFAULT = 0x0      # a stream-scoped system fence before t
+ CU_MEMHOSTREGISTER_PORTABLE = 0x01
+ CU_MEMHOSTREGISTER_DEVICEMAP = 0x02
+ PENDING_MAX = 1 << 16           # GPU mode's enqueued (seq, bytes) per link: far more than a forward's 42
++EAGER_MOST = 128                # TF_GLM_PARTIALS_BF16: the widest decode window (fp32 replies) the reply half must carry:
++#                                 engine.multi_decode_rows, MLA_DECODE_ROWS 64 + TF_GLM_MULTI_WINDOW's 64 at most
+ 
+ 
+ class LinkError(RuntimeError):
+@@ -167,10 +169,12 @@ class Layout:
+     """One exchange's payloads for ``rows`` rows, after each half's control page. Request: the 256-B header slot,
+     normed bf16 [rows, D], pick int32 [rows, S], wts fp32 [rows, S], each section 256-B aligned. Reply: the expert
+     half's fp32 partial [rows, D]. ``fp8`` (TF_GLM_WIRE_FP8, ``wire_fp8``): normed's section holds the rows as E4M3
+-    codes [rows, D] then their UE8M0 scale bytes [rows, D / 32] (256-B aligned) instead."""
++    codes [rows, D] then their UE8M0 scale bytes [rows, D / 32] (256-B aligned) instead. ``bf16``
++    (TF_GLM_PARTIALS_BF16, ``partials_bf16``): a prompt window's reply is the partial as bf16 [rows, D] instead; a
++    decode window's stays fp32."""
+ 
+-    def __init__(self, hidden: int, slots: int, *, fp8: bool = False) -> None:
+-        self.d, self.s, self.fp8 = int(hidden), int(slots), bool(fp8)
++    def __init__(self, hidden: int, slots: int, *, fp8: bool = False, bf16: bool = False) -> None:
++        self.d, self.s, self.fp8, self.bf16 = int(hidden), int(slots), bool(fp8), bool(bf16)
+ 
+     def offsets(self, rows: int) -> tuple[int, int, int, int]:
+         normed = HDR_BYTES
+@@ -190,8 +194,18 @@ class Layout:
+ 
+         return _align(self.d // 32 * rows) - self.d // 32 * rows
+ 
+-    def rep(self, rows: int) -> int:
+-        return 4 * self.d * rows
++    def rep(self, rows: int, prompt: bool = False) -> int:
++        """A reply's bytes: fp32 [rows, D]; with ``bf16``, a prompt window's (``prompt``) bf16 [rows, D]."""
++
++        return (2 if self.bf16 and prompt else 4) * self.d * rows
++
++    def room(self, rows: int) -> int:
++        """The reply half's bytes for windows of up to ``rows`` rows: ``rep(rows)``; with ``bf16``, the larger of a
++        prompt window's bf16 reply at ``rows`` and a decode window's fp32 reply (at most ``EAGER_MOST`` rows)."""
++
++        if not self.bf16:
++            return self.rep(rows)
++        return max(self.rep(rows, prompt=True), self.rep(min(rows, EAGER_MOST)))
+ 
+     def mib(self, rows: int) -> tuple[int, int]:
+         """The smallest mailbox halves (req_mib, rep_mib) that carry ``rows`` rows."""
+@@ -199,7 +213,7 @@ class Layout:
+         def up(n: int) -> int:
+             return (CTRL + n + SEG - 1) // SEG * 4
+ 
+-        return up(self.req(rows)), up(self.rep(rows))
++        return up(self.req(rows)), up(self.room(rows))
+ 
+     def views(self, land, rows: int):
+         """(normed, pick, wts) over a device buffer holding a request's bytes from the header slot's end on; fp8:
+@@ -345,7 +359,7 @@ class Mailbox:
+     def check_room(self, layout: Layout, rows: int) -> None:
+         """Refuse to start when the widest window (``rows``, the prompt chunk) does not fit this mailbox."""
+ 
+-        need_req, need_rep = layout.req(rows), layout.rep(rows)
++        need_req, need_rep = layout.req(rows), layout.room(rows)
+         if need_req > self.req - CTRL or need_rep > self.rep - CTRL:
+             q, p = layout.mib(rows)
+             raise LinkError(f"mailbox {self.path} ({self.req >> 20}+{self.rep >> 20} MiB) cannot carry a {rows}-row "
+diff --git a/src/tensorfold/families/glm5_next/cuda/partials_bf16.py b/src/tensorfold/families/glm5_next/cuda/partials_bf16.py
+new file mode 100644
+index 0000000..ab52d81
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/partials_bf16.py
+@@ -0,0 +1,76 @@
++"""BF16 partial sums on the AFD wire's return (``TF_GLM_PARTIALS_BF16=1``): each expert node rounds its half's weighted
++routed-expert sum of a prompt window to bf16 before it replies, 8,192 bytes a row at hidden 4,096 instead of fp32's
++16,384; the attention node widens them back to fp32 (exact) and adds the two halves and its shared expert in fp32 as
++before (``glue.hc_post``: rank 1's, rank 2's, the shared one, in that order). The halves' sums themselves are unchanged
++(the experts' kernels sum the 8 routed slots in fp32 in slot order, as before); only their one rounding to bf16, to
++nearest even, is new. Decode windows (MODE_EAGER) keep fp32 replies: they carry 1 .. 128 rows, so their bytes are
++small, and they keep today's bits.
++
++The rounding is row-local (each value is rounded alone), so a prompt row's reply is the same in any window: alone or
++grouped (TF_GLM_MULTI_PREFILL), in a pair or lanes, at any exchanges in flight. It changes outputs, so the switch is off
++by default.
++
++Both ends must agree: the attention node announces ``"partials_bf16": 1`` in the settings handshake only when its
++switch is on (off: the handshake as before), and each expert node compares its own switch with it and refuses to start
++on a difference (``refusal``), naming both nodes' settings; an expert node of a tree without the switch refuses the
++unknown key (``afd.settings_mismatch``). Set it the same on all three containers.
++
++glm53f-afd's ranks return bf16 planes the same way: each rank reduces its 8 routed slots in fp32 and rounds the sum to
++bf16, and the coordinator adds the planes in fp32 (hughmadden/glm53f-afd @ 91db3cc, ``crates/glm53f-rank/README.md``:
++the large-M path's reduce step and the return-path table, "Four BF16 planes, added in FP32 by the coordinator"; Hugh
++Madden, @dangerm00se, github.com/hughmadden; MIT, Copyright (c) 2026 Turquoise Bay AI Pty Ltd). No code is copied:
++here the rounding is torch's float-to-bf16 conversion on the expert node and the reply's place in the MCDMA mailbox
++is this tree's (``mcdma.Layout``).
++"""
++
++from __future__ import annotations
++
++import os
++import struct
++
++ENV = "TF_GLM_PARTIALS_BF16"
++
++
++def enabled(value: str | None = None) -> bool:
++    """TF_GLM_PARTIALS_BF16: 1 sends the expert nodes' prompt-window partial sums back as bf16; unset or 0 (the default)
++    as fp32. Anything else refuses (read before the wire opens, on every node)."""
++
++    value = (os.environ.get(ENV, "") if value is None else value).strip() or "0"
++    if value not in ("0", "1"):
++        raise ValueError(f"{ENV}: 0 or 1, not {value!r}")
++    return value == "1"
++
++
++def row_bytes(d: int, on: bool) -> int:
++    """One reply row's bytes: bf16 (2 a value) with the switch on, fp32 (4) off."""
++
++    return (2 if on else 4) * int(d)
++
++
++def refusal(attention: bool, expert: bool, rank: int) -> str:
++    """The expert node's startup refusal when the two nodes' switches differ (``experts_node.serve``)."""
++
++    def said(on: bool) -> str:
++        return "1 (bf16 partial sums)" if on else "unset (fp32 partial sums)"
++
++    return (f"{ENV} differs between the nodes: the attention node has {said(attention)}, expert {rank} has "
++            f"{said(expert)}; both ends of the wire must agree on the reply format: set {ENV} the same on the "
++            "attention node and on both expert nodes")
++
++
++# -- the tests' oracle ----------------------------------------------------------------------------------------------
++def reference_bits(v: float) -> int:
++    """The bf16 bits of an fp32 value rounded to nearest, ties to even (the conversion the expert node uses), from the
++    fp32 bits: add 0x7FFF plus the kept part's lowest bit, keep the top 16 bits. Infinities and zeros keep their sign;
++    a NaN gives a quiet NaN (its payload is the converter's; the tests compare NaN-ness only)."""
++
++    u = struct.unpack("<I", struct.pack("<f", v))[0]
++    if (u & 0x7F800000) == 0x7F800000 and u & 0x007FFFFF:
++        return ((u >> 16) | 0x0040) & 0xFFFF
++    return ((u + 0x7FFF + ((u >> 16) & 1)) >> 16) & 0xFFFF
++
++
++def reference_value(bits: int) -> float:
++    """A bf16 bit pattern's value (exact as fp32)."""
++
++    return struct.unpack("<f", struct.pack("<I", (bits & 0xFFFF) << 16))[0]
+diff --git a/tests/test_glm_partials_bf16.py b/tests/test_glm_partials_bf16.py
+new file mode 100644
+index 0000000..ad8ca73
+--- /dev/null
++++ b/tests/test_glm_partials_bf16.py
+@@ -0,0 +1,972 @@
++"""TF_GLM_PARTIALS_BF16 (``partials_bf16``) on CPU: the expert nodes' prompt-window partial sums back as bf16.
++
++The design is glm53f-afd's return path (hughmadden/glm53f-afd @ 91db3cc, Hugh Madden, @dangerm00se): each rank rounds
++its slot-order fp32 sum to bf16 and the coordinator adds the planes in fp32. No code of it is used here.
++
++- The setting, the handshake (``partials_bf16`` only when on; an older expert refuses the key) and the sizes: the reply
++  bytes per row, the mailbox room (a 2,048-row prompt reply at hidden 4,096 needs a 20 MiB reply half instead of 36,
++  while decode windows of up to 128 rows keep fp32 replies).
++- The pack and unpack: the expert's rounding is round-to-nearest-even, bit for bit against a plain-Python
++  transcription over every class of value (random scales, exact ties both ways, either side of a tie, the largest
++  values and those that round to infinity, subnormals, signed zeros, infinities, NaN); the attention's widening is
++  exact for all 65,536 bf16 patterns; rounding the widened values again changes nothing; the error is at most half a
++  bf16 step; the rounding is row-local.
++- The wire: the real ``AfdWire`` + ``McdmaTransport`` and both experts' ``forwards`` over the fake mcdma-rpcd pair,
++  CPU-, GPU-driven and mixed: prompt windows (plain chunks, a layer slice, a pair, lanes of 3 and 4) come back as the
++  bf16 rounding of each expert's fp32 partial, decode windows as the fp32 partial itself; the shared expert's plane is
++  intact; each reply word carries 2 bytes a value for prompt windows and 4 for decode windows; the mailbox holds the
++  bf16 bytes.
++- The sum order: ``collect`` returns rank 1's, rank 2's and the shared expert's fp32 planes in today's buffer and
++  order, equal to the switch-off planes with the two halves rounded; ``glue.hc_post`` (the Triton kernel under the
++  interpreter, TRITON_INTERPRET=1) over them is the rank-ordered fp32 sum, rounded once, mixed as before.
++- Row-local: a prompt row's reply is the same in any window (alone, in a chunk, a pair, lanes), and lanes at 1 to 4
++  exchanges in flight through the real scheduler equal each lane alone.
++- The expert's reply stream with bf16 rows (faked streams and events), the wire check (0 mismatches), the mailbox
++  sizing at startup on both ends, the startup refusals (a switch that differs between the attention node and an
++  expert node, naming both settings; a bad value, before the handshake) and serve() with both on.
++- The switch off: the settings, the sizes, the replies and the reply lengths are today's.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import json
++import math
++import os
++import struct
++import threading
++import time
++from datetime import timedelta
++from types import SimpleNamespace
++
++import pytest
++
++from tests import test_glm_prefill_pairs as tp
++from tests.glm_afd_fakes import (  # noqa: F401
++    LAYERS,
++    PREFILL,
++    D,
++    DictStore,
++    FakeDaemon,
++    FakeDriver,
++    FakeNode,
++    S,
++    daemon_fixture,
++    env_fixture,
++    fake_cfg,
++    free_port,
++    libpath_fixture,
++    master_fixture,
++    partial,
++    settings,
++    wait_attached,
++    words_fixture,
++)
++
++pytestmark = pytest.mark.torch
++ENV = "TF_GLM_PARTIALS_BF16"
++MODES = [("cpu", ("cpu", "cpu")), ("gpu", ("gpu", "gpu")), ("gpu", ("cpu", "gpu"))]
++
++
++def _p():
++    from tensorfold.families.glm5_next.cuda import partials_bf16
++
++    return partials_bf16
++
++
++def _bf(t):
++    """The bf16 rounding of fp32 rows, widened back: what the attention adds for a prompt window's partial."""
++
++    import torch
++
++    return t.to(torch.bfloat16).to(torch.float32)
++
++
++# -- the setting, the handshake, the sizes -----------------------------------------------------------------------------
++def test_the_setting_the_handshake_and_the_sizes(monkeypatch):
++    from tensorfold.families.glm5_next.cuda import afd, mcdma
++
++    p = _p()
++    monkeypatch.delenv(ENV, raising=False)
++    assert not p.enabled() and not p.enabled("0") and not p.enabled("") and p.enabled("1") and p.enabled(" 1 ")
++    monkeypatch.setenv(ENV, "1")
++    assert p.enabled()
++    for bad in ("2", "on", "bf16", "true", "yes"):
++        with pytest.raises(ValueError, match=ENV):
++            p.enabled(bad)
++    cfg = SimpleNamespace(mlp_kinds=["dense"] * 3 + ["moe"] * 4, quant="exl3", experts=16, top_k=8)
++    plain = afd.settings_for("/nonexistent", cfg, prefill_rows=2048)
++    on = afd.settings_for("/nonexistent", cfg, prefill_rows=2048, partials_bf16=True)
++    assert "partials_bf16" not in plain and on == dict(plain, partials_bf16=1)
++    assert afd.settings_mismatch(plain, on) == "partials_bf16: attention 1 != expert None"   # an older expert refuses
++    assert afd.settings_mismatch(on, on) == ""
++    assert p.row_bytes(4096, True) == 8192 and p.row_bytes(4096, False) == 16384
++    # GLM-5.3-Flash at 2,048 rows: hidden 4,096, top-k 8 + the shared slot. A prompt window's reply from each expert
++    # node is 32 MiB of fp32 today and 16 MiB of bf16 with the switch; decode windows stay fp32; the request is unchanged
++    off, bf = mcdma.Layout(4096, 9), mcdma.Layout(4096, 9, bf16=True)
++    assert off.rep(2048) == off.rep(2048, prompt=True) == bf.rep(2048) == 2048 * 4096 * 4 == 32 << 20
++    assert bf.rep(2048, prompt=True) == 2048 * 4096 * 2 == 16 << 20
++    assert bf.req(2048) == off.req(2048) == 16_924_928
++    # the reply half: today 32 MiB + its control page -> 36 MiB; with the switch the larger of a 2,048-row bf16 reply
++    # and a 128-row fp32 decode reply -> 20 MiB (the request half stays 20 MiB)
++    assert off.room(2048) == 32 << 20 and bf.room(2048) == 16 << 20
++    assert off.mib(2048) == (20, 36) and bf.mib(2048) == (20, 20)
++    assert mcdma.EAGER_MOST == 128
++    for rows in (1, 8, 64, 128):                          # up to 128 rows the fp32 decode reply is the larger
++        assert bf.room(rows) == bf.rep(rows) == 4 * 4096 * rows
++    for rows in (129, 200, 256):                           # then a 128-row decode window's until 256 rows
++        assert bf.room(rows) == 4 * 4096 * 128
++    assert bf.room(1024) == bf.rep(1024, prompt=True) == 2 * 4096 * 1024
++    # per 2,048-row prompt window and MoE layer, both expert nodes' replies into the attention node: 64 MiB -> 32 MiB
++    assert 2 * off.rep(2048) - 2 * bf.rep(2048, prompt=True) == 32 << 20
++    assert "TF_GLM_PARTIALS_BF16 differs" in p.refusal(True, False, 1) and "expert 2 has 1" in p.refusal(False, True, 2)
++
++
++# -- the pack and unpack -----------------------------------------------------------------------------------------------
++def _f32(bits: int) -> float:
++    return struct.unpack("<f", struct.pack("<I", bits & 0xFFFFFFFF))[0]
++
++
++def _values():
++    """fp32 values of every class: random at scales 2^-140 .. 2^127, random bit patterns, exact ties to even both ways
++    (the kept part even and odd), one ulp either side of a tie, the largest bf16 value and the fp32 values that round
++    to infinity, fp32 and bf16 subnormals, signed zeros, infinities. No NaN (``test_the_rounding...`` checks those)."""
++
++    import random
++
++    rng = random.Random(7)
++    vals = []
++    for e in range(-140, 128, 3):
++        vals += [rng.uniform(-1, 1) * 2.0 ** e for _ in range(8)]
++    for _ in range(400):
++        b = rng.getrandbits(32)
++        if (b & 0x7F800000) == 0x7F800000:
++            continue
++        vals.append(_f32(b))
++    for kept in (0x3F80, 0x3F81, 0x4049, 0x404A, 0x0001, 0x0002, 0x7F7E, 0x7F7F, 0xBF80, 0xBF81):
++        for low in (0x8000, 0x7FFF, 0x8001, 0x0000, 0xFFFF):  # the tie, and either side of it
++            vals.append(_f32(kept << 16 | low))
++    vals += [_f32(0x7F7FFFFF), _f32(0x7F7F8000), _f32(0x7F7F7FFF), -_f32(0x7F7F8000)]   # to inf, and not
++    vals += [_f32(1), _f32(0x00008000), _f32(0x00018000), _f32(0x007FFFFF), 0.0, -0.0, math.inf, -math.inf]
++    return vals
++
++
++def test_the_rounding_is_round_to_nearest_even_bit_for_bit():
++    import torch
++
++    p = _p()
++    vals = _values()
++    got = torch.tensor(vals, dtype=torch.float32).to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
++    assert got.tolist() == [p.reference_bits(v) for v in vals]
++    # the reference, spelled out: ties to even both ways, past the largest bf16 to infinity, a tiny subnormal to zero
++    assert p.reference_bits(_f32(0x3F808000)) == 0x3F80 and p.reference_bits(_f32(0x3F818000)) == 0x3F82
++    assert p.reference_bits(_f32(0x3F808001)) == 0x3F81 and p.reference_bits(_f32(0x3F817FFF)) == 0x3F81
++    assert p.reference_bits(_f32(0x7F7F8000)) == 0x7F80 and p.reference_bits(_f32(0x7F7F7FFF)) == 0x7F7F
++    assert p.reference_bits(-0.0) == 0x8000 and p.reference_bits(_f32(1)) == 0x0000
++    nan = torch.tensor([math.nan, -math.nan], dtype=torch.float32).to(torch.bfloat16)
++    assert bool(torch.isnan(nan).all())
++    assert all(math.isnan(p.reference_value(p.reference_bits(v))) for v in (math.nan, -math.nan))
++
++
++def test_the_widening_is_exact_and_the_round_trip():
++    import torch
++
++    p = _p()
++    every = torch.arange(1 << 16, dtype=torch.int32).to(torch.int16).view(torch.bfloat16)     # all 65,536 patterns
++    wide = every.to(torch.float32)
++    pat = torch.arange(1 << 16, dtype=torch.int64)
++    real = ~torch.isnan(wide)
++    assert int(real.sum()) == 65536 - 2 * 127                                                # NaN stays NaN
++    assert torch.equal(wide.view(torch.int32)[real].to(torch.int64) & 0xFFFFFFFF, pat[real] << 16)   # exact
++    assert torch.equal(wide[real].to(torch.bfloat16).view(torch.int16), every[real].view(torch.int16))
++    # the error bound below the overflow point: half a bf16 step (2^-8 relative for normals, 2^-134 absolute in the
++    # subnormal range); the reference's values are torch's
++    vals = [v for v in _values() if math.isfinite(v) and abs(v) < _f32(0x7F7F8000)]
++    x = torch.tensor(vals, dtype=torch.float64)
++    r = torch.tensor(vals, dtype=torch.float32).to(torch.bfloat16).to(torch.float64)
++    assert bool(((r - x).abs() <= torch.maximum(x.abs() * 2.0 ** -8, torch.full_like(x, 2.0 ** -134))).all())
++    assert [p.reference_value(p.reference_bits(v)) for v in vals] == r.tolist()
++    # rounding once more changes nothing: the widened rows are exactly the bf16 values the expert sent
++    once = _bf(torch.tensor(vals, dtype=torch.float32))
++    assert torch.equal(_bf(once), once)
++
++
++def test_the_rounding_is_row_local():
++    """Each value is rounded alone: rows rounded in any grouping or order give the same bits."""
++
++    import torch
++
++    gen = torch.Generator().manual_seed(3)
++    x = torch.randn((48, D), generator=gen) * torch.exp2(torch.randint(-30, 30, (48, 1), generator=gen).float())
++    whole = x.to(torch.bfloat16).view(torch.int16)
++    for cut in (1, 7, 13, 47):
++        assert torch.equal(torch.cat([x[:cut].to(torch.bfloat16), x[cut:].to(torch.bfloat16)]).view(torch.int16), whole)
++    perm = torch.randperm(48, generator=gen)
++    assert torch.equal(x[perm].to(torch.bfloat16).view(torch.int16), whole[perm])
++
++
++# -- the wire ----------------------------------------------------------------------------------------------------------
++def _links(daemon, words, *, attn="cpu", experts=("cpu", "cpu"), bf16=True, check=False, store=None):
++    """Both MCDMA links' attention end and both experts' loops (``experts_node.forwards``) over their own ends, with
++    the experts' ``bf16`` (the handshake's ``partials_bf16``, as ``open_expert_link`` passes it)."""
++
++    from tensorfold.families.glm5_next.cuda import afd_mcdma, experts_node, mcdma
++
++    drv = FakeDriver(words)
++    links = mcdma.AttentionLinks(["a2", "a1"], words=words, driver=drv if attn == "gpu" else None, mode=attn,
++                                 stream=lambda: 0, timeout=10.0, shm_dir=str(daemon.shm), linkup_wait=2)
++    eps = []
++    for half, (name, mode) in enumerate(zip(["a2", "a1"], experts)):
++        link = mcdma.ExpertLink(name, words=words, driver=drv if mode == "gpu" else None, mode=mode,
++                                socket_path=daemon.sock(name), shm_dir=str(daemon.shm), stream=lambda: 0)
++        link.base = links.base[half]
++        end = afd_mcdma.McdmaExpertLink(link, D, S, len(LAYERS), PREFILL, device="cpu", pairs=True, lanes=4,
++                                        bf16=bf16)
++        ep = SimpleNamespace(link=end, node=FakeNode(LAYERS, half), error=None)
++
++        def run(ep=ep, half=half):
++            try:
++                experts_node.forwards(ep.node, ep.link, store if store is not None else DictStore(), half + 1,
++                                      check_on=check)
++            except BaseException as exc:  # noqa: BLE001
++                ep.error = exc
++
++        ep.t = threading.Thread(target=run, daemon=True)
++        ep.t.start()
++        eps.append(ep)
++    return links, eps
++
++
++def _attention(links, port, *, bf16=True):
++    """``glm_afd_fakes.mcdma_attention`` with the handshake's ``partials_bf16`` when ``bf16``."""
++
++    from tensorfold.families.glm5_next.cuda import afd as afd_mod
++    from tensorfold.families.glm5_next.cuda import afd_mcdma
++
++    tr = afd_mcdma.McdmaTransport("127.0.0.1", port, links=links, comm=SimpleNamespace(abort=links.release),
++                                  device="cpu", hidden=D)
++    a = afd_mod.AfdWire("127.0.0.1", port, transport=tr)
++    a.announce(dict(settings(), **({"partials_bf16": 1} if bf16 else {})))
++    return a
++
++
++def _check(a, got, b, rows, layer, sy=None) -> None:
++    """A collected ``[3, rows, D]`` against the experts' function: a prompt window's halves are the bf16 rounding of
++    the fp32 partials (exactly), a decode window's (or any with the switch off) the partials themselves; the shared
++    plane is ``sy`` (``b.sy``'s rows by default)."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda.afd import MODE_EAGER
++
++    prompt = a.bf16 and a.mode != MODE_EAGER
++    for half in (0, 1):
++        p = partial(b.normed[:rows], b.pick[:rows], b.wts[:rows], layer, half)
++        assert torch.equal(got[half], _bf(p) if prompt else p), (layer, half, rows, a.mode)
++        if prompt:
++            assert not torch.equal(got[half], p)          # the rounding happened (the fake's values are not bf16)
++    assert torch.equal(got[2], b.sy[:rows] if sy is None else sy)
++
++
++def _plain(a, rows, gen, *, chunk=True, slice=None) -> None:
++    """One forward (``chunk``: a prompt chunk, else a decode window) or a prompt chunk's layer slice, every reply
++    checked."""
++
++    b = tp._bufs()
++    first, count = slice if slice is not None else (0, len(LAYERS))
++    if slice is None:
++        a.begin(rows, chunk=chunk)
++    else:
++        a.begin(rows, chunk=True, slice=slice)
++    for pos in range(first, first + count):
++        tp._fill(b, rows, gen)
++        a.exchange(b, rows)
++        _check(a, a.collect(b, rows, D), b, rows, LAYERS[pos])
++
++
++def _windows(a, rows, gen) -> None:
++    """A pair (two windows) or lanes (three or four) in the schedule's wire order, every reply checked."""
++
++    bufs = [tp._bufs() for _ in rows]
++    if len(rows) == 2:
++        a.begin_pair(rows)
++    else:
++        a.begin_lanes(rows)
++    for layer in LAYERS:
++        for k, r in enumerate(rows):
++            tp._fill(bufs[k], r, gen)
++            a.use(k)
++            a.exchange(bufs[k], r)
++            _check(a, a.collect(bufs[k], r, D), bufs[k], r, layer)
++
++
++def _record_lengths(monkeypatch) -> list:
++    """Every ``AttentionLinks.collect``'s reply length (the bytes the reply word must carry)."""
++
++    from tensorfold.families.glm5_next.cuda import mcdma
++
++    lengths = []
++    collect = mcdma.AttentionLinks.collect
++
++    def rec(self, outs, rep_len, *a, **k):
++        lengths.append(rep_len)
++        return collect(self, outs, rep_len, *a, **k)
++
++    monkeypatch.setattr(mcdma.AttentionLinks, "collect", rec)
++    return lengths
++
++
++@pytest.mark.parametrize("modes", MODES, ids=["cpu", "gpu", "mixed"])
++def test_bf16_partials_over_the_mcdma_wire(env, daemon, words, master, monkeypatch, modes):
++    """With the switch on at both ends: plain prompt chunks, decode windows, a layer slice, a pair and lanes of 3 and 4.
++    Every prompt window's halves are the bf16 rounding of the experts' fp32 partials, every decode window's the
++    partials, the shared plane intact; each collect waited for 2 bytes a value (prompt) or 4 (decode); the mailbox's
++    reply half holds the bf16 bytes."""
++
++    import torch
++
++    lengths = _record_lengths(monkeypatch)
++    links, eps = _links(daemon, words, attn=modes[0], experts=modes[1])
++    wait_attached(daemon)
++    a = _attention(links, master)
++    assert a.bf16 and a.tr.bf16 and a.tr.layout.bf16
++    gen = torch.Generator().manual_seed(51)
++    want = []
++    _plain(a, 11, gen)                                    # a prompt chunk: bf16
++    want += [2 * 11 * D] * len(LAYERS)
++    _plain(a, 3, gen, chunk=False)                        # a decode window: fp32
++    want += [4 * 3 * D] * len(LAYERS)
++    _plain(a, PREFILL, gen)
++    want += [2 * PREFILL * D] * len(LAYERS)
++    _plain(a, PREFILL, gen, slice=(1, 2))                 # MODE_SLICE: a prompt chunk's layers 1 .. 2
++    want += [2 * PREFILL * D] * 2
++    _windows(a, (9, PREFILL), gen)
++    want += [2 * r * D for _ in LAYERS for r in (9, PREFILL)]
++    _windows(a, (5, PREFILL, 30), gen)
++    want += [2 * r * D for _ in LAYERS for r in (5, PREFILL, 30)]
++    _windows(a, (PREFILL, 7, PREFILL, 1), gen)
++    want += [2 * r * D for _ in LAYERS for r in (PREFILL, 7, PREFILL, 1)]
++    _plain(a, 1, gen, chunk=False)
++    want += [4 * D] * len(LAYERS)
++    _plain(a, 8, gen, chunk=False)                        # the widest decode window of the settings (max_rows 8)
++    want += [4 * 8 * D] * len(LAYERS)
++    assert lengths == want
++    # a prompt forward's reply bytes, as they sit in each mailbox after each collect: the bf16 rows
++    b = tp._bufs()
++    a.begin(6, chunk=True)
++    for layer in LAYERS:
++        tp._fill(b, 6, gen)
++        a.exchange(b, 6)
++        a.collect(b, 6, D)
++        for half, box in enumerate(links.boxes):
++            sent = box.rep_bytes[:2 * 6 * D].view(torch.bfloat16).view(6, D)
++            assert torch.equal(sent, partial(b.normed[:6], b.pick[:6], b.wts[:6], layer, half).to(torch.bfloat16))
++    for ep in eps:
++        assert ep.error is None and len(ep.link.halves) == 1 and ep.link.halves[0].dtype == torch.bfloat16
++    tp._close(daemon, eps)
++
++
++def test_a_row_gets_the_same_reply_in_any_window(env, daemon, words, master):
++    """The same rows sent alone (1 row), in a 48-row chunk, in a pair (second window) and in lanes (every lane) come
++    back with the same bits, row for row."""
++
++    import torch
++
++    links, eps = _links(daemon, words)
++    wait_attached(daemon)
++    a = _attention(links, master)
++    row = tp._bufs()
++    tp._fill(row, PREFILL, torch.Generator().manual_seed(61))
++    seen: dict = {}
++
++    def run(rows_list, kind):
++        bufs = [tp._bufs() for _ in rows_list]
++        for buf, r in zip(bufs, rows_list):
++            for name in ("normed", "pick", "wts", "sy"):
++                getattr(buf, name)[:r] = getattr(row, name)[:r]     # every window holds the first r rows
++        if kind == "plain":
++            a.begin(rows_list[0], chunk=True)
++        elif len(rows_list) == 2:
++            a.begin_pair(rows_list)
++        else:
++            a.begin_lanes(rows_list)
++        for layer in LAYERS:
++            for k, r in enumerate(rows_list):
++                if kind != "plain":
++                    a.use(k)
++                a.exchange(bufs[k], r)
++                got = a.collect(bufs[k], r, D)
++                for i in range(r):
++                    seen.setdefault((layer, i), []).append(got[:2, i].clone())
++
++    run([1], "plain")
++    run([PREFILL], "plain")
++    run([5, PREFILL], "pair")
++    run([PREFILL, 3, 9], "lanes")
++    assert len(seen) == len(LAYERS) * PREFILL
++    for key, got in seen.items():
++        assert all(torch.equal(got[0].view(torch.int32), g.view(torch.int32)) for g in got[1:]), key
++    assert len(seen[(LAYERS[0], 0)]) == 7 and all(ep.error is None for ep in eps)
++    a.layer = a.nlayers
++    tp._close(daemon, eps)
++
++
++def test_the_sum_order_is_unchanged(env, words, master, tmp_path):
++    """``collect`` returns rank 1's, rank 2's and the shared expert's planes as fp32 ``[3, R, D]`` over ``afd_recv``,
++    in today's order: with the switch on they equal the switch-off planes with only the two halves rounded to bf16,
++    so ``hc_post`` (unchanged) adds the rounded halves and the shared expert in fp32 in today's order. The rounding is
++    of each half's whole fp32 sum (the experts' slot-order sum is untouched)."""
++
++    import torch
++
++    rows = 13
++    got: dict = {False: [], True: []}
++    for bf16 in (False, True):
++        w = BfpWire(tmp_path / f"bf16-{bf16}", words, master, 1, bf16=bf16)
++        b = tp._bufs()
++        w.a.begin(rows, chunk=True)
++        for pos in range(len(LAYERS)):
++            sy = _seeded(b, rows, 71 + pos)
++            w.a.exchange(b, rows)
++            b.sy[:rows] = sy
++            g = w.a.collect(b, rows, D)
++            assert g.shape == (3, rows, D) and g.dtype == torch.float32 and g.data_ptr() == b.afd_recv.data_ptr()
++            got[bf16].append(g.clone())
++        w.close()
++    for off, on in zip(got[False], got[True]):
++        assert torch.equal(on[0], _bf(off[0])) and torch.equal(on[1], _bf(off[1])) and torch.equal(on[2], off[2])
++        assert not torch.equal(on[0], off[0])
++
++
++@pytest.mark.skipif(os.environ.get("TRITON_INTERPRET") != "1", reason="the Triton interpreter (TRITON_INTERPRET=1)")
++def test_hc_post_adds_the_widened_halves_in_rank_order():
++    """``glue.hc_post`` (the Triton kernel, interpreted) over switch-on planes (two widened bf16 halves, the shared
++    expert) equals its sum transcribed: rank 1's + rank 2's, + the shared expert's, in fp32, cast once to bf16 as the
++    branch, then mixed with the residual streams as before. Triton 3.8's interpreter casts fp32 to bf16 by truncation
++    where the GPU rounds to nearest even, so the transcription casts the way the interpreter does."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import glue
++
++    def cast(t):                                           # the interpreter's fp32 -> bf16 -> fp32: drop the low half
++        return (t.view(torch.int32) & ~0xFFFF).view(torch.float32)
++
++    gen = torch.Generator().manual_seed(81)
++    rows, d, s = 5, 64, 4
++    halves = torch.randn((2, rows, d), generator=gen) * 3
++    sy = torch.randn((rows, d), generator=gen)
++    x = torch.randn((rows, s * d), generator=gen).to(torch.bfloat16)
++    post = torch.rand((rows, s), generator=gen)
++    comb = torch.rand((rows, 16), generator=gen)
++    on = torch.stack([_bf(halves[0]), _bf(halves[1]), sy]).contiguous()
++    out = torch.empty_like(x)
++    glue.hc_post(x, out, on, post, comb)
++    branch = cast((on[0] + on[1]) + on[2])
++    xs = x.float().view(rows, s, d)
++    for k in range(s):
++        c = [comb[:, j * 4 + k, None] for j in range(4)]
++        mixed = ((c[0] * xs[:, 0] + c[1] * xs[:, 1]) + c[2] * xs[:, 2]) + c[3] * xs[:, 3]
++        want = cast(post[:, k, None] * branch + mixed)
++        assert torch.equal(out.view(rows, s, d)[:, k].float(), want), k
++
++
++def test_the_wire_check_hashes_what_was_sent(env, daemon, words, master, monkeypatch, capsys):
++    """TF_AFD_CHECK=1 with the switch on, over a prompt chunk, a pair and a decode window: the experts hash the rows
++    the attention adds (``McdmaExpertLink.sent``: a prompt window's bf16 rounding, widened), 0 mismatches."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import afd, experts_node
++
++    monkeypatch.setattr(afd, "CHECK_FORWARDS", 4)
++    monkeypatch.setattr(experts_node, "CHECK_FORWARDS", 4)
++    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
++    holder = {}
++    store = SimpleNamespace(set=lambda k, v: holder["s"].set(k, v))
++    links, eps = _links(daemon, words, check=True, store=store)
++    wait_attached(daemon)
++    a = _attention(links, master)
++    holder["s"] = a.store
++    a.check = True
++    gen = torch.Generator().manual_seed(91)
++    _plain(a, 6, gen)
++    _windows(a, (8, 5), gen)
++    _plain(a, 2, gen, chunk=False)
++    a.begin(2)
++    a.layer = a.nlayers
++    out = capsys.readouterr().out
++    assert a.checked == 4 and a.mismatches == 0, out
++    assert "4 forwards (2 of them in prompt chunk pairs, seqs 2-3), 0 mismatches" in out
++    tp._close(daemon, eps)
++
++
++# -- exchanges in flight -----------------------------------------------------------------------------------------------
++class BfpWire:
++    """N link pairs of the fake mcdma-rpcd pair (tests/test_glm_mcdma_inflight.py's ``Wire``) with the switch at both
++    ends: the attention's ``AfdWire`` over ``McdmaTransport``, both experts' ``forwards`` over their N links."""
++
++    def __init__(self, root, words, port, n, *, attn="cpu", experts=("cpu", "cpu"), bf16=True) -> None:
++        from tensorfold.families.glm5_next.cuda import afd as afd_mod
++        from tensorfold.families.glm5_next.cuda import afd_mcdma, experts_node, mcdma
++
++        root.mkdir(parents=True, exist_ok=True)
++        self.n, self.layers = n, list(LAYERS)
++        self.names = [mcdma.more_link(name, j) for j in range(n) for name in ("a2", "a1")]
++        self.daemon = FakeDaemon(root, self.names)
++        self.drv = FakeDriver(words)
++        self.links = mcdma.AttentionLinks(self.names, words=words, driver=self.drv if attn == "gpu" else None,
++                                          mode=attn, stream=lambda: 0, timeout=10.0, shm_dir=str(self.daemon.shm),
++                                          linkup_wait=2)
++        self.eps = []
++        for half, mode in enumerate(experts):
++            mine = []
++            for j in range(n):
++                name = self.names[2 * j + half]
++                link = mcdma.ExpertLink(name, words=words, driver=self.drv if mode == "gpu" else None, mode=mode,
++                                        socket_path=self.daemon.sock(name), shm_dir=str(self.daemon.shm),
++                                        stream=lambda: 0)
++                link.base = self.links.base[2 * j + half]
++                mine.append(link)
++            end = afd_mcdma.McdmaExpertLink(mine[0] if n == 1 else mine, D, S, len(self.layers), PREFILL,
++                                            device="cpu", pairs=True, lanes=4, bf16=bf16)
++            ep = SimpleNamespace(link=end, node=FakeNode(self.layers, half), error=None)
++
++            def run(ep=ep, half=half):
++                try:
++                    experts_node.forwards(ep.node, ep.link, DictStore(), half + 1)
++                except BaseException as exc:  # noqa: BLE001
++                    ep.error = exc
++
++            ep.t = threading.Thread(target=run, daemon=True)
++            ep.t.start()
++            self.eps.append(ep)
++        end = time.monotonic() + 5
++        while any(self.daemon.svc[x] is None for x in self.names):
++            assert time.monotonic() < end, "services never attached"
++            time.sleep(0.01)
++        self.tr = afd_mcdma.McdmaTransport("127.0.0.1", port, links=self.links,
++                                           comm=SimpleNamespace(abort=self.links.release), device="cpu", hidden=D)
++        self.a = afd_mod.AfdWire("127.0.0.1", port, transport=self.tr)
++        self.a.announce(dict(settings(layers=self.layers), **({"partials_bf16": 1} if bf16 else {})))
++        assert self.a.depth == n and self.a.bf16 == bf16
++
++    def close(self) -> None:
++        for x in self.names:
++            self.daemon.bye(x)
++        for ep in self.eps:
++            ep.t.join(5)
++            assert not ep.t.is_alive()
++        self.daemon.close()
++
++
++def _seeded(b, rows, seed: int):
++    """tests/test_glm_mcdma_inflight.py's ``_rows``: the request rows from a seed; returns the shared expert output,
++    which the caller writes after the exchange (``forward.moe_send``'s order)."""
++
++    import torch
++
++    gen = torch.Generator().manual_seed(seed)
++    b.normed[:rows] = torch.randn((rows, D), generator=gen).to(torch.bfloat16)
++    b.pick[:rows] = torch.randint(0, 16, (rows, S), generator=gen, dtype=torch.int32)
++    b.wts[:rows] = torch.rand((rows, S), generator=gen)
++    return torch.randn((rows, D), generator=gen)
++
++
++def _lanes_run(monkeypatch, w: BfpWire, rows, seed: int, out: dict, flight: dict) -> None:
++    """``rows``' chunks as lanes through the real scheduler (``prefill_pairs._forward_lanes``), each lane's layer loop
++    a stand-in (tests/test_glm_mcdma_inflight.py's ``_lanes_run``), every reply checked and kept."""
++
++    from tensorfold.families.glm5_next.cuda import prefill_pairs as pp
++
++    a = w.a
++    bufs = [tp._bufs() for _ in rows]
++
++    def steps(e, ch):
++        k, r, b = ch.slot, ch.R, bufs[ch.slot]
++        for pos, layer in enumerate(w.layers):
++            sy = _seeded(b, r, seed + 100 * k + pos)
++            yield pp.SEND
++            e.w.afd.use(k)
++            e.w.afd.exchange(b, r)
++            b.sy[:r] = sy                          # the shared expert, while the exchange flies
++            flight["now"] += 1
++            flight["max"] = max(flight["max"], flight["now"])
++            yield pp.WAIT
++            e.w.afd.use(k)
++            got = e.w.afd.collect(b, r, D)
++            flight["now"] -= 1
++            _check(a, got, b, r, layer, sy)
++            out[(seed, k, pos)] = got.clone()
++            yield pp.DONE
++
++    monkeypatch.setattr(pp, "_steps", steps)
++    e = SimpleNamespace(w=SimpleNamespace(afd=a))
++    if len(rows) == 2:
++        a.begin_pair(rows)
++    else:
++        a.begin_lanes(rows)
++    pp._forward_lanes(e, [pp.Chunk([None], k, bufs[k], R=rows[k]) for k in range(len(rows))])
++
++
++def _plain_run(w: BfpWire, rows, seed: int, out: dict, *, k: int = 0) -> None:
++    """One forward with ``_lanes_run``'s seeding for lane ``k`` (a prompt chunk above 8 rows, else a decode window)."""
++
++    b = tp._bufs()
++    w.a.begin(rows, chunk=rows > 8)
++    for pos in range(len(w.layers)):
++        sy = _seeded(b, rows, seed + 100 * k + pos)
++        w.a.exchange(b, rows)
++        b.sy[:rows] = sy
++        got = w.a.collect(b, rows, D)
++        _check(w.a, got, b, rows, w.layers[pos], sy)
++        out[(seed, k, pos)] = got.clone()
++
++
++GROUPS = [(PREFILL, 13, 21, PREFILL), (9, PREFILL, 30), (9, PREFILL)]     # lanes of 4, 3 and a pair
++
++
++@pytest.mark.parametrize("modes", MODES, ids=["cpu", "gpu", "mixed"])
++def test_bf16_replies_in_flight_equal_each_lane_alone(env, words, master, tmp_path, monkeypatch, modes):
++    """N = 1 to 4 exchanges in flight with the switch on: lanes of 4, 3 and 2 through the real scheduler, then a
++    decode window. Every reply equals the serial run's (each lane alone over one link pair): the rounding is row-local,
++    so a concurrent reply equals its solo reply. At most N were in flight and N were reached; each expert link kept
++    its own bf16 rows."""
++
++    import torch
++
++    ref = BfpWire(tmp_path / "serial", words, master, 1, attn=modes[0], experts=modes[1])
++    serial: dict = {}
++    for g, rows in enumerate(GROUPS):
++        for k, r in enumerate(rows):
++            _plain_run(ref, r, 1000 * (g + 1), serial, k=k)
++    _plain_run(ref, 3, 9000, serial)
++    ref.close()
++    for n in (1, 2, 3, 4):
++        w = BfpWire(tmp_path / f"n{n}", words, master, n, attn=modes[0], experts=modes[1])
++        out, tops = {}, []
++        for g, rows in enumerate(GROUPS):
++            flight = {"now": 0, "max": 0}
++            _lanes_run(monkeypatch, w, rows, 1000 * (g + 1), out, flight)
++            tops.append(flight["max"])
++        _plain_run(w, 3, 9000, out)
++        assert out.keys() == serial.keys() and all(torch.equal(out[x], serial[x]) for x in out), n
++        assert tops == [min(n, len(rows)) for rows in GROUPS], (n, tops)
++        assert not w.tr._flight and not w.a._busy and w.a.dead is None
++        for ep in w.eps:
++            assert ep.error is None and len(ep.link.halves) == n
++        w.close()
++
++
++# -- the expert's reply stream (GPU-driven; streams and events faked) ----------------------------------------------------
++class _Ev:
++    def __init__(self, log, name) -> None:
++        self.log, self.name = log, name
++
++    def record(self, stream=None) -> None:
++        self.log.append(("record", self.name, stream.name))
++
++
++class _Stream:
++    def __init__(self, log, name, handle) -> None:
++        self.log, self.name, self.cuda_stream = log, name, handle
++
++    def wait_event(self, ev) -> None:
++        self.log.append(("wait", self.name, ev.name))
++
++
++def test_the_reply_stream_rounds_and_copies(monkeypatch):
++    """Two links, GPU-driven, a prompt window (tests/test_glm_mcdma_inflight.py's ``test_the_reply_stream`` with the
++    switch): ``reply`` records the compute's event, the reply stream waits for it, rounds the link's rows into the
++    link's own bf16 rows and copies their bytes into the reply mailbox (both inside the stream's context), stages the
++    word there with the bf16 length, then records the link's sent event; the third request waits for link 0's last
++    copy. A decode window's reply goes as fp32, today's way."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import afd_mcdma
++
++    log = []
++    comp, side = _Stream(log, "compute", 11), _Stream(log, "reply", 22)
++    monkeypatch.setattr(torch.cuda, "current_stream", lambda *a, **k: comp)
++
++    @contextlib.contextmanager
++    def on(stream):
++        log.append(("enter", stream.name))
++        yield
++        log.append(("exit", stream.name))
++
++    monkeypatch.setattr(torch.cuda, "stream", on)
++    rows = 4
++
++    def fake_link(j):
++        box = SimpleNamespace(rep_bytes=torch.zeros(rows * D * 4, dtype=torch.uint8))
++        return SimpleNamespace(name=f"a2-{j}" if j else "a2", mode="gpu", base=1, box=box,
++                               stage_gpu=lambda seq, n, stream=None, j=j: log.append(("stage", j, seq, n, stream)))
++
++    links = [fake_link(0), fake_link(1)]
++    end = afd_mcdma.McdmaExpertLink(links, D, S, len(LAYERS), PREFILL, device="cpu", bf16=True)
++    assert [h.dtype for h in end.halves] == [torch.bfloat16] * 2 and end.halves[0].shape == (PREFILL, D)
++    assert end.halves[0].data_ptr() != end.halves[1].data_ptr()
++    end.side = side                                             # as on CUDA (__init__'s branch)
++    end.outs = [torch.zeros((PREFILL, D)) for _ in links]
++    end._computed = [_Ev(log, f"computed{j}") for j in range(2)]
++    end._sent = [_Ev(log, f"sent{j}") for j in range(2)]
++    end._used = [False, False]
++    end.bf16_rep, end.n_rep = True, rows * D * 2                # a prompt window (next_forward / _open set these)
++    copies = []
++    real_copy = torch.Tensor.copy_
++
++    def copy(self, src, non_blocking=False):
++        copies.append((self.dtype, src.dtype, log[-1][0] if log else None))
++        return real_copy(self, src, non_blocking=non_blocking)
++
++    for k in range(3):
++        log.clear()
++        copies.clear()
++        j = k % 2
++        dst = end.out(rows)
++        assert dst.data_ptr() == end.outs[j].data_ptr()
++        rows_k = torch.full((rows, D), 0.1 * (k + 1))           # the compute's rows (not bf16 values)
++        dst.copy_(rows_k)
++        monkeypatch.setattr(torch.Tensor, "copy_", copy)
++        end.reply(0, dst)
++        monkeypatch.setattr(torch.Tensor, "copy_", real_copy)
++        want = ([("wait", "compute", "sent0")] if k == 2 else []) + [
++            ("record", f"computed{j}", "compute"), ("wait", "reply", f"computed{j}"), ("enter", "reply"),
++            ("exit", "reply"), ("stage", j, 1 + k // 2, rows * D * 2, 22), ("record", f"sent{j}", "reply")]
++        assert log == want, (k, log)
++        # the rounding, then the bytes, both inside the reply stream's context
++        assert copies == [(torch.bfloat16, torch.float32, "enter"), (torch.uint8, torch.uint8, "enter")], copies
++        sent = links[j].box.rep_bytes[:rows * D * 2].view(torch.bfloat16).view(rows, D)
++        assert torch.equal(sent, rows_k.to(torch.bfloat16))
++        assert torch.equal(end.sent(dst), _bf(dst)) and not torch.equal(end.sent(dst), dst)
++        assert end.at == (k + 1) % 2 and end.seqs[j] == 2 + k // 2
++    log.clear()
++    end.bf16_rep, end.n_rep = False, rows * D * 4               # a decode window: fp32, today's path
++    other = torch.full((rows, D), 0.7)
++    end.reply(0, other)
++    assert log == [("stage", 1, 2, rows * D * 4, None)]
++    assert torch.equal(links[1].box.rep_bytes.view(torch.float32).view(rows, D), other)
++    assert end.sent(other) is other
++
++
++# -- the mailbox sizing ------------------------------------------------------------------------------------------------
++def test_the_mailbox_room_at_glm_size():
++    """GLM-5.3-Flash's 2,048-row windows: 20 + 36 MiB mailboxes (the fp32 replies' sizes) carry both formats; 20 + 20
++    MiB carry the switch's replies and are refused without it, naming the sizes to run; 20 + 16 MiB are refused either
++    way."""
++
++    from tensorfold.families.glm5_next.cuda import mcdma
++
++    def box(req_mib, rep_mib):
++        return SimpleNamespace(req=req_mib << 20, rep=rep_mib << 20, path="/dev/shm/mcdma-rpc.a2", name="a2")
++
++    off, bf = mcdma.Layout(4096, 9), mcdma.Layout(4096, 9, bf16=True)
++    for lay in (off, bf):
++        mcdma.Mailbox.check_room(box(20, 36), lay, 2048)
++    mcdma.Mailbox.check_room(box(20, 20), bf, 2048)
++    with pytest.raises(mcdma.LinkError, match=r"\(20\+20 MiB\) cannot carry a 2048-row window .* rep_mib>=36"):
++        mcdma.Mailbox.check_room(box(20, 20), off, 2048)
++    with pytest.raises(mcdma.LinkError, match=r"\(20\+16 MiB\) cannot carry .* req_mib>=20 rep_mib>=20"):
++        mcdma.Mailbox.check_room(box(20, 16), bf, 2048)
++
++
++def test_the_mailbox_room_at_startup_on_both_ends(env, words, tmp_path):
++    """Real mailbox files at GLM's sizes (hidden 4,096, 2,048-row windows) of 20 + 20 MiB: the attention's
++    ``publish`` and the expert's ``open_expert_link`` accept them with the switch on and refuse them without it."""
++
++    from tensorfold.families.glm5_next.cuda import afd_mcdma, mcdma
++
++    daemon = FakeDaemon(tmp_path, ["a2", "a1"], req=20 << 20, rep=20 << 20)
++    try:
++        links = mcdma.AttentionLinks(["a2", "a1"], words=words, mode="cpu", timeout=5, shm_dir=str(daemon.shm),
++                                     linkup_wait=2)
++        glm = dict(settings(prefill=2048), top_k=8)
++        tr = afd_mcdma.McdmaTransport("", 0, links=links, comm=object(), device="cpu", hidden=4096)
++        tr.publish(dict(glm, partials_bf16=1))
++        assert tr.bf16 and tr.layout.room(2048) == 16 << 20
++        tr2 = afd_mcdma.McdmaTransport("", 0, links=links, comm=object(), device="cpu", hidden=4096)
++        with pytest.raises(mcdma.LinkError, match=r"rep_mib>=36"):
++            tr2.publish(glm)
++        env.setattr(mcdma, "link_name", lambda: "a2")
++        init = mcdma.ExpertLink.__init__
++
++        def link_init(self, name, **kw):
++            kw.setdefault("socket_path", daemon.sock(name))
++            init(self, name, **kw)
++
++        env.setattr(mcdma.ExpertLink, "__init__", link_init)
++        cfg = SimpleNamespace(hidden=4096, top_k=8)
++        theirs = dict(glm, transport="mcdma", mcdma_links=["a2", "a1"])
++        with pytest.raises(mcdma.LinkError, match=r"rep_mib>=36"):
++            afd_mcdma.open_expert_link(theirs, 1, cfg, None, device="cpu", log=lambda *a, **k: None)
++        with contextlib.suppress(OSError):                     # that process would exit: its service goes away
++            daemon.bye("a2")                                   # (the refused link's socket is closed already)
++        store = DictStore()
++        store.set("afd_mcdma/base/1", b"1")
++        end = afd_mcdma.open_expert_link(dict(theirs, partials_bf16=1), 1, cfg, store, device="cpu",
++                                         log=lambda *a, **k: None)
++        assert end.bf16 and end.lay.bf16 and len(end.halves) == 1 and end.halves[0].shape == (2048, 4096)
++        daemon.bye("a2")
++        end.close()
++    finally:
++        daemon.close()
++
++
++# -- startup: the switch at both ends ----------------------------------------------------------------------------------
++def _store_and_expert(env, tmp_path):
++    """The attention's three-rank store (as ``StoreComm(0, ...)`` hosts it) and expert 1's ``serve`` in a thread (no
++    weights: the node would be a FakeNode); returns (server, port, thread, errors)."""
++
++    from torch.distributed import TCPStore
++
++    from tensorfold.families.glm5_next.cuda import experts_node
++
++    port = free_port()
++    server = TCPStore("127.0.0.1", port, 3, True, timeout=timedelta(seconds=30), wait_for_workers=False)
++    env.setattr(experts_node, "ALIVE_EVERY", 3600)
++    env.setattr(experts_node.Config, "read", staticmethod(lambda _d: fake_cfg()))
++    env.setattr(experts_node, "ExpertNode", lambda _d, h, layers, **_: FakeNode(layers, h))
++    errors: dict = {}
++
++    def run():
++        try:
++            experts_node.serve(tmp_path, 0, "127.0.0.1", port, device="cpu")
++        except BaseException as exc:  # noqa: BLE001
++            errors["x"] = exc
++
++    t = threading.Thread(target=run, daemon=True)
++    t.start()
++    return server, port, t, errors
++
++
++@pytest.mark.parametrize("attention,expert", [(True, False), (False, True)], ids=["attention-on", "expert-on"])
++def test_a_switch_that_differs_is_refused_at_startup(env, tmp_path, attention, expert):
++    """The attention announces ``partials_bf16`` only when its switch is on; an expert node whose own switch differs
++    refuses before it opens its link or loads anything, with a message naming both settings, and publishes it as its
++    error key (the attention's watchdog prints it and stops)."""
++
++    from tensorfold.families.glm5_next.cuda import afd as afd_mod
++
++    if expert:
++        env.setenv(ENV, "1")
++    else:
++        env.delenv(ENV, raising=False)
++    server, port, t, errors = _store_and_expert(env, tmp_path)
++    s = afd_mod.Store("127.0.0.1", port)
++    s.set("afd_settings", json.dumps(afd_mod.settings_for(tmp_path, fake_cfg(), prefill_rows=PREFILL,
++                                                          partials_bf16=attention)).encode())
++    t.join(20)
++    assert not t.is_alive()
++    exc = errors.get("x")
++    assert isinstance(exc, SystemExit), repr(exc)
++    said = {True: "1 (bf16 partial sums)", False: "unset (fp32 partial sums)"}
++    assert f"the attention node has {said[attention]}, expert 1 has {said[expert]}" in str(exc)
++    assert "set TF_GLM_PARTIALS_BF16 the same on the attention node and on both expert nodes" in str(exc)
++    assert bytes(s.get("afd_error/1")).decode() in str(exc)
++    assert not s.check(["afd_ready/1"]) and not s.check(["afd_loaded/1"])     # refused before the link and the load
++    del server
++
++
++def test_a_bad_value_is_refused_before_the_handshake(env, tmp_path):
++    from tensorfold.families.glm5_next.cuda import afd as afd_mod
++
++    env.setenv(ENV, "on")
++    server, port, t, errors = _store_and_expert(env, tmp_path)
++    t.join(20)
++    assert not t.is_alive() and isinstance(errors.get("x"), ValueError) and ENV in str(errors["x"])
++    s = afd_mod.Store("127.0.0.1", port)
++    assert ENV in bytes(s.get("afd_error/1")).decode() and not s.check(["afd_settings"])   # before any handshake read
++    del server
++
++
++def test_serve_with_the_switch_on_at_both_ends(env, words, tmp_path):
++    """Both experts' ``serve`` with the switch on, the attention announcing it (``settings_for(partials_bf16=True)``,
++    as ``engine`` does): the handshake passes, each expert's link rounds its prompt windows' replies; prompt chunks,
++    decode windows and a pair come back as expected."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import afd as afd_mod
++    from tensorfold.families.glm5_next.cuda import afd_mcdma, experts_node, mcdma
++
++    daemon = FakeDaemon(tmp_path, ["a2", "a1"])
++    env.setenv(ENV, "1")
++    env.setattr(afd_mod, "WATCH_EVERY", 3600)
++    env.setattr(experts_node, "ALIVE_EVERY", 3600)
++    env.setattr(experts_node.Config, "read", staticmethod(lambda _d: fake_cfg()))
++    env.setattr(experts_node, "ExpertNode", lambda _d, half, layers, **_: FakeNode(layers, half))
++    by_thread = {"x0": "a2", "x1": "a1"}
++    env.setattr(mcdma, "link_name", lambda: by_thread[threading.current_thread().name])
++    init = mcdma.ExpertLink.__init__
++
++    def link_init(self, name, **kw):
++        kw.setdefault("socket_path", daemon.sock(name))
++        init(self, name, **kw)
++
++    env.setattr(mcdma.ExpertLink, "__init__", link_init)
++    port, errors = free_port(), {}
++
++    def run(half):
++        try:
++            experts_node.serve(tmp_path, half, "127.0.0.1", port, device="cpu")
++        except BaseException as exc:  # noqa: BLE001
++            errors[half] = exc
++
++    threads = [threading.Thread(target=run, args=(h,), name=f"x{h}", daemon=True) for h in (0, 1)]
++    for t in threads:
++        t.start()
++    links = mcdma.AttentionLinks(["a2", "a1"], words=words, mode="cpu", timeout=10, shm_dir=str(daemon.shm),
++                                 linkup_wait=2)
++    tr = afd_mcdma.McdmaTransport("127.0.0.1", port, links=links, device="cpu", hidden=D)
++    a = afd_mod.AfdWire("127.0.0.1", port, transport=tr)
++    a.announce(afd_mod.settings_for(tmp_path, fake_cfg(), prefill_rows=PREFILL, pairs=True, partials_bf16=True))
++    a.wait_loaded(30)
++    assert a.bf16 and tr.bf16
++    gen = torch.Generator().manual_seed(11)
++    _plain(a, 4, gen, chunk=False)
++    _plain(a, PREFILL, gen)
++    _windows(a, (9, PREFILL), gen)
++    _plain(a, 1, gen, chunk=False)
++    for x in ("a2", "a1"):
++        daemon.bye(x)
++    for t in threads:
++        t.join(10)
++        assert not t.is_alive()
++    assert all(isinstance(errors[h], mcdma.LinkError) for h in (0, 1)), errors
++    daemon.close()
++
++
++# -- the switch off ----------------------------------------------------------------------------------------------------
++@pytest.mark.parametrize("modes", MODES, ids=["cpu", "gpu", "mixed"])
++def test_the_switch_off_is_todays_wire(env, daemon, words, master, monkeypatch, modes):
++    """Unset: the layout's sizes are today's, every reply is the fp32 partial and every collect waited for 4 bytes a
++    value; the expert ends hold no bf16 rows and ``sent`` is the identity."""
++
++    import torch
++
++    from tensorfold.families.glm5_next.cuda import afd_mcdma, mcdma
++
++    monkeypatch.delenv(ENV, raising=False)
++    lengths = _record_lengths(monkeypatch)
++    links, eps = _links(daemon, words, attn=modes[0], experts=modes[1], bf16=False)
++    wait_attached(daemon)
++    a = _attention(links, master, bf16=False)
++    assert not a.bf16 and not a.tr.bf16 and not a.tr.layout.bf16
++    lay = mcdma.Layout(D, S)
++    assert all(lay.rep(r) == lay.rep(r, prompt=True) == lay.room(r) == 4 * D * r for r in (1, 48, 2048))
++    gen = torch.Generator().manual_seed(5)
++    _plain(a, 11, gen)
++    _plain(a, 3, gen, chunk=False)
++    _windows(a, (9, PREFILL), gen)
++    _windows(a, (5, PREFILL, 30), gen)
++    assert lengths == ([4 * 11 * D] * 4 + [4 * 3 * D] * 4 + [4 * r * D for _ in LAYERS for r in (9, PREFILL)]
++                       + [4 * r * D for _ in LAYERS for r in (5, PREFILL, 30)])
++    for ep in eps:
++        assert ep.error is None and ep.link.halves is None and not ep.link.bf16 and not ep.link.bf16_rep
++        x = torch.ones(2, D)
++        assert ep.link.sent(x) is x
++    assert afd_mcdma.McdmaExpertLink.__init__.__kwdefaults__["bf16"] is False
++    a.layer = a.nlayers
++    tp._close(daemon, eps)

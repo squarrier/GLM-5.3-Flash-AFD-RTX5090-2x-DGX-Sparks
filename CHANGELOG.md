@@ -1,5 +1,65 @@
 # Changelog
 
+## 2.15: four exchanges in flight, BF16 partial sums, the big-window kernel schedule, the watcher
+- **Same engine, machines, checkpoint and drafter as 2.1**, which stays at the tag
+  [`v2.1`](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/tree/v2.1). TensorFold v0.6.5
+  (`609ca41`) plus 51 patches: 2.1's 48, unchanged byte for byte, and 3 new ones (0049-0051).
+- **New settings, on in `.env.example`** (each measured in the lab against the configuration without it, in this
+  order):
+  - four MoE exchanges in flight to each Spark, with four prompt lanes (`MCDMA_INFLIGHT=4`, 2.1: 2;
+    `TF_GLM_PREFILL_LANES=4`, patch 0026, which 2.1 shipped off): four links to each Spark, and on the attention host
+    a second connect daemon for the fourth (one daemon holds six peers). Fresh 8K prompts 11.0% faster, a cold ~2.6K
+    prompt's first token 3.9% sooner, with 2.1's replies bit for bit;
+  - a 32-row verify window at eight streams (`TF_GLM_MULTI_WINDOW=32`, 2.1: 64): the coding-agent load at eight
+    requests 9.6% faster, with the same replies, and a KV pool of 1,585,152 tokens (2.1: 1,579,008);
+  - BF16 partial sums on the return wire for prompt windows (0050, `TF_GLM_PARTIALS_BF16=1` in both `ATTN_ENV` and
+    `EXPERT_ENV`), written to the design of glm53f-afd's BF16 return planes by Hugh Madden
+    ([@dangerm00se](https://x.com/dangerm00se)): the Sparks' replies to prompt windows are half the bytes, a cold ~2.6K
+    prompt's first token comes 8.3% sooner and long prompts fill 2.9% faster. It changes the replies (mean KL 0.00218
+    against the same configuration without it; AEON-30 22 of 30, against 23); decode windows keep fp32 replies.
+    `./start.sh` refuses to start when the two lines disagree;
+  - glm53f-rank's own schedule for its biggest windows, from Hugh Madden's expert prompt kernels (64-row groups, 16
+    gate/up warps, 512-column down chunks; `TF_GLM_EXPERT_KERNEL_MT=4`, `_GW=16`, `_NT=4`, `_L2=1`, patch 0049), on
+    the Sparks' prompt windows of 1,536 rows and more only (`TF_GLM_EXPERT_KERNEL_TIER_ROWS=1536`, patch 0051): long
+    prompts 6.7% faster, with the same replies.
+- **The watcher is back** (`extras/watch`, ported from v1.0): once a minute it checks `/health`, `/v1/models` and a
+  tiny streamed reply, records telemetry, and runs `./start.sh recover` after two failed checks, with a circuit
+  breaker. With it: `./start.sh recover`; `SIGTERM`-only stops (containers with `--init` and `--restart=no`,
+  `STOP_WAIT`); a control lock for `up`, `recover`, `probe` and `stop.sh`; and a stop marker the watcher respects.
+  `tests/test_watch.sh` runs it against a stand-in server, and the dry run adds seven `recover` cases.
+- **Measured** in the lab with the same harnesses as 2.1's numbers, the combined configuration on one boot
+  (2026-10-07), against 2.1 as published (its
+  same-window run): fresh 8K / 31K / 62K prompts 3,374 / 3,642 / 3,707 tok/s against 2,946 / 3,030 / 3,138 (1.15x /
+  1.20x / 1.18x); a cold 100K prompt's first token in 27.1 s against 32.4 s (0.84x), a cold ~2.6K one's in 1.058 s
+  against 1.313 s (0.81x); the arena's 65,535 x 10 cell at 1,151 / 64.5 t/s and 7.67 s to the first token (2.1: 1,198
+  / 64.2 and 7.70 s), 100,000 x 5 at 1,935 / 68.0 t/s and 3.85 s (1,872 / 65.8 and 4.00 s). Decode numbers move with
+  BF16's different texts, not with a decode change: one stream 71.3 / 86.1 / 91.4 tok/s (2.1: 75.7 / 81.5 / 83.2),
+  four streams 114.1 (110.6). After the soak and the drills the prompt set measured the same (3,290 / 3,647 /
+  3,709 tok/s; 27.0 s). No same-window run against Mia's recipe for 2.15: 2.1's against her v1.8 stays in the docs,
+  as 2.1's.
+- **Soak and drills**, with the watcher on: a 4.11-hour window of mixed load at up to eight requests, 3.59 hours under
+  load: 4,071 requests, all answered 200, no restarts; decode drift at most -1.9%; memory creep at most +0.23 GiB/h;
+  a ~240K needle found under load; AEON-30 22 of 30 under the load, as idle. **The soak failed its probe check:**
+  in two of nine loaded rounds a long streamed tool call paused 6.3 and 7.0 s between events (the limit is 6 s), and
+  the largest gap between probe rounds was 60 minutes (the limit is 45). The four failure drills passed, serving
+  again 309-384 s after each fault through the watcher. A stopped expert process fails the request in flight after
+  23 s (TensorFold#214); new requests get HTTP 429, then 500, and `/health` stays 200 until the restart
+  ([README](README.md#soak-and-failure-drills)).
+- **Measured and left off** ([docs/DESIGN.md](docs/DESIGN.md#measured-and-off)): her draft policy at her `fnc7:0.3`
+  (spark-bench decode +3.7%, geometric mean; the coding-agent load -5.2%); her queued-cancel fix alone (0037, desy0305's with
+  johnwhited's delivery-failure handling: a waiting request whose client left drops in 0.10 s instead of 100.3 s, but
+  the ten-client cell's prompt rate fell 5.6%); her copy drafts (not ported; in a lab build, edits +24% but quoting a
+  tool's JSON result 27% slower); and glm53f-rank's big-window schedule on every window (the ten-client cell's first
+  token 3.5% later).
+- **Upstream:** Ash Hart's second answer on [TensorFold#214](https://github.com/ashhart/TensorFold/issues/214)
+  (2026-10-07): the split wants two commands with a transport between them; TensorFold's Zig engine ports GLM to one
+  box first, and the split follows on the same expert weights; a failed expert process must fail the request
+  ([README](README.md#upstream)).
+- **Credits** follow Mia's attribution rules ([AGENTS.md](AGENTS.md)), with 2.1 as the before: every 2.1 name is kept.
+  Hugh Madden's rows add the BF16 return planes (0050) and glm53f-rank's big-window schedule (0049, 0051); the four
+  prompt lanes were already his design (0026). The watcher is v1.0's, credited as v1.0's credits name it.
+- Further work moves to TensorFold's Zig engine.
+
 ## 2.1: kept prompts in host RAM, Hugh Madden's expert prompt kernels, her v1.8 fixes, TensorFold 0.6.6
 - **Same engine, machines, checkpoint and drafter as 2.0**, which stays at the tag
   [`v2.0`](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/tree/v2.0). TensorFold v0.6.5

@@ -1,29 +1,37 @@
 #!/bin/bash
-# Static checks, no hardware needed: bash syntax, shellcheck (if installed), Python syntax, the topology lib.sh
-# derives from .env.example, the TF_GLM_* env check, the patch series' shape and credits, the scrub, and the files
-# kept byte-identical (AGENTS.md, the host guard's code).
+# Static checks, no hardware needed: bash syntax, shellcheck (if installed), Python syntax, SIGTERM only (no SIGKILL
+# to a container or GPU process anywhere in the scripts), the topology lib.sh derives from .env.example, the TF_GLM_*
+# env check, the patch series' shape and credits, the scrub, and the files kept byte-identical (AGENTS.md, the host
+# guard's code).
 # With TF_REPO=<a TensorFold clone that has the pinned tag>, also applies patches/ in order with `git apply --check`.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail=0
 scripts=(build.sh download.sh start.sh stop.sh scripts/lib.sh tools/export_patches.sh tests/test_static.sh tests/test_dryrun.sh
-         extras/gb10-hostguard/install.sh)
+         tests/test_watch.sh extras/gb10-hostguard/install.sh)
 for f in "${scripts[@]}"; do bash -n "$f" || { echo "bash -n FAIL $f"; fail=1; }; done
 if command -v shellcheck >/dev/null; then shellcheck -S error "${scripts[@]}" || fail=1; fi
 python3 -c 'import sys; [compile(open(f).read(), f, "exec") for f in sys.argv[1:]]' scripts/prebuild_ext.py tools/patch_credits.py \
-  extras/gb10-hostguard/gb10-hostguard.py || { echo "python syntax FAIL"; fail=1; }
+  extras/gb10-hostguard/gb10-hostguard.py extras/watch/glm53f-afd-watch extras/watch/glm53f-afd-report \
+  || { echo "python syntax FAIL"; fail=1; }
+
+# SIGTERM only: nothing here sends SIGKILL to a container or a GPU process (docker rm -f / docker stop / kill -9 ...)
+if grep -nP '^\s*[^#\s].*(docker (container )?rm -f|docker (container )?kill(?! --signal TERM)|docker stop\b|\bp?kill -(9|KILL|s KILL)\b|signal\.SIGKILL)' \
+    build.sh start.sh stop.sh scripts/lib.sh extras/watch/glm53f-afd-watch; then echo "SIGTERM-only FAIL"; fail=1; fi
 
 # topology and the env check, from the example values only (no exported variable may leak in)
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/scripts" "$tmp/patches"; cp .env.example "$tmp/.env"; cp scripts/lib.sh "$tmp/scripts/"; cp patches/*.patch "$tmp/patches/"
 out=$(env -i PATH="$PATH" HOME="$HOME" bash -c ". '$tmp/scripts/lib.sh'
   echo \"\${HOST[attn]} \${HOST[x0]} \${HOST[x1]}|\${FABRIC_IP[x1]}|\${LINK[x0]},\${LINK[x1]}|\${EXPERT_RANK[x1]}|\${RDMA_DEV[attn]} \${RDMA_DEV[x0]}|\$BASE_URL|\${#TREE_ID}|\${EXT_DIR%-*}|\${CONTAINER[x1]}|\$MCDMA_INFLIGHT|\$(links | tr '\n' ' ')\"")
-exp="10.0.0.10 10.0.0.11 10.0.0.12|10.10.1.12|x0,x1|1|mlx5_0 rocep1s0f0|http://10.0.0.10:8000|12|/srv/glm-afd/ext|glm-afd-x1|2|x0 x1 x0-1 x1-1 "
+exp="10.0.0.10 10.0.0.11 10.0.0.12|10.10.1.12|x0,x1|1|mlx5_0 rocep1s0f0|http://10.0.0.10:8000|12|/srv/glm-afd/ext|glm-afd-x1|4|x0 x1 x0-1 x1-1 x0-2 x1-2 x0-3 x1-3 "
 [ "$out" = "$exp" ] || { echo "topology FAIL: $out"; fail=1; }
+cpeer=$(env -i PATH="$PATH" HOME="$HOME" bash -c ". '$tmp/scripts/lib.sh'; for c in \$(connects); do echo \"\$c: \$(cpeers \$c | tr '\n' ' ')\"; done")
+[ "$cpeer" = $'connect: 0 1 2 \nconnect2: 3 ' ] || { echo "connect daemons FAIL: $cpeer"; fail=1; }
 env_ok=$(env -i PATH="$PATH" HOME="$HOME" bash -c ". '$tmp/scripts/lib.sh'; envpairs ATTN_ENV \"\$ATTN_ENV\"")
-case "$env_ok" in *"-e TF_GLM_SHARED_PREFIX=1"*"-e TF_GLM_STREAM_SMOOTH_MS=400"*"-e TF_GLM_KDA_CHUNKED=1"*"-e TF_GLM_PREFILL_PAIRS=1"*"-e TF_GLM_DFLASH_POLICY=fnc5:0.2"*"-e TF_GLM_CACHE_ROOM=1"*"-e TF_GLM_KEPT_HOST=1"*"-e TF_GLM_HOST_CACHE_GIB=24"*"-e TF_GLM_FILL_PAIRS=1"*"-e TF_GLM_DECIDE_THEN_COPY=1"*"-e TF_GLM_CAPACITY_STATUS=1"*"-e TF_GLM_DELIVERY_ABORT=1"*) ;; *) echo "envpairs FAIL: $env_ok"; fail=1 ;; esac
+case "$env_ok" in *"-e TF_GLM_SHARED_PREFIX=1"*"-e TF_GLM_STREAM_SMOOTH_MS=400"*"-e TF_GLM_KDA_CHUNKED=1"*"-e TF_GLM_PREFILL_PAIRS=1"*"-e TF_GLM_DFLASH_POLICY=fnc5:0.2"*"-e TF_GLM_CACHE_ROOM=1"*"-e TF_GLM_KEPT_HOST=1"*"-e TF_GLM_HOST_CACHE_GIB=24"*"-e TF_GLM_FILL_PAIRS=1"*"-e TF_GLM_DECIDE_THEN_COPY=1"*"-e TF_GLM_CAPACITY_STATUS=1"*"-e TF_GLM_DELIVERY_ABORT=1"*"-e TF_GLM_MULTI_WINDOW=32"*"-e TF_GLM_PREFILL_LANES=4"*"-e TF_GLM_PARTIALS_BF16=1"*) ;; *) echo "envpairs FAIL: $env_ok"; fail=1 ;; esac
 xenv=$(env -i PATH="$PATH" HOME="$HOME" bash -c ". '$tmp/scripts/lib.sh'; envpairs EXPERT_ENV \"\$EXPERT_ENV\"")
-case "$xenv" in *"-e TF_GLM_EXL3_DEC=1"*"-e TF_GLM_EXL3_LOADS=nc"*"-e TF_GLM_EXL3_PROMPT=1"*"-e TF_GLM_EXPERT_KERNEL=g53"*) ;; *) echo "envpairs FAIL (experts): $xenv"; fail=1 ;; esac
+case "$xenv" in *"-e TF_GLM_EXL3_DEC=1"*"-e TF_GLM_EXL3_LOADS=nc"*"-e TF_GLM_EXL3_PROMPT=1"*"-e TF_GLM_EXPERT_KERNEL=g53"*"-e TF_GLM_PARTIALS_BF16=1"*"-e TF_GLM_EXPERT_KERNEL_MT=4"*"-e TF_GLM_EXPERT_KERNEL_GW=16"*"-e TF_GLM_EXPERT_KERNEL_NT=4"*"-e TF_GLM_EXPERT_KERNEL_L2=1"*"-e TF_GLM_EXPERT_KERNEL_TIER_ROWS=1536"*) ;; *) echo "envpairs FAIL (experts): $xenv"; fail=1 ;; esac
 for bad in 'TF_GLM_X=1;id' 'FOO=1' 'TF_GLM_X=$(id)' 'TF_GLM_X=1 PYTHONPATH=/x'; do
   if env -i PATH="$PATH" HOME="$HOME" bash -c ". '$tmp/scripts/lib.sh'; envpairs T '$bad'" >/dev/null 2>&1; then
     echo "envpairs FAIL: accepted '$bad'"; fail=1

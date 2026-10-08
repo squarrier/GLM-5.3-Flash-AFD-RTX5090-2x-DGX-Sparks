@@ -1,0 +1,846 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 00:21:59 -0400
+Subject: [PATCH] glm5_next/cuda: knobs for the g53 expert kernels'
+ configuration (TF_GLM_EXPERT_KERNEL_MT, _GW, _NT, _L2, _FUSE, _DISCARD, _SK,
+ _SKD, _SWIGLU)
+
+Under TF_GLM_EXPERT_KERNEL=g53 (glm53f-afd's large-M expert prompt kernels, written by Hugh Madden, glm53f-afd @
+91db3cc), every field of the kernels' configuration (glm53f-rank's g53r_cfg) now has an env knob on the expert
+containers, so the launch shape can be tuned for the GPU the experts run on. The defaults were measured on another
+GPU, at four ranks of half this width.
+
+- Unset (every knob): nothing changes. switch() returns the settings it returned before, every window runs
+  default_cfg as before, the node calls routed() as before and prints the same line.
+- Set: one value for every window size. MT (2, 4: 32- or 64-row groups), GW (8, 16 gate/up warps), NT (1, 2, 4:
+  down chunks of 128 nt columns), L2 (1, 2: evict-first trellis loads), FUSE and DISCARD (1, 2) keep every bit
+  (glm53f-rank's own statement; a CPU emulation of the kernels' work decomposition shows it, and a GPU test checks
+  the CUDA kernels' bytes at 256-2,048 rows). SK, SKD (1, 2, 4) and SWIGLU (0, 1) change outputs; set, they too
+  apply to every window, so a prompt row's bits still never depend on its window. A K split that needs more than
+  the node's prompt scratch gets its buffer at the node's start, and the line says how much.
+- The node's line adds "schedule <fields> for every window (the same bits | <fields>: outputs change)" when a knob
+  is set.
+
+Tests: tests/test_glm_g53_schedule.py (CPU: names, refusals, the defaults unchanged at every window size, one field a
+knob, the node's calls and line; and tests/glm_g53_schedule.py's emulated digests: the schedule fields give the
+default's bits, sk, skd and the SwiGLU precision other bits, the same under every schedule, a row's bits whatever
+its window, and a negative control). tests/cuda/test_glm_g53_kernel.py gains the schedules' byte check and a times
+report (TF_G53_TUNE_TIMES) for the GPU. tests/test_glm_g53_kernel.py clears the knobs too, so a run's environment
+cannot move its switch tests.
+
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+ .../families/glm5_next/cuda/g53_experts.py    |  80 ++++-
+ tests/cuda/test_glm_g53_kernel.py             |  56 ++++
+ tests/glm_g53_schedule.py                     | 302 ++++++++++++++++++
+ tests/test_glm_g53_kernel.py                  |   3 +-
+ tests/test_glm_g53_schedule.py                | 250 +++++++++++++++
+ 5 files changed, 685 insertions(+), 6 deletions(-)
+ create mode 100644 tests/glm_g53_schedule.py
+ create mode 100644 tests/test_glm_g53_schedule.py
+
+diff --git a/src/tensorfold/families/glm5_next/cuda/g53_experts.py b/src/tensorfold/families/glm5_next/cuda/g53_experts.py
+index bb5b8cb..4041fae 100644
+--- a/src/tensorfold/families/glm5_next/cuda/g53_experts.py
++++ b/src/tensorfold/families/glm5_next/cuda/g53_experts.py
+@@ -31,13 +31,18 @@ skd 1: one FP32 MMA chain a sum over ascending k tiles; its fused epilogue; the
+ acc + w * (y * 1/sqrt(128) * svh), built with --fmad=false), not the grouped kernel's split-K sums and combine. The
+ rotation and order schedules, the rows per group, the tilings and the row count keep every bit (glm53f-rank's own
+ statement). It never becomes a default by itself.
++
++The schedule (TF_GLM_EXPERT_KERNEL_MT, _GW, _NT, _L2, _FUSE, _DISCARD; each unset: default_cfg's value for the window,
++as before): one value for every window, so a launch shape can be tuned for the GPU the experts run on. These fields
++keep every bit. TF_GLM_EXPERT_KERNEL_SK, _SKD and _SWIGLU (the K splits and the SwiGLU precision) change outputs; set,
++they too apply to every window, so a prompt row's bits still never depend on its window.
+ """
+ 
+ from __future__ import annotations
+ 
+ import math
+ import os
+-from dataclasses import dataclass
++from dataclasses import dataclass, replace
+ from functools import lru_cache
+ from pathlib import Path
+ 
+@@ -52,6 +57,19 @@ MIN_ROWS = 1             # every prompt window takes the large-M kernels here: a
+ MAX_ROWS = 4096          # glm53f-rank's MAX_ROWS (a wire lane's cap)
+ H, WID, E, TOPK = 4096, 1024, 288, 8
+ NVCC = ["-O3", "--fmad=false", "--ftz=false", "--prec-div=true"]   # glm53f-rank's build.rs flags (arch from build)
++# One knob a configuration field (the values g53_rank.cpp accepts); unset: default_cfg's value for the window.
++SCHEDULE_ENVS = {
++    "mt": ("TF_GLM_EXPERT_KERNEL_MT", (2, 4)),               # 16-row tiles a group: 32- or 64-row groups
++    "gw": ("TF_GLM_EXPERT_KERNEL_GW", (8, 16)),              # gate/up MMA warps a block
++    "nt": ("TF_GLM_EXPERT_KERNEL_NT", (1, 2, 4)),            # down: 16-column tiles a warp (128 nt-column chunks)
++    "l2": ("TF_GLM_EXPERT_KERNEL_L2", (1, 2)),               # 2: trellis words loaded evict-first
++    "fuse": ("TF_GLM_EXPERT_KERNEL_FUSE", (1, 2)),           # 2: the epilogue and the reduce fused
++    "discard": ("TF_GLM_EXPERT_KERNEL_DISCARD", (1, 2)),     # 2: consumed partial sums dropped from L2 (fused only)
++    "sk": ("TF_GLM_EXPERT_KERNEL_SK", (1, 2, 4)),            # gate/up K splits (outputs change)
++    "skd": ("TF_GLM_EXPERT_KERNEL_SKD", (1, 2, 4)),          # down K splits (outputs change)
++    "swiglu": ("TF_GLM_EXPERT_KERNEL_SWIGLU", (0, 1)),       # 1: FP32 SwiGLU (outputs change)
++}
++BIT_FIELDS = ("sk", "skd", "swiglu")   # the only fields that change a bit (glm53f-rank's own statement)
+ 
+ 
+ @lru_cache(maxsize=1)
+@@ -96,6 +114,14 @@ def default_cfg(rows: int, *, rowrot: bool = True, order: bool = False) -> Cfg:
+     return Cfg(mt=4, sk=1, skd=1, nt=4, gw=16, l2=1, fuse=2, discard=2, swiglu=0, rot=rot, gord=gord)
+ 
+ 
++def tuned_cfg(rows: int, *, rowrot: bool = True, order: bool = False, fields: dict | None = None) -> Cfg:
++    """default_cfg(rows) with ``fields`` (``schedule()``'s: the knobs set) over it, the same values for every window
++    size. No fields: default_cfg itself."""
++
++    c = default_cfg(rows, rowrot=rowrot, order=order)
++    return replace(c, **fields) if fields else c
++
++
+ def _flag(name: str, default: bool) -> bool:
+     v = os.environ.get(name, "").strip()
+     if v == "":
+@@ -105,11 +131,32 @@ def _flag(name: str, default: bool) -> bool:
+     return v == "1"
+ 
+ 
++def schedule() -> dict:
++    """The configuration knobs set (SCHEDULE_ENVS: TF_GLM_EXPERT_KERNEL_MT, _GW, _NT, _L2, _FUSE, _DISCARD, _SK, _SKD,
++    _SWIGLU), as {field: value}; empty when none is (every window then runs default_cfg, as before). Bad values
++    refuse."""
++
++    got = {}
++    for field, (name, ok) in SCHEDULE_ENVS.items():
++        v = os.environ.get(name, "").strip()
++        if v == "":
++            continue
++        try:
++            n = int(v)
++        except ValueError:
++            n = None
++        if n not in ok:
++            raise ValueError(f"{name} is one of {', '.join(map(str, ok))}, not {v!r}")
++        got[field] = n
++    return got
++
++
+ def switch() -> dict | None:
+     """TF_GLM_EXPERT_KERNEL, read once at the node's start: None (unset, empty or ``tf``: TensorFold's kernels) or the
+     settings of ``g53``: min_rows (TF_GLM_EXPERT_KERNEL_ROWS, 1..4,096, default 1: every prompt window; above 1 the
+     smaller windows stay on TensorFold's kernels and a prompt row's bits depend on its window), rowrot
+-    (TF_GLM_EXPERT_KERNEL_ROWROT, default 1) and order (TF_GLM_EXPERT_KERNEL_ORDER, default 0). Bad values refuse."""
++    (TF_GLM_EXPERT_KERNEL_ROWROT, default 1) and order (TF_GLM_EXPERT_KERNEL_ORDER, default 0), plus ``schedule``
++    (``schedule()``'s fields) when a configuration knob is set. Bad values refuse."""
+ 
+     v = os.environ.get(ENV, "").strip().lower()
+     if v in ("", "tf"):
+@@ -125,7 +172,11 @@ def switch() -> dict | None:
+     if not MIN_ROWS <= rows <= MAX_ROWS:
+         raise ValueError(f"{ROWS_ENV}: {MIN_ROWS}..{MAX_ROWS} (the smallest prompt window through the kernels), "
+                          f"not {rows}")
+-    return {"min_rows": rows, "rowrot": _flag(ROWROT_ENV, True), "order": _flag(ORDER_ENV, False)}
++    got = {"min_rows": rows, "rowrot": _flag(ROWROT_ENV, True), "order": _flag(ORDER_ENV, False)}
++    fields = schedule()
++    if fields:
++        got["schedule"] = fields
++    return got
+ 
+ 
+ def layer_ready(ex) -> str | None:
+@@ -243,9 +294,12 @@ class Node:
+         b = node.buf
+         self.node, self.min_rows = node, int(settings["min_rows"])
+         self.rowrot, self.order = bool(settings["rowrot"]), bool(settings["order"])
++        self.fields = dict(settings.get("schedule") or {})   # the configuration knobs set: none, default_cfg's
+         self.max_rows = min(MAX_ROWS, b.prefill_rows)
+         self.ready = {i: layer_ready(ex) is None for i, ex in node.by_layer.items()}
+         self.scratch = Scratch(self.max_rows, b.routed.device, share=getattr(b, "pref", None))
++        if self.fields:                 # K splits past the prompt scratch's room: the owned buffers now, not in a window
++            self.scratch.big(self.max_rows, self.config(self.max_rows))
+         if any(self.ready.values()) and b.routed.is_cuda:
+             _ext()                  # loaded (prebuilt: tools/prebuild_ext.py) at the start, not in a prompt forward
+         shared = sum(1 for i, ok in self.ready.items()
+@@ -253,11 +307,24 @@ class Node:
+         floor = ("every prompt window: a row's bits whatever its window" if self.min_rows <= MIN_ROWS else
+                  f"{ROWS_ENV}={self.min_rows}: windows under {self.min_rows} rows stay on TensorFold's kernels, so a "
+                  f"prompt row's bits depend on its window")
++        tuned = ""
++        if self.fields:
++            bits = [f for f in BIT_FIELDS if f in self.fields]
++            own = self.scratch._own
++            tuned = (f"; schedule {' '.join(f'{k} {v}' for k, v in self.fields.items())} for every window ("
++                     + (f"{', '.join(bits)}: outputs change" if bits else "the same bits")
++                     + (f"; {sum(t.numel() * t.element_size() for t in own) >> 20} MiB own scratch" if own else "")
++                     + ")")
+         print(f"[tensorfold] afd expert {node.half + 1}: {ENV}=g53: prompt chunks of {self.min_rows}-{self.max_rows} "
+               f"rows through glm53f-afd's large-M expert kernels (Hugh Madden; outputs class; {floor}; rowrot "
+               f"{'on' if self.rowrot else 'off'} ({shared} layers share one gate/up suh), order "
+-              f"{'on' if self.order else 'off'}); {sum(self.ready.values())} of {len(self.ready)} MoE layers in scope",
+-              flush=True)
++              f"{'on' if self.order else 'off'}); {sum(self.ready.values())} of {len(self.ready)} MoE layers in scope"
++              f"{tuned}", flush=True)
++
++    def config(self, R: int) -> Cfg:
++        """The configuration a window of R rows runs: default_cfg with the knobs set over it."""
++
++        return tuned_cfg(R, rowrot=self.rowrot, order=self.order, fields=self.fields)
+ 
+     def takes(self, layer_i: int, R: int, prompt: bool) -> bool:
+         """A prompt chunk's window (``prompt``: the node's MODE_CHUNK, MODE_SLICE, MODE_PAIR and MODE_LANES forwards)
+@@ -274,5 +341,8 @@ class Node:
+         b = self.node.buf
+         normed, pick, wts = x if x is not None else (b.normed[:R], b.pick[:R], b.wts[:R])
+         dst = b.routed[:R] if out is None else out
++        if self.fields:                 # a configuration knob set: that configuration for every window
++            return routed(normed, pick, wts, self.node.by_layer[layer_i], self.scratch, dst, R, self.node.cfg.limit,
++                          self.config(R))
+         return routed(normed, pick, wts, self.node.by_layer[layer_i], self.scratch, dst, R, self.node.cfg.limit,
+                       rowrot=self.rowrot, order=self.order)
+diff --git a/tests/cuda/test_glm_g53_kernel.py b/tests/cuda/test_glm_g53_kernel.py
+index 6cb1a46..741d5a5 100644
+--- a/tests/cuda/test_glm_g53_kernel.py
++++ b/tests/cuda/test_glm_g53_kernel.py
+@@ -23,6 +23,8 @@ node's GPU with no model server loaded.
+   4,096 rows for the port, glm53f-rank and TensorFold's kernels (the grouped kernel, up to 2,048 rows on a GPU without
+   the 147,456 B of shared memory it needs above that, GB10's case; and the EXL3 prompt kernel of TF_GLM_EXL3_PROMPT=1,
+   which ran those prompt windows before g53) (TF_G53_TIMES: a JSON file to write them to).
++- The configuration knobs' schedules (TF_GLM_EXPERT_KERNEL_MT, _GW, _NT, _L2, _FUSE, _DISCARD, and _ORDER) at
++  prompt-chunk sizes: the default's bits; their times at 256-2,048 rows (report only; TF_G53_TUNE_TIMES: a JSON file).
+ 
+ TF_GLM_MODEL_DIR (with TF_G53_LAYER, default the first MoE layer, and TF_G53_HALF, default 0): one MoE layer's half of
+ the real checkpoint instead of synthetic tiles.
+@@ -605,3 +607,57 @@ def test_times_report(layer, request, monkeypatch):
+         old = json.loads(Path(path).read_text()) if Path(path).exists() else {}
+         old.update(res)
+         Path(path).write_text(json.dumps(old, indent=1))
++
++
++# ------------------------------------------------------------------- the configuration knobs' schedules (same bits)
++
++TUNE = ({"mt": 4, "gw": 16}, {"mt": 4, "gw": 16, "nt": 2}, {"mt": 4, "gw": 16, "nt": 4, "l2": 1},
++        {"mt": 4, "gw": 16, "nt": 2, "l2": 1}, {"mt": 4, "gw": 16, "nt": 2, "gord": 2}, {"gord": 2}, {"l2": 1},
++        {"nt": 1}, {"nt": 4}, {"gw": 16, "nt": 1}, {"fuse": 1}, {"discard": 1})
++
++
++def _label(kw: dict) -> str:
++    return " ".join(f"{k} {v}" for k, v in kw.items()) or "default"
++
++
++@pytest.mark.parametrize("R", [256, 1024, 2048])
++@pytest.mark.parametrize("kind", ["uniform", "skewed"])
++def test_tuned_schedules_keep_every_bit(layer, R, kind):
++    """The schedules the configuration knobs (TF_GLM_EXPERT_KERNEL_MT, _GW, _NT, _L2, _FUSE, _DISCARD) and
++    TF_GLM_EXPERT_KERNEL_ORDER can give a prompt chunk's window: the default's bytes."""
++
++    _, ex = layer
++    inp = _inputs(R, kind, 77 + R)
++    want = _ours(ex, inp, _cfg(R))
++    for kw in TUNE:
++        assert _bits_equal(_ours(ex, inp, _cfg(R, **kw)), want), (R, kind, kw)
++
++
++def test_tuned_times_report(layer):
++    """Information (TF_G53_TUNE_TIMES: a JSON file to write them to): ms a call for the default and each schedule of
++    TUNE at 256-2,048 rows, uniform and skewed routing."""
++
++    from tensorfold.families.glm5_next.cuda import g53_experts
++
++    name, ex = layer
++    res = {}
++    for R in (256, 512, 1024, 2048):
++        for kind in ("uniform", "skewed"):
++            inp = _inputs(R, kind, 61 + R)
++            s = _scratch(R)
++            out = torch.empty((R, D), dtype=torch.float32, device="cuda")
++            row = {}
++            for kw in ({}, *TUNE):
++                cfg = _cfg(R, **kw)
++
++                def call(inp=inp, s=s, out=out, R=R, cfg=cfg):
++                    g53_experts.routed(inp.x, inp.pick, inp.wts, ex, s, out, R, LIMIT, cfg)
++
++                row[_label(kw)] = _time(call, n=20)
++            res[f"{name} R{R} {kind}"] = row
++            print(f"[tune times, ms a call] {name} R{R} {kind}: {row}")
++    path = os.environ.get("TF_G53_TUNE_TIMES")
++    if path:
++        old = json.loads(Path(path).read_text()) if Path(path).exists() else {}
++        old.update(res)
++        Path(path).write_text(json.dumps(old, indent=1))
+diff --git a/tests/glm_g53_schedule.py b/tests/glm_g53_schedule.py
+new file mode 100644
+index 0000000..90149bb
+--- /dev/null
++++ b/tests/glm_g53_schedule.py
+@@ -0,0 +1,302 @@
++"""A CPU emulation of g53_rank.cu's work decomposition, for tests/test_glm_g53_schedule.py (expert prompt kernels from
++glm53f-afd, written by Hugh Madden (@dangerm00se, github.com/hughmadden), glm53f-afd @ 91db3cc, MIT, Copyright (c)
++2026 Turquoise Bay AI Pty Ltd; ported in families/glm5_next/cuda/g53_rank.cu).
++
++It runs a call the way the kernels split it, at reduced sizes (``Dims``; the kernels' own are H 4,096, WID 1,024,
++512-column blocks, 288 experts), with every index formula of g53_rank.cu:
++- the plan: an expert's pairs in ascending expert order, in an arbitrary order within the expert (the kernel's
++  atomics), cut into groups of 16 mt pairs; the group order (gord 2: order_kernel's interleave of single- and
++  multi-group experts);
++- gate/up items (matrix, column block, group, K split) taken in any order (persistent blocks and their item
++  counter); in an item, warp w of gw owns n tiles cb * TPB + w * NT .. + NT (NT = TPB / gw), m tiles past the group's
++  rows are predicated off and rows past its pairs are zero and never stored; one MMA chain a sum over the split's k
++  tiles in ascending order; the row rotation once a row (rot 2) or per (row, matrix) (rot 1);
++- the epilogue fused (the last of a group's 2 CB sk items runs it for the group's pairs) or as its own pass, the K
++  splits summed in order from 0;
++- down items (group, chunk of 128 nt columns, K split) in any order, 8 warps of nt n tiles each, the K split's k tiles
++  ascending;
++- the reduce fused (the item that brings a (row, chunk) to its 8 skd arrivals reduces it) or as its own pass, slots in
++  order, splits in order;
++- discard (fused only): every partial-sum line a fused epilogue or reduce consumed is poisoned (NaN) at once, so a
++  later read would show in the output; l2 changes no value (a cache policy).
++
++Every product and sum is the reference's (tests/glm_g53_reference.py): fwht128, the BF16 roundings, FP32 sums in the
++kernels' order. An m16n8k16 MMA is modelled as acc + float32(the 16 products summed in k order in float64): a fixed
++function of the row, the column and the accumulator, as the tensor cores are (rows and columns independent). Only the
++order in which the schedule feeds it is under test.
++"""
++
++from __future__ import annotations
++
++import hashlib
++from dataclasses import dataclass
++
++import numpy as np
++
++from tests import glm_g53_reference as ref
++
++TOPK, HAD = 8, 128
++F32 = np.float32
++
++
++@dataclass(frozen=True)
++class Dims:
++    H: int = 512      # gate/up K, down N (kernels: 4,096)
++    WID: int = 512    # gate/up N, down K (kernels: 1,024, a TP2 half)
++    CBW: int = 256    # gate/up column block (kernels: 512): 16 n tiles, so gw 8 -> NT 2, gw 16 -> NT 1
++    E: int = 16       # experts (kernels: 288)
++
++    @property
++    def CB(self):
++        return self.WID // self.CBW
++
++    @property
++    def TPB(self):    # n tiles of a column block
++        return self.CBW // 16
++
++    @property
++    def KB(self):     # gate/up 128-wide K blocks (kernels: 32)
++        return self.H // HAD
++
++    @property
++    def NTG(self):    # gate/up n tiles of the slice, down k tiles
++        return self.WID // 16
++
++
++def layer(d: Dims, rng: np.random.Generator, shared: bool = True) -> dict:
++    """Random FP16 weights and scales for ``d.E`` experts (decoded weights stand in for the trellises: the decode is
++    per tile and has no schedule). ``shared``: one gate/up suh for every expert (rot 2 possible)."""
++
++    def h(*shape, mag=1.0):
++        return (rng.standard_normal(shape) * mag).astype(np.float16).astype(F32)
++
++    one = h(1, d.H, mag=0.5)
++    suh_g = np.repeat(one, d.E, 0) if shared else h(d.E, d.H, mag=0.5)
++    suh_u = suh_g.copy() if shared else h(d.E, d.H, mag=0.5)
++    return {"wg": h(d.E, d.H, d.WID, mag=0.05), "wu": h(d.E, d.H, d.WID, mag=0.05), "wd": h(d.E, d.WID, d.H, mag=0.05),
++            "suh_g": suh_g, "suh_u": suh_u, "svh_g": h(d.E, d.WID, mag=0.5), "svh_u": h(d.E, d.WID, mag=0.5),
++            "suh_d": h(d.E, d.WID, mag=0.5), "svh_d": h(d.E, d.H, mag=0.5), "shared": shared}
++
++
++def inputs(d: Dims, R: int, rng: np.random.Generator, skew: float = 1.1):
++    """R BF16 rows, 8 distinct experts a row (a few hot ones, as routing has), weights in [0.05, 0.35)."""
++
++    x = ref.bf16r(rng.standard_normal((R, d.H)).astype(F32))
++    p = 1.0 / np.arange(1, d.E + 1) ** skew
++    p = p[rng.permutation(d.E)]
++    pick = np.stack([rng.choice(d.E, TOPK, replace=False, p=p / p.sum()) for _ in range(R)]).astype(np.int64)
++    w = (rng.random((R, TOPK)) * 0.3 + 0.05).astype(F32)
++    return x, pick, w
++
++
++def _mma_chain(acc: np.ndarray, a: np.ndarray, b: np.ndarray, k_tiles) -> np.ndarray:
++    """acc [m, n] after one MMA a k tile, in ``k_tiles``' order: acc + float32(sum over the tile's 16 k of a * b)."""
++
++    for kt in k_tiles:
++        s = np.zeros(acc.shape, np.float64)
++        for j in range(kt * 16, kt * 16 + 16):
++            s = s + a[:, j:j + 1].astype(np.float64) * b[j:j + 1, :].astype(np.float64)
++        acc = (acc + s.astype(F32)).astype(F32)
++    return acc
++
++
++def _rotate(x: np.ndarray, suh: np.ndarray) -> np.ndarray:
++    return ref.rotate(x, suh)          # row_rotate: x * suh, fwht128, * 1/sqrt(128), FP16 (as float32)
++
++
++def plan(pick: np.ndarray, E: int, gr: int, rng: np.random.Generator | None):
++    """(groups [(expert, start, count)], pair_row, pair_route, inverse); within an expert the pairs in a random order
++    (the kernel's atomics) when ``rng``, else route order."""
++
++    ids = pick.reshape(-1)
++    routes = ids.size
++    order = []
++    for e in range(E):
++        mine = np.nonzero(ids == e)[0]
++        order.extend(rng.permutation(mine) if rng is not None else mine)
++    pair_route = np.asarray(order, dtype=np.int64)
++    pair_row = pair_route // TOPK
++    inverse = np.empty(routes, dtype=np.int64)
++    inverse[pair_route] = np.arange(routes)
++    cnt = np.bincount(ids, minlength=E)
++    base = np.concatenate([[0], np.cumsum(cnt)[:-1]])
++    groups = [(e, int(base[e]) + k * gr, int(min(gr, cnt[e] - k * gr)))
++              for e in range(E) for k in range((int(cnt[e]) + gr - 1) // gr)]
++    return groups, pair_row, pair_route, inverse
++
++
++def group_order(groups: list) -> list:
++    """order_kernel's gorder (one thread's arithmetic for every slot): heavy groups (an expert with several) and light
++    ones merged evenly, each list in plan order."""
++
++    n = len(groups)
++    heavy = [(i > 0 and groups[i - 1][0] == groups[i][0]) or (i + 1 < n and groups[i + 1][0] == groups[i][0])
++             for i in range(n)]
++    nh = sum(heavy)
++    nl = n - nh
++    gorder = [-1] * n
++    hb = 0
++    for i in range(n):
++        if heavy[i]:
++            hh = hb
++            hb += 1
++            q = ((2 * hh + 1) * nl + nh - 1) // nh if nh else 0
++            pos = hh + min(q // 2, nl)
++        else:
++            lo = i - hb
++            f = ((2 * lo + 1) * nh) // nl if nl else 0
++            pos = lo + min((f + 1) // 2, nh)
++        gorder[pos] = i
++    assert sorted(gorder) == list(range(n)), "the group order is a permutation"
++    return gorder
++
++
++def ffn(d: Dims, L: dict, x: np.ndarray, pick: np.ndarray, w: np.ndarray, cfg: dict, *, seed: int | None = None,
++        limit: float = 10.0) -> np.ndarray:
++    """The half's rows [R, H] (float32) as g53_ffn_launch computes them with configuration ``cfg`` (mt, sk, skd, nt,
++    gw, l2, fuse, discard, swiglu, rot, gord). ``seed``: the plan's within-expert order and the order the items are
++    taken in are shuffled with it (None: plan and grid order)."""
++
++    rng = np.random.default_rng(seed) if seed is not None else None
++    mt, sk, skd, nt, gw = cfg["mt"], cfg["sk"], cfg["skd"], cfg["nt"], cfg["gw"]
++    fused, discard = cfg["fuse"] == 2, cfg["fuse"] == 2 and cfg["discard"] == 2
++    bf16 = cfg["swiglu"] == 0
++    R = x.shape[0]
++    P = R * TOPK
++    NT = d.TPB // gw                                  # gate/up n tiles a warp
++    CW = 8 * nt * 16                                  # down chunk width: 8 warps of nt n tiles
++    nch = d.H // CW
++    assert NT >= 1 and d.TPB % gw == 0 and d.KB % sk == 0 and d.NTG % skd == 0 and (d.NTG // skd) % 8 == 0
++    assert nch >= 1 and d.H % CW == 0
++    rowrot = cfg["rot"] == 2 and L["shared"]
++    groups, pair_row, pair_route, inverse = plan(pick, d.E, 16 * mt, rng)
++    ng = len(groups)
++    gorder = group_order(groups) if cfg["gord"] == 2 else list(range(ng))
++    z = np.full((2, sk, P, d.WID), np.nan, F32)
++    xd = np.full((P, d.WID), np.nan, F32)
++    zd = np.full((skd, P, d.H), np.nan, F32)
++    out = np.full((R, d.H), np.nan, F32)
++    xh = _rotate(x, L["suh_g"][0]) if rowrot else None  # rotrows_kernel: once a row with the shared suh
++
++    def epilogue_item(e, gp, blk):
++        n = slice(blk * HAD, blk * HAD + HAD)
++        gv, uv = np.zeros(HAD, F32), np.zeros(HAD, F32)
++        for s in range(sk):
++            gv = (gv + z[0, s, gp, n]).astype(F32)
++            uv = (uv + z[1, s, gp, n]).astype(F32)
++        gv, uv = ref.fwht128(gv), ref.fwht128(uv)
++        gg = (gv * ref.HAD_SCALE).astype(F32) * L["svh_g"][e, n]
++        uu = (uv * ref.HAD_SCALE).astype(F32) * L["svh_u"][e, n]
++        lim = F32(limit)
++        with np.errstate(over="ignore"):
++            if bf16:
++                gg = np.minimum(ref.bf16r(gg), lim)
++                uu = np.minimum(np.maximum(ref.bf16r(uu), -lim), lim)
++                act = ref.bf16r(ref.bf16r(gg / (F32(1) + np.exp(-gg))) * uu)
++            else:
++                gg = np.minimum(gg, lim)
++                uu = np.minimum(np.maximum(uu, -lim), lim)
++                act = gg / (F32(1) + np.exp(-gg)) * uu
++        v = ref.fwht128(act.astype(F32) * L["suh_d"][e, n])
++        xd[gp, n] = (v * ref.HAD_SCALE).astype(np.float16).astype(F32)
++
++    def reduce_item(row, blk):
++        n = slice(blk * HAD, blk * HAD + HAD)
++        acc = np.zeros(HAD, F32)
++        for s in range(TOPK):
++            gp = inverse[row * TOPK + s]
++            v = (F32(0) + zd[0, gp, n]).astype(F32)
++            for k in range(1, skd):
++                v = (v + zd[k, gp, n]).astype(F32)
++            v = ref.fwht128(v)
++            t = ((v * ref.HAD_SCALE).astype(F32) * L["svh_d"][pick[row, s], n]).astype(F32)
++            acc = (acc + (F32(w[row, s]) * t).astype(F32)).astype(F32)
++        out[row, n] = acc
++
++    # gate/up: items (mat, cb, group, split), matrix fastest, then the column block, then the group, then the split
++    items = list(range(2 * d.CB * ng * sk))
++    if rng is not None:
++        items = list(rng.permutation(items))
++    gcnt = [0] * ng
++    seen = np.zeros((2, sk, P, d.WID), np.int32)
++    for item in items:
++        mc, rest = item % (2 * d.CB), item // (2 * d.CB)
++        mat, cb, gs, split = mc & 1, mc >> 1, rest % ng, rest // ng
++        g = gorder[gs]
++        e, start, count = groups[g]
++        mt_used = (count + 15) // 16
++        rows = np.zeros((mt_used * 16, d.H), F32)       # rows past the group's pairs: zero, never stored
++        suh = L["suh_u"][e] if mat else L["suh_g"][e]
++        for r in range(count):
++            rr = pair_row[start + r]
++            rows[r] = xh[rr] if xh is not None else _rotate(x[rr:rr + 1], suh)[0]
++        W = L["wu"][e] if mat else L["wg"][e]
++        kbs = d.KB // sk
++        k_tiles = range(split * kbs * 8, split * kbs * 8 + kbs * 8)
++        for warp in range(gw):
++            cols = [cb * d.CBW + warp * NT * 16 + i * 16 + hh * 8 + 2 * t4 + c
++                    for i in range(NT) for hh in range(2) for t4 in range(4) for c in range(2)]
++            acc = _mma_chain(np.zeros((mt_used * 16, len(cols)), F32), rows, W[:, cols], k_tiles)
++            z[mat, split][start:start + count, cols] = acc[:count]
++            seen[mat, split][start:start + count, cols] += 1
++        gcnt[g] += 1
++        if fused and gcnt[g] == 2 * d.CB * sk:           # the last of the group's items: its epilogue
++            for gp in range(start, start + count):
++                for blk in range(d.WID // HAD):
++                    epilogue_item(e, gp, blk)
++            if discard:
++                z[:, :, start:start + count, :] = np.nan
++    for g, (_, start, count) in enumerate(groups):    # every (pair, column) of every split written exactly once
++        assert (seen[:, :, start:start + count, :] == 1).all(), "a partial sum written other than once"
++    if not fused:
++        for gp in range(P):
++            r = pair_route[gp]
++            for blk in range(d.WID // HAD):
++                epilogue_item(int(pick[r // TOPK, r % TOPK]), gp, blk)
++    # down: items (group, chunk, split), the group fastest
++    items = list(range(ng * nch * skd))
++    if rng is not None:
++        items = list(rng.permutation(items))
++    rcnt = np.zeros((R, nch), np.int32)
++    kts = d.NTG // skd
++    for item in items:
++        g = gorder[item % ng]
++        chunk, split = (item // ng) % nch, item // (ng * nch)
++        e, start, count = groups[g]
++        mt_used = (count + 15) // 16
++        rows = np.zeros((mt_used * 16, d.WID), F32)
++        rows[:count] = xd[start:start + count]
++        k_tiles = range(split * kts, split * kts + kts)
++        for warp in range(8):
++            cols = [chunk * CW + warp * nt * 16 + i * 16 + hh * 8 + 2 * t4 + c
++                    for i in range(nt) for hh in range(2) for t4 in range(4) for c in range(2)]
++            acc = _mma_chain(np.zeros((mt_used * 16, len(cols)), F32), rows, L["wd"][e][:, cols], k_tiles)
++            zd[split][start:start + count, cols] = acc[:count]
++        if fused:                                         # each pair's row counts one arrival for this chunk
++            for r in range(count):
++                row = pair_row[start + r]
++                rcnt[row, chunk] += 1
++                if rcnt[row, chunk] == TOPK * skd:
++                    rcnt[row, chunk] = 0
++                    for blk in range(chunk * (CW // HAD), (chunk + 1) * (CW // HAD)):
++                        reduce_item(row, blk)
++                    if discard:
++                        for s in range(TOPK):
++                            zd[:, inverse[row * TOPK + s], chunk * CW:(chunk + 1) * CW] = np.nan
++    if not fused:
++        for row in range(R):
++            for blk in range(d.H // HAD):
++                reduce_item(row, blk)
++    return out
++
++
++def digest(a: np.ndarray) -> str:
++    return hashlib.sha256(np.ascontiguousarray(a, dtype=F32).tobytes()).hexdigest()[:16]
++
++
++def base_cfg(**kw) -> dict:
++    """The kernels' up-to-2,048-row default (default_cfg) with ``kw`` over it."""
++
++    c = {"mt": 2, "sk": 1, "skd": 1, "nt": 2, "gw": 8, "l2": 2, "fuse": 2, "discard": 2, "swiglu": 0, "rot": 2, "gord": 1}
++    c.update(kw)
++    return c
+diff --git a/tests/test_glm_g53_kernel.py b/tests/test_glm_g53_kernel.py
+index f86ee1b..cf2cef5 100644
+--- a/tests/test_glm_g53_kernel.py
++++ b/tests/test_glm_g53_kernel.py
+@@ -29,7 +29,8 @@ from tensorfold.cuda.exl3 import format as fmt
+ from tensorfold.families.glm5_next.cuda import g53_experts
+ from tests import glm_g53_reference as ref
+ 
+-ENVS = (g53_experts.ENV, g53_experts.ROWS_ENV, g53_experts.ROWROT_ENV, g53_experts.ORDER_ENV)
++ENVS = (g53_experts.ENV, g53_experts.ROWS_ENV, g53_experts.ROWROT_ENV, g53_experts.ORDER_ENV,
++        *(name for name, _ in g53_experts.SCHEDULE_ENVS.values()))
+ 
+ 
+ @pytest.fixture(autouse=True)
+diff --git a/tests/test_glm_g53_schedule.py b/tests/test_glm_g53_schedule.py
+new file mode 100644
+index 0000000..df8b6fc
+--- /dev/null
++++ b/tests/test_glm_g53_schedule.py
+@@ -0,0 +1,250 @@
++"""The g53 configuration knobs and which configuration fields can change a bit (TF_GLM_EXPERT_KERNEL=g53's
++TF_GLM_EXPERT_KERNEL_MT, _GW, _NT, _L2, _FUSE, _DISCARD, _SK, _SKD, _SWIGLU; expert prompt kernels from glm53f-afd,
++written by Hugh Madden (@dangerm00se, github.com/hughmadden), glm53f-afd @ 91db3cc, MIT, Copyright (c) 2026 Turquoise
++Bay AI Pty Ltd). CPU only:
++
++- unset, nothing changes: switch() gives the settings it gave before, every window runs default_cfg, and the node
++  calls routed() as before (no configuration passed, no new buffer, the same startup line);
++- each knob sets its field and only its field, for every window size; bad values refuse; the knobs are read only
++  under TF_GLM_EXPERT_KERNEL=g53; set, the node passes the configuration on every window, says so on its line and
++  claims any buffer K splits need at its start;
++- tests/glm_g53_schedule.py, an emulation of the kernels' work decomposition: the schedule fields (rows per group,
++  warps, down chunks, L2 policy, fusion, discard, row rotation, group order, the plan's order within an expert, the
++  order the items are taken in) give the default's bits; sk, skd and the SwiGLU precision give other bits, the same
++  under every schedule; a row's bits do not depend on its window under any configuration.
++
++The GPU test (tests/cuda/test_glm_g53_kernel.py) checks the CUDA kernels' bits for the same schedules.
++"""
++
++from __future__ import annotations
++
++from dataclasses import fields as dc_fields
++from dataclasses import replace
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++
++from tensorfold.families.glm5_next.cuda import g53_experts
++from tests import glm_g53_schedule as sched
++from tests.test_glm_g53_kernel import _layer, _node
++
++KNOBS = {field: name for field, (name, _) in g53_experts.SCHEDULE_ENVS.items()}
++ENVS = (g53_experts.ENV, g53_experts.ROWS_ENV, g53_experts.ROWROT_ENV, g53_experts.ORDER_ENV, *KNOBS.values())
++SIZES = (1, 2, 7, 63, 64, 65, 594, 2047, 2048, 2049, 4095, 4096)
++
++
++@pytest.fixture(autouse=True)
++def _clean_env(monkeypatch):
++    for k in ENVS:
++        monkeypatch.delenv(k, raising=False)
++
++
++# ------------------------------------------------------------------------------------------------------- the knobs
++
++def test_names_and_classes():
++    assert KNOBS == {"mt": "TF_GLM_EXPERT_KERNEL_MT", "gw": "TF_GLM_EXPERT_KERNEL_GW", "nt": "TF_GLM_EXPERT_KERNEL_NT",
++                     "l2": "TF_GLM_EXPERT_KERNEL_L2", "fuse": "TF_GLM_EXPERT_KERNEL_FUSE",
++                     "discard": "TF_GLM_EXPERT_KERNEL_DISCARD", "sk": "TF_GLM_EXPERT_KERNEL_SK",
++                     "skd": "TF_GLM_EXPERT_KERNEL_SKD", "swiglu": "TF_GLM_EXPERT_KERNEL_SWIGLU"}
++    assert g53_experts.BIT_FIELDS == ("sk", "skd", "swiglu")
++    cfg_fields = {f.name for f in dc_fields(g53_experts.Cfg)}
++    assert set(KNOBS) == cfg_fields - {"rot", "gord"}         # rot and gord: TF_GLM_EXPERT_KERNEL_ROWROT / _ORDER
++    # the values g53_rank.cpp accepts (sk and skd: those whose sums fit the node's prompt scratch or a start buffer)
++    assert {f: ok for f, (_, ok) in g53_experts.SCHEDULE_ENVS.items()} == {
++        "mt": (2, 4), "gw": (8, 16), "nt": (1, 2, 4), "l2": (1, 2), "fuse": (1, 2), "discard": (1, 2),
++        "sk": (1, 2, 4), "skd": (1, 2, 4), "swiglu": (0, 1)}
++
++
++def test_unset_knobs_are_the_settings_and_configurations_before(monkeypatch):
++    monkeypatch.setenv(g53_experts.ENV, "g53")
++    assert g53_experts.schedule() == {}
++    assert g53_experts.switch() == {"min_rows": 1, "rowrot": True, "order": False}      # no "schedule" key
++    for R in range(1, g53_experts.MAX_ROWS + 1):
++        for rowrot, order in ((True, False), (False, True)):
++            want = g53_experts.default_cfg(R, rowrot=rowrot, order=order)
++            assert g53_experts.tuned_cfg(R, rowrot=rowrot, order=order) == want
++            assert g53_experts.tuned_cfg(R, rowrot=rowrot, order=order, fields={}) == want
++    for k in KNOBS.values():                                    # empty is unset
++        monkeypatch.setenv(k, " ")
++    assert g53_experts.switch() == {"min_rows": 1, "rowrot": True, "order": False}
++
++
++def test_each_knob_sets_its_field_and_only_its_field_for_every_window(monkeypatch):
++    monkeypatch.setenv(g53_experts.ENV, "g53")
++    names = [f.name for f in dc_fields(g53_experts.Cfg)]
++    for field, (name, ok) in g53_experts.SCHEDULE_ENVS.items():
++        for v in ok:
++            monkeypatch.setenv(name, f" {v} ")
++            s = g53_experts.switch()
++            assert s == {"min_rows": 1, "rowrot": True, "order": False, "schedule": {field: v}}
++            for R in SIZES:
++                d, c = g53_experts.default_cfg(R), g53_experts.tuned_cfg(R, fields=s["schedule"])
++                assert getattr(c, field) == v
++                assert all(getattr(c, f) == getattr(d, f) for f in names if f != field), (field, v, R)
++        monkeypatch.delenv(name)
++    for field, v in (("mt", 4), ("gw", 16), ("nt", 2), ("l2", 1)):     # several at once: a sweep line
++        monkeypatch.setenv(KNOBS[field], str(v))
++    got = g53_experts.switch()["schedule"]
++    assert got == {"mt": 4, "gw": 16, "nt": 2, "l2": 1}
++    for R in SIZES:
++        assert g53_experts.tuned_cfg(R, fields=got) == replace(g53_experts.default_cfg(R), mt=4, gw=16, nt=2, l2=1)
++
++
++def test_bad_knob_values_refuse(monkeypatch):
++    monkeypatch.setenv(g53_experts.ENV, "g53")
++    for field, bad in (("mt", "3"), ("mt", "x"), ("mt", "4.0"), ("gw", "12"), ("nt", "8"), ("nt", "0"), ("l2", "0"),
++                       ("fuse", "3"), ("discard", "0"), ("sk", "8"), ("sk", "3"), ("skd", "8"), ("swiglu", "2"),
++                       ("swiglu", "bf16")):
++        monkeypatch.setenv(KNOBS[field], bad)
++        with pytest.raises(ValueError, match=KNOBS[field]):
++            g53_experts.switch()
++        monkeypatch.delenv(KNOBS[field])
++
++
++def test_knobs_are_read_only_under_the_switch(monkeypatch):
++    monkeypatch.setenv(KNOBS["mt"], "3")                     # a bad value, but TensorFold's kernels run every window
++    assert g53_experts.switch() is None
++    monkeypatch.setenv(g53_experts.ENV, "tf")
++    assert g53_experts.switch() is None
++
++
++def test_every_window_keeps_one_set_of_bit_fields(monkeypatch):
++    """Set or not, the knobs give every window size the same sk, skd and SwiGLU precision, the only fields that change
++    a bit: a prompt row's bits never depend on its window."""
++
++    for fields in ({}, {"mt": 4, "gw": 16}, {"mt": 2, "nt": 4, "l2": 1}, {"sk": 2}, {"skd": 4}, {"swiglu": 1},
++                   {"sk": 4, "skd": 2, "nt": 1}):
++        bits = {(c.sk, c.skd, c.swiglu) for R in range(1, g53_experts.MAX_ROWS + 1)
++                for c in (g53_experts.tuned_cfg(R, fields=fields),
++                          g53_experts.tuned_cfg(R, rowrot=False, order=True, fields=fields))}
++        assert len(bits) == 1, fields
++
++
++# ---------------------------------------------------------------------------------------------------------- the node
++
++def test_node_calls_routed_as_before_without_knobs_and_with_the_configuration_with(monkeypatch):
++    seen = []
++    monkeypatch.setattr(g53_experts, "routed", lambda x, pick, wts, ex, s, out, R, limit, *a, **k: seen.append(
++        (R, a, k)) or out[:R])
++    _, node = _node(monkeypatch)
++    h = g53_experts.Node(node, {"min_rows": 1, "rowrot": True, "order": False})
++    for R in (1, 6, 70, 256):
++        h.compute(3, R)
++    assert seen == [(R, (), {"rowrot": True, "order": False}) for R in (1, 6, 70, 256)]     # the call before
++    assert h.fields == {} and h.scratch._own is None
++    seen.clear()
++    fields = {"mt": 4, "gw": 16, "nt": 2}
++    h = g53_experts.Node(node, {"min_rows": 1, "rowrot": True, "order": True, "schedule": fields})
++    for R in (1, 70, 256):
++        h.compute(3, R)
++    assert seen == [(R, (g53_experts.tuned_cfg(R, rowrot=True, order=True, fields=fields),), {}) for R in (1, 70, 256)]
++    assert h.config(256) == replace(g53_experts.default_cfg(256, rowrot=True, order=True), mt=4, gw=16, nt=2)
++    assert h.scratch._own is None                          # the schedule fits the node's prompt scratch
++
++
++def _expert_node(monkeypatch):
++    from tensorfold.families.glm5_next.cuda import experts_node
++
++    cfg = SimpleNamespace(hidden=4096, top_k=8, moe_width=2048, experts=288, limit=10.0)
++    monkeypatch.setattr(experts_node.Config, "read", staticmethod(lambda _d: cfg))
++    monkeypatch.setattr(experts_node, "load_half", lambda _d, _h, layers, device="cuda": [_layer() for _ in layers])
++    real = experts_node.ExpertBuffers
++
++    def cpu_buffers(c, rows, prefill_rows, device):
++        return real(c, rows=rows, prefill_rows=prefill_rows, device="cpu")
++
++    monkeypatch.setattr(experts_node, "ExpertBuffers", cpu_buffers)
++    return lambda: experts_node.ExpertNode("/nowhere", 1, [3, 4], prefill_rows=256)
++
++
++def test_node_line_unchanged_without_knobs_and_with_the_schedule_with(monkeypatch, capsys):
++    make = _expert_node(monkeypatch)
++    monkeypatch.setenv(g53_experts.ENV, "g53")
++    node = make()
++    line = capsys.readouterr().out.strip().splitlines()[-1]
++    assert line.endswith("rowrot on (0 layers share one gate/up suh), order off); 2 of 2 MoE layers in scope")
++    assert node.g53.fields == {} and node.g53.scratch._own is None
++    monkeypatch.setenv(KNOBS["mt"], "4")
++    monkeypatch.setenv(KNOBS["gw"], "16")
++    node = make()
++    line = capsys.readouterr().out.strip().splitlines()[-1]
++    assert line.endswith("2 of 2 MoE layers in scope; schedule mt 4 gw 16 for every window (the same bits)")
++    assert node.g53.fields == {"mt": 4, "gw": 16} and node.g53.scratch._own is None
++    monkeypatch.setenv(KNOBS["skd"], "2")                   # down K splits: past the prompt scratch, a start buffer
++    node = make()
++    line = capsys.readouterr().out.strip().splitlines()[-1]
++    own = node.g53.scratch._own
++    P = 256 * 8
++    assert own is not None and own[0].numel() >= 2 * P * 1024 + 2 * P * 4096
++    mib = sum(t.numel() * t.element_size() for t in own) >> 20
++    assert line.endswith(f"; schedule mt 4 gw 16 skd 2 for every window (skd: outputs change; {mib} MiB own scratch)")
++    z, _xd, zd, _xh = node.g53.scratch.big(256, node.g53.config(256))   # the start buffer serves the widest window
++    assert node.g53.scratch._own is own and zd.data_ptr() == own[0][z.numel():].data_ptr()
++
++
++# ---------------------------------------------------------------------------- the emulated decomposition (CPU digests)
++
++D = sched.Dims()
++SAME_BITS = ({"mt": 4, "gw": 16}, {"mt": 4, "gw": 16, "nt": 2}, {"mt": 4, "gw": 16, "nt": 4, "l2": 1}, {"mt": 4},
++             {"gw": 16}, {"nt": 1}, {"nt": 4}, {"gw": 16, "nt": 1}, {"l2": 1}, {"fuse": 1}, {"discard": 1},
++             {"gord": 2}, {"rot": 1}, {"mt": 4, "gw": 16, "nt": 2, "gord": 2})
++CHANGED_BITS = ({"sk": 2}, {"sk": 4}, {"skd": 2}, {"skd": 4}, {"swiglu": 1})
++
++
++@pytest.fixture(scope="module")
++def case():
++    rng = np.random.default_rng(53)
++    L = sched.layer(D, rng, shared=True)
++    x, pick, w = sched.inputs(D, 80, rng)
++    want = sched.ffn(D, L, x, pick, w, sched.base_cfg())
++    assert np.isfinite(want).all()
++    counts = np.bincount(pick.reshape(-1), minlength=D.E)
++    assert counts.max() > 64 and (counts > 32).sum() >= 2 and (counts <= 32).sum() >= 2   # 1-3 groups an expert
++    return SimpleNamespace(L=L, x=x, pick=pick, w=w, want=want)
++
++
++def test_emulated_schedule_fields_keep_every_bit(case):
++    want = sched.digest(case.want)
++    for i, kw in enumerate(SAME_BITS):
++        got = sched.ffn(D, case.L, case.x, case.pick, case.w, sched.base_cfg(**kw), seed=i % 3 or None)
++        assert sched.digest(got) == want, kw
++    again = sched.ffn(D, case.L, case.x, case.pick, case.w, sched.base_cfg(), seed=7)   # plan and item order shuffled
++    assert sched.digest(again) == want
++
++
++def test_emulated_bit_fields_change_bits_the_same_under_every_schedule(case):
++    want = sched.digest(case.want)
++    for bits in CHANGED_BITS:
++        a = sched.ffn(D, case.L, case.x, case.pick, case.w, sched.base_cfg(**bits))
++        assert np.isfinite(a).all() and sched.digest(a) != want, bits
++        b = sched.ffn(D, case.L, case.x, case.pick, case.w, sched.base_cfg(**bits, mt=4, gw=16, nt=4, l2=1, fuse=1,
++                                                                             gord=2), seed=5)
++        assert sched.digest(b) == sched.digest(a), bits
++
++
++def test_emulated_rows_bits_whatever_their_window(case):
++    for kw in ({}, {"mt": 4, "gw": 16, "nt": 2}, {"sk": 2, "skd": 2}):
++        full = sched.ffn(D, case.L, case.x, case.pick, case.w, sched.base_cfg(**kw))
++        for lo, hi in ((0, 1), (1, 9), (9, 80)):
++            cfg = dict(kw)
++            if hi - lo > 20:                           # the widest part under another schedule as well
++                cfg.update(mt=4, gw=16)
++            part = sched.ffn(D, case.L, case.x[lo:hi], case.pick[lo:hi], case.w[lo:hi], sched.base_cfg(**cfg), seed=lo)
++            assert sched.digest(part) == sched.digest(full[lo:hi]), (kw, lo, hi)
++
++
++def test_emulation_sees_a_changed_sum_order(case, monkeypatch):
++    """A negative control: the digests do see an order change. The k tiles of every MMA chain in descending order
++    (a schedule that reorders a sum) give other bits."""
++
++    real = sched._mma_chain
++    monkeypatch.setattr(sched, "_mma_chain", lambda acc, a, b, k_tiles: real(acc, a, b, list(k_tiles)[::-1]))
++    got = sched.ffn(D, case.L, case.x, case.pick, case.w, sched.base_cfg())
++    assert np.isfinite(got).all() and sched.digest(got) != sched.digest(case.want)
++
++
++def test_emulated_group_order_interleaves_single_and_multi_group_experts():
++    groups = [(0, 0, 32), (0, 32, 32), (0, 64, 5), (1, 69, 7), (2, 76, 20), (3, 96, 32), (3, 128, 1), (4, 129, 3)]
++    order = sched.group_order(groups)          # heavy (an expert with several groups): 0, 1, 2, 5, 6; light: 3, 4, 7
++    assert order == [0, 3, 1, 2, 4, 5, 7, 6]   # order_kernel: heavy h at (2h + 1) / 2nh, light l at (2l + 1) / 2nl

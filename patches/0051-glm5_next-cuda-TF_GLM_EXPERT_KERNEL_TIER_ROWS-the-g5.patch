@@ -1,0 +1,539 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Scott Quarrier <squarrier@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 08:46:54 -0400
+Subject: [PATCH] glm5_next/cuda: TF_GLM_EXPERT_KERNEL_TIER_ROWS, the g53
+ schedule knobs on big prompt windows only
+
+Under TF_GLM_EXPERT_KERNEL=g53 (glm53f-afd's large-M expert prompt kernels, written by Hugh Madden, glm53f-afd @
+91db3cc), the configuration knobs (TF_GLM_EXPERT_KERNEL_MT, _GW, _NT, _L2, _FUSE, _DISCARD) set one schedule for
+every prompt window. On GB10, glm53f-rank's own above-2,048-row schedule (mt 4, gw 16, nt 4, l2 1) runs about 5 %
+faster than the default on 2,048-row windows but 4-10 % slower on 256-1,024-row ones, so set for every window it
+costs the smaller windows part of what it gains on the full ones.
+
+- TF_GLM_EXPERT_KERNEL_TIER_ROWS=N (1..4,096): the knobs' schedule runs windows of at least N rows only, and smaller
+  windows keep default_cfg's. Unset or empty: the knobs apply to every window, as before.
+- Bits: the fields it tiers keep every bit, and a row's bits do not depend on its window, so a row gets the same bits
+  on either side of N. It tiers only those same-bits fields: with _SK, _SKD or _SWIGLU set it refuses at the node's
+  start.
+- The node's start line names it ("; schedule <fields> for windows of N-<widest> rows, default_cfg's for 1-<N - 1>
+  (tier TF_GLM_EXPERT_KERNEL_TIER_ROWS=N; the same bits)"); with no knob set it says every window runs default_cfg.
+
+Tests: tests/test_glm_g53_tier.py (CPU: the name; unset as before; the split at N for every window size 1-4,096 with
+one set of bit fields; refusals, read only under g53; the node's calls and start line; and tests/glm_g53_schedule.py's
+emulated decomposition at 1,024- and 2,048-row windows with N 1,536 and mt 4 gw 16 nt 4 l2 1: a row's bits are the
+same in either window and equal to the default schedule's). tests/cuda/test_glm_g53_kernel.py gains the GPU byte
+check of windows of 1,024-2,048 rows on either side of N for N 1,280-2,048, and TF_G53_TUNE_ROWS / TF_G53_TUNE_N for
+its times report. The g53 test files clear the new variable too.
+
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes
+
+---
+ .../families/glm5_next/cuda/g53_experts.py    |  78 +++++-
+ tests/cuda/test_glm_g53_kernel.py             |  42 +++-
+ tests/test_glm_g53_kernel.py                  |   2 +-
+ tests/test_glm_g53_schedule.py                |   3 +-
+ tests/test_glm_g53_tier.py                    | 237 ++++++++++++++++++
+ 5 files changed, 348 insertions(+), 14 deletions(-)
+ create mode 100644 tests/test_glm_g53_tier.py
+
+diff --git a/src/tensorfold/families/glm5_next/cuda/g53_experts.py b/src/tensorfold/families/glm5_next/cuda/g53_experts.py
+index 4041fae..db87a0a 100644
+--- a/src/tensorfold/families/glm5_next/cuda/g53_experts.py
++++ b/src/tensorfold/families/glm5_next/cuda/g53_experts.py
+@@ -36,6 +36,11 @@ The schedule (TF_GLM_EXPERT_KERNEL_MT, _GW, _NT, _L2, _FUSE, _DISCARD; each unse
+ as before): one value for every window, so a launch shape can be tuned for the GPU the experts run on. These fields
+ keep every bit. TF_GLM_EXPERT_KERNEL_SK, _SKD and _SWIGLU (the K splits and the SwiGLU precision) change outputs; set,
+ they too apply to every window, so a prompt row's bits still never depend on its window.
++
++The tier (TF_GLM_EXPERT_KERNEL_TIER_ROWS=N, 1..4,096; unset: the knobs set apply to every window, as above): the
++schedule the knobs set runs only windows of at least N rows, and smaller windows keep default_cfg's, so a schedule that
++pays on full prompt windows need not cost the small ones. It tiers the same-bits fields only (a row's bits then still
++never depend on its window): with _SK, _SKD or _SWIGLU set it refuses.
+ """
+ 
+ from __future__ import annotations
+@@ -70,6 +75,7 @@ SCHEDULE_ENVS = {
+     "swiglu": ("TF_GLM_EXPERT_KERNEL_SWIGLU", (0, 1)),       # 1: FP32 SwiGLU (outputs change)
+ }
+ BIT_FIELDS = ("sk", "skd", "swiglu")   # the only fields that change a bit (glm53f-rank's own statement)
++TIER_ENV = "TF_GLM_EXPERT_KERNEL_TIER_ROWS"   # the smallest window the knobs' schedule runs (unset: every window)
+ 
+ 
+ @lru_cache(maxsize=1)
+@@ -114,12 +120,22 @@ def default_cfg(rows: int, *, rowrot: bool = True, order: bool = False) -> Cfg:
+     return Cfg(mt=4, sk=1, skd=1, nt=4, gw=16, l2=1, fuse=2, discard=2, swiglu=0, rot=rot, gord=gord)
+ 
+ 
+-def tuned_cfg(rows: int, *, rowrot: bool = True, order: bool = False, fields: dict | None = None) -> Cfg:
++def tuned_cfg(rows: int, *, rowrot: bool = True, order: bool = False, fields: dict | None = None,
++              tier: int | None = None) -> Cfg:
+     """default_cfg(rows) with ``fields`` (``schedule()``'s: the knobs set) over it, the same values for every window
+-    size. No fields: default_cfg itself."""
++    size; with ``tier`` (TF_GLM_EXPERT_KERNEL_TIER_ROWS) only for windows of at least ``tier`` rows, smaller ones
++    default_cfg(rows) (the tier takes the same-bits fields only). No fields: default_cfg itself."""
+ 
+     c = default_cfg(rows, rowrot=rowrot, order=order)
+-    return replace(c, **fields) if fields else c
++    if not fields:
++        return c
++    if tier is not None:
++        bits = [f for f in BIT_FIELDS if f in fields]
++        if bits:
++            raise ValueError(f"{TIER_ENV} tiers the same-bits fields only, not {', '.join(bits)}")
++        if rows < tier:
++            return c
++    return replace(c, **fields)
+ 
+ 
+ def _flag(name: str, default: bool) -> bool:
+@@ -151,12 +167,37 @@ def schedule() -> dict:
+     return got
+ 
+ 
++def tier_rows(fields: dict) -> int | None:
++    """TF_GLM_EXPERT_KERNEL_TIER_ROWS (read with the knobs, under g53 only): None when unset or empty (the knobs set
++    apply to every window, as before), else N (1..4,096): the knobs' schedule runs windows of at least N rows only,
++    smaller ones keep default_cfg's. It tiers the same-bits fields only: with a knob that changes bits (``fields``
++    holding sk, skd or swiglu) it refuses, since a row would then get other bits in a big window than in a small one.
++    Bad values refuse."""
++
++    v = os.environ.get(TIER_ENV, "").strip()
++    if v == "":
++        return None
++    try:
++        n = int(v)
++    except ValueError:
++        n = None
++    if n is None or not MIN_ROWS <= n <= MAX_ROWS:
++        raise ValueError(f"{TIER_ENV} is a window size of {MIN_ROWS}..{MAX_ROWS} rows (the smallest window the "
++                         f"knobs' schedule runs), not {v!r}")
++    bits = [SCHEDULE_ENVS[f][0] for f in BIT_FIELDS if f in fields]
++    if bits:
++        raise ValueError(f"{TIER_ENV} tiers the same-bits fields only: {', '.join(bits)} change a row's bits, so they "
++                         f"apply to every window (unset them, or {TIER_ENV})")
++    return n
++
++
+ def switch() -> dict | None:
+     """TF_GLM_EXPERT_KERNEL, read once at the node's start: None (unset, empty or ``tf``: TensorFold's kernels) or the
+     settings of ``g53``: min_rows (TF_GLM_EXPERT_KERNEL_ROWS, 1..4,096, default 1: every prompt window; above 1 the
+     smaller windows stay on TensorFold's kernels and a prompt row's bits depend on its window), rowrot
+     (TF_GLM_EXPERT_KERNEL_ROWROT, default 1) and order (TF_GLM_EXPERT_KERNEL_ORDER, default 0), plus ``schedule``
+-    (``schedule()``'s fields) when a configuration knob is set. Bad values refuse."""
++    (``schedule()``'s fields) when a configuration knob is set and ``tier_rows`` (``tier_rows()``) when
++    TF_GLM_EXPERT_KERNEL_TIER_ROWS is. Bad values refuse."""
+ 
+     v = os.environ.get(ENV, "").strip().lower()
+     if v in ("", "tf"):
+@@ -176,6 +217,9 @@ def switch() -> dict | None:
+     fields = schedule()
+     if fields:
+         got["schedule"] = fields
++    tier = tier_rows(fields)
++    if tier is not None:
++        got["tier_rows"] = tier
+     return got
+ 
+ 
+@@ -295,6 +339,8 @@ class Node:
+         self.node, self.min_rows = node, int(settings["min_rows"])
+         self.rowrot, self.order = bool(settings["rowrot"]), bool(settings["order"])
+         self.fields = dict(settings.get("schedule") or {})   # the configuration knobs set: none, default_cfg's
++        tier = settings.get("tier_rows")   # TF_GLM_EXPERT_KERNEL_TIER_ROWS: the knobs' smallest window (None: all)
++        self.tier = None if tier is None else int(tier)
+         self.max_rows = min(MAX_ROWS, b.prefill_rows)
+         self.ready = {i: layer_ready(ex) is None for i, ex in node.by_layer.items()}
+         self.scratch = Scratch(self.max_rows, b.routed.device, share=getattr(b, "pref", None))
+@@ -311,20 +357,36 @@ class Node:
+         if self.fields:
+             bits = [f for f in BIT_FIELDS if f in self.fields]
+             own = self.scratch._own
+-            tuned = (f"; schedule {' '.join(f'{k} {v}' for k, v in self.fields.items())} for every window ("
++            tuned = (f"; schedule {' '.join(f'{k} {v}' for k, v in self.fields.items())} {self._span()} ("
++                     + (f"tier {TIER_ENV}={self.tier}; " if self.tier is not None else "")
+                      + (f"{', '.join(bits)}: outputs change" if bits else "the same bits")
+                      + (f"; {sum(t.numel() * t.element_size() for t in own) >> 20} MiB own scratch" if own else "")
+                      + ")")
++        elif self.tier is not None:
++            tuned = f"; tier {TIER_ENV}={self.tier} with no schedule knob set: every window runs default_cfg"
+         print(f"[tensorfold] afd expert {node.half + 1}: {ENV}=g53: prompt chunks of {self.min_rows}-{self.max_rows} "
+               f"rows through glm53f-afd's large-M expert kernels (Hugh Madden; outputs class; {floor}; rowrot "
+               f"{'on' if self.rowrot else 'off'} ({shared} layers share one gate/up suh), order "
+               f"{'on' if self.order else 'off'}); {sum(self.ready.values())} of {len(self.ready)} MoE layers in scope"
+               f"{tuned}", flush=True)
+ 
++    def _span(self) -> str:
++        """The windows the knobs' schedule runs, for the start line: every one, or under TF_GLM_EXPERT_KERNEL_TIER_ROWS
++        those of tier rows and up (the rest default_cfg's)."""
++
++        t, lo, hi = self.tier, self.min_rows, self.max_rows
++        if t is None or t <= lo:
++            return "for every window"
++        if t > hi:
++            return f"for no window (windows here are at most {hi} rows: every one runs default_cfg)"
++        sizes = f"{t}-{hi}" if t < hi else f"{t}"
++        return f"for windows of {sizes} rows, default_cfg's for {lo}-{t - 1}"
++
+     def config(self, R: int) -> Cfg:
+-        """The configuration a window of R rows runs: default_cfg with the knobs set over it."""
++        """The configuration a window of R rows runs: default_cfg with the knobs set over it (under
++        TF_GLM_EXPERT_KERNEL_TIER_ROWS only for windows of at least that many rows)."""
+ 
+-        return tuned_cfg(R, rowrot=self.rowrot, order=self.order, fields=self.fields)
++        return tuned_cfg(R, rowrot=self.rowrot, order=self.order, fields=self.fields, tier=self.tier)
+ 
+     def takes(self, layer_i: int, R: int, prompt: bool) -> bool:
+         """A prompt chunk's window (``prompt``: the node's MODE_CHUNK, MODE_SLICE, MODE_PAIR and MODE_LANES forwards)
+@@ -341,7 +403,7 @@ class Node:
+         b = self.node.buf
+         normed, pick, wts = x if x is not None else (b.normed[:R], b.pick[:R], b.wts[:R])
+         dst = b.routed[:R] if out is None else out
+-        if self.fields:                 # a configuration knob set: that configuration for every window
++        if self.fields:                 # a configuration knob set: config(R) (every window, or the tier's and up)
+             return routed(normed, pick, wts, self.node.by_layer[layer_i], self.scratch, dst, R, self.node.cfg.limit,
+                           self.config(R))
+         return routed(normed, pick, wts, self.node.by_layer[layer_i], self.scratch, dst, R, self.node.cfg.limit,
+diff --git a/tests/cuda/test_glm_g53_kernel.py b/tests/cuda/test_glm_g53_kernel.py
+index 741d5a5..7b29a18 100644
+--- a/tests/cuda/test_glm_g53_kernel.py
++++ b/tests/cuda/test_glm_g53_kernel.py
+@@ -24,7 +24,9 @@ node's GPU with no model server loaded.
+   the 147,456 B of shared memory it needs above that, GB10's case; and the EXL3 prompt kernel of TF_GLM_EXL3_PROMPT=1,
+   which ran those prompt windows before g53) (TF_G53_TIMES: a JSON file to write them to).
+ - The configuration knobs' schedules (TF_GLM_EXPERT_KERNEL_MT, _GW, _NT, _L2, _FUSE, _DISCARD, and _ORDER) at
+-  prompt-chunk sizes: the default's bits; their times at 256-2,048 rows (report only; TF_G53_TUNE_TIMES: a JSON file).
++  prompt-chunk sizes: the default's bits; their times at 256-2,048 rows (report only; TF_G53_TUNE_TIMES: a JSON file;
++  TF_G53_TUNE_ROWS: other sizes). The tier (TF_GLM_EXPERT_KERNEL_TIER_ROWS) of 1,280-2,048 rows with glm53f-rank's
++  above-2,048-row schedule: windows of 1,024-2,048 rows on either side of it keep the default's bits.
+ 
+ TF_GLM_MODEL_DIR (with TF_G53_LAYER, default the first MoE layer, and TF_G53_HALF, default 0): one MoE layer's half of
+ the real checkpoint instead of synthetic tiles.
+@@ -633,15 +635,47 @@ def test_tuned_schedules_keep_every_bit(layer, R, kind):
+         assert _bits_equal(_ours(ex, inp, _cfg(R, **kw)), want), (R, kind, kw)
+ 
+ 
++TIERS = (1280, 1536, 1792, 2048)                 # TF_GLM_EXPERT_KERNEL_TIER_ROWS: the candidate sizes
++BIG = {"mt": 4, "gw": 16, "nt": 4, "l2": 1}       # glm53f-rank's own schedule above 2,048 rows
++
++
++@pytest.mark.parametrize("kind", ["uniform", "skewed"])
++def test_tier_windows_keep_every_bit(layer, kind):
++    """TF_GLM_EXPERT_KERNEL_TIER_ROWS=N with the knobs of glm53f-rank's above-2,048-row schedule (mt 4, gw 16, nt 4,
++    l2 1): that schedule on windows of N rows and up, default_cfg's below. Windows of 1,024, N - 1, N, 2,047 and 2,048
++    rows, from the front and the back of a 2,048-row prompt, give every row the bytes of the default schedule's
++    2,048-row call, for each candidate N."""
++
++    from tensorfold.families.glm5_next.cuda import g53_experts
++
++    _, ex = layer
++    inp = _inputs(2048, kind, 1536)
++    want = _ours(ex, inp, _cfg(2048))
++    done = set()
++    for n in TIERS:
++        for R in (1024, n - 1, n, 2047, 2048):
++            cfg = g53_experts.tuned_cfg(R, fields=BIG, tier=n)
++            assert cfg == (_cfg(R) if R < n else _cfg(R, **BIG)), (n, R)
++            for lo in (0, 2048 - R):
++                if (lo, R, cfg) in done:
++                    continue
++                done.add((lo, R, cfg))
++                part = SimpleNamespace(x=inp.x[lo:lo + R], pick=inp.pick[lo:lo + R], wts=inp.wts[lo:lo + R])
++                assert _bits_equal(_ours(ex, part, cfg), want[lo:lo + R]), (kind, n, R, lo, cfg)
++
++
+ def test_tuned_times_report(layer):
+     """Information (TF_G53_TUNE_TIMES: a JSON file to write them to): ms a call for the default and each schedule of
+-    TUNE at 256-2,048 rows, uniform and skewed routing."""
++    TUNE at 256-2,048 rows (TF_G53_TUNE_ROWS: other window sizes, comma-separated; TF_G53_TUNE_N: timed calls a
++    median, default 20), uniform and skewed routing."""
+ 
+     from tensorfold.families.glm5_next.cuda import g53_experts
+ 
+     name, ex = layer
++    sizes = tuple(int(v) for v in os.environ.get("TF_G53_TUNE_ROWS", "256,512,1024,2048").split(","))
++    n = int(os.environ.get("TF_G53_TUNE_N", "20"))
+     res = {}
+-    for R in (256, 512, 1024, 2048):
++    for R in sizes:
+         for kind in ("uniform", "skewed"):
+             inp = _inputs(R, kind, 61 + R)
+             s = _scratch(R)
+@@ -653,7 +687,7 @@ def test_tuned_times_report(layer):
+                 def call(inp=inp, s=s, out=out, R=R, cfg=cfg):
+                     g53_experts.routed(inp.x, inp.pick, inp.wts, ex, s, out, R, LIMIT, cfg)
+ 
+-                row[_label(kw)] = _time(call, n=20)
++                row[_label(kw)] = _time(call, n=n)
+             res[f"{name} R{R} {kind}"] = row
+             print(f"[tune times, ms a call] {name} R{R} {kind}: {row}")
+     path = os.environ.get("TF_G53_TUNE_TIMES")
+diff --git a/tests/test_glm_g53_kernel.py b/tests/test_glm_g53_kernel.py
+index cf2cef5..a6f9d81 100644
+--- a/tests/test_glm_g53_kernel.py
++++ b/tests/test_glm_g53_kernel.py
+@@ -29,7 +29,7 @@ from tensorfold.cuda.exl3 import format as fmt
+ from tensorfold.families.glm5_next.cuda import g53_experts
+ from tests import glm_g53_reference as ref
+ 
+-ENVS = (g53_experts.ENV, g53_experts.ROWS_ENV, g53_experts.ROWROT_ENV, g53_experts.ORDER_ENV,
++ENVS = (g53_experts.ENV, g53_experts.ROWS_ENV, g53_experts.ROWROT_ENV, g53_experts.ORDER_ENV, g53_experts.TIER_ENV,
+         *(name for name, _ in g53_experts.SCHEDULE_ENVS.values()))
+ 
+ 
+diff --git a/tests/test_glm_g53_schedule.py b/tests/test_glm_g53_schedule.py
+index df8b6fc..c0b3261 100644
+--- a/tests/test_glm_g53_schedule.py
++++ b/tests/test_glm_g53_schedule.py
+@@ -30,7 +30,8 @@ from tests import glm_g53_schedule as sched
+ from tests.test_glm_g53_kernel import _layer, _node
+ 
+ KNOBS = {field: name for field, (name, _) in g53_experts.SCHEDULE_ENVS.items()}
+-ENVS = (g53_experts.ENV, g53_experts.ROWS_ENV, g53_experts.ROWROT_ENV, g53_experts.ORDER_ENV, *KNOBS.values())
++ENVS = (g53_experts.ENV, g53_experts.ROWS_ENV, g53_experts.ROWROT_ENV, g53_experts.ORDER_ENV, g53_experts.TIER_ENV,
++        *KNOBS.values())
+ SIZES = (1, 2, 7, 63, 64, 65, 594, 2047, 2048, 2049, 4095, 4096)
+ 
+ 
+diff --git a/tests/test_glm_g53_tier.py b/tests/test_glm_g53_tier.py
+new file mode 100644
+index 0000000..aa72737
+--- /dev/null
++++ b/tests/test_glm_g53_tier.py
+@@ -0,0 +1,237 @@
++"""The g53 schedule tier, TF_GLM_EXPERT_KERNEL_TIER_ROWS (expert prompt kernels from glm53f-afd, written by Hugh Madden
++(@dangerm00se, github.com/hughmadden), glm53f-afd @ 91db3cc, MIT, Copyright (c) 2026 Turquoise Bay AI Pty Ltd). CPU
++only:
++
++- unset, nothing changes: switch() gives no tier, the knobs set apply to every window, and the node calls routed() and
++  prints its line as before;
++- set to N: the schedule the knobs set runs windows of N rows and up, smaller windows keep default_cfg's; bad values
++  refuse, and so do the fields that change bits (sk, skd, SwiGLU); it is read only under TF_GLM_EXPERT_KERNEL=g53; the
++  node's start line names the tier;
++- tests/glm_g53_schedule.py's emulation of the kernels' work decomposition at 1,024- and 2,048-row windows, with N
++  1,536 and the knobs of glm53f-rank's above-2,048-row schedule (mt 4, gw 16, nt 4, l2 1): the 1,024-row window runs
++  default_cfg's schedule and the 2,048-row one the tuned schedule, and a row's bits are the same in either window and
++  equal to the default schedule's.
++
++The GPU test (tests/cuda/test_glm_g53_kernel.py::test_tier_windows_keep_every_bit) checks the CUDA kernels' bytes for
++the same windows.
++"""
++
++from __future__ import annotations
++
++import gc
++from dataclasses import fields as dc_fields
++from dataclasses import replace
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++
++from tensorfold.families.glm5_next.cuda import g53_experts
++from tests import glm_g53_schedule as sched
++from tests.test_glm_g53_kernel import _layer, _node
++
++KNOBS = {field: name for field, (name, _) in g53_experts.SCHEDULE_ENVS.items()}
++ENVS = (g53_experts.ENV, g53_experts.ROWS_ENV, g53_experts.ROWROT_ENV, g53_experts.ORDER_ENV, g53_experts.TIER_ENV,
++        *KNOBS.values())
++BIG = {"mt": 4, "gw": 16, "nt": 4, "l2": 1}       # glm53f-rank's own schedule above 2,048 rows
++BASE = {"min_rows": 1, "rowrot": True, "order": False}
++
++
++@pytest.fixture(autouse=True)
++def _clean_env(monkeypatch):
++    for k in ENVS:
++        monkeypatch.delenv(k, raising=False)
++
++
++def _knobs(monkeypatch, fields=BIG, tier=None):
++    monkeypatch.setenv(g53_experts.ENV, "g53")
++    for field, v in fields.items():
++        monkeypatch.setenv(KNOBS[field], str(v))
++    if tier is not None:
++        monkeypatch.setenv(g53_experts.TIER_ENV, tier)
++
++
++# ------------------------------------------------------------------------------------------------------- the knob
++
++def test_name():
++    assert g53_experts.TIER_ENV == "TF_GLM_EXPERT_KERNEL_TIER_ROWS"
++    assert g53_experts.TIER_ENV not in KNOBS.values()           # not a configuration field
++
++
++def test_unset_tier_is_the_behaviour_before(monkeypatch):
++    _knobs(monkeypatch)
++    assert g53_experts.switch() == {**BASE, "schedule": BIG}                      # no "tier_rows" key
++    monkeypatch.setenv(g53_experts.TIER_ENV, " ")                                 # empty is unset
++    assert g53_experts.switch() == {**BASE, "schedule": BIG}
++    for R in range(1, g53_experts.MAX_ROWS + 1):                 # the knobs on every window, as K1 ran them
++        want = replace(g53_experts.default_cfg(R), **BIG)
++        assert g53_experts.tuned_cfg(R, fields=BIG) == want
++        assert g53_experts.tuned_cfg(R, fields=BIG, tier=None) == want
++    monkeypatch.delenv(KNOBS["mt"])
++    for k in BIG:
++        monkeypatch.delenv(KNOBS[k], raising=False)
++    assert g53_experts.switch() == BASE
++
++
++def test_tier_runs_the_schedule_on_windows_of_n_rows_and_up(monkeypatch):
++    _knobs(monkeypatch, tier=" 1536 ")
++    s = g53_experts.switch()
++    assert s == {**BASE, "schedule": BIG, "tier_rows": 1536}
++    bits = set()
++    for R in range(1, g53_experts.MAX_ROWS + 1):
++        for rowrot, order in ((True, False), (False, True)):
++            d = g53_experts.default_cfg(R, rowrot=rowrot, order=order)
++            c = g53_experts.tuned_cfg(R, rowrot=rowrot, order=order, fields=s["schedule"], tier=s["tier_rows"])
++            assert c == (d if R < 1536 else replace(d, **BIG)), (R, rowrot, order)
++            bits.add((c.sk, c.skd, c.swiglu))
++    assert bits == {(1, 1, 0)}                     # one set of bit fields for every window: a row's bits whatever it
++    for n, below, above in ((1, None, 1), (2048, 2047, 2048), (4096, 4095, 4096)):
++        if below is not None:
++            assert g53_experts.tuned_cfg(below, fields=BIG, tier=n) == g53_experts.default_cfg(below)
++        assert g53_experts.tuned_cfg(above, fields=BIG, tier=n) == replace(g53_experts.default_cfg(above), **BIG)
++
++
++def test_tier_without_a_knob_changes_nothing(monkeypatch):
++    _knobs(monkeypatch, fields={}, tier="1536")
++    s = g53_experts.switch()
++    assert s == {**BASE, "tier_rows": 1536}                     # no "schedule": every window default_cfg's
++    for R in (1, 1535, 1536, 2048, 4096):
++        assert g53_experts.tuned_cfg(R, fields={}, tier=1536) == g53_experts.default_cfg(R)
++
++
++def test_bad_tier_values_refuse(monkeypatch):
++    _knobs(monkeypatch)
++    for bad in ("0", "-1", "4097", "x", "1536.0", "1,536", "1536 rows"):
++        monkeypatch.setenv(g53_experts.TIER_ENV, bad)
++        with pytest.raises(ValueError, match=g53_experts.TIER_ENV):
++            g53_experts.switch()
++
++
++def test_tier_refuses_the_fields_that_change_bits(monkeypatch):
++    for field, v in (("sk", 2), ("skd", 2), ("swiglu", 1), ("swiglu", 0), ("sk", 1)):
++        _knobs(monkeypatch, fields={**BIG, field: v}, tier="1536")
++        with pytest.raises(ValueError, match=KNOBS[field]):
++            g53_experts.switch()
++        monkeypatch.delenv(g53_experts.TIER_ENV)
++        assert g53_experts.switch()["schedule"] == {**BIG, field: v}     # without the tier: every window, as before
++        monkeypatch.delenv(KNOBS[field])
++        with pytest.raises(ValueError, match=g53_experts.TIER_ENV):
++            g53_experts.tuned_cfg(2048, fields={**BIG, field: v}, tier=1536)
++
++
++def test_tier_is_read_only_under_the_switch(monkeypatch):
++    monkeypatch.setenv(g53_experts.TIER_ENV, "x")             # a bad value, but TensorFold's kernels run every window
++    assert g53_experts.switch() is None
++    monkeypatch.setenv(g53_experts.ENV, "tf")
++    assert g53_experts.switch() is None
++
++
++# ---------------------------------------------------------------------------------------------------------- the node
++
++def test_node_runs_default_cfg_under_the_tier_and_the_schedule_from_it(monkeypatch):
++    from tensorfold.families.glm5_next.cuda import experts_node
++
++    seen = []
++    monkeypatch.setattr(g53_experts, "routed", lambda x, pick, wts, ex, s, out, R, limit, *a, **k: seen.append(
++        (R, a, k)) or out[:R])
++    _, node = _node(monkeypatch)
++    node.buf = experts_node.ExpertBuffers(node.cfg, rows=8, prefill_rows=2048, device="cpu")
++    sizes = (1, 70, 1024, 1535, 1536, 2047, 2048)
++    h = g53_experts.Node(node, {**BASE, "schedule": BIG, "tier_rows": 1536})
++    assert h.tier == 1536 and h.max_rows == 2048 and h.scratch._own is None
++    for R in sizes:
++        h.compute(3, R)
++    want = [g53_experts.default_cfg(R) if R < 1536 else replace(g53_experts.default_cfg(R), **BIG) for R in sizes]
++    assert seen == [(R, (c,), {}) for R, c in zip(sizes, want)]
++    seen.clear()
++    h = g53_experts.Node(node, {**BASE, "schedule": BIG})            # unset: the knobs on every window, as before
++    for R in sizes:
++        h.compute(3, R)
++    assert seen == [(R, (replace(g53_experts.default_cfg(R), **BIG),), {}) for R in sizes]
++    seen.clear()
++    h = g53_experts.Node(node, {**BASE, "tier_rows": 1536})          # a tier with no knob: the call before
++    for R in (1, 2048):
++        h.compute(3, R)
++    assert seen == [(R, (), {"rowrot": True, "order": False}) for R in (1, 2048)]
++    del h, node                                                      # ~2 GB of CPU buffers
++    gc.collect()
++
++
++def _expert_node(monkeypatch):
++    from tensorfold.families.glm5_next.cuda import experts_node
++
++    cfg = SimpleNamespace(hidden=4096, top_k=8, moe_width=2048, experts=288, limit=10.0)
++    monkeypatch.setattr(experts_node.Config, "read", staticmethod(lambda _d: cfg))
++    monkeypatch.setattr(experts_node, "load_half", lambda _d, _h, layers, device="cuda": [_layer() for _ in layers])
++    real = experts_node.ExpertBuffers
++
++    def cpu_buffers(c, rows, prefill_rows, device):
++        return real(c, rows=rows, prefill_rows=prefill_rows, device="cpu")
++
++    monkeypatch.setattr(experts_node, "ExpertBuffers", cpu_buffers)
++    return lambda prefill_rows: experts_node.ExpertNode("/nowhere", 1, [3, 4], prefill_rows=prefill_rows)
++
++
++def test_start_line_names_the_tier(monkeypatch, capsys):
++    make = _expert_node(monkeypatch)
++    monkeypatch.setenv(g53_experts.ENV, "g53")
++
++    def line(prefill_rows=256):     # a 2,048-row node's CPU buffers are ~2 GB: one at a time
++        node = make(prefill_rows)
++        assert node.g53.scratch._own is None
++        del node
++        gc.collect()
++        return capsys.readouterr().out.strip().splitlines()[-1]
++
++    assert line().endswith("rowrot on (0 layers share one gate/up suh), order off); 2 of 2 MoE layers in scope")
++    monkeypatch.setenv(g53_experts.TIER_ENV, "192")                   # a tier, no knob
++    assert line().endswith("2 of 2 MoE layers in scope; tier TF_GLM_EXPERT_KERNEL_TIER_ROWS=192 with no schedule knob "
++                           "set: every window runs default_cfg")
++    monkeypatch.delenv(g53_experts.TIER_ENV)
++    _knobs(monkeypatch)                                                # the knobs, no tier: K1's line
++    assert line().endswith("2 of 2 MoE layers in scope; schedule mt 4 gw 16 nt 4 l2 1 for every window (the same bits)")
++    for n, span in (("192", "for windows of 192-256 rows, default_cfg's for 1-191"),
++                    ("256", "for windows of 256 rows, default_cfg's for 1-255"),
++                    ("1", "for every window"),
++                    ("1536", "for no window (windows here are at most 256 rows: every one runs default_cfg)")):
++        monkeypatch.setenv(g53_experts.TIER_ENV, n)
++        assert line().endswith(f"2 of 2 MoE layers in scope; schedule mt 4 gw 16 nt 4 l2 1 {span} (tier "
++                               f"TF_GLM_EXPERT_KERNEL_TIER_ROWS={n}; the same bits)"), n
++    monkeypatch.setenv(g53_experts.TIER_ENV, "1536")                  # 2,048-row prompt windows, as served
++    got = line(2048)
++    assert "TF_GLM_EXPERT_KERNEL=g53: prompt chunks of 1-2048 rows through glm53f-afd's large-M expert kernels" in got
++    assert got.endswith("2 of 2 MoE layers in scope; schedule mt 4 gw 16 nt 4 l2 1 for windows of 1536-2048 rows, "
++                        "default_cfg's for 1-1535 (tier TF_GLM_EXPERT_KERNEL_TIER_ROWS=1536; the same bits)")
++
++
++# ---------------------------------------------------------------------------- the emulated decomposition (CPU digests)
++
++# Reduced sizes (the kernels': H 4,096, WID 1,024, 512-column blocks, 288 experts); the tuned schedule's 512-column
++# down chunks need H 512. At 2,048 rows the 64 experts get 53-1,937 rows: one 64-row group or several.
++DT = sched.Dims(H=512, WID=256, CBW=256, E=64)
++
++
++def _emu(c) -> dict:
++    return {f.name: getattr(c, f.name) for f in dc_fields(c)}
++
++
++def test_emulated_tier_a_rows_bits_in_a_1024_and_a_2048_row_window_are_the_default_schedules(monkeypatch):
++    _knobs(monkeypatch, tier="1536")
++    s = g53_experts.switch()
++    cfg = {R: g53_experts.tuned_cfg(R, rowrot=s["rowrot"], order=s["order"], fields=s["schedule"], tier=s["tier_rows"])
++           for R in (8, 1024, 2048)}
++    assert cfg[8] == g53_experts.default_cfg(8) and cfg[1024] == g53_experts.default_cfg(1024)   # under the tier
++    assert cfg[2048] == replace(g53_experts.default_cfg(2048), **BIG) != g53_experts.default_cfg(2048)
++    assert _emu(g53_experts.default_cfg(2048)) == sched.base_cfg()          # the emulation's default schedule
++    rng = np.random.default_rng(1536)
++    L = sched.layer(DT, rng, shared=True)
++    x, pick, w = sched.inputs(DT, 2048, rng)
++    counts = np.bincount(pick.reshape(-1), minlength=DT.E)
++    assert (counts <= 64).sum() >= 4 and (counts > 128).sum() >= 8      # one and several 64-row groups an expert
++    want = sched.ffn(DT, L, x, pick, w, sched.base_cfg())                  # 2,048 rows, default schedule
++    assert np.isfinite(want).all()
++    full = sched.ffn(DT, L, x, pick, w, _emu(cfg[2048]), seed=11)          # 2,048 rows, the tier's: tuned
++    assert sched.digest(full) == sched.digest(want)
++    for lo, hi in ((0, 1024), (2040, 2048)):                               # 1,024 and 8 rows: default_cfg's
++        part = sched.ffn(DT, L, x[lo:hi], pick[lo:hi], w[lo:hi], _emu(cfg[hi - lo]), seed=lo + 1)
++        assert sched.digest(part) == sched.digest(full[lo:hi]), (lo, hi)

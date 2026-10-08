@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""extras/watch/glm53f-afd-report [days=1]: glm53f-afd-watch's telemetry as a markdown summary.
+
+Reads STATE_DIR/telemetry/*.jsonl (STATE_DIR as the watcher: default ~/.local/state/glm-afd/watch, or CTL_STATE/watch)
+and prints: availability over the runs that were not on hold, the failed checks, probe TTFT, the hourly decode bench,
+the recoveries (rc and seconds), the hold-offs by reason, and per host the memory floor, swap, pressure, GPU power and
+temperature, kernel events and the samples with the MCDMA links not all up. The data for tuning --parallel, the cache
+budget or MIN_FREE_GIB_EXPERT, and for seeing a slow leak before it bites.
+"""
+import collections
+import glob
+import json
+import os
+import statistics as st
+import sys
+import time
+
+CTL_STATE = os.path.expanduser(os.environ.get("CTL_STATE") or "~/.local/state/glm-afd")
+STATE = os.path.expanduser(os.environ.get("STATE_DIR") or f"{CTL_STATE}/watch")
+
+try:
+    days = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
+except ValueError:
+    print("usage: glm53f-afd-report [days]")
+    sys.exit(2)
+cut = time.time() - days * 86400
+R = []
+for path in sorted(glob.glob(f"{STATE}/telemetry/*.jsonl")):
+    with open(path) as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("ts", 0) >= cut:
+                R.append(r)
+if not R:
+    print(f"no telemetry in the last {days:g} day(s) under {STATE}/telemetry")
+    sys.exit(0)
+R.sort(key=lambda r: r.get("ts", 0))
+
+
+def pct(v, q):
+    v = sorted(v)
+    return v[min(len(v) - 1, int(q * len(v)))] if v else None
+
+
+def fmt(x, n=1):
+    return "-" if x is None else f"{x:.{n}f}"
+
+
+watched = [r for r in R if not r.get("hold") and r.get("mode", "serving") == "serving"]
+up = [r for r in watched if r.get("healthy")]
+ttft = [r["probe"]["ttft_s"] for r in up if (r.get("probe") or {}).get("ttft_s")]
+busy = [r for r in watched if (r.get("probe") or {}).get("busy")]
+bench = [(r["iso"], r["bench"]["tok_s_e2e"]) for r in R if isinstance(r.get("bench"), dict) and r["bench"].get("tok_s_e2e")]
+recs = [r for r in R if r.get("recover")]
+holds = collections.Counter(str(r.get("hold") or r.get("mode")).split(" (")[0] for r in R
+                            if r.get("hold") or r.get("mode", "serving") != "serving")
+whys = collections.Counter(w.split(":")[0][:60] for r in watched if not r.get("healthy") for w in r.get("why", []))
+
+print(f"# glm53f-afd watch: {R[0]['iso']} to {R[-1]['iso']} ({len(R)} runs, last {days:g} day(s))\n")
+print(f"- Availability (runs not on hold: /health 200, the model listed, the probe's nonce back): "
+      f"**{100 * len(up) / max(1, len(watched)):.2f}%** ({len(up)}/{len(watched)})"
+      + (f"; {len(busy)} of them busy (the probe waited past its timeout while tokens flowed)" if busy else ""))
+print(f"- Probe TTFT p50 / p95: {fmt(pct(ttft, .5), 3)} / {fmt(pct(ttft, .95), 3)} s")
+if whys:
+    print("- Failed checks: " + "; ".join(f"{k} x{v}" for k, v in whys.most_common(8)))
+if holds:
+    print("- Held off: " + "; ".join(f"{k} x{v}" for k, v in holds.most_common()))
+if bench:
+    v = [b for _, b in bench]
+    print(f"- Hourly 256-token decode bench (end-to-end tok/s): n={len(v)}, median {st.median(v):.1f}, "
+          f"min {min(v):.1f}, max {max(v):.1f}; first {v[0]:.1f}, last {v[-1]:.1f}")
+wd = sum((r.get("attn_log") or {}).get("watchdog", 0) for r in R)
+er = sum((r.get("attn_log") or {}).get("errors", 0) for r in R)
+print(f"- Attention log: {wd} AFD watchdog line(s), {er} error line(s)")
+lk = [r for r in R if r.get("links_want") and r.get("links_up") is not None and r["links_up"] < r["links_want"]]
+print(f"- MCDMA links not all up in {len(lk)} run(s)")
+print(f"- Recoveries: {len(recs)}" + "".join(
+    f"\n  - {r['iso']}: rc {r['recover']['rc']} in {r['recover']['seconds']} s after {r['recover'].get('after_fails')} "
+    f"failed runs ({str(r['recover'].get('why', ''))[:120]})" for r in recs))
+if any(r.get("latched") for r in R):
+    print(f"- LATCHED in {sum(1 for r in R if r.get('latched'))} run(s): see {STATE}/latched")
+print("\n| host | min MemAvailable GiB | p50 | max swap GiB | max PSI full | GPU util p95 % | max power W "
+      "| max temp C | kernel events |")
+print("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+for h in ("attn", "x0", "x1"):
+    hs = [r[h] for r in R if (r.get(h) or {}).get("ssh")]
+    if not hs:
+        continue
+
+    def g(k, hs=hs):
+        return [x[k] for x in hs if x.get(k) is not None]
+
+    a = g("avail_gib")
+    print(f"| {h} | {fmt(min(a) if a else None)} | {fmt(st.median(a) if a else None)} | "
+          f"{fmt(max(g('swap_used_gib') or [0]))} | {fmt(max(g('psi_full_avg10') or [0]), 2)} | "
+          f"{fmt(pct(g('gpu_util'), .95), 0)} | {fmt(max(g('gpu_power_w') or [0]))} | "
+          f"{fmt(max(g('gpu_temp_c') or [0]), 0)} | {sum(g('kern_events'))} |")

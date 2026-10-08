@@ -17,14 +17,20 @@ RDMA_GID_INDEX=${RDMA_GID_INDEX:-3}; RDMA_MTU=${RDMA_MTU:-4096}
 MCDMA_LINK0=${MCDMA_LINK0:-x0}; MCDMA_LINK1=${MCDMA_LINK1:-x1}; MCDMA_CTRL_PORT=${MCDMA_CTRL_PORT:-18820}
 MCDMA_REQ_MIB=${MCDMA_REQ_MIB:-20}; MCDMA_REP_MIB=${MCDMA_REP_MIB:-36}
 # MoE exchanges in flight per expert node (TF_GLM_MCDMA_INFLIGHT): one MCDMA link pair each. Link j of an expert node
-# is NAME (j = 0), then NAME-1, NAME-2, with control port MCDMA_CTRL_PORT + j; one connect daemon takes up to six peers.
+# is NAME (j = 0), then NAME-1, NAME-2, NAME-3, with control port MCDMA_CTRL_PORT + j. One connect daemon takes up to
+# six peers (MCDMA), so links 0-2 of both nodes go to `connect` and, at 4, link 3 of both to a second one, `connect2`.
 MCDMA_INFLIGHT=${MCDMA_INFLIGHT:-1}
-[[ "$MCDMA_INFLIGHT" =~ ^[1-3]$ ]] || { echo "MCDMA_INFLIGHT must be 1, 2 or 3 (got '$MCDMA_INFLIGHT')" >&2; exit 2; }
+[[ "$MCDMA_INFLIGHT" =~ ^[1-4]$ ]] || { echo "MCDMA_INFLIGHT must be 1, 2, 3 or 4 (got '$MCDMA_INFLIGHT')" >&2; exit 2; }
 API_BIND=${API_BIND:-0.0.0.0}; API_PORT=${API_PORT:-8000}; MASTER_PORT=${MASTER_PORT:-29551}
 MODEL_NAME=${MODEL_NAME:-GLM-5.3-Flash-EXL3}; MODEL_ALIAS=${MODEL_ALIAS:-glm-5.3-flash}
 CONTEXT=${CONTEXT:-262144}; MEMORY_RESERVE_GIB=${MEMORY_RESERVE_GIB:-2}
 AFD_CHECK=${AFD_CHECK:-0}; AFD_CHECK_FORWARDS=${AFD_CHECK_FORWARDS:-256}; AFD_TIME=${AFD_TIME:-0}
 MIN_FREE_GIB_EXPERT=${MIN_FREE_GIB_EXPERT:-100}; HEALTH_WAIT=${HEALTH_WAIT:-2400}; QUIET_MAX=${QUIET_MAX:-1200}
+STOP_WAIT=${STOP_WAIT:-60}; MEM_WAIT=${MEM_WAIT:-180}
+[[ "$STOP_WAIT" =~ ^[1-9][0-9]{0,3}$ ]] || { echo "STOP_WAIT must be seconds, 1-9999 (got '$STOP_WAIT')" >&2; exit 2; }
+[[ "$MEM_WAIT" =~ ^[0-9]{1,4}$ ]] || { echo "MEM_WAIT must be seconds, 0-9999 (got '$MEM_WAIT')" >&2; exit 2; }
+# On the controller: the control lock and ./stop.sh's stop marker (extras/watch leaves a stopped stack alone)
+CTL_STATE=${CTL_STATE:-$HOME/.local/state/glm-afd}
 IMAGE=${IMAGE:-glm-afd-tensorfold:v0.6.5}; BUILD_DIR=${BUILD_DIR:-./build}
 case "$BUILD_DIR" in /*) ;; *) BUILD_DIR=$ROOT/${BUILD_DIR#./} ;; esac
 
@@ -64,41 +70,96 @@ envpairs() {   # KNOB VALUE -> "-e K=V ..." on stdout, or a refusal
 }
 
 # Containers: detached, never restarted by docker, first in line for the OOM killer (so a runaway container goes
-# before sshd does), labelled so ./stop.sh finds every one of them.
+# before sshd does), labelled so ./stop.sh finds every one of them. --init makes docker's tini PID 1, so a SIGTERM
+# reaches the TF process (as PID 1 itself the expert node, which installs no SIGTERM handler, would never see it).
 drun() {  # NODE NAME docker-run-args...
   local h=$1 name=$2; shift 2
-  rsh "$h" "docker run -d --restart=no --oom-score-adj=1000 --label glm-afd=1 --name $name $(printf '%q ' "$@")" >/dev/null
+  rsh "$h" "docker run -d --init --restart=no --oom-score-adj=1000 --label glm-afd=1 --name $name $(printf '%q ' "$@")" >/dev/null
 }
-dstop() {  # NODE: remove the stack's containers, then wait up to 60 s for the GPU to have no holders
-  local h=$1 i
-  rsh "$h" 'ids=$(docker ps -aq --filter label=glm-afd=1); [ -z "$ids" ] || docker rm -f $ids >/dev/null'
+# SIGTERM only, never SIGKILL (a GB10 can strand memory or hang when a GPU process is killed hard): the stack's running
+# containers on a node get one `docker kill --signal TERM`, then up to STOP_WAIT s to exit; the exited ones are removed.
+# A container still running after that is left running and named (return 1): look at it before anything else.
+dstop() {  # NODE
+  local h=$1 ids left t=0 i
+  ids=$(rsh "$h" 'docker ps -q --filter label=glm-afd=1') || { log "WARN: $h: no answer over SSH: nothing stopped there"; return 1; }
+  ids=${ids//$'\n'/ }
+  if [ -n "${ids// /}" ]; then
+    rsh "$h" "docker kill --signal TERM $ids >/dev/null" || log "WARN: $h: docker kill --signal TERM failed"
+    while [ -n "$(rsh "$h" 'docker ps -q --filter label=glm-afd=1' || true)" ] && [ $t -lt "$STOP_WAIT" ]; do
+      sleep 2; t=$((t + 2))
+    done
+  fi
+  left=$(rsh "$h" "docker ps --filter label=glm-afd=1 --format '{{.Names}}'" || echo "(no answer)")
+  left=${left//$'\n'/ }
+  rsh "$h" 'ids=$(docker ps -aq --filter label=glm-afd=1 --filter status=exited --filter status=created --filter status=dead); [ -z "$ids" ] || docker rm $ids >/dev/null' || true
+  if [ -n "${left// /}" ]; then
+    log "WARN: $h: $left still running ${STOP_WAIT} s after SIGTERM: left running, not killed (docs/TROUBLESHOOTING.md)"
+    return 1
+  fi
   for i in $(seq 30); do
-    [ -z "$(rsh "$h" 'nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null')" ] && return 0
+    [ -z "$(rsh "$h" 'nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null' || true)" ] && return 0
     sleep 2
   done
-  log "WARN: $h: the GPU still has holders 60 s after the containers were removed"
+  log "WARN: $h: the GPU still has holders 60 s after the containers exited"
 }
+drm() {  # NODE NAME: remove one of the stack's containers; one SIGTERM first if it still runs, never SIGKILL
+  local h=$1 c=$2 t=0
+  if _drm_running "$h" "$c"; then
+    rsh "$h" "docker kill --signal TERM $c >/dev/null" || true
+    while _drm_running "$h" "$c"; do
+      [ $t -ge "$STOP_WAIT" ] && { log "WARN: $h: $c still running ${STOP_WAIT} s after SIGTERM: left running, not killed"; return 1; }
+      sleep 2; t=$((t + 2))
+    done
+  fi
+  rsh "$h" "docker rm $c >/dev/null 2>&1" || true
+}
+_drm_running() { [ "$(rsh "$1" "docker inspect -f '{{.State.Running}}' $2 2>/dev/null" || true)" = true ]; }
 
-wait_mem() {  # GB10 hands unified memory back a few s after a tenant exits: start only once it is back
+wait_mem() {  # NODE [soft]: GB10 hands unified memory back a few s after a tenant exits: start only once it is back
   local h=$1 a t=0
   [ "$h" = attn ] && return 0
   while :; do
     a=$(rsh "$h" "awk '/MemAvailable/{printf \"%d\", \$2/1048576}' /proc/meminfo" 2>/dev/null || echo 0)
     [ "${a:-0}" -ge "$MIN_FREE_GIB_EXPERT" ] && return 0
-    [ $t -ge 180 ] && die "$h MemAvailable ${a} GiB < $MIN_FREE_GIB_EXPERT GiB after 180 s: memory not returned, not starting"
+    if [ $t -ge "$MEM_WAIT" ]; then
+      [ "${2:-}" = soft ] && { log "$h MemAvailable ${a} GiB < $MIN_FREE_GIB_EXPERT GiB after $MEM_WAIT s: memory not returned"; return 1; }
+      die "$h MemAvailable ${a} GiB < $MIN_FREE_GIB_EXPERT GiB after $MEM_WAIT s: memory not returned, not starting"
+    fi
     sleep 5; t=$((t + 5))
   done
 }
 
-status_connect() {  # the connect daemon's STATUS (one PEER line per link)
-  rsh attn "python3 -c \"import socket,time; s=socket.socket(socket.AF_UNIX); s.connect('$AFD_HOME/mcdma/connect.sock'); s.sendall(b'STATUS\\\\n'); time.sleep(0.5); print(s.recv(65536).decode())\"" 2>/dev/null
+ctl_lock() {  # one start.sh up/recover/probe or stop.sh at a time on this controller (rc 75 when another one runs)
+  [ "${GLM_AFD_LOCKED:-0}" = 1 ] && return 0      # a stop.sh that start.sh runs after a failure holds its lock
+  mkdir -p "$CTL_STATE" || die "cannot create $CTL_STATE"
+  exec 9>"$CTL_STATE/ctl.lock"
+  flock -n 9 || { echo "$(date +%T) glm-afd: another start.sh up/recover/probe or stop.sh is running ($CTL_STATE/ctl.lock)" >&2; exit 75; }
+  export GLM_AFD_LOCKED=1
+}
+
+connects() {  # the connect daemons on the attention host: links 0-2 on `connect`, link 3 on `connect2` (six peers a daemon)
+  echo connect
+  [ "$MCDMA_INFLIGHT" -gt 3 ] && echo connect2
+  return 0
+}
+cpeers() {  # CONNECT-DAEMON: its link numbers j (each one link to each expert node)
+  local j
+  for j in $(seq 0 $((MCDMA_INFLIGHT - 1))); do
+    if [ "$1" = connect ] && [ "$j" -lt 3 ]; then echo "$j"; elif [ "$1" = connect2 ] && [ "$j" -ge 3 ]; then echo "$j"; fi
+  done
+}
+status_connect() {  # the connect daemons' STATUS (one PEER line per link)
+  local c
+  for c in $(connects); do
+    rsh attn "python3 -c \"import socket,time; s=socket.socket(socket.AF_UNIX); s.connect('$AFD_HOME/mcdma/$c.sock'); s.sendall(b'STATUS\\\\n'); time.sleep(0.5); print(s.recv(65536).decode())\"" 2>/dev/null || return 1
+  done
 }
 lname() { if [ "$2" = 0 ]; then echo "$1"; else echo "$1-$2"; fi; }   # link j of an expert node: NAME, NAME-1, ...
-links() {  # every link name, in the connect daemon's peer order: x0 x1, then x0-1 x1-1, ...
+links() {  # every link name, in the connect daemons' peer order: x0 x1, then x0-1 x1-1, ...
   local j
   for j in $(seq 0 $((MCDMA_INFLIGHT - 1))); do echo "$(lname "$MCDMA_LINK0" "$j") $(lname "$MCDMA_LINK1" "$j")"; done
 }
-links_up() {  # how many of the expected links the connect daemon reports up
+links_up() {  # how many of the expected links the connect daemons report up
   local s n c=0
   s=$(status_connect || true)
   for n in $(links); do grep -q "^PEER $n up " <<< "$s" && c=$((c + 1)); done
@@ -116,4 +177,13 @@ stop_daemons() {  # NODE SOCKET...: SHUTDOWN to each, then SIGTERM; never SIGKIL
     [ $t -ge 25 ] && { log "WARN: mcdma-rpcd still running on $h after SHUTDOWN+TERM; leaving it (no SIGKILL)"; return 1; }
   done
   return 0
+}
+stop_all_daemons() {  # the connect daemons first, then every link's listen daemon, at any MCDMA_INFLIGHT (1-4) it ran with
+  local h rc=0
+  stop_daemons attn "$AFD_HOME/mcdma/connect.sock" "$AFD_HOME/mcdma/connect2.sock" || rc=1
+  for h in "${EXPERTS[@]}"; do
+    stop_daemons "$h" "$AFD_HOME/mcdma/${LINK[$h]}.sock" "$AFD_HOME/mcdma/${LINK[$h]}-1.sock" "$AFD_HOME/mcdma/${LINK[$h]}-2.sock" \
+      "$AFD_HOME/mcdma/${LINK[$h]}-3.sock" || rc=1
+  done
+  return $rc
 }

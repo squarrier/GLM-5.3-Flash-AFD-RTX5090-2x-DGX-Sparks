@@ -3,8 +3,8 @@
 This recipe serves GLM-5.3-Flash with [TensorFold](https://github.com/ashhart/TensorFold) split across three
 machines: one RTX 5090 runs everything except the routed experts, and two DGX Sparks hold the routed experts.
 Every MoE layer's exchange between them goes over [MCDMA](https://github.com/ashhart/MCDMA)'s RDMA link daemons.
-TensorFold is pinned at v0.6.5; `patches/` adds the split and MiaAI-Lab's GLM work on top of it, and its last three
-patches are TensorFold v0.6.6's own commits.
+TensorFold is pinned at v0.6.5; `patches/` adds the split and MiaAI-Lab's GLM work on top of it, and patches
+0046-0048 are TensorFold v0.6.6's own commits.
 
 ## The three nodes
 
@@ -25,22 +25,24 @@ naming both values. `./start.sh up` follows that order.
 2. It sends the layer's normed rows, the router's picks and the routing weights to both expert nodes, as one packed
    request into each node's mailbox.
 3. While the experts work, it runs the layer's shared expert.
-4. Each expert node runs its half of the routed experts and writes its fp32 partial sum back as one reply.
-5. The attention node adds the three (its shared expert and the two partials) and goes on.
+4. Each expert node runs its half of the routed experts and writes its fp32 partial sum back as one reply (for a
+   prompt window, rounded to BF16 with `TF_GLM_PARTIALS_BF16=1`).
+5. The attention node adds the three in fp32 (its shared expert and the two partials) and goes on.
 
 All of this is eager: the attention node captures no CUDA graphs across the wire, and the expert nodes refuse any
 forward mode but eager and prompt chunks.
 
 ## The MCDMA wire
 
-- **Daemons.** An `mcdma-rpcd` link daemon runs natively on each host. The attention host runs the connect end of
-  every link; each Spark runs the listen end of its own links, one daemon a link: `MCDMA_INFLIGHT` links to each Spark
-  (2 in `.env.example`, named `x0`, `x0-1` and `x1`, `x1-1`; link j listens on `MCDMA_CTRL_PORT` + j). `./start.sh up`
-  starts the listen ends, then the connect end, and waits until the connect daemon reports every link up. `./stop.sh`
-  stops them in the reverse order.
+- **Daemons.** `mcdma-rpcd` link daemons run natively on each host. Each Spark runs the listen end of its own links,
+  one daemon a link: `MCDMA_INFLIGHT` links to each Spark (4 in `.env.example`, named `x0`, `x0-1`, `x0-2`, `x0-3` and
+  `x1`, ...; link j listens on `MCDMA_CTRL_PORT` + j). The attention host runs the connect ends: one connect daemon
+  holds six peers, so links 0-2 of both Sparks go to `connect` and, at four links, link 3 of both to a second one,
+  `connect2`. `./start.sh up` starts the listen ends, then the connect ends, and waits until the connect daemons
+  report every link up. `./stop.sh` stops them in the reverse order.
 - **Mailboxes.** The daemons create the mailboxes under `/dev/shm`; the containers reach them through `--ipc=host`
   and load `libmcdma-rpc.so` from the MCDMA build (`TF_AFD_MCDMA_LIB`). A request half of 20 MiB and a reply half
-  of 36 MiB fit a 2,048-row prompt chunk (a 16.9 MB request and a 32 MiB reply).
+  of 36 MiB fit a 2,048-row prompt chunk (a 16.9 MB request and a 32 MiB reply; 16 MiB with BF16 partial sums).
 - **GPU-driven exchange.** Where the device supports CUDA stream memory operations, the serving stream itself writes
   and waits on the mailbox words (`cuStreamWriteValue64` / `cuStreamWaitValue64`): no host sync per layer. Otherwise
   the exchange is CPU-driven. `TF_AFD_MCDMA_MODE=auto` (the default) picks GPU-driven when the startup probe passes
@@ -60,9 +62,22 @@ forward mode but eager and prompt chunks.
   one compute stream, so its kernels and bits are those of one link. With pairs on, the next chunk's exchange goes out
   as soon as its attention has run, while the other chunk's is still unanswered, so the Sparks find the next request
   waiting when they reply. The handshake carries `"inflight": N`, which an expert of an older tree refuses.
+- **Prompt lanes.** With `TF_GLM_PREFILL_LANES=N` (patch 0026; 4 in `.env.example`, with four exchanges in flight)
+  the prompt chunk pairs above take up to N chunks at once (`MODE_LANES`): each lane's exchange goes out on its own
+  link as soon as its attention has run, so the Sparks find the next lane's request waiting. Unset, it follows
+  prompt pairs (2 with them on, else 1).
+- **BF16 partial sums.** With `TF_GLM_PARTIALS_BF16=1` on all three nodes (patch 0050) each expert node rounds its
+  partial sum for a prompt window (`MODE_CHUNK`, `MODE_SLICE`, `MODE_PAIR`, `MODE_LANES`) to BF16, to nearest even,
+  and replies with 8,192 bytes a row instead of 16,384; decode windows keep fp32 replies. The attention node widens
+  the two halves exactly and adds them with its shared expert's rows in fp32, in the same order as before. The
+  rounding is row-local, so a prompt row's reply is the same in any window. The handshake carries
+  `"partials_bf16": 1`, and an expert node whose own setting differs refuses to start, naming both.
 - **Failure.** A request left unanswered for `TF_AFD_MCDMA_TIMEOUT` seconds (30) or an expert whose heartbeat goes
-  stale (5 s beats, 20 s) fails the in-flight requests with HTTP 503, and the attention node logs `afd: ...`. Restart
-  the whole stack, not one node.
+  stale (5 s beats, 20 s) fails the in-flight requests, and the attention node logs `afd: ...`. A streamed request
+  gets an error event; a request that waited for the verdict gets the capacity answer (HTTP 429 with
+  `TF_GLM_CAPACITY_STATUS=1`, else 503), and every later one HTTP 500 until the restart; `/health` keeps answering
+  200 (it answers from a snapshot). The soak measured it for a stopped expert:
+  [BENCHMARKS](BENCHMARKS.md#215s-soak-and-failure-drills). Restart the whole stack, not one node.
 - **Audit.** `AFD_CHECK=1` hashes both sides' wire tensors every layer for `AFD_CHECK_FORWARDS` forwards and prints
   the mismatch count; `AFD_TIME=1` prints per-layer exchange times.
 
@@ -80,10 +95,10 @@ lane follow the table ([deviations](#deviations-from-her-main-lane)); the levers
 
 | `.env` | Switch | What |
 | --- | --- | --- |
-| `PARALLEL=8` | `--parallel 8`, `TF_GLM_MULTI_WINDOW=64` | up to eight requests decode together (her recipe patch 0069; her main lane serves four): one cache pool, batched verify windows of up to 64 rows, DFlash2 drafts for every stream; each reply equals the one its request gets alone ([eight streams](#eight-streams)) |
+| `PARALLEL=8` | `--parallel 8`, `TF_GLM_MULTI_WINDOW=32` | up to eight requests decode together (her recipe patch 0069; her main lane serves four): one cache pool, batched verify windows of up to 32 rows ([a 32-row verify window](#a-32-row-verify-window)), DFlash2 drafts for every stream; each reply equals the one its request gets alone ([eight streams](#eight-streams)) |
 | `DENSE=q4` | `TF_GLM_DENSE=q4` | the dense weights in MSE-searched 4-bit groups of 64, the head in FP8 (lossy against BF16, as in her recipe) |
 | `KV=fp8` | `TF_GLM_KV=fp8` | the DSA latent and indexer caches as e4m3 rows with a power-of-two scale each |
-| `CACHE_GIB=8.5`, `CACHE_ENTRIES=20` | `TF_GLM_CACHE_GIB`, `TF_GLM_CACHE_ENTRIES` | kept prompt states for the prompt cache, and the KV pool from the rest of the budget: 1,579,008 tokens at eight streams with the kept states in host RAM (727,040 at 2.0's 6.5 GiB with them on the GPU; [kept prompts in host RAM](#kept-prompts-in-host-ram)) |
+| `CACHE_GIB=8.5`, `CACHE_ENTRIES=20` | `TF_GLM_CACHE_GIB`, `TF_GLM_CACHE_ENTRIES` | kept prompt states for the prompt cache, and the KV pool from the rest of the budget: 1,585,152 tokens at eight streams with the kept states in host RAM (1,579,008 with 2.1's 64-row window; 727,040 at 2.0's 6.5 GiB with them on the GPU; [kept prompts in host RAM](#kept-prompts-in-host-ram)) |
 | `ATTN_ENV` | `TF_GLM_KEPT_HOST=1`, `TF_GLM_HOST_CACHE_GIB=24` | this recipe's host RAM tier on the attention node (patch 0032, after glm53f-afd's design; [below](#kept-prompts-in-host-ram)): kept prompts' states in pinned host RAM, and up to 24 GiB of evicted prompts' rows parked there |
 | `ATTN_ENV` | `TF_GLM_FILL_PAIRS=1` | this recipe's fills during decode for her sliced fills (patch 0033; [below](#prompt-chunks-filled-as-pairs-while-streams-decode)) |
 | `ATTN_ENV` | `TF_GLM_DECIDE_THEN_COPY=1`, `TF_GLM_CAPACITY_STATUS=1`, `TF_GLM_DELIVERY_ABORT=1` | her v1.8 serving fixes, as her lane applies them (patches 0042, 0043, 0045; [below](#her-v18-serving-fixes)) |
@@ -101,7 +116,10 @@ lane follow the table ([deviations](#deviations-from-her-main-lane)); the levers
 | `ATTN_ENV` | `TF_GLM_PREFILL_PAIRS=1` | this recipe's prompt chunk pairs (patch 0022): while no stream decodes, two consecutive prompt chunks go through the layers together, one chunk's attention on the 5090 while the Sparks compute the other's experts; 144 MiB of buffers for the second chunk |
 | `ATTN_ENV` | `TF_GLM_CACHE_ROOM=1` | this recipe's room rule for her pool code (patch 0025; [below](#the-pools-room-rule)) |
 | `ATTN_ENV` | `TF_GLM_PREFILL_ORDER=sjf` | this recipe's shortest-first order for her grouped prompt chunk (patch 0029; [below](#shortest-first-prompt-order)) |
-| `MCDMA_INFLIGHT=2` | `TF_GLM_MCDMA_INFLIGHT=2` | two MoE exchanges in flight to each Spark, each on its own link (patch 0027; [below](#two-exchanges-in-flight)) |
+| `MCDMA_INFLIGHT=4` | `TF_GLM_MCDMA_INFLIGHT=4` | four MoE exchanges in flight to each Spark, each on its own link (patch 0027; [below](#four-exchanges-in-flight-and-four-prompt-lanes)) |
+| `ATTN_ENV` | `TF_GLM_PREFILL_LANES=4` | this recipe's prompt lanes (patch 0026, after glm53f-afd's design): up to four prompt chunks at once, each exchange on its own link ([below](#four-exchanges-in-flight-and-four-prompt-lanes)) |
+| `ATTN_ENV`, `EXPERT_ENV` | `TF_GLM_PARTIALS_BF16=1` | BF16 partial sums on the return wire for prompt windows (patch 0050, after glm53f-afd's design), the same on all three nodes ([below](#bf16-partial-sums-on-the-return-wire)) |
+| `EXPERT_ENV` | `TF_GLM_EXPERT_KERNEL_MT=4`, `_GW=16`, `_NT=4`, `_L2=1`, `TF_GLM_EXPERT_KERNEL_TIER_ROWS=1536` | glm53f-rank's own schedule for its biggest windows, on the Sparks' prompt windows of 1,536 rows and more (patches 0049, 0051; [below](#glm53f-ranks-schedule-on-the-big-prompt-windows)) |
 | `ATTN_ENV` | `TF_GLM_LATENT_MMA=1`, `TF_GLM_HC_MMA=1`, `TF_GLM_SEQ_ROWS=256`, `TF_GLM_SPARSE_ONEPASS=1`, `TF_GLM_PROMPT_DSA=1` | her attention-side prompt kernels (patch 0028; [below](#her-attention-side-prompt-kernels)) |
 | (default) | `TF_GLM_EXL3_NFIRST`, `_PF`, `_ORDER`, `_ROWROT` | the expert nodes' prompt-window launch order, register prefetch and per-row rotation, on by default for windows of 64 rows or more; `=0` turns one off |
 
@@ -110,7 +128,7 @@ rows from `TF_GLM_SHARED_PREFIX` to `TF_GLM_KEEP_REASONING`, without `TF_GLM_EXL
 greedy replies (5 of 5) and every row of the concurrent-stream check (33 of 33) are bit-identical to the same lane's
 replies without them, and each new kernel's output is byte-identical to the kernel it replaces (1,323 checks on the
 5090, 233 on each Spark). This update's draft policy setting, room rule, shortest-first order and second exchange in
-flight change no reply either; each section below gives its check. Four change the prompt arithmetic, so the replies:
+flight change no reply either; each section below gives its check. Five change the prompt arithmetic, so the replies:
 
 - `TF_GLM_KDA_CHUNKED=1`: its kernel is byte-identical to Mia's (36 of 36 cases: two head counts, six row counts, three
   positions), and against the serial kernel's log-probs over 1,866 positions it gives a mean KL of 0.002967, a p99 of
@@ -122,10 +140,15 @@ flight change no reply either; each section below gives its check. Four change t
   ([below](#her-attention-side-prompt-kernels)).
 - `TF_GLM_EXPERT_KERNEL=g53` (2.1): the expert nodes' prompt rows take glm53f-rank's bits, the same in every window
   from 1 row to 4,096 ([below](#hugh-maddens-expert-prompt-kernels-on-the-sparks)).
+- `TF_GLM_PARTIALS_BF16=1` (2.15): each half's sum for a prompt window is rounded to BF16 once
+  ([below](#bf16-partial-sums-on-the-return-wire)).
 
 2.1's other switches change no reply: with the host RAM tier, prompt fills during decode and her v1.8 fixes on, the
 lab's greedy replies, concurrent-stream rows and long-prompt replies equal the same configuration's without them,
-bit for bit, on every boot that added one ([BENCHMARKS](BENCHMARKS.md#21s-levers-one-at-a-time)).
+bit for bit, on every boot that added one ([BENCHMARKS](BENCHMARKS.md#21s-levers-one-at-a-time)). 2.15's other
+settings change no reply either: four exchanges in flight with four lanes, the 32-row window and the big-window
+schedule each gave the replies of the configuration without them, bit for bit
+([BENCHMARKS](BENCHMARKS.md#215s-levers-one-at-a-time)).
 
 `TF_GLM_PREFILL_PAIRS=1` changes only the order of two chunks' kernels, never a chunk's rows or arithmetic: with it on,
 the greedy replies (5 of 5), the 22 concurrent requests' 33 recorded cases, and the prompt cache's replies and cached
@@ -139,16 +162,20 @@ counts equal pairs off, bit for bit, on top of `TF_GLM_KDA_CHUNKED=1`.
   replies of the serial KDA kernel; the chunked kernel's replies differ slightly, and the drafter drafts fewer rows a
   round on them. `fnc5:0.2`, the same noise-aware rule with up to five drafts and a 0.2 threshold, keeps most of the
   policy's decode gain without that cost ([the draft policy setting](#the-draft-policy-setting)). Put
-  `TF_GLM_DFLASH_POLICY=fnc7:0.3` in its place to run her lane's.
-- **Eight streams, where her main lane serves four** (`PARALLEL=8`, her recipe patch 0069, with the 64-row verify
-  window her recipe sets past four requests). On the 5090 the extra streams' working memory comes out of the cache
-  budget; with the kept states in host RAM the KV pool is 1,579,008 tokens ([eight streams](#eight-streams)).
+  `TF_GLM_DFLASH_POLICY=fnc7:0.3` in its place to run her lane's. Measured again on 2.1's configuration for 2.15,
+  `fnc7:0.3` gave spark-bench decode +3.7% (geometric mean) for the coding-agent load -5.2%, and `fnc6:0.25`
+  +2.5% for -3.2%; neither was adopted.
+- **Eight streams, where her main lane serves four** (`PARALLEL=8`, her recipe patch 0069), with a 32-row verify
+  window where her recipe sets 64 past four requests ([a 32-row verify window](#a-32-row-verify-window)). On the 5090
+  the extra streams' working memory comes out of the cache budget; with the kept states in host RAM the KV pool is
+  1,585,152 tokens ([eight streams](#eight-streams)).
 - **Kept prompts' states in the attention host's RAM** (`TF_GLM_KEPT_HOST=1`, `TF_GLM_HOST_CACHE_GIB=24`, patch
   0032). Her lane keeps them in the Sparks' unified memory beside the cache; the 5090's 32 GB cannot hold them and a
   large pool both ([below](#kept-prompts-in-host-ram)).
 - **Hugh Madden's expert prompt kernels take the Sparks' prompt chunks** (`TF_GLM_EXPERT_KERNEL=g53`, patches 0034 and
   0035), where her lane runs her EXL3 prompt kernel: fresh prompts 13.6% faster on this split, with other replies
-  ([below](#hugh-maddens-expert-prompt-kernels-on-the-sparks)).
+  ([below](#hugh-maddens-expert-prompt-kernels-on-the-sparks)); on windows of 1,536 rows and more they run
+  glm53f-rank's own big-window schedule ([below](#glm53f-ranks-schedule-on-the-big-prompt-windows)).
 - **2,048-row prompt chunks, where her lane runs 4,096** (her recipe patches 0004 and 0008, here patch 0031, shipped
   off): on this split's expert nodes the EXL3 grouping kernel cannot launch a prompt window over 2,812 rows on GB10
   ([measured and off](#measured-and-off)).
@@ -157,8 +184,10 @@ counts equal pairs off, bit for bit, on top of `TF_GLM_KDA_CHUNKED=1`.
   ([measured and off](#measured-and-off)). Her v1.8 fixes 0078, 0081 and 0083 are on, as in her lane.
 - **Prompt chunk pairs are on** (`TF_GLM_PREFILL_PAIRS=1`, this recipe's patch 0022). Her two-Spark recipe has no
   equivalent: its prompt overlap works across its two TP ranks, which this split does not have.
-- **Two MoE exchanges are in flight to each Spark** (`MCDMA_INFLIGHT=2`, patch 0027). Her lane has no wire between
-  attention and experts; on this split the second exchange keeps the Sparks busy ([below](#two-exchanges-in-flight)).
+- **Four MoE exchanges are in flight to each Spark, with four prompt lanes** (`MCDMA_INFLIGHT=4`, patches 0027 and
+  0026), **and the Sparks return prompt windows' sums in BF16** (`TF_GLM_PARTIALS_BF16=1`, patch 0050). Her lane has
+  no wire between attention and experts; on this split the exchanges in flight keep the Sparks busy, and the BF16
+  replies halve the return bytes ([below](#four-exchanges-in-flight-and-four-prompt-lanes)).
 - **Two changes to her code's behaviour** (this recipe's, each behind its own switch): the pool's room rule
   (`TF_GLM_CACHE_ROOM=1`, patch 0025) changes which kept prompts her pool code (her recipe patch 0030) evicts, and
   shortest-first prompt order (`TF_GLM_PREFILL_ORDER=sjf`, patch 0029) changes the order in which her grouped prompt
@@ -171,12 +200,14 @@ counts equal pairs off, bit for bit, on top of `TF_GLM_KDA_CHUNKED=1`.
 
 ## The switches
 
-Each switch below is a lever 2.0 or 2.1 adds: whose work it is, how it is set, what it does and what it measured.
+Each switch below is a lever 2.0, 2.1 or 2.15 adds: whose work it is, how it is set, what it does and what it measured.
 Each was measured on the hardware this recipe targets against the same configuration without it, in the order they
 were added; [BENCHMARKS](BENCHMARKS.md#20s-levers-one-at-a-time) names each baseline of 2.0's, and
 [2.1's](BENCHMARKS.md#21s-levers-one-at-a-time). 2.0's own numbers come from one boot with its levers on
 ([BENCHMARKS](BENCHMARKS.md#20-as-shipped)); 2.1's from the same-window run ([BENCHMARKS](BENCHMARKS.md#21-in-the-same-window-as-mias-recipe-v18)).
-2.1's levers are the last five sections.
+2.1's levers are the five sections from [kept prompts in host RAM](#kept-prompts-in-host-ram) to
+[TensorFold 0.6.6](#tensorfold-066), and 2.15's the last four, with numbers from the lab's boots
+([BENCHMARKS](BENCHMARKS.md#215s-levers-one-at-a-time)).
 
 ### Her EXL3 prompt kernel on the Sparks
 
@@ -244,7 +275,8 @@ were added; [BENCHMARKS](BENCHMARKS.md#20s-levers-one-at-a-time) names each base
   [MCDMA](https://github.com/ashhart/MCDMA), whose protocol carries one request per link, so exchanges in flight take
   more links. Patch 0027 writes the queued exchanges for MCDMA and this tree's prompt chunks; no code is copied.
 - **Switch:** `MCDMA_INFLIGHT=2` in `.env`: the scripts start two listen daemons on each Spark and pass
-  `TF_GLM_MCDMA_INFLIGHT=2` to the attention node (patch 0027; 1 = one link to each Spark).
+  `TF_GLM_MCDMA_INFLIGHT=2` to the attention node (patch 0027; 1 = one link to each Spark). 2.15 sets 4
+  ([four exchanges in flight](#four-exchanges-in-flight-and-four-prompt-lanes)).
 - **What:** [the wire](#the-mcdma-wire). The Sparks find the next request waiting when they reply, instead of idling
   while a reply crosses the wire and the next request comes back.
 - **Measured** (against the same configuration with one link pair): each Spark's idle time per exchange **7.33 ->
@@ -305,13 +337,14 @@ were added; [BENCHMARKS](BENCHMARKS.md#20s-levers-one-at-a-time) names each base
 - **Whose:** MiaAI-Lab's: her recipe patch 0069 (`glm-eight-streams`) at her recipe's v1.5 commit `1576746`, ported,
   with the 64-row verify window her recipe sets past four requests (`TF_GLM_MULTI_WINDOW` defaults to 32 here).
 - **Switch:** `PARALLEL=8` in `.env` with `TF_GLM_MULTI_WINDOW=64` in `ATTN_ENV` and `CACHE_GIB=6.5` (patch 0030;
-  `PARALLEL` 1-8, the window 16-64 rows).
+  `PARALLEL` 1-8, the window 16-64 rows). 2.1 raised `CACHE_GIB` to 8.5, and 2.15 sets the window to 32
+  ([a 32-row verify window](#a-32-row-verify-window)).
 - **What:** up to eight requests decode together. At four or fewer streams with the window unset, every table, buffer
   and kernel call is the one before. On the 5090 the extra streams' working memory comes out of the cache budget: at
   eight streams the card went over its memory gate (27,136 MiB) with a 7.5 GiB budget (27,600 MiB) and with 7 GiB and
   the 64-row window (27,370 MiB), so the budget is 6.5 GiB and the KV pool 727,040 tokens instead of 966,656. In 2.1
   the kept states live in host RAM ([kept prompts in host RAM](#kept-prompts-in-host-ram)): the budget is 8.5 GiB and
-  the pool 1,579,008 tokens, under the same gate.
+  the pool 1,579,008 tokens, under the same gate (1,585,152 with 2.15's 32-row window).
 - **Measured** (against four streams at 8 GiB, the arena's 32K and 64K cells at five and ten clients): the first token
   **15.0 -> 13.2 s** at 32,768 x 10 and **15.3 -> 13.8 s** at 65,535 x 10 (−10.8% geometric mean), 6.5 -> 6.2 s and 6.7
   -> 6.5 s at five clients; prompt rates 1.12-1.34x and generation 1.05-1.08x in all four cells (65,535 x 10: 768.9 /
@@ -423,6 +456,85 @@ were added; [BENCHMARKS](BENCHMARKS.md#20s-levers-one-at-a-time) names each base
   no `priority` of its own is served as background. This recipe passes no `--name-priority`, so serving is unchanged.
 - **Why:** it is TensorFold's latest Python release ([Upstream](../README.md#upstream)).
 
+### Four exchanges in flight and four prompt lanes
+
+- **Whose:** Hugh Madden's designs, as for [two exchanges in flight](#two-exchanges-in-flight): the exchanges kept in
+  flight ahead of the expert ranks, and the prefill in lanes (glm53f-afd `91db3cc`, `crates/glm53f-forward/src/forward.rs`,
+  `run_lanes`, four lanes of 2,048 rows; the two-lane prefill of his mimo26f-afd `bab9fa2` before it). Patches 0027 and
+  0026 write them for MCDMA and this tree's prompt chunks; no code is copied. The second connect daemon is this
+  recipe's: MCDMA's connect daemon takes six peers.
+- **Switch:** `MCDMA_INFLIGHT=4` in `.env` (four listen daemons on each Spark, two connect daemons on the attention host,
+  `TF_GLM_MCDMA_INFLIGHT=4` on the attention node) with `TF_GLM_PREFILL_LANES=4` in `ATTN_ENV`. 2.1 ran two in
+  flight, with prompt pairs as its two lanes.
+- **What:** up to four prompt chunks go through the layers together, and each one's exchange goes out on its own link
+  as soon as its attention has run, so the Sparks find more requests waiting. The order changes, never a row: the
+  replies are the configuration's without it, bit for bit.
+- **Measured** (the lab, against the same configuration with three in flight and three lanes, itself 2.1's with the
+  32-row window): fresh 8K prompts **+11.0%** (3,124 against 2,814 tok/s), the geometric mean of 8K / 31K / 62K +3.6%;
+  a cold ~2.6K prompt's first token 3.9% sooner; every other measure inside its noise. Bits equal (the greedy,
+  concurrent and long-prompt replies); the 5090 peaked at 25.93 GiB, under the 27.5 GiB gate. Against 2.1's two in
+  flight, three in flight had already given fresh 31K / 62K prompts +11.0% / +7.4% and a cold 100K prompt's first
+  token 7.2% sooner, for fresh 8K prompts 3.0% slower; four took that back. Two cold 200K prompts sent together share the four lanes: the first was answered after about 90 s
+  instead of about 60 s with three lanes, the second at the same time as before (about 120 s); the tiered schedule
+  below brought the first back to 56 s (one run each).
+- **Memory:** when patch 0026 was first measured, four lanes ran the 5090 out of memory, because each later lane
+  added a 1.25 GiB working segment. On 2.1's tree the prompt fills no longer grow the 5090's memory, and four lanes
+  fit.
+
+### A 32-row verify window
+
+- **Whose:** her recipe patch 0069's verify window (`TF_GLM_MULTI_WINDOW`, patch 0030), which her recipe sets to 64 past
+  four requests; the value is this recipe's.
+- **Switch:** `TF_GLM_MULTI_WINDOW=32` in `ATTN_ENV` (2.1: 64).
+- **What:** at eight streams a verify round carries at most 32 rows, so the drafter's longest drafts are cut: in the
+  lab's coding-agent load at eight requests, 3.99 rows a stream and round instead of 5.93, with 72% of the drafted rows
+  accepted instead of 61%. Each round is 28% shorter and there are 26% more of them. At four streams the window does
+  not bind (23.7 rows a round either way). The smaller verify buffers give the KV pool 6,144 more tokens: 1,585,152.
+- **Measured** (the lab, against the same configuration at 64 rows): the coding-agent load at eight requests **+9.6%**
+  (394.8 against 360.3 tok/s; 50.0 a stream against 45.7), at four requests -0.1%; every other measure inside its
+  noise. Bits equal (greedy 5 of 5, concurrent 11 of 11, long prompts 5 of 5).
+
+### BF16 partial sums on the return wire
+
+- **Whose:** Hugh Madden ([@dangerm00se](https://x.com/dangerm00se), [hughmadden](https://github.com/hughmadden))
+  authored the BF16 return path of [glm53f-afd](https://github.com/hughmadden/glm53f-afd) at `91db3cc`
+  (`crates/glm53f-rank/README.md`: the large-M path's reduce step and the return-path table, "Four BF16 planes, added in
+  FP32 by the coordinator"): each expert rank sums its routed experts in FP32, rounds the sum to BF16 and returns it.
+  Patch 0050 writes it for this tree's MCDMA wire; no code is copied.
+- **Switch:** `TF_GLM_PARTIALS_BF16=1` in both `ATTN_ENV` and `EXPERT_ENV`. The three nodes must agree: an expert node
+  whose setting differs refuses to start, and `./start.sh` refuses the two lines first.
+- **What:** [the wire](#the-mcdma-wire). A prompt window's replies are 8,192 bytes a row instead of 16,384; decode
+  windows keep fp32 replies, so decode does not change.
+- **Measured** (the lab, against the same configuration without it, four in flight): a cold ~2.6K prompt's first token
+  **8.3% sooner** (1.102 against 1.202 s), fresh 31K / 62K prompts **+2.9%**, a cold 100K prompt's first token 2.7%
+  sooner, fresh 8K +1.7%; the ten-client arena cell's first token 5.8% sooner and its prompt rate +7.1%. The wire check
+  found 0 mismatches in 256 forwards (pairs and lanes among them), and the 5090 peaked at 25.93 GiB.
+- **Replies:** each half's sum is rounded once, so the replies change. Against the same configuration without it, over
+  1,866 forced positions: mean KL **0.00218** (the gate 0.003), p99 0.0351 (0.05), top-1 99.04% (98.5%). Replies stay
+  deterministic, drafted replies equal undrafted ones, and concurrent replies equal their solo runs. AEON-30 scored
+  **22 of 30** with it (the bar is 21; 23 without it). Its decode numbers moved with the new texts, not with decode
+  speed: at four requests of the coding-agent load the drafter accepted 67% of its drafts instead of 61% (one stream
+  prose -5%, JSON +10%, the coding-agent load at four requests +8.3%). Remove it from both lines to keep 2.1's
+  replies.
+
+### glm53f-rank's schedule on the big prompt windows
+
+- **Whose:** the schedule is glm53f-rank's own for its windows above 2,048 rows, in Hugh Madden's expert prompt kernels
+  ([above](#hugh-maddens-expert-prompt-kernels-on-the-sparks)): 64-row groups, 16 gate/up warps, 512-column down
+  chunks, and the experts' weights loaded normally rather than evict-first. Patch 0049 (this recipe's) adds knobs for
+  every field of the kernels' launch configuration, and patch 0051 (this recipe's) a row tier for them.
+- **Switch:** `TF_GLM_EXPERT_KERNEL_MT=4`, `_GW=16`, `_NT=4`, `_L2=1` with `TF_GLM_EXPERT_KERNEL_TIER_ROWS=1536` in
+  `EXPERT_ENV`. The knobs these four set keep every bit (a GPU test checks the kernels' bytes); the knobs that would not
+  (`_SK`, `_SKD`, `_SWIGLU`) are refused with the tier.
+- **What:** on GB10 that schedule runs a 2,048-row window about 5% faster than the default, but windows of 256 to 1,024
+  rows 4-10% slower, so it runs on windows of 1,536 rows and more only, and smaller windows keep the default. A row's
+  bits are the same on either side.
+- **Measured** (the lab, against the same configuration with the default schedule): fresh 31K / 62K prompts **+6.7%**
+  and a cold 100K prompt's first token **6.7% sooner** (27.09 against 29.03 s), fresh 8K +6.0%, a cold ~2.6K prompt's
+  3.6% sooner; decode and the arena's 100,000 x 5 cell unchanged; the ten-client cell's first token +2.2% against the
+  pooled base, inside its noise (-0.5% against its same-session base run). Bits equal. On every window, without the
+  tier, the schedule had cost that cell's first token 3.5% and its prompt rate 4.5%.
+
 ## Measured and off
 
 These ship in the patches, off. Each was measured on this hardware and not adopted.
@@ -453,7 +565,7 @@ These ship in the patches, off. Each was measured on this hardware and not adopt
   65,535 x 10 cell's prompt rate fell 8.1% and its first token came 4.3% later (spark-bench -0.3%). Without them, a
   request whose client leaves while it waits for a lane stays queued until a lane frees (100-127 s in the lab's
   probe); with `TF_GLM_QUEUED_CANCEL=1` it is dropped at once (0.15 s). Each switch can be set alone; the lab measured
-  them only together.
+  them only together; for 2.15 it measured `TF_GLM_QUEUED_CANCEL` alone ([below](#measured-for-215-and-left-off)).
 
 ### Admission at saturation (patch 0044)
 
@@ -463,24 +575,41 @@ These ship in the patches, off. Each was measured on this hardware and not adopt
 - **Measured (lab):** with `TF_GLM_MAX_QUEUED=0`, four requests past eight busy lanes were refused with `Retry-After: 5`
   in 0.01 s; unset, the same four waited and were served after 132-135 s. Left unset, as in her lane.
 
-### Prefill lanes and FP8 wire rows
+### FP8 wire rows (patch 0026)
 
-- **Whose:** Hugh Madden authored both in [glm53f-afd](https://github.com/hughmadden/glm53f-afd) at `91db3cc`: prefill
-  in four lanes of 2,048 rows (`crates/glm53f-forward/src/forward.rs`, `run_lanes`), which generalizes the two-lane
-  prefill of whole prompt chunks in his [mimo26f-afd](https://github.com/hughmadden/mimo26f-afd) at `bab9fa2`, and FP8
-  E4M3 wire rows with a UE8M0 scale per 32 values (`crates/glm53f-coordinator/kernels/wire.cu`). That row format is
-  DS41RT's, by T.J. Purtell ([@wrldsuksgo2mars](https://x.com/wrldsuksgo2mars), [tpurtell](https://github.com/tpurtell),
-  [ds41rt](https://github.com/tpurtell/ds41rt)), carried through mimo26f-afd. Patch 0026 writes both for TensorFold
+- **Whose:** Hugh Madden authored FP8 E4M3 wire rows with a UE8M0 scale per 32 values in
+  [glm53f-afd](https://github.com/hughmadden/glm53f-afd) at `91db3cc` (`crates/glm53f-coordinator/kernels/wire.cu`). That
+  row format is DS41RT's, by T.J. Purtell ([@wrldsuksgo2mars](https://x.com/wrldsuksgo2mars), [tpurtell](https://github.com/tpurtell),
+  [ds41rt](https://github.com/tpurtell/ds41rt)), carried through his [mimo26f-afd](https://github.com/hughmadden/mimo26f-afd).
+  Patch 0026 writes them, with the prompt lanes ([on](#four-exchanges-in-flight-and-four-prompt-lanes)), for TensorFold
   and MCDMA; no code is copied.
-- **Switches:** `TF_GLM_PREFILL_LANES=N` (1-4; unset follows prompt pairs: 2 with them on, else 1) and
-  `TF_GLM_WIRE_FP8=1` (patch 0026).
-- **Why off:**
-  - Four lanes with four exchanges in flight ran the 5090 out of memory on the first ~8K cold prompt, at 31,800 MiB:
-    each later lane adds one more 1.25 GiB working segment of the sparse attention, not just its 193 MiB of buffers.
-  - FP8 wire rows (4,224 bytes a row at hidden 4,096, against bf16's 8,192) fail the KL gate against the serial KDA
-    kernel's reference log-probs (mean 0.00454, p99 0.0772, top-1 98.39%; the gate is 0.003, 0.05 and 98.5%), and
-    they bought no prefill speed (the four prompt rates' geometric mean −0.8%): the wire's bytes are not what limits
-    prompts here.
+- **Switch:** `TF_GLM_WIRE_FP8=1` (patch 0026).
+- **Why off:** FP8 wire rows (4,224 bytes a row at hidden 4,096, against bf16's 8,192) fail the KL gate against the
+  serial KDA kernel's reference log-probs (mean 0.00454, p99 0.0772, top-1 98.39%; the gate is 0.003, 0.05 and 98.5%),
+  and they bought no prefill speed (the four prompt rates' geometric mean -0.8%): the wire's bytes are not what limits
+  prompts here. (2.0 and 2.1 also shipped the four lanes off: on the tree they were first measured on, four lanes ran
+  the 5090 out of memory. 2.15 runs them: [above](#four-exchanges-in-flight-and-four-prompt-lanes).)
+
+### Measured for 2.15 and left off
+
+Each was measured in the lab on 2.1's configuration (or on the one before it adopted the next lever) and not adopted.
+
+- **Three exchanges in flight with three lanes:** fresh 31K / 62K prompts +11.0% / +7.4% and a cold 100K prompt's
+  first token 7.2% sooner, for fresh 8K prompts 3.0% slower. It was adopted as a trade, then replaced by four.
+- **Her draft policy at `fnc7:0.3`, and at `fnc6:0.25`:** [deviations](#deviations-from-her-main-lane).
+- **Her queued-cancel fix alone** (`TF_GLM_QUEUED_CANCEL=1`, patch 0037: her recipe patch 0073 by desy0305, with
+  johnwhited's delivery-failure handling): a waiting request whose client left was dropped in 0.10 s, with eight
+  running, instead of 100.3 s, and the replies were unchanged; but the ten-client arena cell's prompt rate fell 5.6%
+  (6.7% against three boots of the configuration without it) and its first token came 2.2% later. That cell is the one
+  where requests wait in the queue. It stays off, and can be set alone.
+- **Her copy drafts** (her recipe patches 0007, 0013 and 0032, not ported; measured on a lab build with her lines):
+  edits and rewrites of pasted text +24% to +50%, but quoting failed records from a tool's JSON result 27% slower (36%
+  at four requests), the coding-agent load 1.2-1.7% slower and spark-bench decode -0.5%. They would need a
+  per-request switch. Her L2 prefetch on the same build changed nothing (+0.0%).
+- **glm53f-rank's big-window schedule on every window** (patch 0049 without patch 0051's tier): fresh 31K / 62K prompts
+  +5.2%, a cold 100K prompt's first token 4.6% sooner, but the ten-client cell's first token 3.5% later and its prompt
+  rate 4.5% lower: the schedule is slower on windows of 256 to 1,024 rows. The tier keeps its gain without that cost
+  ([above](#glm53f-ranks-schedule-on-the-big-prompt-windows)).
 
 ## The patches
 
@@ -514,8 +643,8 @@ patch's author, message and credits.
 | 0023 | the chunked KDA prompt kernel, a 64-token prompt grid and prompt replay, `TF_GLM_KDA_CHUNKED` | `ATTN_ENV` | port of her patches 0012, 0014, 0039, 0008, 0042 |
 | 0024 | her EXL3 prompt kernel for the routed experts' prompt chunks, `TF_GLM_EXL3_PROMPT` | `EXPERT_ENV` | port of her patches 0004, 0009, 0020 |
 | 0025 | the pool's room rule, `TF_GLM_CACHE_ROOM` | `ATTN_ENV` | this recipe's change to her patch 0030's pool code |
-| 0026 | prefill lanes, `TF_GLM_PREFILL_LANES`, and FP8 wire rows, `TF_GLM_WIRE_FP8` | no ([measured and off](#measured-and-off)) | this recipe's code; Hugh Madden authored the designs in glm53f-afd and mimo26f-afd, and the FP8 row format is T.J. Purtell's (ds41rt) |
-| 0027 | several MoE exchanges in flight to each expert node, `TF_GLM_MCDMA_INFLIGHT` | `MCDMA_INFLIGHT=2` | this recipe's code; Hugh Madden authored the design in glm53f-afd |
+| 0026 | prefill lanes, `TF_GLM_PREFILL_LANES`, and FP8 wire rows, `TF_GLM_WIRE_FP8` | lanes: `ATTN_ENV` (4); FP8 rows: no ([measured and off](#measured-and-off)) | this recipe's code; Hugh Madden authored the designs in glm53f-afd and mimo26f-afd, and the FP8 row format is T.J. Purtell's (ds41rt) |
+| 0027 | several MoE exchanges in flight to each expert node, `TF_GLM_MCDMA_INFLIGHT` | `MCDMA_INFLIGHT=4` | this recipe's code; Hugh Madden authored the design in glm53f-afd |
 | 0028 | her attention-side prompt kernels behind five switches | `ATTN_ENV` | port of her patches 0004, 0009, 0028 |
 | 0029 | shortest-first prompt order with aging, `TF_GLM_PREFILL_ORDER` | `ATTN_ENV` | this recipe's change to her patch 0049's grouped chunk |
 | 0030 | up to eight concurrent streams, `TF_GLM_MULTI_WINDOW` | `PARALLEL=8`, `ATTN_ENV` | port of her patch 0069 |
@@ -537,6 +666,9 @@ patch's author, message and credits.
 | 0046 | `--name-priority ID=background` on the CUDA server | — (not passed) | TensorFold v0.6.6's `dce62cf`, by Philip Mossop ([TensorFold#445](https://github.com/ashhart/TensorFold/pull/445)) |
 | 0047 | `--name-priority` resolves a local model path before naming it | — | TensorFold v0.6.6's `07f3777`, by Ash Hart |
 | 0048 | release: TensorFold 0.6.6 | yes | TensorFold v0.6.6's `cb2ebf0`, by Ash Hart |
+| 0049 | knobs for the g53 expert kernels' launch configuration (`TF_GLM_EXPERT_KERNEL_MT`, `_GW`, `_NT`, `_L2`, `_FUSE`, `_DISCARD`, `_SK`, `_SKD`, `_SWIGLU`) | `EXPERT_ENV` (with 0051's tier) | this recipe's, on 0034; the schedule set is glm53f-rank's |
+| 0050 | BF16 partial sums on the return wire for prompt windows, `TF_GLM_PARTIALS_BF16` | `ATTN_ENV`, `EXPERT_ENV` | this recipe's code; Hugh Madden authored the design (glm53f-afd's BF16 return planes) |
+| 0051 | the knobs' schedule on prompt windows of at least N rows only, `TF_GLM_EXPERT_KERNEL_TIER_ROWS` | `EXPERT_ENV` (1,536) | this recipe's, on 0049 |
 
 Her pull-request commits are her commits, with her authorship, and TensorFold's own v0.6.6 commits (0046-0048) keep
 theirs; each of those three names its upstream commit in its notes. Each port names her recipe patches in its subject,
@@ -545,7 +677,7 @@ from, Apache-2.0) in the patch notes; TensorFold's `THIRD_PARTY_NOTICES.md` in t
 and the ports of her contributors' patches name their authors in their messages. The three changes of this recipe's
 to her ported code (0025, 0029, 0033) keep `Co-authored-by: MiaAI-Lab` as well, and their notes name her patch and
 recipe commit and say the change is this recipe's; 0034's notes name the parts of her patches it reimplements.
-Patches 0026, 0027, 0032 and 0034 name Hugh Madden's files and commits, and T.J. Purtell's work where it is used, in
+Patches 0026, 0027, 0032, 0034 and 0050 name Hugh Madden's files and commits (0049 and 0051 name his kernels), and T.J. Purtell's work where it is used, in
 their messages and in `THIRD_PARTY_NOTICES.md`. `tools/export_patches.sh` regenerates `patches/` from a TensorFold
 branch and checks all of this. Each release configuration was measured on the same code plus one commit of exchange
 and round timers, which were switched off in every measured run and are not shipped.
@@ -585,6 +717,12 @@ With pairs on, a 2,048-row chunk's exchange window took 35.95 ms per MoE layer: 
 (patch 0027) hide most of that, so each Spark idles 2.03 ms per exchange instead of 7.33 ms. Her attention-side
 prompt kernels (patch 0028) shorten the 5090's own part: a cold 100K prompt's first token 11.5% sooner.
 
+2.15 works on the same three parts. Four exchanges in flight with four lanes keep more requests waiting at the
+Sparks; the BF16 replies halve the bytes that come back for a prompt window, which helps most where the wire is a
+larger share of the exchange (a cold ~2.6K prompt's first token 8.3% sooner, long prompts 2.9% faster); and
+glm53f-rank's big-window schedule runs the Sparks' kernels about 5% faster on full 2,048-row windows (long prompts
+6.7% faster). The Sparks' expert compute is still the floor.
+
 ## Limits
 
 - The `glm5_next` CUDA family and EXL3 checkpoints only; `tensorfold experts` refuses anything else.
@@ -603,23 +741,30 @@ prompt kernels (patch 0028) shorten the 5090's own part: a cold 100K prompt's fi
   lane ([BENCHMARKS](BENCHMARKS.md#three-arena-cells-20-as-shipped)). 2.1 against her v1.8: at ten clients on
   65,535-token contexts, prompt rate 1.94x, aggregate generation 1.69x and the first token in 0.45x the time, while
   each request decoded at 0.80x (12.7 against 16.0 tok/s); at five clients on 100K, 2.58x, 1.57x and 0.49x, and per
-  request 1.08x (18.6 against 17.2) ([BENCHMARKS](BENCHMARKS.md#21-in-the-same-window-as-mias-recipe-v18)).
+  request 1.08x (18.6 against 17.2) ([BENCHMARKS](BENCHMARKS.md#21-in-the-same-window-as-mias-recipe-v18)). 2.15
+  was not measured against her lane. In the lab against 2.1 as published (the same harnesses), the ten-client
+  cell's prompt rate was 0.96x, aggregate generation 1.01x, first token 1.00x and generation per request 1.09x, and
+  the five-client cell's 1.03x, 1.03x, 0.96x and 0.98x ([BENCHMARKS](BENCHMARKS.md#215-in-the-lab)).
 - A request whose client leaves while it waits for a lane stays queued until a lane frees (100-127 s in the lab's
   probe): her patch 0073, which drops it at once (`TF_GLM_QUEUED_CANCEL=1`, patch 0037), ships off with her v1.7.1
-  kept-prompt patches ([measured and off](#measured-and-off)).
-- One KV pool of 1,579,008 tokens at eight streams holds every request's cache; the 20 kept prompts' states sit in the
+  kept-prompt patches; alone, it cost the ten-client arena cell 5.6% of its prompt rate
+  ([measured and off](#measured-for-215-and-left-off)).
+- One KV pool of 1,585,152 tokens at eight streams holds every request's cache; the 20 kept prompts' states sit in the
   attention host's pinned RAM, and prompts the pool evicts for room park their rows there (up to 24 GiB). Mia's two
   Sparks hold 1,710,080 tokens at four streams (each request up to 262,144). Deep contexts that outgrow the pool and
   the host tier fill prompts again. As 2.0 shipped (727,040 tokens), the arena's 5 x 100K and 10 x 65K cells resumed
-  every request (cache hits 49.5% and 49.2%, the ideal); with 2.1's pool they still do.
+  every request (cache hits 49.5% and 49.2%, the ideal); with 2.1's and 2.15's pools they still do.
 - The host RAM tier needs RAM the attention host can pin: 33.35 GiB as shipped. A prompt dropped by the 20-prompt cap
   is not parked, only one the pool evicts for room.
-- `MCDMA_INFLIGHT` is 1-3 in the scripts: one connect daemon on the attention host holds six peers, two links a
-  setting. Patch 0027 takes up to 4, which needs a second connect daemon.
+- `MCDMA_INFLIGHT` is 1-4, as patch 0027 takes: one connect daemon on the attention host holds six peers, so at 4
+  the scripts start a second one for link 3 of both Sparks.
 - Prompt chunk pairs run only while no stream decodes; a prompt that arrives while others decode fills in layer slices,
   unpaired.
 - With `tool_choice: "none"` the server offers the model no tools, but the model can still write tool-call markup as
   plain text. That is TensorFold 0.6.5's behaviour, unchanged by patch 0020.
+- Known limitation: under eight requests of mixed load with long prompts, a long streamed tool call can pause about
+  7 s between stream events (6.3 and 7.0 s in the soak, against its probe's 6 s limit:
+  [BENCHMARKS](BENCHMARKS.md#215s-soak-and-failure-drills)).
 - Not ported from Mia's recipe:
   - copy drafts and their 16-row verify windows (her patches 0007, 0013, 0032);
   - the parts that only make sense on two TP ranks: the hyper-connection split, the prefill overlap across ranks, her
@@ -638,7 +783,12 @@ engine is frozen ([#286](https://github.com/ashhart/TensorFold/issues/286), at 0
 one model over several machines through mcdma links; an attention-on-one-GPU, experts-on-the-Sparks layout would be a
 new placement there, once GLM-5.3-Flash is on the Zig engine and the Zig engine serves CUDA. He cites this split's
 finding that expert compute, not the wire, sets the round time ([where the time goes](#where-the-time-goes)) as the
-reference for that design. This recipe stays on the Python engine: v0.6.5 with v0.6.6's commits (patches 0046-0048)
+reference for that design. He answered again on 2026-10-07
+([his second reply](https://github.com/ashhart/TensorFold/issues/214#issuecomment-6033151997)): the split wants two
+commands, a serve process for attention and an expert process for the routed experts, with a transport between
+them; the Zig engine ports GLM to one box first, and the split follows on the same expert weights; and a failed
+expert process must fail the request, not hang the attention side, as this split does: in the soak's drill the
+request in flight failed 23.3 s after an expert's process stopped ([the wire](#the-mcdma-wire)). This recipe stays on the Python engine: v0.6.5 with v0.6.6's commits (patches 0046-0048)
 and the rest of `patches/`.
 
 ## Who designed the split
@@ -651,8 +801,10 @@ Hugh Madden ([@dangerm00se](https://x.com/dangerm00se), [hughmadden](https://git
 [ds41rt](https://github.com/tpurtell/ds41rt), [glmrt](https://github.com/tpurtell/glmrt-5.3-1rtx-4spark) and
 [cuteafd](https://github.com/tpurtell/cuteafd), engines that run attention on RTX GPUs and the routed experts on DGX
 Sparks. This recipe runs that split on TensorFold over MCDMA. From glm53f-afd it carries one piece of code, Hugh
-Madden's expert prompt kernels (patches 0034 and 0035, on), whose split of every expert by intermediate channel is
-glmrt's; it uses no other code from their engines. Four of Hugh Madden's designs are written here for this tree: the
-exchanges kept in flight ahead of the expert ranks (patch 0027, on), the host RAM tier for kept prompts (patch 0032,
-on), and the prefill lanes and FP8 wire rows (patch 0026, off), whose row format is T.J. Purtell's DS41RT format.
+Madden's expert prompt kernels (patches 0034 and 0035, on; with glm53f-rank's own big-window schedule on the biggest
+windows, patches 0049 and 0051), whose split of every expert by intermediate channel is glmrt's; it uses no other
+code from their engines. Five of Hugh Madden's designs are written here for this tree: the exchanges kept in flight
+ahead of the expert ranks (patch 0027, on), the host RAM tier for kept prompts (patch 0032, on), the prefill lanes
+(patch 0026, on), the FP8 wire rows (patch 0026, off), whose row format is T.J. Purtell's DS41RT format, and the BF16
+return planes (patch 0050, on).
 Everything else is credited in [NOTICE.md](../NOTICE.md).

@@ -1,13 +1,14 @@
 # NOTICE
 
-GLM-5.3-Flash on 1x RTX 5090 + 2x DGX Spark, version 2.1: TensorFold with MiaAI-Lab's GLM work
+GLM-5.3-Flash on 1x RTX 5090 + 2x DGX Spark, version 2.15: TensorFold with MiaAI-Lab's GLM work
 Copyright 2026 Scott Quarrier
 
 This version's own scripts, patches and documentation are licensed under the Apache License, Version 2.0
 ([LICENSE](LICENSE)). If you redistribute it or a modified version of it, keep this NOTICE file and state what you
-changed (Apache-2.0, section 4). Version 2.0 (2026-10-05) stays at the tag
-[`v2.0`](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/tree/v2.0), under the same licence;
-every credit it gives is kept in this version. Version 1.0, the glm53f-afd version of 2026-09-30, stays MIT-licensed
+changed (Apache-2.0, section 4). Versions 2.0 (2026-10-05) and 2.1 (2026-10-06) stay at the tags
+[`v2.0`](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/tree/v2.0) and
+[`v2.1`](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/tree/v2.1), under the same licence;
+every credit they give is kept in this version. Version 1.0, the glm53f-afd version of 2026-09-30, stays MIT-licensed
 at the tag [`v1.0`](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/tree/v1.0); its credits are
 kept below, verbatim, in [Previous version (v1.0)](#previous-version-v10).
 
@@ -99,9 +100,10 @@ with her authorship; each patch names its pull request and her upstream commit:
   order. It keeps `Co-authored-by: MiaAI-Lab` and a credit header naming her patches and commit. Patches 0021, 0032
   and 0035 also keep `Co-authored-by: MiaAI-Lab` (0032 changes the `--parallel` decoder's kept prompts in `multi.py`;
   0035 extends 0034).
-- This project's own patches are 0001, 0008, 0011, 0021, 0022 (prompt chunk pairs), 0026 (prefill lanes and FP8 wire
-  rows, off), 0027 (exchanges in flight) and 0032 (kept prompts in host RAM); 0026, 0027 and 0032 write designs of
-  Hugh Madden's (below).
+- This project's own patches are 0001, 0008, 0011, 0021, 0022 (prompt chunk pairs), 0026 (prefill lanes, on, and FP8
+  wire rows, off), 0027 (exchanges in flight), 0032 (kept prompts in host RAM), 0049 and 0051 (launch-configuration
+  knobs for glm53f-afd's expert prompt kernels, and a row tier for them) and 0050 (BF16 partial sums on the return
+  wire); 0026, 0027, 0032 and 0050 write designs of Hugh Madden's (below).
 
 ## Contributors to her recipe whose patches are ported here
 
@@ -165,6 +167,12 @@ in the patched tree.
   `LICENSES/glm53f-afd-LICENSE.tensorfold.txt`, the TensorFold MIT notice glm53f-rank keeps), names them in the files'
   headers, and records the code in TensorFold's `THIRD_PARTY_NOTICES.md` ("GLM expert prompt kernels from
   glm53f-afd"). Keep them with any copy of a patched tree. The patch's other changes are offered under Apache-2.0.
+- Patches 0049 and 0051 are this project's code (Apache-2.0): environment knobs for the kernels' launch configuration
+  (glm53f-rank's `g53r_cfg`: `TF_GLM_EXPERT_KERNEL_MT`, `_GW`, `_NT`, `_L2` and others), and a row tier that runs the
+  knobs' schedule on prompt windows of at least N rows only (`TF_GLM_EXPERT_KERNEL_TIER_ROWS`). The schedule
+  `.env.example` sets (64-row groups, 16 gate/up warps, 512-column down chunks, and the experts' weights loaded
+  normally rather than evict-first) is glm53f-rank's own schedule for its windows above 2,048 rows; `.env.example` runs
+  it on windows of 1,536 rows and more.
 
 ## The attention/expert split: its authors (designs; their code only as stated above)
 
@@ -186,7 +194,8 @@ in the patched tree.
   flight ahead of the expert ranks (glm53f-afd `91db3cc`, `crates/glm53f-serve/src/lib.rs`; `TF_GLM_MCDMA_INFLIGHT`,
   on in `.env.example`), the prefill in two and four lanes (mimo26f-afd `bab9fa2`,
   `crates/mimo26-coordinator/src/dforward.rs`; glm53f-afd `crates/glm53f-forward/src/forward.rs`;
-  `TF_GLM_PREFILL_LANES`, off) and FP8 wire rows (glm53f-afd's `Fp8E4m3Ue8m0K32`; `TF_GLM_WIRE_FP8`, off). The FP8
+  `TF_GLM_PREFILL_LANES=4`, on in `.env.example` from 2.15) and FP8 wire rows (glm53f-afd's `Fp8E4m3Ue8m0K32`;
+  `TF_GLM_WIRE_FP8`, off). The FP8
   rows use the row format of T.J. Purtell's ds41rt, E4M3 with a UE8M0 scale per 32 values, which reached glm53f-afd
   through mimo26f-afd. TensorFold's `THIRD_PARTY_NOTICES.md` in the patched tree names them, in its "GLM prefill lanes
   and FP8 wire rows" and "GLM exchanges in flight" sections, with glm53f-afd's MIT notice (Copyright (c) 2026
@@ -196,6 +205,12 @@ in the patched tree.
   "KV snapshots and the RAM tier"; `TF_GLM_KEPT_HOST`, `TF_GLM_HOST_CACHE_GIB`, on in `.env.example`). glm53f-afd's
   NOTICE credits the tier to his mimo26f-afd, and its host cache's eviction design to T.J. Purtell's ds41rt.
   TensorFold's `THIRD_PARTY_NOTICES.md` in the patched tree names it in "GLM kept prompts in host RAM".
+- Patch 0050 writes a fifth of his designs, with no code copied: glm53f-afd's BF16 return planes
+  (`crates/glm53f-rank/README.md`: the large-M path's reduce step and the return-path table, "Four BF16 planes, added
+  in FP32 by the coordinator"). Each expert node sums its routed experts in FP32, rounds the sum to BF16 for prompt
+  windows and returns it; the attention node adds the planes in FP32 (`TF_GLM_PARTIALS_BF16`, on in `.env.example`
+  from 2.15). TensorFold's `THIRD_PARTY_NOTICES.md` in the patched tree names it in "GLM BF16 partial sums on the return
+  wire", with glm53f-afd's MIT notice.
 - glm53f-rank's expert prompt kernels in patch 0034 (above) keep glmrt's split of every expert by intermediate
   channel, which T.J. Purtell designed.
 
@@ -238,6 +253,9 @@ in the patched tree.
   Docker and the NVIDIA Container Toolkit; git; `huggingface_hub` (`hf`) for the downloads.
 - `extras/gb10-hostguard/` is v1.0's host guard, carried over unchanged in its code: Python's standard library and
   systemd only.
+- `extras/watch/` is v1.0's watcher (keep-alive, telemetry and its report), ported to this version: Python's standard
+  library, run from cron or a systemd timer. v1.0's credits name its author: v1.0's orchestrating agent (Claude Opus
+  5.5 in the Hermes agent harness) wrote it, with v1.0's other operations code.
 
 ## AGENTS.md (rules for agents that edit this repo)
 

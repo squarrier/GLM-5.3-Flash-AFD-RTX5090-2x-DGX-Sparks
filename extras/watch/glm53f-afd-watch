@@ -1,0 +1,489 @@
+#!/usr/bin/env python3
+"""extras/watch/glm53f-afd-watch: keep-alive and telemetry for the stack ./start.sh brings up. One run per call;
+run it every minute from cron or a systemd timer on the controller (the machine you run ./start.sh from):
+
+    * * * * * /path/to/repo/extras/watch/glm53f-afd-watch >> $HOME/.local/state/glm-afd/watch/alerts.log 2>&1
+
+It prints only when it acts or something needs you, so its output (alerts.log, or cron's mail) is the alert channel.
+
+Checks, every run: /health answers 200 (and no decode iteration has been stuck for WATCH_STALL_S); /v1/models lists
+MODEL_NAME or MODEL_ALIAS; a tiny streamed probe, thinking off, returns its nonce; the attention log has no new
+watchdog line ("... restart the serving stack"). A probe that times out while /health shows tokens still being
+produced counts as busy, not as a failure.
+
+Acts: after WATCH_FAILS (2) failed runs in a row it runs `./start.sh recover` (GLM_AFD_CALLER=watch): the three
+containers are stopped with SIGTERM and started again, and the MCDMA daemons too when a link or a daemon is down.
+
+Holds off (records, does not count, does not act):
+  * STATE_DIR/mode says maintenance (`echo maintenance > STATE_DIR/mode`; `echo serving > ...` resumes);
+  * ./stop.sh left its stop marker (CTL_STATE/stopped): a stack stopped by hand stays down until ./start.sh up;
+  * another ./start.sh up/recover/probe or ./stop.sh holds the control lock (CTL_STATE/ctl.lock);
+  * for 10 minutes after the controller boots.
+Circuit breaker: at most WATCH_MAX_RECOVERIES (3) recoveries in WATCH_WINDOW_H (6) hours, then it latches: it alerts
+and keeps collecting, and acts again after `rm STATE_DIR/latched`. A recover that needs you (rc 3: a container still
+ran after SIGTERM, or a Spark's memory did not come back) latches at once. It never reboots and never sends SIGKILL.
+
+Telemetry: one JSON line per run in STATE_DIR/telemetry/YYYY-MM-DD.jsonl (glm53f-afd-report [days] rolls them up):
+the checks, probe TTFT, per host MemAvailable/swap/PSI, GPU util/memory/power/temperature/clock, the stack's
+containers, mcdma-rpcd count, new kernel Xid/NVRM/OOM lines; the MCDMA links up; the attention log's new error and
+watchdog lines; an hourly 256-token decode bench when the stack is idle (WATCH_BENCH=0 turns it off).
+
+Settings come from the repo's .env (WATCH_ENV_FILE to use another file); exported variables win. The WATCH_* ones:
+  WATCH_FAILS 2, WATCH_MAX_RECOVERIES 3, WATCH_WINDOW_H 6, WATCH_PROBE_TIMEOUT 120 (s), WATCH_STALL_S 600,
+  WATCH_BENCH 1, WATCH_SSH 1 (0: no host telemetry), WATCH_BASE (default http://ATTN_HOST:API_PORT), WATCH_API_KEY,
+  WATCH_RECOVER (default "<repo>/start.sh recover"), WATCH_RECOVER_TIMEOUT (HEALTH_WAIT + 1800 s),
+  WATCH_ATTN_LOG (AFD_HOME/logs/attn.log), WATCH_CONTAINERS (label=glm-afd=1, a `docker ps --filter`),
+  WATCH_CONNECT_SOCK (AFD_HOME/mcdma/connect.sock; at MCDMA_INFLIGHT=4 also connect2.sock beside it), STATE_DIR
+  (CTL_STATE/watch), CTL_STATE (~/.local/state/glm-afd).
+"""
+import datetime
+import fcntl
+import json
+import os
+import random
+import re
+import shlex
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", ".."))
+WATCHDOG_LINE = "restart the serving stack"       # the attention's AFD watchdog: "afd: <why>; in-flight requests fail, ..."
+ERROR_RE = re.compile(r"Traceback|CUDA error|illegal memory access|out of memory|WireError|LinkError|afd: ")
+
+
+def load_env() -> dict:
+    """The .env as bash reads it (start.sh sources it), then the caller's exports on top, as scripts/lib.sh does."""
+    path = os.environ.get("WATCH_ENV_FILE") or os.path.join(REPO, ".env")
+    if not os.path.isfile(path):
+        print(f"glm53f-afd-watch: no {path} (cp .env.example .env, or set WATCH_ENV_FILE)", file=sys.stderr)
+        sys.exit(2)
+    base = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
+    r = subprocess.run(["bash", "-c", 'set -a; . "$1" >/dev/null 2>&1; env -0', "env", path], env=base,
+                       capture_output=True, timeout=30)
+    out = {}
+    for item in r.stdout.split(b"\0"):
+        k, sep, v = item.decode(errors="replace").partition("=")
+        if sep and k not in ("PWD", "SHLVL", "_", "OLDPWD"):
+            out[k] = v
+    out.update(os.environ)
+    return out
+
+
+ENV = load_env()
+
+
+def setting(name, default=""):
+    v = ENV.get(name, "")
+    return default if v == "" else v
+
+
+def num(name, default):
+    try:
+        return float(setting(name, str(default)))
+    except ValueError:
+        print(f"glm53f-afd-watch: {name} must be a number (got {setting(name)!r})", file=sys.stderr)
+        sys.exit(2)
+
+
+HOME = os.path.expanduser("~")
+CTL_STATE = os.path.expanduser(setting("CTL_STATE", f"{HOME}/.local/state/glm-afd"))
+STATE = os.path.expanduser(setting("STATE_DIR", f"{CTL_STATE}/watch"))
+TEL = f"{STATE}/telemetry"
+AFD_HOME = setting("AFD_HOME", "/srv/glm-afd")
+SSH_USER = setting("SSH_USER")
+HOSTS = {"attn": setting("ATTN_HOST"), "x0": setting("EXPERT0_HOST"), "x1": setting("EXPERT1_HOST")}
+API_PORT = setting("API_PORT", "8000")
+BASE = setting("WATCH_BASE", f"http://{HOSTS['attn']}:{API_PORT}").rstrip("/")
+MODEL = setting("MODEL_NAME", "GLM-5.3-Flash-EXL3")
+ALIAS = setting("MODEL_ALIAS", "glm-5.3-flash")
+API_KEY = setting("WATCH_API_KEY")
+AUTH = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+FAILS = int(num("WATCH_FAILS", 2))
+MAX_RECOVERIES = int(num("WATCH_MAX_RECOVERIES", 3))
+WINDOW_S = num("WATCH_WINDOW_H", 6) * 3600
+PROBE_TIMEOUT = num("WATCH_PROBE_TIMEOUT", 120)
+STALL_S = num("WATCH_STALL_S", 600)
+BENCH = setting("WATCH_BENCH", "1") == "1"
+USE_SSH = setting("WATCH_SSH", "1") == "1" and all(HOSTS.values())
+RECOVER = setting("WATCH_RECOVER", f"{shlex.quote(os.path.join(REPO, 'start.sh'))} recover")
+RECOVER_TIMEOUT = num("WATCH_RECOVER_TIMEOUT", num("HEALTH_WAIT", 2400) + 1800)
+ATTN_LOG = setting("WATCH_ATTN_LOG", f"{AFD_HOME}/logs/attn.log")
+CONTAINERS = setting("WATCH_CONTAINERS", "label=glm-afd=1")
+CONNECT_SOCK = setting("WATCH_CONNECT_SOCK", f"{AFD_HOME}/mcdma/connect.sock")
+try:
+    LINKS_WANT = 2 * int(setting("MCDMA_INFLIGHT", "1"))
+except ValueError:
+    LINKS_WANT = None
+# one connect daemon holds six peers (MCDMA): at four in flight, link 3 of both expert nodes is on `connect2`, beside it
+CONNECT_SOCKS = [CONNECT_SOCK] + ([os.path.join(os.path.dirname(CONNECT_SOCK), "connect2.sock")]
+                                  if (LINKS_WANT or 0) > 6 else [])
+for name, ok in (("WATCH_FAILS", FAILS >= 1), ("WATCH_MAX_RECOVERIES", MAX_RECOVERIES >= 1),
+                 ("WATCH_PROBE_TIMEOUT", PROBE_TIMEOUT > 0)):
+    if not ok:
+        print(f"glm53f-afd-watch: {name} must be at least 1", file=sys.stderr)
+        sys.exit(2)
+if not (HOSTS["attn"] or setting("WATCH_BASE")) or not BASE.startswith(("http://", "https://")):
+    print("glm53f-afd-watch: no endpoint: set ATTN_HOST (and API_PORT) in .env, or WATCH_BASE", file=sys.stderr)
+    sys.exit(2)
+
+os.makedirs(TEL, exist_ok=True)
+now = time.time()
+alerts, events = [], []
+
+
+# ---------------------------------------------------------------------------------------------- small helpers
+def rd(name, default=""):
+    try:
+        with open(f"{STATE}/{name}") as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def wr(name, val):
+    with open(f"{STATE}/{name}", "w") as f:
+        f.write(str(val))
+
+
+def sh(cmd, timeout=60, env=None):
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, env=env)
+        return r.returncode, r.stdout + (r.stderr if r.returncode else "")
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        return 124, out
+
+
+def rsh(node, cmd, timeout=30):
+    target = f"{SSH_USER}@{HOSTS[node]}" if SSH_USER else HOSTS[node]
+    return sh(f"timeout {int(timeout)} ssh -o BatchMode=yes -o ConnectTimeout=8 {shlex.quote(target)} "
+              f"{shlex.quote(cmd)}", timeout + 5)
+
+
+def http(path, body=None, timeout=8.0):
+    req = urllib.request.Request(BASE + path, data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Content-Type": "application/json", **AUTH})
+    t = time.time()
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, r.read().decode(errors="replace"), time.time() - t
+
+
+def get_health():
+    """(code, the JSON body or {}, error text)."""
+    try:
+        code, body, _ = http("/health", timeout=8)
+        try:
+            return code, json.loads(body), ""
+        except ValueError:
+            return code, {}, ""
+    except urllib.error.HTTPError as e:
+        return e.code, {}, e.read().decode(errors="replace")[:200]
+    except Exception as e:  # noqa: BLE001  refused, reset, timed out: down
+        return 0, {}, f"{type(e).__name__}: {e}"[:200]
+
+
+def tokens(h):
+    v = h.get("completion_tokens_total")
+    return v if isinstance(v, (int, float)) else None
+
+
+def probe():
+    """A streamed reply, thinking off, that must contain this run's nonce: (ok, ttft_s, total_s, error)."""
+    nonce = f"PONG-{random.randint(1000, 9999)}"
+    body = {"model": MODEL, "messages": [{"role": "user", "content": f"Reply with exactly: {nonce}"}],
+            "max_tokens": 24, "temperature": 0, "stream": True, "chat_template_kwargs": {"enable_thinking": False}}
+    req = urllib.request.Request(BASE + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json", **AUTH})
+    t0 = time.time()
+    ttft, text = None, ""
+    try:
+        with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT) as r:
+            for raw in r:
+                if time.time() - t0 > PROBE_TIMEOUT:
+                    return False, ttft, time.time() - t0, "timeout"
+                line = raw.decode(errors="replace").strip()
+                if not line.startswith("data:") or line == "data: [DONE]":
+                    continue
+                d = json.loads(line[5:])
+                if d.get("error"):
+                    return False, ttft, time.time() - t0, f"stream error: {json.dumps(d['error'])[:160]}"
+                c = ((d.get("choices") or [{}])[0].get("delta") or {}).get("content") or ""
+                if c and ttft is None:
+                    ttft = time.time() - t0
+                text += c
+    except urllib.error.HTTPError as e:
+        return False, ttft, time.time() - t0, f"HTTP {e.code}: {e.read().decode(errors='replace')[:160]}"
+    except Exception as e:  # noqa: BLE001
+        msg = f"{type(e).__name__}: {e}"[:160]
+        return False, ttft, time.time() - t0, ("timeout" if "timed out" in msg.lower() else msg)
+    if nonce in text:
+        return True, ttft, time.time() - t0, ""
+    return False, ttft, time.time() - t0, f"wrong reply: {text[:80]!r}"
+
+
+def bench():
+    """A fixed 256-token decode, one stream, thinking off, temperature 0 (decode drift over days)."""
+    body = {"model": MODEL, "messages": [{"role": "user", "content":
+            "Write a detailed explanation of how a hash map handles collisions, with a Python example."}],
+            "max_tokens": 256, "temperature": 0, "ignore_eos": True, "chat_template_kwargs": {"enable_thinking": False}}
+    _, out, dt = http("/v1/chat/completions", body, timeout=300)
+    u = json.loads(out).get("usage", {})
+    n = u.get("completion_tokens") or 0
+    return {"completion_tokens": n, "seconds": round(dt, 2), "tok_s_e2e": round(n / dt, 1) if dt else None}
+
+
+def lock_busy(path):
+    """True when another process holds an flock on path (we take it non-blocking and let go at once)."""
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+
+# ---------------------------------------------------------------------------------------------- one run at a time
+_run_lock = os.open(f"{STATE}/watch.lock", os.O_RDWR | os.O_CREAT, 0o644)
+try:
+    fcntl.flock(_run_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(0)      # an earlier run is still going (a recover takes minutes): it records its own results
+
+rec = {"ts": int(now), "iso": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+       "mode": rd("mode", "serving"), "latched": os.path.exists(f"{STATE}/latched")}
+
+# ---------------------------------------------------------------------------------------------- hosts
+def hostcmd(since: int) -> str:
+    """One SSH round per host. Kernel lines are counted from the previous run's mark to this run's, both in the host's
+    own clock (`kern N MARK`), so a line is counted once however often the watcher runs."""
+    return (
+        "awk '/MemAvailable/{a=$2}/SwapTotal/{st=$2}/SwapFree/{sf=$2}END{printf \"mem %.1f %.1f\\n\",a/1048576,(st-sf)/1048576}' /proc/meminfo\n"
+        "awk '/full/{split($2,x,\"=\");print \"psi\",x[2]}' /proc/pressure/memory 2>/dev/null\n"
+        "nvidia-smi --query-gpu=utilization.gpu,memory.used,power.draw,temperature.gpu,clocks.sm --format=csv,noheader,nounits 2>/dev/null | head -1 | sed 's/^/gpu /'\n"
+        f"docker ps -a --filter {shlex.quote(CONTAINERS)} --format 'ctr {{{{.Names}}}} {{{{.State}}}}' 2>/dev/null\n"
+        "echo \"rpcd $(pgrep -xc mcdma-rpcd)\"\n"
+        f"t=$(date +%s); echo \"kern $(journalctl -k --since @{int(since)} --until @$t --no-pager -q 2>/dev/null | grep -ciE 'xid|nvrm|out of memory|oom-kill|hung_task') $t\"\n"
+    )
+
+
+if USE_SSH:
+    for node in HOSTS:
+        try:
+            since = int(rd(f"{node}.kern_since", "0") or 0)
+        except ValueError:
+            since = 0
+        since = min(max(since, int(now) - 6 * 3600), int(now)) if since else int(now) - 180
+        rc, out = rsh(node, hostcmd(since))
+        hs = {"ssh": rc in (0, 1) and "mem " in out}
+        for line in out.splitlines():
+            p = line.split()
+            if not p:
+                continue
+            try:
+                if p[0] == "mem":
+                    hs["avail_gib"], hs["swap_used_gib"] = float(p[1]), float(p[2])
+                elif p[0] == "psi":
+                    hs["psi_full_avg10"] = float(p[1])
+                elif p[0] == "gpu":
+                    v = [x.strip() for x in " ".join(p[1:]).split(",")]
+                    f = lambda x: None if "N/A" in x or "[" in x else float(x)  # noqa: E731
+                    hs.update(gpu_util=f(v[0]), gpu_mem_mib=f(v[1]), gpu_power_w=f(v[2]), gpu_temp_c=f(v[3]),
+                              sm_mhz=f(v[4]))
+                elif p[0] == "ctr" and len(p) >= 3:
+                    hs.setdefault("containers", {})[p[1]] = p[2]
+                elif p[0] == "rpcd":
+                    hs["mcdma_rpcd"] = int(p[1]) if len(p) > 1 and p[1].isdigit() else 0
+                elif p[0] == "kern":
+                    hs["kern_events"] = int(p[1])
+                    if len(p) > 2 and p[2].isdigit():
+                        hs["kern_mark"] = int(p[2])
+            except (ValueError, IndexError):
+                pass
+        rec[node] = hs
+        if not hs["ssh"]:
+            n = int(rd(f"{node}.sshfail", "0") or 0) + 1
+            wr(f"{node}.sshfail", n)
+            if n == 2:
+                alerts.append(f"{node} ({HOSTS[node]}): no answer over SSH for 2 runs.")
+            continue
+        wr(f"{node}.sshfail", 0)
+        if "kern_mark" in hs:
+            wr(f"{node}.kern_since", hs["kern_mark"])
+        if hs.get("kern_events"):
+            events.append(f"{node}: {hs['kern_events']} new kernel Xid/NVRM/OOM line(s) since the last run")
+    # the MCDMA links, as the connect daemons on the attention host report them
+    up = 0
+    for sock in CONNECT_SOCKS:
+        rc, out = rsh("attn", "python3 -c " + shlex.quote(
+            "import socket,sys,time\ns=socket.socket(socket.AF_UNIX)\ns.settimeout(3)\n"
+            f"s.connect({sock!r})\ns.sendall(b'STATUS\\n')\ntime.sleep(0.5)\nsys.stdout.write(s.recv(65536).decode())"))
+        up += len(re.findall(r"^PEER \S+ up ", out, re.M)) if rc == 0 else 0
+    rec["links_up"] = up
+    rec["links_want"] = LINKS_WANT
+
+    # the attention log since the last run: new watchdog and error lines
+    rc, out = rsh("attn", f"f={shlex.quote(ATTN_LOG)}; test -f \"$f\" && echo \"$(stat -c %i \"$f\") $(wc -l < \"$f\")\"")
+    p = out.split()
+    if rc == 0 and len(p) == 2 and p[1].isdigit():
+        ino, n = p[0], int(p[1])
+        prev_ino, prev_n = rd("attnlog.inode"), int(rd("attnlog.n", "0") or 0)
+        start = prev_n + 1 if prev_ino == ino and prev_n <= n else 1
+        wr("attnlog.inode", ino)
+        wr("attnlog.n", n)
+        if n >= start:
+            _, new = rsh("attn", f"sed -n '{start},{min(n, start + 5000)}p' {shlex.quote(ATTN_LOG)}")
+            wd = [line for line in new.splitlines() if WATCHDOG_LINE in line]
+            errs = [line for line in new.splitlines() if ERROR_RE.search(line)]
+            rec["attn_log"] = {"new_lines": n - start + 1, "watchdog": len(wd), "errors": len(errs)}
+            if wd:
+                rec["watchdog_line"] = wd[-1][:300]
+            if errs:
+                events.append("attention log: " + errs[-1][:240])
+
+# ---------------------------------------------------------------------------------------------- checks
+hc, h, herr = get_health()
+rec["health"] = hc
+why = []
+if hc != 200:
+    why.append(f"/health {hc or 'no answer'} {herr[:100]}".strip())
+else:
+    for k in ("requests_running", "requests_total", "completion_tokens_total", "iteration_s", "busy"):
+        if k in h:
+            rec[k] = h[k]
+    if isinstance(h.get("streams"), dict):
+        rec["streams"] = h["streams"]
+    it = h.get("iteration_s")
+    if isinstance(it, (int, float)) and it > STALL_S:
+        why.append(f"a decode iteration has run {it:.0f} s (> WATCH_STALL_S {STALL_S:.0f})")
+    try:
+        mc, mbody, _ = http("/v1/models", timeout=8)
+        ids = [m.get("id") for m in json.loads(mbody).get("data", [])]
+        rec["models_ok"] = mc == 200 and (MODEL in ids or ALIAS in ids)
+        if not rec["models_ok"]:
+            why.append(f"/v1/models lists {ids[:4]}, not {MODEL} or {ALIAS}")
+    except Exception as e:  # noqa: BLE001
+        rec["models_ok"] = False
+        why.append(f"/v1/models: {type(e).__name__}: {e}"[:160])
+    if not why:
+        ok, ttft, total, err = probe()
+        rec["probe"] = {"ok": ok, "ttft_s": round(ttft, 3) if ttft is not None else None, "total_s": round(total, 2)}
+        if not ok:
+            rec["probe"]["err"] = err
+            h2 = get_health()[1]
+            if err == "timeout" and tokens(h) is not None and tokens(h2) is not None and tokens(h2) > tokens(h):
+                rec["probe"]["busy"] = True      # tokens flowed while the probe waited for a slot: busy, not down
+            else:
+                why.append(f"probe: {err}")
+if rec.get("watchdog_line"):
+    why.append("the attention's AFD watchdog fired: " + rec["watchdog_line"][-160:])
+healthy = not why and (rec.get("probe", {}).get("ok") or rec.get("probe", {}).get("busy"))
+rec["healthy"] = bool(healthy)
+if why:
+    rec["why"] = why
+
+# ---------------------------------------------------------------------------------------------- hold-offs
+hold = None
+if rec["mode"] == "maintenance":
+    hold = "maintenance mode"
+elif os.path.exists(f"{CTL_STATE}/stopped"):
+    try:
+        with open(f"{CTL_STATE}/stopped") as f:
+            hold = "stopped by hand (" + f.read().strip()[:80] + "); ./start.sh up starts it"
+    except OSError:
+        hold = "stopped by hand"
+elif lock_busy(f"{CTL_STATE}/ctl.lock"):
+    hold = "a start.sh up/recover/probe or stop.sh is running"
+else:
+    try:
+        with open("/proc/uptime") as f:
+            if float(f.read().split()[0]) < 600:
+                hold = "boot grace (the controller started < 10 min ago)"
+    except (OSError, ValueError):
+        pass
+if hold:
+    rec["hold"] = hold
+
+# ---------------------------------------------------------------------------------------------- keep-alive
+if healthy:
+    down_since = rd("down_since")
+    if down_since:
+        alerts.append(f"glm53f-afd is serving again (down for {now - float(down_since):.0f} s).")
+        wr("down_since", "")
+    wr("fails", 0)
+    if BENCH and not hold and datetime.datetime.now().minute < 2 and not rec.get("requests_running"):
+        try:
+            rec["bench"] = bench()
+        except Exception as e:  # noqa: BLE001
+            rec["bench"] = {"err": f"{type(e).__name__}: {e}"[:160]}
+elif hold:
+    wr("fails", 0)   # not counted: the operator (or start.sh) owns the stack right now
+else:
+    fails = int(rd("fails", "0") or 0) + 1
+    wr("fails", fails)
+    rec["fails"] = fails
+    if not rd("down_since"):
+        wr("down_since", now)
+    summary = "; ".join(why)[:300]
+    if os.path.exists(f"{STATE}/latched"):
+        if fails == FAILS or fails % 60 == 0:
+            alerts.append(f"glm53f-afd DOWN ({summary}); the watcher is LATCHED ({rd('latched')}), not acting. "
+                          f"Look at ./start.sh status and logs, then `rm {STATE}/latched`.")
+    elif fails >= FAILS:
+        hist = [float(x) for x in rd("recoveries").split() if x and now - float(x) < WINDOW_S]
+        if len(hist) >= MAX_RECOVERIES:
+            wr("latched", f"{len(hist)} recoveries in {WINDOW_S / 3600:g} h at {rec['iso']}")
+            alerts.append(f"glm53f-afd DOWN ({summary}). {len(hist)} recoveries in {WINDOW_S / 3600:g} h: circuit "
+                          "breaker LATCHED, not retrying. Look at ./start.sh status and logs.")
+        else:
+            t = time.time()
+            env = dict(os.environ, GLM_AFD_CALLER="watch")
+            rc, out = sh(RECOVER, timeout=RECOVER_TIMEOUT, env=env)
+            dt = time.time() - t
+            tail = out.strip().splitlines()
+            rec["recover"] = {"rc": rc, "seconds": round(dt, 1), "after_fails": fails, "why": summary,
+                              "tail": "\n".join(tail[-12:])[-1500:]}
+            if rc != 75:   # 75: another start.sh/stop.sh held the lock, nothing was done
+                hist.append(now)
+                wr("recoveries", " ".join(str(int(x)) for x in hist))
+            last = tail[-1] if tail else ""
+            if rc == 0:
+                wr("fails", 0)
+                wr("down_since", "")
+                alerts.append(f"glm53f-afd was down ({summary}); recovered in {dt:.0f} s "
+                              f"({len(hist)}/{MAX_RECOVERIES} in {WINDOW_S / 3600:g} h). {last}")
+            elif rc == 3:
+                wr("latched", f"recover needs you (rc 3) at {rec['iso']}")
+                alerts.append("glm53f-afd DOWN and the recover needs you (a container still ran after SIGTERM, or a "
+                              "Spark's memory did not come back: a reboot of that Spark is your call). Watcher "
+                              f"latched. {' | '.join(tail[-3:])[-400:]}")
+            elif rc == 2:
+                rec["hold"] = "stopped by hand (seen by recover)"
+            elif rc == 75:
+                rec["hold"] = "a start.sh up/recover/probe or stop.sh is running (seen by recover)"
+            elif rc == 4:
+                alerts.append(f"glm53f-afd restarted but its smoke reply failed (recover rc 4): {last[-300:]}")
+            else:
+                alerts.append(f"glm53f-afd DOWN ({summary}); recover failed rc={rc} after {dt:.0f} s: "
+                              f"{' | '.join(tail[-3:])[-400:]}")
+
+# ---------------------------------------------------------------------------------------------- record, alert
+with open(f"{TEL}/{datetime.date.today().isoformat()}.jsonl", "a") as f:
+    f.write(json.dumps(rec) + "\n")
+wr("last_run", rec["iso"])
+if events:
+    with open(f"{STATE}/events.log", "a") as f:
+        for e in events:
+            f.write(f"{rec['iso']} {e}\n")
+if alerts:
+    print(f"glm53f-afd watch ({rec['iso']}):")
+    for a in alerts:
+        print("- " + a)

@@ -71,7 +71,8 @@ prebuild_ext() {  # no-model prebuild into the tree's own extension dir, stale b
   done
   for h in "${NODES[@]}"; do
     rsh "$h" "test -f $AFD_HOME/tree/src/tensorfold/families/glm5_next/cuda/afd.py" || { log "$h: tree not synced at $AFD_HOME/tree"; rc=1; continue; }
-    rsh "$h" "docker rm -f glm-afd-prep-$h >/dev/null 2>&1; mkdir -p $EXT_DIR $AFD_HOME/prep" && rcp "$h" "$AFD_HOME/prep" "$ROOT/scripts/prebuild_ext.py" \
+    drm "$h" "glm-afd-prep-$h" || { rc=1; continue; }      # an earlier prebuild left running: SIGTERM, never SIGKILL
+    rsh "$h" "mkdir -p $EXT_DIR $AFD_HOME/prep" && rcp "$h" "$AFD_HOME/prep" "$ROOT/scripts/prebuild_ext.py" \
       || { log "$h: cannot stage prebuild_ext.py"; rc=1; continue; }
     if drun "$h" "glm-afd-prep-$h" --gpus all --network none -v "$EXT_DIR:/ext" -e TORCH_EXTENSIONS_DIR=/ext \
         -e TRITON_CACHE_DIR=/ext/triton -e MAX_JOBS=4 -v "$AFD_HOME/tree:/tf:ro" -e PYTHONPATH=/tf/src -v "$AFD_HOME/prep:/p:ro" \
@@ -91,7 +92,7 @@ prebuild_ext() {  # no-model prebuild into the tree's own extension dir, stale b
     done
     rsh "$h" "docker logs glm-afd-prep-$h 2>&1 | grep -E '^(OK|FAIL) |prebuild done' | cut -c1-200" || true
   done
-  for h in "${NODES[@]}"; do rsh "$h" "docker rm -f glm-afd-prep-$h >/dev/null 2>&1" || true; done
+  for h in "${NODES[@]}"; do drm "$h" "glm-afd-prep-$h" || rc=1; done   # SIGTERM to one still running, then removed
   return $rc
 }
 
