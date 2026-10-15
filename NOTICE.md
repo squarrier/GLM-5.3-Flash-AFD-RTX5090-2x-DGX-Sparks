@@ -1,4 +1,1160 @@
+# NOTICE — v3.0 native Zig AFD
+
+Copyright 2026 Scott Quarrier. Own packaging is Apache-2.0, unchanged from v2.0. Ash Hart authored TensorFold and MCDMA; Mia authored the GLM recipe, EXL3 quantization, drafter integration and attribution AGENTS.md. All named source authors below keep their original roles, profiles, source revisions and licence texts. The upstream TensorFold copyright line is retained verbatim below.
+
+Native source revision: 1fab9035bb24bb3d647103c7d4285bb230a9a52e. Public packaging removes only private labels/addresses and adds generic configuration, scripts and documentation. Every source author's notice remains; numerical kernels are not rewritten. Claude Opus 5.5 and GPT-6.1 Sol via Hermes authored the local integration and staging; the published previous version also credits the earlier self-hosted GLM-5.3-Flash executor.
+
+No weights, compiled objects, cubins, fatbins, ELF executables, grammar libraries, caches or images are distributed. Install-time compilation uses NVIDIA's compiler and may link libdevice. NVIDIA authored CUDA/libdevice; no permission to redistribute its object-code output is inferred from this source-only release. The exact original build-toolkit redistribution terms remain unresolved for any future binary shipment.
+
+Mia's AGENTS.md remains byte-identical, as already adopted and published. Her page invites project use, but no express standalone SPDX licence was found. The code's Apache-2.0 label does not invent terms for that guide; this pre-existing guide is not assigned an invented blanket code licence.
+
+The source-credit annex in THIRD_PARTY_NOTICES.md distinguishes actual source/design/dependency use from research-only references and later candidates. The pinned 078455ff EXL3 model's published MIT text is retained in LICENSES, with Z.ai's base-model credit; later quantization revisions are not relabelled or selected. No external DFlash2 checkpoint is used by v3.0.
+
+## Native inherited notices
+
+TensorFold
+Copyright 2026 TensorFold contributors
+https://github.com/ashhart/TensorFold
+
+shared_verify local CPU change (2026-10-12) on draft_shared's head dc2ad540 (shared_forward's 976ad633
+with user_drafts's lone drafts beside its shared forward): with
+TF_AFD_USERS 2/4, TF_AFD_USERS_SHARED=1 and TF_AFD_USERS_DRAFTS=1,
+TF_AFD_USERS_SHARED_DRAFTS=1 makes shared_forward's one shared forward a drafted
+verify: each greedy user's window (its pending row and up to three MTP drafts)
+goes into that one forward of at most 8 rows, the row-by-row ops once over every
+row, each window's KDA chain and DSA attention on its own user's State at its
+own position, and acceptance, rollback and MTP drafting per user on its own
+slot; the GB10 halves see today's exchange of every row. Sampled, structured and
+undraftable users keep one-row windows. Unset or 0 is today's path and bytes; 1
+without TF_AFD_USERS_SHARED=1 and TF_AFD_USERS_DRAFTS=1, or any other value, is
+refused by name before any load. Default OFF. Bizuayeu (@Bizuayeu,
+github.com/Bizuayeu) authored the shared verify windows design this
+reimplements: a round's verify windows share one forward, each stream's state
+on its own (github.com/Bizuayeu/TensorFold branch pr/glm53-flash-cuda, a
+TensorFold fork, Apache-2.0, commit 75131b66), with the shared windows' mixer
+(146e113f) and each stream on its own sequence by slot (d3cc052c); no code of
+his was copied. Ash Hart (@ashhart / @ashxhart) authored TensorFold and its
+lane core; Mia (@MiaAI_lab) authored the GLM-5.3 EXL3 lane, its MTP drafter and
+recipe; Hugh Madden (@dangerm00se) and tpurtell (@wrldsuksgo2mars) authored the
+AFD attention/expert split; Turboderp authored EXL3. This change and its CPU
+qualification: Claude Opus 5.5 (Anthropic), via Hermes. Hardware NOT RUN; no
+adoption. Every earlier entry is retained.
+
+shared_forward local CPU change (2026-10-12) on joined_profile's join head b5804353: with
+TF_AFD_USERS 2/4, TF_AFD_USERS_SHARED=1 makes each users round one forward over
+every user's rows: the row-by-row ops (q4 projections, hc_pre/hc_post, norms,
+absorb, router and shared expert, dense MLP, head) once over all rows, and each
+user's KDA chain and DSA attention on its own State at its own position. Stage
+1: undrafted, one row a user; the GB10 halves see today's exchange. Unset or 0
+is today's path and bytes; one user, TF_AFD_USERS_DRAFTS=1 or any other value
+is refused by name before any load. Default OFF. Bizuayeu (@Bizuayeu) designed
+the shared verify forward this reimplements: github.com/Bizuayeu/TensorFold
+branch pr/glm53-flash-cuda (a TensorFold fork, Apache-2.0), commits 75131b66,
+146e113f, d3cc052c and 2bc75a69; no code was copied. Ash Hart (@ashhart /
+@ashxhart) authored TensorFold and its lane core; Mia (@MiaAI_lab) authored the
+GLM-5.3 EXL3 lane and recipe; Hugh Madden (@dangerm00se) and tpurtell
+(@wrldsuksgo2mars) authored the AFD attention/expert split; Turboderp authored
+EXL3. This change and its CPU qualification: Claude Opus 5.5 (Anthropic), via
+Hermes. Hardware NOT RUN; no adoption. Every earlier entry is retained.
+
+structured_users local CPU change (2026-10-12) on server_join's joined head 8086a7de:
+grammar-constrained output with TF_AFD_USERS 2/4 (each users row drawn under its
+own request's mask, a matcher per request, closed on retire, cancel_retired and
+failure_retired; unconstrained lanes untouched) and with TF_GLM_SAMPLING=1 (the
+mask on the widened row before the temperature, top_k, top_p and min_p: a
+disallowed token is -inf, has no mass and is never drawn; the drawn token is
+checked on the host); grammar_join_2's and grammar_join_3's startup refusals of those
+combinations lifted. No new switch; every switch default OFF; Info.structures
+stays false. Ash Hart (@ashhart / @ashxhart) authored TensorFold, its lane core,
+the grammar_mask kernel and MCDMA; @BobClawblaw authored #596; the XGrammar
+contributors (MLC, Apache-2.0) are behind grammar_abi's library; Mia (@MiaAI_lab)
+authored the GLM-5.3 EXL3 lane, its nucleus recipe and union cover; Hugh Madden
+(@dangerm00se) and tpurtell (@wrldsuksgo2mars) authored the AFD
+attention/expert split; Turboderp authored EXL3. concurrent_users_r2: GPT-6.1 Sol (OpenAI
+Codex), via Hermes. The qualification_8a2734a3 line, concurrent_users_r4, concurrent_join and server_join: Claude Opus
+5.5 (Anthropic), via Hermes. This change and its CPU qualification: Claude Opus
+5.5 (Anthropic), via Hermes. Hardware NOT RUN; no adoption. Every earlier entry
+below is retained.
+
+literal_tool_boundary local CPU change (2026-10-12) on four_user_profile's head 197cddd2: a literal
+</tool_call> inside a GLM <arg_value> no longer ends the tool call. One
+boundary, reply_text.callEnd (a value from </arg_key><arg_value> to its
+</arg_value> is data; a call whose value is still open stays open), is shared
+by the final parse, the EOS close, content hiding, the think/tool split and the
+one-call prose filter. No model token, sampling, kernel or switch change; API
+output changes only for those replies. Raymond Lucke (@rwl4) authored the
+design and the test cases reimplemented here: MiaAI-Lab
+GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold PR #158, commit 029a852f
+(Apache-2.0); no code was copied. Mia (@MiaAI_lab) authored the GLM-5.3 EXL3
+lane and recipe; Ash Hart (@ashhart / @ashxhart) authored TensorFold and its
+server. @data-angel / Enntity's sparkglm PR #46 (RC4.1) was read only, and
+nothing was taken from Atlas (AGPL-3.0). literal_boundary (the study and its fixtures) and
+this change and its CPU qualification: Claude Opus 5.5 (Anthropic), via Hermes.
+Hardware NOT RUN; no adoption. Every earlier entry is retained.
+
+tool_response_fixes local CPU change (2026-10-12) on joined_profile's join head b5804353: three
+server fixes by Bizuayeu (@Bizuayeu, github.com/Bizuayeu), ported from his
+branch pr/glm53-flash-cuda of github.com/Bizuayeu/TensorFold (Apache-2.0):
+b9528625, a GLM argument key the model wrote without its <arg_key> gets it back
+(tool_parse.repairGlmKeys, read by glmCall); 557011805, the end token's close
+closes a GLM value it cut inside <arg_value> with </arg_value></tool_call> when
+the call then parses strictly, while a value holding the call's closer stays
+open (Mia's malformed-value rule and literal_tool_boundary's literal-closer rule unchanged);
+be17a101, /v1/responses accepts OpenAI's eight include values and ignores them,
+refuses any other value by name, and refuses an include that is not a list of
+strings. Taken from his commits (Apache-2.0): repairGlmKeys and its tag scan,
+adapted from b9528625 (zig/src/server/tool_parse.zig); the eight include values
+and both refusal messages, adapted from be17a101
+(zig/src/server/responses_translate.zig); his test cases
+(zig/src/server/tool_parse_test.zig from b9528625 and 557011805,
+zig/src/server/responses_include_test.zig from be17a101, and tool_api_fixes's fixture
+zig/src/server/tool_api_fixes_fixtures_test.zig); the frozen corpus case and its golden
+reply (zig/tests/server/corpus.py and golden/responses/refuse-include.json from
+be17a101; golden/cases.json regenerated for that one case). The end-token close
+(tool_parse.glmClose, reply_text.openValue) is reimplemented from 557011805's
+design. His fixes follow the 2.x line, after MiaAI-Lab's TensorFold #285 and
+patch 0093. No model token, sampling, kernel or switch change; API output
+changes only for those replies and requests. Mia (@MiaAI_lab) authored the
+GLM-5.3 EXL3 lane and recipe; Raymond Lucke (@rwl4) authored the literal-closer
+design literal_tool_boundary reimplemented (MiaAI-Lab GLM PR #158, 029a852f); Ash Hart
+(@ashhart / @ashxhart) authored TensorFold and its server. tool_api_fixes (the study and
+its fixtures) and this change and its CPU qualification: Claude Opus 5.5
+(Anthropic), via Hermes. Hardware NOT RUN; no adoption. Every earlier entry is
+retained.
+
+concurrent_join local CPU join (2026-10-12): grammar_join_3's integrated head 8385b771
+plus a cherry-pick (-x, original author kept) of concurrent_users_r4 b77e2a06 (a failed
+round's streams are released as errors, failure_retired under
+TF_AFD_USERS_TRACE=1; cancellations keep cancel_retired; finish events, HTTP
+replies and the exchange wire unchanged; every switch default OFF).
+Ash Hart (@ashhart / @ashxhart) authored TensorFold, its lane core and MCDMA;
+@BobClawblaw authored #596; the XGrammar contributors (MLC, Apache-2.0) are
+behind grammar_abi's library; Mia (@MiaAI_lab) authored the GLM-5.3 EXL3 lane,
+recipe and attribution template; Hugh Madden (@dangerm00se) and tpurtell
+(@wrldsuksgo2mars) authored the AFD attention/expert split; Turboderp authored
+EXL3. concurrent_users_r2: GPT-6.1 Sol (OpenAI Codex), via Hermes. concurrent_users_r4, qualification_af0d6a64 and
+grammar_join_3: Claude Opus 5.5 (Anthropic), via Hermes. This join and its CPU
+qualification: Claude Opus 5.5 (Anthropic), via Hermes. Hardware NOT RUN; no
+adoption. Every earlier entry below is retained.
+
+grammar_join_3 local CPU join (2026-10-11): grammar_join_2's integrated GRAM head 6c81d20a
+plus a cherry-pick (-x, original author kept) of grammar_server 0c3d5288 (served
+compiler ownership and response_format wiring for the AFD attention role,
+behind TF_AFD_GRAMMAR_SERVE, TF_AFD_GRAMMAR_LIB and TF_AFD_GRAMMAR_LIB_SHA256),
+then build wiring for grammar_server's CPU tests and one startup-scope test.
+Ash Hart (@ashhart / @ashxhart) authored TensorFold/MCDMA, grammar_mask.cu,
+mask-before-draw and the v1.0.6 tf_grammar.cc shim; @BobClawblaw authored
+#596 (libtfgrammar and the lane-core grammar); the XGrammar contributors
+(MLC, Apache-2.0), dlpack and picojson are behind grammar_abi's library; Mia
+(@MiaAI_lab) authored the GLM-5.3 EXL3 lane, recipe and attribution template;
+Hugh Madden (@dangerm00se) and tpurtell (@wrldsuksgo2mars) designed the AFD
+attention/expert split; Turboderp authored EXL3. Every author and licence in
+the entries below is retained verbatim. The pick applied without conflicts.
+The GRAM line was done by GPT-6.1 Sol (OpenAI Codex) and Claude Opus 5.5
+(Anthropic), via Hermes; grammar_mask, qualification_64bda797, grammar_join, grammar_join_2 and grammar_server
+by Claude Opus 5.5 (Anthropic), via Hermes.
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes.
+Default OFF; Info.structures stays false unless TF_AFD_GRAMMAR_SERVE=1 (with
+the mask); no adoption, deployment or hardware result.
+
+grammar_join_2 local CPU join (2026-10-11): integrated head 4dd4dcbb plus
+cherry-picks (-x, original authors kept) of the GRAM line 94ff8fec..4d60e1eb
+(21 commits) and grammar_mask 045dd856 (device-masked greedy draw for the
+single-user AFD attention role), then grammar_tests test build wiring and a startup
+refusal of TF_AFD_GRAMMAR_MASK=1 with TF_AFD_USERS>1 or TF_GLM_SAMPLING=1.
+Ash Hart (@ashhart / @ashxhart) authored TensorFold/MCDMA, grammar_mask.cu,
+mask-before-draw and the v1.0.6 tf_grammar.cc shim; @BobClawblaw authored
+#596 (libtfgrammar and the lane-core grammar); the XGrammar contributors
+(MLC, Apache-2.0), dlpack and picojson are behind grammar_abi's library; Mia
+(@MiaAI_lab) authored the GLM-5.3 EXL3 lane, recipe and attribution template;
+Hugh Madden (@dangerm00se) and tpurtell (@wrldsuksgo2mars) designed the AFD
+attention/expert split; Turboderp authored EXL3. Every author and licence in
+the entries below is retained verbatim. Only adjacent-line conflicts were
+resolved, as unions. The GRAM line was done by GPT-6.1 Sol (OpenAI Codex)
+and Claude Opus 5.5 (Anthropic), via Hermes; grammar_mask, qualification_64bda797 and grammar_join
+by Claude Opus 5.5 (Anthropic), via Hermes.
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes.
+Default OFF; Info.structures stays false; no adoption, deployment or hardware
+result.
+
+stream_join local CPU join (2026-10-11): joined head 3202352c plus cherry-picks
+(-x, original authors kept) of SSE 139aa26f, prose_filter_852a 45f2d299, concurrent_users_r2
+54c2b59b and sampling_tests 4ae62ad8 (qualification_45c10bcf nucleus; Mia's NUCLEUS_UNION, recipe 549fdc5
+patch 0034). Ash Hart (@ashhart / @ashxhart) authored TensorFold/MCDMA; Mia
+(@MiaAI_lab) authored the recipe and attribution template; @akol1 authored
+TensorFold #650's condition; every author and licence in the entries below is
+retained verbatim. Only adjacent-line conflicts were resolved, as unions.
+Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes.
+Default OFF; no adoption, deployment or hardware result.
+
+prose_filter_852a local-only whole-response correction (2026-10-11):
+@akol1 (https://github.com/akol1) authored TensorFold #650's content condition,
+https://github.com/ashhart/TensorFold/pull/650,
+commit 720c409114c123ed1efa19f0725cd05acc189786 over
+base a6aa4782bf4ffe87ccee4a0a5cbf2efb2dd01cba, Apache-2.0.
+This tree reimplements only wholeBody's documented condition. No upstream
+warm_turns architecture, second warm-history hunk or upstream test copied.
+The new prose_filter_c06f_test.zig fixture adapts byte-token fake text/engine and
+in-process memory transport patterns from exact SSE base
+139aa26ffe682e7585b75b507688d43ee78cd121 files
+zig/src/server/tool_wire_probe.zig and zig/src/server/qualification_59878042_rich_route_test.zig.
+The new prose_filter_c06f-build.zig adapts that base's zig/build/qualification_59878042_tests.zig graph.
+Those files retain TensorFold Apache-2.0 and inherited MIT obligations;
+Ash Hart authored TensorFold/MCDMA and the SSE contributors below authored
+the retained SSE implementation/tests. Mia (@MiaAI_lab) authored the recipe
+and attribution template. All inherited NOTICE/licences remain verbatim.
+Assisted-by: GPT-6.1 Sol (OpenAI Codex; planning and execution), via Hermes.
+No source candidate adoption, publishing, AOT/GPU build or hardware result.
+
+qualification_d8ba0062 local native SSE integration (2026-10-10):
+Ash Hart (@ashhart / @ashxhart, https://github.com/ashhart/TensorFold) authored
+TensorFold/MCDMA; Mia (@MiaAI_lab, https://github.com/MiaAI-Lab) authored the
+recipe and attribution template. stevehansen (https://github.com/stevehansen)
+authored issue106's diagnosis, first comment design/patch/tests. BadAd84
+(https://github.com/BadAd84) authored the all-route extension/tests at
+90ccb49215d58161f9c6017e9106aeecc45fe762 in
+https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold.
+Jay Leaton (https://github.com/jayleaton/glm53-tensorfold-spark) authored
+inherited parser/cancellation work and the #634 repair retained above.
+GPT-6.1 Sol (OpenAI Codex), via Hermes, authored native SSE implementation,
+private test observations and this mechanical joined-head integration.
+No upstream Python code or weights copied. Default OFF, CPU-only qualification;
+no production, deployment, hardware acceptance or adoption claim. All prior
+notices and Apache/MIT/third-party grants remain verbatim.
+
+TensorFold is licensed under the Apache License, Version 2.0 (LICENSE) from 0.6.0.
+
+credit_audit credit backfill (2026-10-12, text only): the authors below wrote code
+or designs that this tree carries and that had no entry here naming them with
+the repository and commit. Each licence was read at the commit named. Every
+other entry in this file is retained verbatim.
+
+Ash Hart (@ashhart / @ashxhart) authored TensorFold v1.0.7
+(https://github.com/ashhart/TensorFold, commit
+e7c523ebfa16b8094cf9e35e3773a7d25befcc5b, Apache License, Version 2.0),
+including the lane host's Admit hook and its test, which shared_pool ported into
+zig/src/core/engine_api.zig, zig/src/core/lane_host.zig and
+zig/src/core/lane_host_test.zig (cf2c45c8, a cherry-pick of 15f6451d), and
+#639's shared MLA cache pool (glm/pool.zig: regions of 256-token blocks, placed
+first fit), whose region rule zig/src/families/glm/cuda_afd_pool.zig
+reimplements for CUDA with no code copied. ezoushen
+(https://github.com/ezoushen) authored the compaction rule of
+patches/0074-glm-compact-before-evict.patch (pull request #62, issue #61) in
+Mia's https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+(read at 3fd60dfc836fab0f1ed0fd4f0afaf2a1d62b2aab, Apache License, Version
+2.0); cuda_afd_pool.zig reimplements that rule with no code copied.
+
+@BlivionIaG (https://github.com/BlivionIaG) authored TensorFold #623
+(https://github.com/ashhart/TensorFold/pull/623, head commit
+d7b134cdf86a02b7c91d0d137ce733c04ae53cfd, Apache License, Version 2.0): the
+lane core's optional Backend.prefill_step / fillStream and the lane host's
+filling queue. Ash Hart (@ashhart / @ashxhart) merged it into TensorFold as
+1184cdbb12922cd8366f10bc5948fb55d3d52c19. prefill_interleave ported that step form into
+zig/src/core/lanes/open.zig and zig/src/core/lane_host.zig (cd9627dc, a
+cherry-pick of 9263173e), and four_user_profile joined it (197cddd2).
+
+Mia (MiaAI-Lab, https://github.com/MiaAI-Lab, X @MiaAI_lab) authored, in
+https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+(Apache License, Version 2.0, Copyright 2026 MiaAI-Lab): patch
+0004-glm-prompt-kernels at commit 1576746a04983b6eded0551dbf22512ee9e95654,
+whose EXL3 prompt-window expert kernel is zig/kernels/cuda/exl3/k4/ (K4:
+b4b853f7 and ee942a0a, merged as 17d45ea8, as the Python TF-AFD 2.15 lane's
+patch 0024 ports it; the file's header says what was changed) and whose
+one-program sum of a matmul's K splits zig/kernels/cuda/exl3/x1s/ reimplements
+on X1's kernel (SEQ: c898e828, 614cdf7c); and patches 0002-glm-dense-fp8
+(make_f8 and the FP8 matmul _fmm) and 0005-glm-dense-q4 (the q4 dense form and
+quantize4_mse) at v1.10, commit 549fdc562c477d477244d2df0590d6c14bda4889, which
+the FP8 head and q4 dense paths port (3725fc86 and 69349c79 for q4; 657fc439
+and 0ad47f86 for the FP8 head; 32094381 for the MTP layer's FP8 launches).
+Recipe commit 549fdc5, named below for patch 0034, is in that repository:
+https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/549fdc562c477d477244d2df0590d6c14bda4889
+
+BadAd84 (https://github.com/BadAd84) authored three pull requests to Mia's
+https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold (MIT
+License, Copyright (c) 2026 MiaAI-Lab, LICENSES/MiaAI-Lab-MIT.txt): #34
+(0c7b88683c19d14f719287268817f7024341ab75, the draft stop under a confidence
+floor), #35 (a82cf8aee2d25e26c8cbde44dc54a985e54671f7, patches/0010, the
+nucleus draw's row reductions on 1,024 threads) and #36
+(e6a35d22336216b1bd88ab1465139dce9ed9dc12, the MTP draft layer on FP8). This
+tree reimplements those designs with no code copied: TF_GLM_DRAFT_AUTO=cN:P[:F]
+(1efdb33a), TF_GLM_ROWS_1024 (33d8ab99, zig/kernels/cuda/torch_ops/nucleus.cu)
+and TF_GLM_MTP_FP8 (219461a2), the last on Mia's patch 0002 above.
+
+T.J. Purtell (@tpurtell, X @wrldsuksgo2mars, https://github.com/tpurtell)
+authored cuteafd (https://github.com/tpurtell/cuteafd, MIT License, Copyright
+(c) 2026 T.J. Purtell). Hugh Madden (@dangerm00se, https://github.com/hughmadden)
+authored its pull request #22, merged as
+c05d9939a38e3db66767291b500c97933df6497b, which keys decode graphs by what their
+launches read; zig/src/families/glm/cuda_afd_graphs.zig (1aee087e, merged as
+e2b0bb74) reimplements that keying with no code copied.
+
+TensorFold python-0.6 (https://github.com/ashhart/TensorFold, commit
+ed78d6fc204d89d90b045bf033d6551e7714f3a1) is the source of the GLM CUDA kernels
+this tree builds: the glm_* fatbins copy its extension device code, and the
+Triton kernel set (zig/tests/cuda/glm/kernels.json) is compiled ahead of time
+from its kernel sources. Besides Ash Hart, these TensorFold contributors
+authored that code (under the MIT License before 0.6.0, LICENSES/MIT.txt, and
+the Apache License, Version 2.0 from 0.6.0): taussoe
+(https://github.com/taussoe) the latent MLA cache and kda.cu's three-kernel
+wide path (prep/step/out) in fb985b8649c8b42c2ac2aba1fd7c6f905bc8413c, copied
+into zig/kernels/cuda/glm_kda.cu (dd7de994), and DSA scores for any index head
+count in d6ce24fead9d9cc165728941e3f2aabf8c994553; mikolaj92
+(https://github.com/mikolaj92) sparse.py's skip of invisible pool tiles and its
+radix selection bounded to the visible pools
+(b3b8a39119f8da02026b3f2601e02eb411be1339,
+f119334d79981225bc103fae0d25e9ecc477b08f); Andrey Kolesnikov (@akol1,
+https://github.com/akol1) forward.py's EXL3 experts on the universal path for
+any bit width (861348862a0f108027575c6e529e527e0bfe754d); and Mia (MiaAI-Lab)
+the 512-row prompt chunks of latent.py, sparse.py and forward.py
+(b23c10ad305aa068e12b901ee8ebd8166b9aa6fd).
+
+This backfill (the text above, THIRD_PARTY_NOTICES.md's Zig engine, grammar
+library and weights sections, LICENSES/xgrammar-NOTICE.txt and
+LICENSES/picojson-BSD-2-Clause.txt): Claude Opus 5.5 (Anthropic), via Hermes
+(credit_audit). No code, script, model id or default changed.
+
+Jay Leaton (@jayleaton, https://github.com/jayleaton) authored the shared JSON
+incomplete-UTF8-tail bounds repair in https://github.com/ashhart/TensorFold/pull/634,
+commit 4284048d1aca2799e543a7400b3f07519befb515. This branch adapts only that repair
+in zig/src/server/json_write.zig, retaining TensorFold's Apache-2.0 and older
+MIT notices. Ash Hart (@ashhart, https://github.com/ashhart, X @ashxhart)
+authored TensorFold. GPT-6.1 Sol (OpenAI Codex), via Hermes, authored the
+additional local CPU regressions; no general UTF8 validator or float change.
+
+chaog992 (https://github.com/chaog992) authored TensorFold server safety fixes:
+PR #594 https://github.com/ashhart/TensorFold/pull/594,
+commit 711bacf2a3089b2229eb7a0577d313c1630be4c1,
+merge 1b0268954745802a3ee9b0d1828a51f5bdee0c1d (cherry-picked in PRODFIX1);
+PR #560 https://github.com/ashhart/TensorFold/pull/560,
+commit 2193d145397500f7b661dd4697240024e1089b68,
+merge 17a75f55ee25203d0b33bd9e6f487e0a0e337e67
+(already imported at adopted base through 7eab61487f98).
+GPT-6.1 Sol (OpenAI Codex), via Hermes, authored PRODFIX1's local HTTP 400
+refusal policy for nested IDs above u32 and additional ReleaseSafe regressions;
+this differs from upstream #594's unknown-ID clamp behavior.
+
+qualification_214a6e4c local change statement (2026-10-10)
+GPT-6.1 Sol (OpenAI Codex), via Hermes, authored the new native Zig implementation
+and CPU tests. TF_TOOL_REJECTION_LOG=0|1 defaults OFF and changes only name-only
+logging at the final offered-name rejection decision, never wire metadata or policy.
+@BadAd84 (https://github.com/BadAd84) authored the diagnostic design in MiaAI-Lab's
+GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold, PR137, commit
+616b840651a428d514607c3ce5524ed5bc4c206d,
+patches/0114-glm-tool-call-rejections.patch (Apache License, Version 2.0).
+https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/commit/616b840651a428d514607c3ce5524ed5bc4c206d
+No Python code was copied; its default-on mode and metadata were not adopted.
+Mia (MiaAI-Lab, https://github.com/MiaAI-Lab, X @MiaAI_lab) authored that recipe.
+@kky42 (https://github.com/kky42) authored the quoted-tag examples in PR134,
+c66a6cfd9ae16226b30f29df877b0194ae8b3945, in the same recipe; tests retain the
+native behavior without adopting PR134 or PR140 parser/policy changes.
+Jay Leaton (https://github.com/jayleaton, https://x.com/jayleaton) authored the
+parser portions credited in that recipe's unchanged inherited NOTICE, including
+patch 0620 from https://github.com/jayleaton/glm53-tensorfold-spark (Apache-2.0).
+The exact PR137 NOTICE/LICENSE and existing TensorFold Apache-2.0/MIT/third-party
+notices remain in evidence and this tree; no model files or new weights included.
+All earlier notices below are retained verbatim.
+
+Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
+MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
+THIRD_PARTY_NOTICES.md.
+
+sampling_tests's AFD sampling reuses qualification_45c10bcf (qualification_qualification_44ba554e-nucleus, df44f8127f6418886296a07b2ab84147b2047e6d):
+Ash Hart (@ashhart, X @ashxhart) authored TensorFold's Python sampler at ed78d6f
+and the CUDA torch-op kernels. Mia (MiaAI-Lab, https://github.com/MiaAI-Lab,
+X @MiaAI_lab) authored NUCLEUS_UNION, patches/0034-cuda-nucleus-union.patch in
+GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold, recipe commit 549fdc5, issue #91:
+https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold/issues/91.
+The opt-in request wiring, scoped top-k prefix and sampling_tests CPU tests were developed
+with GPT-6.1 Sol (OpenAI Codex), via Hermes; no production/GPU qualification is claimed.
+
+This fork (native TensorFold AFD snapshot) adds AGENTS.md, the credit and attribution guide written by Mia
+(MiaAI-Lab, https://github.com/MiaAI-Lab, X @MiaAI_lab), copied verbatim from
+https://mia-ai.net/lab/downloads/agents-md-credit-and-attribution.
+The two-rank CUDA layer comes from "Qwen3.8-Flash-Next on 2x DGX Spark with
+TensorFold", Copyright 2026 MiaAI-Lab, Apache License, Version 2.0
+(https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold, commit
+cbfc429): zig/src/cuda/roce.zig, roce_proxy.c, roce_proxy_stub.c, comm.zig,
+link.zig and watch.zig, and three NCCL entry points in nccl.zig, from its
+patches/0006-two-ranks.patch (watch.zig's stop handler from 0007-serving.patch);
+zig/kernels/cuda/fn_roce.cu from 0002-kernels.patch, and its build entry from
+0001-build-registry-server.patch; zig/tests/cuda/tp2_gather.zig adapted from
+0006's comm_test.zig, and zig/tests/cuda/tp2/rails.zig from its scripts/nodes.sh.
+Each file's header says what was changed here.
+Its one-shot RoCE all-gather implements the RoCEnante protocol of b12x by
+local-inference-lab (https://github.com/local-inference-lab/b12x), Apache License,
+Version 2.0, in new code: no b12x code is included.
+This fork (native TensorFold AFD snapshot) adds GLM-5.3-Flash's Triton kernel set on
+CUDA from code written by Mia (MiaAI-Lab, https://github.com/MiaAI-Lab, X
+@MiaAI_lab) in https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold
+at commit cbfc429, Copyright 2026 MiaAI-Lab, Apache License, Version 2.0:
+tools/zig/glm_aot.py and glm_aot_rules.py are adapted from her
+tools/zig/flashnext_aot.py; tools/zig/glm_triton_fixtures.py and
+glm_triton_cases.py from her tools/zig/flashnext_triton_fixtures.py; and
+zig/src/families/glm/cuda_triton.zig and cuda_triton_test.zig from her
+zig/src/families/flashnext/cuda_triton.zig. Each file's header says what changed.
+
+The three-node exchange (zig/src/cuda/xchg, zig/kernels/cuda/fn_xchg.cu, and
+tf-xchg in zig/tests/cuda) runs that layer's roce_proxy.c unchanged and is new code
+on the design of its fn_roce.cu; its request and reply layout is the one of the
+Python attention/expert split for TensorFold (TF-AFD 2.15), whose design is Hugh
+Madden's (@dangerm00se) and tpurtell's (@wrldsuksgo2mars).
+
+The expert halves' prompt kernels behind TF_GLM_HALVES_KERNEL=g53kt3r
+(zig/kernels/cuda/g53/, launched by zig/src/families/glm/cuda_g53.zig) are
+glm53f-afd's large-M expert kernels, written by Hugh Madden (@dangerm00se,
+https://github.com/hughmadden), glm53f-afd at commit 91db3cc, MIT License,
+Copyright (c) 2026 Turquoise Bay AI Pty Ltd (LICENSES/glm53f-afd-MIT.txt), with
+TensorFold's EXL3 decoder, MMA and Hadamard pieces kept under glm53f-afd's
+LICENSE.tensorfold (LICENSES/glm53f-afd-LICENSE.tensorfold.txt), as the Python
+TF-AFD 2.15 lane ports them (its patches 0034, 0035, 0049 and 0051); KT3's
+schedule is glm53f-rank's. THIRD_PARTY_NOTICES.md has the details.
+
+The EXL3 expert kernels' L2 prefetch and programmatic dependent launch
+(zig/kernels/cuda/exl3/l2d/, written by zig/tests/cuda/exl3_copies.py from
+zig/tests/cuda/exl3_l2d.patch, and their launches behind TF_GLM_EXL3_L2D and
+TF_GLM_EXL3_PDL) come from patches/0128-glm-full-expert-prefetch.patch, written by
+Mia (MiaAI-Lab, https://github.com/MiaAI-Lab, X @MiaAI_lab), of "GLM-5.3 EXL3 on
+3x DGX Spark with TensorFold", Copyright 2026 Mia's AI Lab (MiaAI-Lab), Apache
+License, Version 2.0 (https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold,
+commit a687724). Its three hunks that do not apply to python-0.6.6 were finished
+by hand; exl3_l2d.patch's header says so. tools/zig/exl3_fixtures_l2d.py records
+the patched wrappers' launches the same way.
+
+The parallel grouping of the EXL3 routed experts' prompt windows
+(group_count_kernel and group_place_kernel in zig/kernels/cuda/exl3/experts.cu
+and exl3/x1/experts.cu, written by zig/tests/cuda/exl3_copies.py from
+zig/tests/cuda/exl3_pgroup.patch, and their launch behind TF_GLM_EXL3_PGROUP) was
+written by bertholomus (Albert Lee, BertholomusAI, https://github.com/bertholomus)
+in https://github.com/bertholomus/TensorFold, branch glm-dsa-tp4, commit dbe0773
+("perf(exl3 experts): prompt chunks decode each weight tile once for up to 64
+member rows"), Apache License, Version 2.0; the two kernels are included unchanged.
+His commits name Claude Opus 5.5 as co-author.
+
+The EXL3 routed experts' prompt-window kernels in zig/kernels/cuda/exl3/mma/
+(grouped_mma_kernel and work_list_kernel, launched behind TF_GLM_EXL3_MMA from
+zig/src/families/glm/cuda_exl3_mma.zig) were written by bertholomus (Albert Lee,
+BertholomusAI, https://github.com/bertholomus) in
+https://github.com/bertholomus/TensorFold: his prompt-chunk work in branch
+glm-dsa-tp4 (commits 2786594 and dbe0773, where grouped_mma_kernel first
+appears); both kernels as copied here, in the work-list form of the tree of branch
+deepseek-v41-tp2 at commit 90b68e0 (experts_grouped.cuh and experts.cu), with one
+change marked in the file (rows rotated once, X1's rowrot); and the launch order
+of his zig/src/families/dsv41/exl3_experts.zig in branch deepseek-v41-zig, commit
+ce20a545. Apache License, Version 2.0. His commits name Claude Opus 5.5 as
+co-author.
+
+qualification_b95086f6 local modifications to zig/src/cuda/launch.zig and driver.zig:
+Jay Leaton (@jayleaton, https://github.com/jayleaton) authored the shared CUDA
+launch diagnostics design in https://github.com/ashhart/TensorFold/pull/635,
+commits 986c996041e25e8b4a0341a8b54524a9d2248c12 and
+5fa8ad0fd9c53131c599c39f8885117d5a582fda (launch.zig describe/failed-call
+context and driver.zig optional cuFuncGetName binding, Apache-2.0).
+Ash Hart (@ashhart / @ashxhart, https://github.com/ashhart) authored the
+common launcher and driver at the retained PRODFIX1 base
+0987b353f71290224460d7f89bc4e9033d3af477.
+GPT-6.1 Sol (OpenAI Codex), via Hermes, authored the local exact-1 default-OFF
+adaptation, lazy bounded optional-name lookup, retained Driver.check path,
+symbol sanitization, and CPU-only tests. No whole upstream file was copied;
+no graph/arena/errorOf/TP changes. All inherited grants and notices remain.
+
+rank_fingerprint (TF_GLM_FINGERPRINT=1, default off: zig/src/cuda/fingerprint.zig, the
+identity exchange in zig/src/cuda/xchg/node.zig and
+zig/src/families/glm/cuda_ranks.zig, zig/tests/cuda/afd_fp.zig and
+zig/build/source_id.zig): the idea of nodes agreeing on build and weight identity
+before the weights serve, and its field list, follow @Bizuayeu
+(https://github.com/Bizuayeu) in https://github.com/Bizuayeu/TensorFold, branch
+pr/glm53-flash-cuda, commit 322b4de6 (zig/src/families/glm/cuda_ranks.zig lines
+1-31: a fingerprint of three env settings, world and rank, capacity, the sha256 of
+config.json, aot.json and the executable, and the snapshot name, all-gathered
+before the weights load), Apache License, Version 2.0. Reimplemented here from
+that field list; no code was copied. Claude Opus 5.5 (Anthropic), via Hermes,
+wrote the implementation and its tests.
+
+
+## Previous version (v2.0)
+
+The complete published v2.0 notice follows verbatim, including its Previous version (v1.0) section. Its deployment/patch/dependency wording applies to those tags, not to v3.0.
+
 # NOTICE
+
+GLM-5.3-Flash on 1x RTX 5090 + 2x DGX Spark, version 2.0: TensorFold with MiaAI-Lab's GLM work
+Copyright 2026 Scott Quarrier
+
+This version's own scripts, patches and documentation are licensed under the Apache License, Version 2.0
+([LICENSE](LICENSE)). If you redistribute it or a modified version of it, keep this NOTICE file and state what you
+changed (Apache-2.0, section 4). Version 1.0, the glm53f-afd version of 2026-09-30, stays MIT-licensed at the tag
+[`v1.0`](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/tree/v1.0); its credits are kept
+below, verbatim, in [Previous version (v1.0)](#previous-version-v10).
+
+This version ships no weights, no binaries and no container images. It builds TensorFold and MCDMA from source and
+downloads the weights from their own repositories. Each component keeps its own licence, stated below for the revision
+this version pins.
+
+## TensorFold (the engine)
+
+- <https://github.com/ashhart/TensorFold>, by Ash Hart ([ashhart](https://github.com/ashhart),
+  [@ashxhart](https://x.com/ashxhart)) and the TensorFold contributors.
+- **Apache-2.0 at v0.6.5** (`609ca419abecebdc5a059498a613680bd3aa847f`), the pinned revision. TensorFold is Apache-2.0
+  from v0.6.0; releases up to v0.5.0 were MIT, and code written before v0.6.0 keeps its MIT notice in TensorFold's
+  `LICENSES/MIT.txt`.
+- TensorFold's NOTICE reads: "TensorFold / Copyright 2026 TensorFold contributors / https://github.com/ashhart/TensorFold".
+  Keep it, and TensorFold's `LICENSES/MIT.txt` notice, with any copy of a patched tree.
+- TensorFold's `THIRD_PARTY_NOTICES.md` lists its own upstreams, among them
+  [ExLlamaV3](https://github.com/turboderp-org/exllamav3) (turboderp, MIT), whose EXL3 format the routed experts are
+  stored in; Hugging Face [transformers](https://github.com/huggingface/transformers) (Apache-2.0), whose `glm5_next`
+  model math TensorFold's GLM CUDA engine implements; and [z-lab/dflash](https://github.com/z-lab/dflash) (Z Lab, MIT),
+  whose DFlash2 architecture its drafter ports.
+- `build.sh` clones it at that revision and applies `patches/`. The patches' changes are offered under Apache-2.0; the
+  TensorFold code they modify, and quote as diff context, stays under TensorFold's licences.
+
+## MiaAI-Lab's TensorFold pull requests
+
+By MiaAI-Lab (Mia's AI Lab; [MiaAI-Lab](https://github.com/MiaAI-Lab), [@MiaAI_lab](https://x.com/MiaAI_lab)), open
+pull requests to TensorFold, under TensorFold's licence (Apache-2.0). Her commits are carried unchanged in substance and
+with her authorship; each patch names its pull request and her upstream commit:
+
+- [ashhart/TensorFold#243](https://github.com/ashhart/TensorFold/pull/243), four commits: patches 0002, 0003, 0004
+  (with a port note for the split) and 0006;
+- [#285](https://github.com/ashhart/TensorFold/pull/285): patch 0005;
+- [#301](https://github.com/ashhart/TensorFold/pull/301): patch 0007.
+
+## MiaAI-Lab's GLM-5.3-Flash EXL3 2x DGX Sparks recipe (ported patches)
+
+- <https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold>, Copyright 2026 MiaAI-Lab, Apache-2.0.
+  Its NOTICE reads: "GLM-5.3-Flash EXL3 on 2x DGX Spark with TensorFold / Copyright 2026 MiaAI-Lab".
+- Ported onto this project's tree, each with `Co-authored-by: MiaAI-Lab` and a credit header naming the recipe
+  patches and the recipe commit:
+
+| This project's patch | Her recipe patches | Her recipe commit |
+| --- | --- | --- |
+| 0009 (`TF_GLM_DENSE=q4`) | 0002, 0005, 0013, 0028 | `cf28cc4f8038be322cdeda220c6f1c8ace8f27d1` (v1.4) |
+| 0010 (`TF_GLM_KV=fp8`) | 0038, 0041 (its ring-base span) | `cf28cc4` (v1.4) |
+| 0012 (`TF_GLM_SHARED_PREFIX`) | 0015 (with 0030's multi-stream parts), 0063 | `1576746a04983b6eded0551dbf22512ee9e95654` (v1.5) |
+| 0013 (expert prompt kernels' launch switches) | 0001, 0020, 0009 | `1576746` (v1.5) |
+| 0014 (`TF_GLM_MULTI_PREFILL`) | 0049 | `1576746` (v1.5) |
+| 0015 (`TF_GLM_STREAM_SMOOTH`) | 0061 | `1576746` (v1.5) |
+| 0016 (`TF_GLM_FILL_BUDGET_MS`) | 0062 (the slice-aware wire is this project's) | `1576746` (v1.5) |
+| 0017 (decode kernels: `TF_GLM_Q4_TILE`, `TF_GLM_HC_DEC`, `TF_GLM_LATENT_STAGES`, `TF_GLM_KDA_WIDE_ROWS`, `TF_GLM_DECODE_SELECT`, `TF_GLM_EXL3_*`) | 0016, 0019, 0031, 0043, 0047 (with 0029's decode-row routing and 0009's `_tokens` kernel) | `1576746` (v1.5) |
+| 0018 (a test follow-up to 0017) | 0016, 0047 | `1576746` (v1.5) |
+| 0019 (`TF_GLM_DFLASH_POLICY`; `fnc5:0.2` in `.env.example`) | 0018, 0021 (with the multi-stream parts of 0027, 0030, 0035) | `1576746` (v1.5) |
+| 0020 (`TF_GLM_TOOL_CALLS`, `TF_GLM_KEEP_REASONING`) | 0036 (with 0053's and 0055's changes), 0051, the text part of 0056 | `1576746` (v1.5) |
+| 0023 (`TF_GLM_KDA_CHUNKED`: the chunked KDA prompt kernel, prompt grid and prompt replay) | 0012, 0014, 0039, 0008, 0042 | `1576746` (v1.5) |
+| 0024 (`TF_GLM_EXL3_PROMPT`: the EXL3 prompt kernel for the routed experts' prompt chunks) | 0004 (its EXL3 prompt kernels), with 0009's shared-row inputs and 0020's item order | `1576746` (v1.5) |
+| 0028 (`TF_GLM_LATENT_MMA`, `TF_GLM_HC_MMA`, `TF_GLM_SEQ_ROWS`, `TF_GLM_SPARSE_ONEPASS`, `TF_GLM_PROMPT_DSA`: the attention node's prompt-chunk kernels) | 0004, 0009, 0028 (with 0038's FP8 cache rows in the one-pass kernel) | `1576746` (v1.5) |
+| 0030 (`TF_GLM_MULTI_WINDOW`: up to eight concurrent streams) | 0069 | `1576746` (v1.5) |
+
+  Two of the notices in her NOTICE apply here, because patches 0017 and 0020 carry code she adapted from Jay
+  Leaton's project (next section). Her other third-party notices cover recipe patches that are not ported here
+  (0006, 0044, 0045, 0046, 0058, 0059, and the contributed 0054, 0057, 0060), so they do not apply to this project.
+- Two of this project's patches change code ported from her recipe, and keep `Co-authored-by: MiaAI-Lab` and a credit
+  header naming her patch and commit (`1576746`, v1.5): 0025 (`TF_GLM_CACHE_ROOM`, the pool's room rule) changes her
+  patch 0030's `MultiDecoder._room` and `_grow`, and 0029 (`TF_GLM_PREFILL_ORDER`, shortest-first prompt order)
+  changes her patch 0049's grouped chunk (`_group`). TensorFold's `THIRD_PARTY_NOTICES.md` in the patched tree records
+  both changes in the sections of the code they change.
+- This project's own patches are 0001, 0008, 0011, 0021, 0022 (prompt chunk pairs), 0026 (prefill lanes and FP8 wire
+  rows, off) and 0027 (exchanges in flight); 0026 and 0027 write designs of Hugh Madden's (below).
+
+## glm53-tensorfold-spark (code adapted in two of her ported patches)
+
+- <https://github.com/jayleaton/glm53-tensorfold-spark>, pinned at `59e0e338b8fe5b7c2c6f73e7e1e705fb6e93c2d4`, the
+  commit that adds its patch 0620 (its patch 0580 came with `2b6ec57` and is unchanged since), **Apache-2.0**.
+  By Jay Leaton ([jayleaton](https://github.com/jayleaton), [@jayleaton](https://x.com/jayleaton)). Its NOTICE reads:
+  "Copyright 2026 Jay Leaton (https://x.com/jayleaton)".
+- Patch 0017: the routed experts' 16-byte non-coherent trellis loads (`TF_GLM_EXL3_LOADS`, her recipe patch 0047)
+  are, as her recipe credits them, adapted from that project's patch 0580 (`exl3_ld.cu`'s `ld_kernel`, `LD_NC`).
+- Patch 0020: parts of her recipe patch 0036 are adapted from that project's patch 0620: the rule that tool calls
+  written inside the think block are the reply's calls when they end it, the reasoning store (keyed by the server's
+  call ids and a signature of the conversation), and `const` schemas and `null` read as None for a nullable string.
+- TensorFold's `THIRD_PARTY_NOTICES.md` in the patched tree names both, in its "GLM decode kernels" and "GLM tool
+  calls" sections.
+
+## MCDMA (the wire)
+
+- <https://github.com/ashhart/MCDMA>, by Ash Hart ([ashhart](https://github.com/ashhart),
+  [@ashxhart](https://x.com/ashxhart)), **Apache-2.0**, pinned at `e672c14ff9fc7b38994caf73025cf1588b4de74e`.
+- `build.sh` builds its link daemon (`mcdma-rpcd`) and `libmcdma-rpc` from source on each host; the split uses them at
+  runtime. None of MCDMA's code is copied into this project or into the patches.
+- Petrus Pennanen ([@ThinkOffApp](https://github.com/ThinkOffApp), [@petruspennanen](https://x.com/petruspennanen))
+  wrote [ashhart/MCDMA#5](https://github.com/ashhart/MCDMA/pull/5): its setup notes and build fix. `build.sh` does
+  not apply #5; it keeps the one compiler warning that #5 fixes as a warning.
+
+## The attention/expert split: its authors (no code from them is used)
+
+- Hugh Madden / Turquoise Bay AI ([@dangerm00se](https://x.com/dangerm00se), [hughmadden](https://github.com/hughmadden))
+  wrote [glm53f-afd](https://github.com/hughmadden/glm53f-afd) (MIT; v1.1.0, `91db3cc6fe672e2724efa3464f63bd31493f63f6`,
+  the engine of this repo's v1.0). Its README describes it as an inference engine that runs GLM-5.3-Flash with the RTX
+  5090 running attention, the KV cache, drafting, sampling and the API, and the DGX Sparks running the routed experts:
+  attention-FFN disaggregation (AFD). He also wrote [mimo26f-afd](https://github.com/hughmadden/mimo26f-afd) (MIT;
+  v1.2.0, `bab9fa2`), the source of glm53f-afd's serving shell, wire codec and RDMA transport. This version runs the
+  same split on TensorFold over MCDMA.
+- T.J. Purtell ([tpurtell](https://github.com/tpurtell), [@wrldsuksgo2mars](https://x.com/wrldsuksgo2mars)) wrote
+  [ds41rt](https://github.com/tpurtell/ds41rt) (`3067d06`), [glmrt](https://github.com/tpurtell/glmrt-5.3-1rtx-4spark)
+  (`dc6d9b8`) and [cuteafd](https://github.com/tpurtell/cuteafd) (`c650feb`), engines that run attention on RTX GPUs and
+  the routed experts on DGX Sparks over RoCE; glmrt's README calls itself an Attention-FFN Disaggregation (AFD) engine
+  for GLM-5.3 on one RTX PRO 6000 and four Sparks. Per glm53f-afd's NOTICE, glm53f-afd adapted kernels from ds41rt
+  (`3067d06`) and reimplemented ds41rt's wire format and RDMA transport (through mimo26f-afd) and glmrt's TP4 EXL3 split
+  and prefill reduce-scatter, which T.J. Purtell designed.
+- Patches 0026 and 0027 write three of Hugh Madden's designs for this tree, with no code copied: the exchanges kept in
+  flight ahead of the expert ranks (glm53f-afd `91db3cc`, `crates/glm53f-serve/src/lib.rs`; `TF_GLM_MCDMA_INFLIGHT`,
+  on in `.env.example`), the prefill in two and four lanes (mimo26f-afd `bab9fa2`,
+  `crates/mimo26-coordinator/src/dforward.rs`; glm53f-afd `crates/glm53f-forward/src/forward.rs`;
+  `TF_GLM_PREFILL_LANES`, off) and FP8 wire rows (glm53f-afd's `Fp8E4m3Ue8m0K32`; `TF_GLM_WIRE_FP8`, off). The FP8
+  rows use the row format of T.J. Purtell's ds41rt, E4M3 with a UE8M0 scale per 32 values, which reached glm53f-afd
+  through mimo26f-afd. TensorFold's `THIRD_PARTY_NOTICES.md` in the patched tree names them, in its "GLM prefill lanes
+  and FP8 wire rows" and "GLM exchanges in flight" sections, with glm53f-afd's MIT notice (Copyright (c) 2026
+  Turquoise Bay AI Pty Ltd).
+
+## Other authors of work the ported patches build on (no code from them is used)
+
+- fla-org ([fla-org](https://github.com/fla-org)): [flash-linear-attention](https://github.com/fla-org/flash-linear-attention)
+  (MIT) implements the published chunkwise algorithm of gated delta networks and Kimi Delta Attention. Mia's chunked
+  KDA kernel (patch 0023) computes that algorithm's chunked WY / UT form of the delta-rule recurrence; as her recipe's
+  CREDITS say, her kernels are written anew.
+- Patryk Mikołajczyk ([mikolaj92](https://github.com/mikolaj92)) wrote
+  [ashhart/TensorFold#140](https://github.com/ashhart/TensorFold/pull/140), which skips the DSA pool tiles a row cannot
+  see and bounds GLM's radix selection to the pools it can; TensorFold v0.6.0 has that bound for its selection kernel.
+  Her recipe patch 0043 (in patch 0017, `TF_GLM_DECODE_SELECT`) adds the same bound to decode scoring and the split
+  selection.
+- Aditya Thyagarajan ([aditya1503](https://github.com/aditya1503)) wrote
+  [ashhart/TensorFold#200](https://github.com/ashhart/TensorFold/pull/200), MTP concurrency (closed; #243 superseded
+  it). Patch 0008's message credits it.
+
+## Weights (downloaded by `download.sh`; never included in this repository)
+
+- **GLM-5.3-Flash** by Z.AI ([zai-org](https://huggingface.co/zai-org), [@Zai_org](https://x.com/Zai_org)),
+  <https://huggingface.co/zai-org/GLM-5.3-Flash> (revision `eb9eb208eb0d988989d07a6a12d0fdeb5f52574a`): **MIT**. Z.AI's
+  licence for the base model ships with the checkpoint as `LICENSE-GLM-5.3-Flash`.
+- **The quantization**, <https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold> by Mia's AI Lab:
+  **Apache-2.0** (its `LICENSE`), pinned at `76c0b5173166d2795dd48860f45d8224817f894c`. Its safetensors are
+  byte-identical to revision `078455ff`, the revision measured; only the licence files and the model card differ. Made
+  with [exllamav3](https://github.com/turboderp-org/exllamav3) by turboderp ([turboderp](https://github.com/turboderp),
+  [@turboderp_](https://x.com/turboderp_); MIT); the checkpoint records no exllamav3 revision.
+- **The DFlash2 drafter**, <https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2> by IncoAI
+  ([incoai](https://huggingface.co/incoai)), pinned at `bf582e4eacc1810f76656d1811693ff6c6737d2a`: **CC BY-NC-ND 4.0**,
+  non-commercial use only, no derivatives. Referenced by name and downloaded from its own repository; never
+  redistributed here. Leave `DRAFTER_DIR` empty to serve without it.
+
+## Build and runtime dependencies (not included)
+
+- NVIDIA's PyTorch container, `nvcr.io/nvidia/pytorch:26.07-py3`, the base of the serving image that `build.sh` builds
+  on each host, under the NVIDIA Software License Agreement and the Product-Specific Terms for NVIDIA AI Products,
+  which the container prints at start. TensorFold's Python dependencies are installed from PyPI into that image.
+- [rdma-core](https://github.com/linux-rdma/rdma-core) (`libibverbs`), a C compiler and make on the hosts, for MCDMA;
+  Docker and the NVIDIA Container Toolkit; git; `huggingface_hub` (`hf`) for the downloads.
+- `extras/gb10-hostguard/` is v1.0's host guard, carried over unchanged in its code: Python's standard library and
+  systemd only.
+
+## AGENTS.md (rules for agents that edit this repo)
+
+`AGENTS.md` is "AGENTS.md - credit and attribution" by Mia ([@MiaAI_lab](https://x.com/MiaAI_lab), [MiaAI-Lab](https://github.com/MiaAI-Lab)), included unchanged (sha256 `81a6dd958181aa1d`) from <https://mia-ai.net/lab/downloads/agents-md-credit-and-attribution> (added 4 October 2026). Her page publishes it for use in other projects: "Drop this file in a project as AGENTS.md."
+
+## Not used
+
+- No vLLM, and no code from glm53f-afd, mimo26f-afd, ds41rt, glmrt or cuteafd.
+- No vision: GLM's vision encoder and image paths (her recipe patches 0003, 0050, 0054 and 0056's image part) are not
+  ported; this project serves text only.
+- No Local Inference Lab weights: the EXL3 TR3 4-bpw quantization by Local Inference Lab, Inc. that this repo's v1.0
+  serves is not used by this version (v1.0's licence-required attribution is kept below).
+
+## Previous version (v1.0)
+
+[v1.0](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/tree/v1.0) (commit `b8f1743`: the
+glm53f-afd version of 2026-09-30, with the credit update of 2026-10-04) runs glm53f-afd v1.1.0 with Local Inference
+Lab's TR3 4-bpw experts. It stays MIT-licensed at that tag, and its weights' licence-required attribution applies to
+anyone who runs it. Its credits follow verbatim: its README's first-screen credits, its README's "License and
+credits" section, then its whole NOTICE.md. In them, "this repo", "this repository", "this recipe" and "this
+README" mean v1.0, and their links to `LICENSE`, `NOTICE.md` and the README's Performance section point at v1.0's
+own files at the tag.
+
+### v1.0's README: first-screen credits
+
+This repo is a deployment recipe, not a new engine. It runs Z.ai's [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) (`eb9eb208`) with **[glm53f-afd](https://github.com/hughmadden/glm53f-afd)** v1.1.0 (`91db3cc`), by Hugh Madden / Turquoise Bay AI ([@dangerm00se](https://x.com/dangerm00se), [hughmadden](https://github.com/hughmadden)), on a mixed box:
+
+> **Weights attribution (required by licence):** routed-expert weights are *GLM-5.3-Flash TR3 4bpw* by **Local Inference Lab, Inc.** (published by Brandon M. Music, revision `5ab363a8`). Upstream: <https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw>, project home: <https://local-inference-lab.ai/>, licensed LicenseRef-LIL-Attribution-1.0 / ShapleyMCG 1.0. The DFlash2 drafter is [incoai/GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2) by [IncoAI](https://huggingface.co/incoai) (revision `bf582e4e`), CC BY-NC-ND 4.0 (non-commercial). This repo contains no weights; see [NOTICE.md](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/blob/v1.0/NOTICE.md).
+
+> **README layout:** this README uses the layout of the README of [GLM-5.3-Flash-EXL3-2x-DGX-Sparks](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks) by Mia ([@MiaAI_lab](https://x.com/MiaAI_lab), [MiaAI-Lab](https://github.com/MiaAI-Lab)), at [`674155d`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/tree/674155dec2f2f62bb879801b5ce2cfc759a0bebf). Her two-Spark lane is the comparison baseline in [Performance](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/blob/v1.0/README.md#performance). No code from her repo is used.
+
+### v1.0's README: License and credits
+
+This repo's scripts, units and docs are **MIT** ([LICENSE](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/blob/v1.0/LICENSE)). MIT matches the engine it wraps (glm53f-afd, MIT) and most of that engine's upstreams, and it keeps the recipe easy to reuse. The repo vendors no third-party code and ships no weights. Everything it downloads or builds keeps its own licence, listed in **[NOTICE.md](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/blob/v1.0/NOTICE.md)**:
+
+- **engine:** glm53f-afd, MIT;
+- **base model:** zai-org GLM-5.3-Flash, MIT;
+- **EXL3 experts:** Local Inference Lab, LIL Attribution 1.0 / ShapleyMCG 1.0, with **attribution required**;
+- **DFlash2 drafter:** CC BY-NC-ND 4.0, **non-commercial**.
+
+This recipe does not use vLLM, and it contains no code from Mia's AGPL-3.0 repo. It uses that repo's README layout, credited at the top.
+
+All the hard parts are other people's work:
+
+- **[glm53f-afd](https://github.com/hughmadden/glm53f-afd)** by Hugh Madden / Turquoise Bay AI ([@dangerm00se](https://x.com/dangerm00se)): the engine, its KL gate, and [the report](https://services.turquoisebay.ai/share/glm53f-afd/). It incorporates or derives from, per its NOTICE: Hugh Madden's [mimo26f-afd](https://github.com/hughmadden/mimo26f-afd); T.J. Purtell's ([@wrldsuksgo2mars](https://x.com/wrldsuksgo2mars)) [ds41rt](https://github.com/tpurtell/ds41rt), [glmrt](https://github.com/tpurtell/glmrt-5.3-1rtx-4spark) and [sparkinfer-glmrt](https://github.com/tpurtell/sparkinfer-glmrt); Ash Hart's ([@ashhart](https://github.com/ashhart)) [TensorFold](https://github.com/ashhart/TensorFold); fla-org's [flash-linear-attention](https://github.com/fla-org/flash-linear-attention); Z Lab's [z-lab/dflash](https://github.com/z-lab/dflash); the sgl-project's [SGLang](https://github.com/sgl-project/sglang); Local Inference Lab's [b12x](https://github.com/local-inference-lab/b12x); turboderp's [ExLlamaV3](https://github.com/turboderp-org/exllamav3); and Hugging Face's [transformers](https://github.com/huggingface/transformers).
+- **Weights:**
+  - [Z.ai](https://huggingface.co/zai-org/GLM-5.3-Flash): the base model.
+  - **Local Inference Lab, Inc.** (published by Brandon M. Music): EXL3 TR3 4bpw experts, BF16 teacher logits and KL method. Upstream <https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw>, project home <https://local-inference-lab.ai/>.
+  - [IncoAI](https://huggingface.co/incoai): the DFlash2 drafter.
+  - [malaiwah](https://huggingface.co/malaiwah) (Michel Belleau): the quant-fidelity registry.
+- **The two-Spark reference:** [MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks) by Mia ([@MiaAI_lab](https://x.com/MiaAI_lab)). This README uses its layout, at [`674155d`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/tree/674155dec2f2f62bb879801b5ce2cfc759a0bebf), and her lane is our comparison baseline.
+- **[AGENTS.md](AGENTS.md):** the credit and attribution rules by Mia ([@MiaAI_lab](https://x.com/MiaAI_lab), [MiaAI-Lab](https://github.com/MiaAI-Lab)), from [mia-ai.net](https://mia-ai.net/lab/downloads/agents-md-credit-and-attribution), unchanged. Agents that edit this repo follow them.
+- **This recipe:** [@squarrier](https://github.com/squarrier), with the AI agents above.
+
+### v1.0's NOTICE.md: upstream projects, weights and licences
+
+This repository (scripts, systemd units, docs, patch) is licensed **MIT**; see [LICENSE](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/blob/v1.0/LICENSE). It is a deployment recipe. It contains **no model weights, no engine source, and no code copied from the projects below**, except `patches/0001-*.patch`, a modification of glm53f-afd offered under glm53f-afd's own MIT terms.
+
+`build.sh` downloads and builds the engine from its upstream repository. `download.sh` downloads the weights from their publishers. When you run them, you obtain those works directly from their authors, under **their** licences listed below. Read those licences before you use, deploy, or redistribute anything.
+
+#### Required attribution: EXL3 expert weights
+
+The routed-expert weights used by this recipe are **GLM-5.3-Flash TR3 4bpw (EXL3 K4)** by **Local Inference Lab, Inc.** (published by Brandon M. Music):
+
+- Upstream source: <https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw>
+- Project home: <https://local-inference-lab.ai/>
+- Licence: `LicenseRef-LIL-Attribution-1.0` (the model card calls it *ShapleyMCG License 1.0*). It is MIT-derived with an attribution **condition**. The rank images `download.sh` creates are derivative works (TP4 slices) and fall under the same licence. This repository does not distribute them.
+
+#### Engine (built from source by `build.sh`, not vendored)
+
+| Project | Licence | Role |
+|---|---|---|
+| [hughmadden/glm53f-afd](https://github.com/hughmadden/glm53f-afd) v1.1.0 `91db3cc`, © 2026 Turquoise Bay AI Pty Ltd | MIT | The serving engine: coordinator, expert ranks, RDMA wire, API, KL gate. `patches/0001` modifies it. |
+
+glm53f-afd itself incorporates or derives from the following. Its [`NOTICE.md`](https://github.com/hughmadden/glm53f-afd/blob/91db3cc6fe672e2724efa3464f63bd31493f63f6/NOTICE.md) and `docs/REUSE.md` are the authoritative ledger. Each licence below is the one that applies to the revision glm53f-afd v1.1.0 took code or constants from. A project may have relicensed later releases.
+
+| Project | Licence |
+|---|---|
+| [hughmadden/mimo26f-afd](https://github.com/hughmadden/mimo26f-afd) | MIT |
+| [tpurtell/ds41rt](https://github.com/tpurtell/ds41rt) (T.J. Purtell) | MIT |
+| [tpurtell/glmrt-5.3-1rtx-4spark](https://github.com/tpurtell/glmrt-5.3-1rtx-4spark) (T.J. Purtell) | MIT |
+| [tpurtell/sparkinfer-glmrt](https://github.com/tpurtell/sparkinfer-glmrt) / [local-inference-lab/b12x](https://github.com/local-inference-lab/b12x) | Apache-2.0 |
+| [ashhart/TensorFold](https://github.com/ashhart/TensorFold) @ `bb4b4a3` (v0.3.4.1), plus copy-window constants from `a83ed1e` (v0.3.2) | MIT for those revisions. TensorFold is Apache-2.0 from v0.6.0 (upstream `e3ac0ea`). |
+| [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3) | MIT |
+| [fla-org/flash-linear-attention](https://github.com/fla-org/flash-linear-attention) | MIT |
+| [z-lab/dflash](https://github.com/z-lab/dflash) | MIT |
+| [sgl-project/sglang](https://github.com/sgl-project/sglang) | Apache-2.0 |
+| [huggingface/transformers](https://github.com/huggingface/transformers) | Apache-2.0 |
+| linux-rdma/rdma-core headers | GPL-2.0 or OpenIB.org BSD (used under BSD) |
+
+#### Weights and models (downloaded by `download.sh`, not included)
+
+| Work | Publisher | Revision used | Licence |
+|---|---|---|---|
+| GLM-5.3-Flash, official FP8 (non-expert tensors) | [zai-org](https://huggingface.co/zai-org/GLM-5.3-Flash) | `eb9eb208` | MIT |
+| GLM-5.3-Flash TR3 4bpw EXL3 K4 (routed experts) | [Local Inference Lab / brandonmusic](https://huggingface.co/brandonmusic/GLM-5.3-Flash-tr3-4bpw) | `5ab363a8` | LIL Attribution 1.0 / ShapleyMCG 1.0 (see above) |
+| GLM-5.3-Flash DFlash2 drafter | [incoai](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2) | `bf582e4e` | **CC BY-NC-ND 4.0: non-commercial, no derivatives** |
+
+The DFlash2 drafter's licence forbids commercial use. For a commercial deployment, run without it: remove `--drafter` from `site/glm53f-afd-coord-run`. Single-stream decode drops to about 45 tok/s.
+
+#### Build and runtime dependencies (not vendored)
+
+NVIDIA CUDA Toolkit container images (`nvidia/cuda:*-devel`; NVIDIA Deep Learning Container License), the NVIDIA driver and CUDA MPS, the Rust toolchain (MIT/Apache-2.0), Docker, rdma-core, and `huggingface_hub` (Apache-2.0).
+
+**Not used:** vLLM. This recipe does not use or include vLLM. vLLM appears only in the README comparison, which cites Mia's two-Spark vLLM lane.
+
+#### Reference projects (layout and comparison only, no code taken)
+
+- [MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks) (AGPL-3.0; MIT before 2026-09-07), by Mia ([@MiaAI_lab](https://x.com/MiaAI_lab), [MiaAI-Lab](https://github.com/MiaAI-Lab)). This README uses its layout, at [`674155d`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks/tree/674155dec2f2f62bb879801b5ce2cfc759a0bebf), and her lane is the comparison baseline. **No code from it is included or adapted here.**
+- The public four-Spark recipes that glm53f-afd's NOTICE lists as sources: Matt Mastracci's ([@mmastrac](https://github.com/mmastrac)) [mmastrac/glm-5.3-flash-4x-gx10](https://github.com/mmastrac/glm-5.3-flash-4x-gx10) at `5ea4121` (no licence file), and Zbigniew Majewski's ([knapcio](https://github.com/knapcio)) [knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4](https://github.com/knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4) at `beca637` (MIT). glm53f-afd adapts parts of them, recorded in its `docs/REUSE.md`; nothing of theirs is in this repo.
+
+#### AGENTS.md (rules for agents that edit this repo)
+
+`AGENTS.md` is "AGENTS.md - credit and attribution" by Mia ([@MiaAI_lab](https://x.com/MiaAI_lab), [MiaAI-Lab](https://github.com/MiaAI-Lab)), included unchanged (sha256 `81a6dd958181aa1d`) from <https://mia-ai.net/lab/downloads/agents-md-credit-and-attribution> (added 4 October 2026). Her page publishes it for use in other projects: "Drop this file in a project as AGENTS.md."
+
+## Public ledger author/source credits
+
+# Third-party source records
+
+Generated from the captured provenance render and its active rows. No private task names, evidence paths or history are distributed. A reference remains a reference; an unlicensed or non-permissive reference supplies no copied code. Original inherited notices follow.
+
+## Ash Hart (@ashhart)
+
+Profile: https://github.com/ashhart
+
+- **code-copied**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/f8fe17d24629aedabf90bbf78279dd776e6d62e7) at `f8fe17d24629aedabf90bbf78279dd776e6d62e7` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Ash Hart (@ashhart, X @ashxhart) authored TensorFold; its v1.0.2 commit f8fe17d is the base of this fork (native TensorFold AFD snapshot).
+- **code-copied**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/ed78d6fc204d89d90b045bf033d6551e7714f3a1) at `ed78d6fc204d89d90b045bf033d6551e7714f3a1` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Ash Hart and the TensorFold contributors authored python-0.6's EXL3 kernels and GLM's exl3.cu (ashhart/TensorFold ed78d6f), which f3949cf7 copied into zig/kernels/cuda/exl3/.
+- **code-copied**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/ed78d6fc204d89d90b045bf033d6551e7714f3a1) at `ed78d6fc204d89d90b045bf033d6551e7714f3a1` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Ash Hart authored python-0.6's GLM extension device code (ashhart/TensorFold ed78d6f), which local integration copied as the glm_* fatbins (dd7de994).
+- **code-copied**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/db281878ddb836fd0df510d8771ecb7e0fe47d26) at `db281878ddb836fd0df510d8771ecb7e0fe47d26` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Ash Hart authored copies.py (ashhart/TensorFold db28187), which local integration brought back as zig/tests/cuda/copies.py.
+- **code-ported**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/ed78d6fc204d89d90b045bf033d6551e7714f3a1) at `ed78d6fc204d89d90b045bf033d6551e7714f3a1` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Ash Hart authored python-0.6's GLM Triton kernel sources (glue.py, attention.py, qmm.py and most of forward.py, latent.py and sparse.py; ashhart/TensorFold ed78d6f), compiled ahead of time into the Triton kernel set (ed10d2f4) and wrapped in Zig (22dc0785).
+- **code-copied**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/afa35dc0b6b3ae889ea3f26ace68c4e45cb162a7) at `afa35dc0b6b3ae889ea3f26ace68c4e45cb162a7` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Ash Hart authored the fix that keeps a declared GLM tool's name when it has spaces (ashhart/TensorFold afa35dc0), cherry-picked as 6b433291.
+- **code-copied**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/1b0268954745802a3ee9b0d1828a51f5bdee0c1d) at `1b0268954745802a3ee9b0d1828a51f5bdee0c1d` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. chaog992 authored TensorFold #594 (711bacf2): nested completion prompt ids past u32 decode as unknown ids; Ash Hart's merge 1b026895 was picked as 647941a3.
+- **dependency**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/c080a18eeae970a742135ee86325115b0387a1c8) at `c080a18eeae970a742135ee86325115b0387a1c8` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Ash Hart authored TensorFold v1.0.6's tf_grammar.cc shim (c080a18e), which wraps XGrammar in local integration's libtfgrammar.so.
+- **design**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/c080a18eeae970a742135ee86325115b0387a1c8) at `c080a18eeae970a742135ee86325115b0387a1c8` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Ash Hart authored v1.0.6's mask-before-draw (tf_grammar_mask, c080a18e), which local integration's device-masked greedy draw follows (b11df7cf).
+- **code-ported**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/d7b134cdf86a02b7c91d0d137ce733c04ae53cfd) at `d7b134cdf86a02b7c91d0d137ce733c04ae53cfd` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. @BlivionIaG authored TensorFold #623 (head d7b134cd): the lane core's optional prefill_step / fillStream and the host's filling queue; Ash Hart merged it as 1184cdbb. local integration ported it (9263173e, picked as cd9627dc).
+- **code-ported**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/e7c523ebfa16b8094cf9e35e3773a7d25befcc5b) at `e7c523ebfa16b8094cf9e35e3773a7d25befcc5b` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Ash Hart authored TensorFold v1.0.7 (e7c523eb): the lane host's Admit hook and its test, which local integration ported (15f6451d, picked as cf2c45c8), and #639's shared MLA cache pool, whose region rule cuda_afd_pool.zig reimplements with no code copied.
+- **code-copied**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/c080a18eeae970a742135ee86325115b0387a1c8) at `c080a18eeae970a742135ee86325115b0387a1c8` (Apache-2.0). Related study/test-package or later candidate; not newly adopted in v3.0. Ash Hart authored TensorFold v1.0.6's tf_grammar.cc shim (c080a18e), which wraps XGrammar in local integration's libtfgrammar.so.
+- **reference**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/60626dc1b2505375854dc94c06718f7ae67ebda9) at `60626dc1b2505375854dc94c06718f7ae67ebda9` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. Mia (@MiaAI_lab/MiaAI-Lab) authored the native GLM EXL3 recipe/port in this pinned repository; Ash Hart and TensorFold contributors authored the engine/arithmetic, Jürgen Schmied authored native CUDA serving/registry, and local-inference-lab authored b12x/RoCEnante.
+- **reference**, [https://github.com/ahinore/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/ahinore/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/2636c1cb3019ede4ab27191299d5ad6843344942) at `2636c1cb3019ede4ab27191299d5ad6843344942` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. iegamo (@ahinore) authored PR164 input literal-added-token marking in this fork/commit; its commit preserves Claude Opus 5.5 as co-author, and all Mia/TensorFold/inherited notices remain intact.
+- **reference**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/e7c523ebfa16b8094cf9e35e3773a7d25befcc5b) at `e7c523ebfa16b8094cf9e35e3773a7d25befcc5b` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. Ash Hart (@ashhart/@ashxhart) and TensorFold contributors authored the configured v1.0.7 base read here to reconstruct selected shared-source patch hunks; no implementation was taken into our engine.
+
+## Mia (@MiaAI_lab)
+
+Profile: https://github.com/MiaAI-Lab
+
+- **reference**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/b5808ac) at `b5808ac` (NOASSERTION). Research/benchmark reference only; no code taken for v3.0. Mia (@MiaAI_lab) authored the GLM-5.3-Flash EXL3 TensorFold lane github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold; local integration prints local integration's recorded gb10 C4 figures for its b5808ac (100.5 tok/s aggregate, 25.9-29.6 per stream) beside local integration-STREAMS for comparison; nothing was taken and gb10 is never contacted.
+- **code-ported**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/b23c10ad305aa068e12b901ee8ebd8166b9aa6fd) at `b23c10ad305aa068e12b901ee8ebd8166b9aa6fd` (MIT). Native source, reimplemented design or build/runtime dependency. Mia (MiaAI-Lab) authored the 512-row prompt chunks of latent.py, sparse.py and forward.py (ashhart/TensorFold b23c10ad), compiled into the Triton kernel set (ed10d2f4).
+- **design**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/3fd60dfc836fab0f1ed0fd4f0afaf2a1d62b2aab) at `3fd60dfc836fab0f1ed0fd4f0afaf2a1d62b2aab` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. ezoushen authored the compaction rule of patch 0074-glm-compact-before-evict (pull request #62, issue #61) in Mia's GLM-5.3-Flash recipe, read at 3fd60dfc; cuda_afd_pool.zig reimplements it with no code copied.
+- **code-ported**, [https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/tree/cbfc429) at `cbfc429` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Mia (MiaAI-Lab) authored the two-rank CUDA layer of patch 0006 (with 0002 and 0007) in Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold at cbfc429, which local integration ported (b5adb25e) and local integration's exchange reuses for its RoCE proxy (2b6703d7).
+- **code-ported**, [https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/tree/cbfc429) at `cbfc429` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Mia authored flashnext_aot.py, flashnext_triton_fixtures.py and cuda_triton.zig in Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold at cbfc429, from which tools/zig/glm_aot*.py, glm_triton_*.py and cuda_triton*.zig are adapted (ed10d2f4, 22dc0785).
+- **code-ported**, [https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold/tree/a687724) at `a687724` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Mia authored patches/0128-glm-full-expert-prefetch.patch (L2 prefetch, programmatic launch) of GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold at a687724, applied to the EXL3 expert kernel copies in zig/kernels/cuda/exl3/l2d/ (7d6ab8a2).
+- **code-ported**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/549fdc562c477d477244d2df0590d6c14bda4889) at `549fdc562c477d477244d2df0590d6c14bda4889` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Mia authored NUCLEUS_UNION, patches/0034-cuda-nucleus-union.patch at recipe commit 549fdc5 of GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold, which local integration ported for the TP nucleus draw (df44f812) and local integration reuses (4ae62ad8, picked as 29769d49).
+- **code-ported**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/549fdc562c477d477244d2df0590d6c14bda4889) at `549fdc562c477d477244d2df0590d6c14bda4889` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Mia authored patches/0005-glm-dense-q4.patch (the q4 dense form, quantize4_mse) at v1.10, commit 549fdc5, of her GLM-5.3-Flash recipe, which qualification_63cac091.5 B8 ported as TF_GLM_DENSE=q4 (3725fc86).
+- **code-ported**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/549fdc562c477d477244d2df0590d6c14bda4889) at `549fdc562c477d477244d2df0590d6c14bda4889` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Mia authored patches/0002-glm-dense-fp8.patch (make_f8 and the FP8 matmul _fmm) at v1.10, commit 549fdc5, of her GLM-5.3-Flash recipe, which qualification_63cac091.5 B9 ported for the FP8 head (657fc439).
+- **code-ported**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/549fdc562c477d477244d2df0590d6c14bda4889) at `549fdc562c477d477244d2df0590d6c14bda4889` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Mia authored patch 0002's FP8 matmul at 549fdc5, whose launches the MTP draft layer on FP8 uses (32094381, 219461a2).
+- **code-ported**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/1576746a04983b6eded0551dbf22512ee9e95654) at `1576746a04983b6eded0551dbf22512ee9e95654` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Mia authored recipe patches 0001-glm-exl3-prompt-experts, 0020-glm-prompt-experts-order and 0009-glm-prefill-kernels at 1576746, adapted onto the universal kernel and carried by local integration into zig/kernels/cuda/exl3/x1/ (5ab6226b).
+- **code-ported**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/1576746a04983b6eded0551dbf22512ee9e95654) at `1576746a04983b6eded0551dbf22512ee9e95654` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Mia authored patches/0004-glm-prompt-kernels.patch at 1576746, the EXL3 prompt-window expert kernel that local integration ported into zig/kernels/cuda/exl3/local integration/ (b4b853f7) as the Python TF-AFD 2.15 lane's patch 0024 ports it.
+- **design**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/1576746a04983b6eded0551dbf22512ee9e95654) at `1576746a04983b6eded0551dbf22512ee9e95654` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Mia authored the one-program sum of a matmul's K splits in patch 0004-glm-prompt-kernels, which zig/kernels/cuda/exl3/x1s/ (SEQ) reimplements on X1's kernel (c898e828).
+- **reference**, [https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/tree/a3aa89835022c55ca8e55008c37785954834e04f) at `a3aa89835022c55ca8e55008c37785954834e04f` (MIT). Research/benchmark reference only; no code taken for v3.0. Mia authored the Flash Next vision patch 0008 (a3aa8983), which upstream TensorFold's Python engine ported; no file of it is in this Zig tree.
+- **design**, [https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold/tree/ba19a9c16a51175a90e1b135748219c4fb51fb0b) at `ba19a9c16a51175a90e1b135748219c4fb51fb0b` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Mia (@MiaAI_lab) authored tools/exact.py in GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold (ba19a9c), whose exactness checks (each reply equal to its alone reference) local integration's client implements with new code (local integration-kit 813781c2) and the users path's together = solo tests follow.
+- **reference**, [https://mia-ai.net/lab/downloads/agents-md-credit-and-attribution](https://mia-ai.net/lab/downloads/agents-md-credit-and-attribution) at `81a6dd958181aa1d581cb24d54d30a327842e955bd42b40256e54bfc1abfa8cb` (none). Research/benchmark reference only; no code taken for v3.0. Mia (@MiaAI_lab) authored the AGENTS.md credit and attribution guide; local integration read its published page and download and preserves her credit without copying additional guide text into the shipping change or assigning it an invented licence.
+- **reference**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/60626dc1b2505375854dc94c06718f7ae67ebda9) at `60626dc1b2505375854dc94c06718f7ae67ebda9` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. Mia (@MiaAI_lab/MiaAI-Lab) authored the native GLM EXL3 recipe/port in this pinned repository; Ash Hart and TensorFold contributors authored the engine/arithmetic, Jürgen Schmied authored native CUDA serving/registry, and local-inference-lab authored b12x/RoCEnante.
+- **reference**, [https://github.com/ahinore/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/ahinore/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/2636c1cb3019ede4ab27191299d5ad6843344942) at `2636c1cb3019ede4ab27191299d5ad6843344942` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. iegamo (@ahinore) authored PR164 input literal-added-token marking in this fork/commit; its commit preserves Claude Opus 5.5 as co-author, and all Mia/TensorFold/inherited notices remain intact.
+
+## Mia (@MiaAI_lab)
+
+Profile: https://huggingface.co/Mia-AiLab
+
+- **weights**, [https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold/tree/078455ffe6472f9a52fbc1139f58b9db2881b25c) at `078455ffe6472f9a52fbc1139f58b9db2881b25c` (MIT). Pinned runtime weights, not shipped. Mia's AI Lab (@MiaAI_lab) made the EXL3 quantization Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold (revision 078455ff), with exllamav3, of Z.ai's GLM-5.3-Flash: the weights the GLM-5.3-Flash lane reads (7cecb415). Never shipped.
+- **weights**, [https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold/tree/078455ffe6472f9a52fbc1139f58b9db2881b25c) at `078455ffe6472f9a52fbc1139f58b9db2881b25c` (MIT). Pinned runtime weights, not shipped. Mia's AI Lab (@MiaAI_lab) made the EXL3 quantization Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold (revision 078455ff), with exllamav3, of Z.ai's GLM-5.3-Flash: the weights every local integration lab boot loads on attention-host/expert1-host/expert0-host (local integration head e7c960e8). Never copied or shipped.
+- **weights**, [https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold/tree/078455ffe6472f9a52fbc1139f58b9db2881b25c) at `078455ffe6472f9a52fbc1139f58b9db2881b25c` (MIT). Pinned runtime weights, not shipped. Mia's AI Lab (@MiaAI_lab) made the EXL3 quantization Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold (revision 078455ff), with exllamav3, of Z.ai's GLM-5.3-Flash: the weights every local integration lab boot loads on attention-host/expert1-host/expert0-host (local integration's final head 6b0d285a). Never copied or shipped.
+- **weights**, [https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold/tree/078455ffe6472f9a52fbc1139f58b9db2881b25c) at `078455ffe6472f9a52fbc1139f58b9db2881b25c` (MIT). Pinned runtime weights, not shipped. Mia (@MiaAI_lab) authored the EXL3 quantization of GLM-5.3-Flash by Z.ai in Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold revision 078455ff; its exact published licence and card are MIT, with Copyright (c) 2026 Z.AI Co., Ltd.
+- **weights**, [https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold/tree/41ba3c2b82eff6ef5b93debff02f47ae4681d824) at `41ba3c2b82eff6ef5b93debff02f47ae4681d824` (Apache-2.0). Other weight revision documented for licence history; not selected. Mia (@MiaAI_lab) authored the EXL3 quantization of Z.ai GLM-5.3-Flash; at revision 41ba3c2b its published terms are Apache-2.0 for the quantization, with Z.ai MIT retained for the base model in LICENSE-GLM-5.3-Flash.
+- **weights**, [https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold/tree/078455ffe6472f9a52fbc1139f58b9db2881b25c) at `078455ffe6472f9a52fbc1139f58b9db2881b25c` (MIT). Pinned runtime weights, not shipped. Mia's AI Lab (@MiaAI_lab) made the EXL3 quantization Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold (revision 078455ff), with exllamav3, of Z.ai's GLM-5.3-Flash: the weights every local integration lab boot loads on attention-host/expert1-host/expert0-host (local integration's final head 6b0d285a, local integration's kit). Never copied or shipped.
+
+## AEON-7 (@AEON-7)
+
+Profile: https://github.com/AEON-7
+
+- **reference**, [https://github.com/AEON-7/Aeon-Bench-Pod](https://github.com/AEON-7/Aeon-Bench-Pod/tree/8651bcb5869d8e392fbb58d0059d73d346afeeb3) at `8651bcb5869d8e392fbb58d0059d73d346afeeb3` (MIT). Research/benchmark reference only; no code taken for v3.0. AEON-7 (@AEON-7, github.com/AEON-7) authored the AEON Bench Pod (github.com/AEON-7/Aeon-Bench-Pod at 8651bcb5, MIT), whose AEON-30 eval local integration's local integration kit runs against the lab endpoint (gate G-AEON) through Hermes's local endpoint runner on Scott's fork commit 9990ec10; nothing of it is copied into the TensorFold fork or the kit.
+- **reference**, [https://github.com/AEON-7/Aeon-Bench-Pod](https://github.com/AEON-7/Aeon-Bench-Pod/tree/8651bcb5869d8e392fbb58d0059d73d346afeeb3) at `8651bcb5869d8e392fbb58d0059d73d346afeeb3` (MIT). Research/benchmark reference only; no code taken for v3.0. AEON-7 (@AEON-7, github.com/AEON-7) authored the AEON Bench Pod (github.com/AEON-7/Aeon-Bench-Pod at 8651bcb5, MIT), whose AEON-30 eval local integration's kit runs under local integration load (S-AEON) through the canonical aeon_one.sh wrapper on Scott's fork commit 9990ec10; nothing of it is copied into the kit.
+- **reference**, [https://github.com/AEON-7/Aeon-Bench-Pod](https://github.com/AEON-7/Aeon-Bench-Pod/tree/8651bcb5869d8e392fbb58d0059d73d346afeeb3) at `8651bcb5869d8e392fbb58d0059d73d346afeeb3` (MIT). Research/benchmark reference only; no code taken for v3.0. AEON-7 (@AEON-7, github.com/AEON-7) authored the AEON Bench Pod (github.com/AEON-7/Aeon-Bench-Pod at 8651bcb5, MIT), whose AEON-30 eval local integration ran on boot M-on (G-AEON) against the lab URL through the local integration kit's canonical aeon_one.sh wrapper on Scott's fork commit 9990ec10; nothing of it is copied.
+
+## Andrey Kolesnikov (@akol1)
+
+Profile: https://github.com/akol1
+
+- **code-ported**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/861348862a0f108027575c6e529e527e0bfe754d) at `861348862a0f108027575c6e529e527e0bfe754d` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Andrey Kolesnikov (@akol1) authored forward.py's EXL3 experts on the universal path for any bit width (ashhart/TensorFold 86134886), compiled into the Triton kernel set (ed10d2f4).
+- **design**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/720c409114c123ed1efa19f0725cd05acc189786) at `720c409114c123ed1efa19f0725cd05acc189786` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Andrey Kolesnikov (@akol1) authored TensorFold #650's whole-response content condition (ashhart/TensorFold 720c4091), which local integration reimplemented (56b60ccd).
+
+## Apple Inc. (ml-explore)
+
+Profile: https://github.com/ml-explore
+
+- **code-ported**, [https://github.com/ml-explore/mlx](https://github.com/ml-explore/mlx/tree/v0.32.3) at `v0.32.3` (MIT). Native source, reimplemented design or build/runtime dependency. Apple Inc. (ml-explore) authored MLX, whose affine quantization layout and 0.32 kernel arithmetic the inherited Metal kernels of Ash's base reproduce.
+- **code-ported**, [https://github.com/ml-explore/mlx-lm](https://github.com/ml-explore/mlx-lm/tree/v0.31.3) at `v0.31.3` (MIT). Native source, reimplemented design or build/runtime dependency. Apple Inc. (ml-explore) authored mlx-lm, whose expert selection the inherited Metal routing kernels of Ash's base reproduce.
+
+## Ashish Kulkarni
+
+Profile: https://github.com/py-pdf/pypdf
+
+- **dependency**, [https://github.com/py-pdf/pypdf](https://github.com/py-pdf/pypdf/tree/6.20.0) at `6.20.0` (BSD-3-Clause). Verification-only dependency; not used or shipped by v3.0. Mathieu Fenniak, Ashish Kulkarni and Steve Witham are the copyright authors named by pypdf's BSD-3-Clause LICENSE; local integration uses installed pypdf 6.20.0 (github.com/py-pdf/pypdf) only to read back the own-code PDF artifact and verify its six pages and complete text. No pypdf code is copied into the TensorFold engine, kit or package.
+
+## avlp12
+
+Profile: https://github.com/avlp12
+
+- **reference**, [https://github.com/Blaizzy/mlx-vlm](https://github.com/Blaizzy/mlx-vlm) at `unversioned reference` (MIT). Research/benchmark reference only; no code taken for v3.0. Prince Canuma's mlx-vlm and its PRs #2030 (Lazarus-931), #2105/#2107 (avlp12) and #2245 (raullenchai) are credited by upstream TensorFold for its Python/Metal GLM engine; none of that Python code is in this tree.
+
+## BadAd84 (@BadAd84)
+
+Profile: https://github.com/BadAd84
+
+- **design**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/90ccb49215d58161f9c6017e9106aeecc45fe762) at `90ccb49215d58161f9c6017e9106aeecc45fe762` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. BadAd84 authored the all-route SSE extension and tests (90ccb492) in Mia's GLM-5.3-Flash recipe, after stevehansen's issue106 diagnosis, design and patch; local integration's native SSE transport reimplements them (139aa26f, picked as aa39deb2).
+- **design**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/616b840651a428d514607c3ce5524ed5bc4c206d) at `616b840651a428d514607c3ce5524ed5bc4c206d` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. BadAd84 authored the tool-call rejection log design of patch 0114 (PR137, 616b8406) in Mia's recipe, which local integration reimplements default-off (19db3dba).
+- **reference**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/11619a191999398c6392e8079fe4dcc545cc3f1a) at `11619a191999398c6392e8079fe4dcc545cc3f1a` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. BadAd84 authored the FILL_ROWS change (PR #119, 11619a19) in Mia's recipe; local integration compared against it and took no code.
+- **design**, [https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/tree/0c7b88683c19d14f719287268817f7024341ab75) at `0c7b88683c19d14f719287268817f7024341ab75` (MIT). Native source, reimplemented design or build/runtime dependency. BadAd84 authored pull request #34 (the draft stop under a confidence floor) to Mia's Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold at 0c7b8868, a design this tree reimplements with no code copied (1efdb33a).
+- **design**, [https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/tree/a82cf8aee2d25e26c8cbde44dc54a985e54671f7) at `a82cf8aee2d25e26c8cbde44dc54a985e54671f7` (MIT). Native source, reimplemented design or build/runtime dependency. BadAd84 authored pull request #35 (patches/0010, the nucleus draw's row reductions on 1,024 threads) to Mia's Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold at a82cf8ae, a design this tree reimplements with no code copied (33d8ab99).
+- **design**, [https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/tree/e6a35d22336216b1bd88ab1465139dce9ed9dc12) at `e6a35d22336216b1bd88ab1465139dce9ed9dc12` (MIT). Native source, reimplemented design or build/runtime dependency. BadAd84 authored pull request #36 (the MTP draft layer on FP8) to Mia's Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold at e6a35d22, a design this tree reimplements with no code copied (219461a2).
+
+## bertholomus (@bertholomus)
+
+Profile: https://github.com/bertholomus
+
+- **code-copied**, [https://github.com/bertholomus/TensorFold](https://github.com/bertholomus/TensorFold/tree/dbe0773) at `dbe0773` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. bertholomus (Albert Lee, BertholomusAI) authored group_count_kernel and group_place_kernel (bertholomus/TensorFold glm-dsa-tp4 dbe0773), carried unchanged into the EXL3 expert kernels (0cb7622f).
+- **code-copied**, [https://github.com/bertholomus/TensorFold](https://github.com/bertholomus/TensorFold/tree/90b68e063a0b8bba59aaf13340ef16619e751195) at `90b68e063a0b8bba59aaf13340ef16619e751195` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. bertholomus authored grouped_mma_kernel and work_list_kernel (bertholomus/TensorFold deepseek-v41-tp2 90b68e0; first in glm-dsa-tp4 2786594), copied into zig/kernels/cuda/exl3/mma/ with one marked change (fd624f2e).
+- **design**, [https://github.com/bertholomus/TensorFold](https://github.com/bertholomus/TensorFold/tree/ce20a545ff5ec805651fea28d9d3ffbd8e211f89) at `ce20a545ff5ec805651fea28d9d3ffbd8e211f89` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. bertholomus authored the launch order of deepseek-v41-zig's exl3_experts.zig (bertholomus/TensorFold ce20a545), which the halves' MMA launcher follows (fd624f2e).
+
+## Bizuayeu (@Bizuayeu)
+
+Profile: https://github.com/Bizuayeu
+
+- **code-ported**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/b952862585cf1bb564c297926c0072db2b48bc71) at `b952862585cf1bb564c297926c0072db2b48bc71` (Apache-2.0). Related study/test-package or later candidate; not newly adopted in v3.0. Bizuayeu (@Bizuayeu) authored the GLM key repair (a call whose <arg_key> the model wrote as whitespace gets it back) and its test case in github.com/Bizuayeu/TensorFold commit b9528625 (Apache-2.0); local integration's served probe m1 ports that test case's input and expected call, and the dry fake reimplements the repair's outcome.
+- **code-ported**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/557011805a64639ff5730aa980f7a100ab3ee7d9) at `557011805a64639ff5730aa980f7a100ab3ee7d9` (Apache-2.0). Related study/test-package or later candidate; not newly adopted in v3.0. Bizuayeu (@Bizuayeu) authored the end-token close (a GLM value the end token left open is closed) and its test case in github.com/Bizuayeu/TensorFold commit 557011805 (Apache-2.0); local integration's served probe m2 ports that test case's input and expected call, and the dry fake reimplements the close's outcome.
+- **code-ported**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/be17a101c47c6f20ac2295ea59922ad777d02252) at `be17a101c47c6f20ac2295ea59922ad777d02252` (Apache-2.0). Related study/test-package or later candidate; not newly adopted in v3.0. Bizuayeu (@Bizuayeu) authored the Responses include rule (OpenAI's eight include values accepted, any other value refused by name, a non-list refused), its two refusal messages and its test cases in github.com/Bizuayeu/TensorFold commit be17a101 (Apache-2.0); local integration's served probes m3a-m3c port those test cases, spec.py carries his values and messages, and the dry fake reimplements the rule.
+- **reference**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/75131b66c39fdcf55dbd130ccaec166b65394f3d) at `75131b66c39fdcf55dbd130ccaec166b65394f3d` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. Bizuayeu (@Bizuayeu) authored the shared verify forward design (a round's verify windows share one forward, each stream's state on its own) in github.com/Bizuayeu/TensorFold commit 75131b66 (Apache-2.0), which local integration local integration reimplements and local integration local integration builds on; local integration's kit only switches those on and gates them in the local integration.
+- **reference**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/146e113f6ae3a0b2b45626af6ac627479b4e2127) at `146e113f6ae3a0b2b45626af6ac627479b4e2127` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. Bizuayeu (@Bizuayeu) authored the shared verify forward design (the shared windows' mixer (cuda_shared.zig)) in github.com/Bizuayeu/TensorFold commit 146e113f (Apache-2.0), which local integration local integration reimplements and local integration local integration builds on; local integration's kit only switches those on and gates them in the local integration.
+- **reference**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/d3cc052c554790c7767b126ab61c1831cd14fc7a) at `d3cc052c554790c7767b126ab61c1831cd14fc7a` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. Bizuayeu (@Bizuayeu) authored the shared verify forward design (concurrent streams, each on its own sequence (a slot) on every rank) in github.com/Bizuayeu/TensorFold commit d3cc052c (Apache-2.0), which local integration local integration reimplements and local integration local integration builds on; local integration's kit only switches those on and gates them in the local integration.
+- **reference**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/2bc75a69db885fd6523c6bac1ff7cee66f6b496b) at `2bc75a69db885fd6523c6bac1ff7cee66f6b496b` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. Bizuayeu (@Bizuayeu) authored the shared verify forward design (a prompt pass goes a chunk at a time, the other streams' rounds between chunks) in github.com/Bizuayeu/TensorFold commit 2bc75a69 (Apache-2.0), which local integration local integration reimplements and local integration local integration builds on; local integration's kit only switches those on and gates them in the local integration.
+- **design**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/75131b66c39fdcf55dbd130ccaec166b65394f3d) at `75131b66c39fdcf55dbd130ccaec166b65394f3d` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Bizuayeu (@Bizuayeu) authored a round's verify windows sharing one forward, each stream's state on its own (Bizuayeu/TensorFold pr/glm53-flash-cuda 75131b66), the shared verify forward local integration reimplements with no code copied (badfae2d, 976ad633; on local integration cfc9ddd5, 27042de1).
+- **design**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/146e113f6ae3a0b2b45626af6ac627479b4e2127) at `146e113f6ae3a0b2b45626af6ac627479b4e2127` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Bizuayeu (@Bizuayeu) authored the shared verify forward (follow-up commit) (Bizuayeu/TensorFold pr/glm53-flash-cuda 146e113f), the shared verify forward local integration reimplements with no code copied (badfae2d, 976ad633; on local integration cfc9ddd5, 27042de1).
+- **design**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/d3cc052c554790c7767b126ab61c1831cd14fc7a) at `d3cc052c554790c7767b126ab61c1831cd14fc7a` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Bizuayeu (@Bizuayeu) authored the shared verify forward (follow-up commit) (Bizuayeu/TensorFold pr/glm53-flash-cuda d3cc052c), the shared verify forward local integration reimplements with no code copied (badfae2d, 976ad633; on local integration cfc9ddd5, 27042de1).
+- **design**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/2bc75a69db885fd6523c6bac1ff7cee66f6b496b) at `2bc75a69db885fd6523c6bac1ff7cee66f6b496b` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Bizuayeu (@Bizuayeu) authored the shared verify forward (follow-up commit) (Bizuayeu/TensorFold pr/glm53-flash-cuda 2bc75a69), the shared verify forward local integration reimplements with no code copied (badfae2d, 976ad633; on local integration cfc9ddd5, 27042de1).
+- **code-ported**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/b952862585cf1bb564c297926c0072db2b48bc71) at `b952862585cf1bb564c297926c0072db2b48bc71` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Bizuayeu authored repairGlmKeys and its tag scan, with test cases (Bizuayeu/TensorFold b9528625), ported by local integration (83a8b1cb, e293790e; on local integration a9e0b220, b794fb79).
+- **code-ported**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/557011805a64639ff5730aa980f7a100ab3ee7d9) at `557011805a64639ff5730aa980f7a100ab3ee7d9` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Bizuayeu authored the end token's close of a cut GLM value (design), with test cases (Bizuayeu/TensorFold 55701180), ported by local integration (83a8b1cb, e293790e; on local integration a9e0b220, b794fb79).
+- **code-ported**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/be17a101c47c6f20ac2295ea59922ad777d02252) at `be17a101c47c6f20ac2295ea59922ad777d02252` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Bizuayeu authored /v1/responses include handling, its tests and the frozen corpus case (Bizuayeu/TensorFold be17a101), ported by local integration (83a8b1cb, e293790e; on local integration a9e0b220, b794fb79).
+- **design**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/322b4de6c40318e2ce4a263b7c6505300b557ff4) at `322b4de6c40318e2ce4a263b7c6505300b557ff4` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Bizuayeu authored the rank fingerprint field list of cuda_ranks.zig lines 1-31 (Bizuayeu/TensorFold 322b4de6), which local integration reimplements with no code copied (81d7a557; on local integration aa70858b).
+- **design**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/75131b66c39fdcf55dbd130ccaec166b65394f3d) at `75131b66c39fdcf55dbd130ccaec166b65394f3d` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Bizuayeu (@Bizuayeu) authored the shared verify windows design (a round's verify windows share one forward, each stream's state on its own) in github.com/Bizuayeu/TensorFold commit 75131b66 (Apache-2.0); local integration local integration reimplements its drafted form on the AFD users path (each user's pending row and MTP drafts verified in one forward, accepted and rolled back per user) without his code.
+- **design**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/146e113f6ae3a0b2b45626af6ac627479b4e2127) at `146e113f6ae3a0b2b45626af6ac627479b4e2127` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Bizuayeu (@Bizuayeu) authored the shared windows' mixer (each window's mixer part on its own stream's state inside the one shared forward, in cuda_shared.zig) in github.com/Bizuayeu/TensorFold commit 146e113f (Apache-2.0); local integration local integration reimplements that split for drafted windows in cuda_afd_users_dsv.zig without his code.
+- **design**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/d3cc052c554790c7767b126ab61c1831cd14fc7a) at `d3cc052c554790c7767b126ab61c1831cd14fc7a` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Bizuayeu (@Bizuayeu) authored concurrent streams, each on its own sequence (state, sampling rule and MTP rows by slot on every rank), in github.com/Bizuayeu/TensorFold commit d3cc052c (Apache-2.0); local integration local integration keeps each user's MTP head, held drafts and rollback on its own slot that way, without his code.
+- **design**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/75131b66c39fdcf55dbd130ccaec166b65394f3d) at `75131b66c39fdcf55dbd130ccaec166b65394f3d` (Apache-2.0). Related study/test-package or later candidate; not newly adopted in v3.0. Bizuayeu (@Bizuayeu) authored the shared verify design in https://github.com/Bizuayeu/TensorFold at 75131b66c39fdcf55dbd130ccaec166b65394f3d (Apache-2.0), which local integration extends through local integration; his MTP drafting is per stream, this new batched-MTP extension copies none of his code.
+- **design**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/75131b66c39fdcf55dbd130ccaec166b65394f3d) at `75131b66c39fdcf55dbd130ccaec166b65394f3d` (Apache-2.0). Related study/test-package or later candidate; not newly adopted in v3.0. Bizuayeu (@Bizuayeu) authored the shared verify windows design in github.com/Bizuayeu/TensorFold commit 75131b66 (Apache-2.0); local integration carries local integration's reimplementation through to 16 total rows while retaining each stream's own State and <=4-row window, without copying his code.
+- **design**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/146e113f6ae3a0b2b45626af6ac627479b4e2127) at `146e113f6ae3a0b2b45626af6ac627479b4e2127` (Apache-2.0). Related study/test-package or later candidate; not newly adopted in v3.0. Bizuayeu (@Bizuayeu) authored the shared windows mixer in github.com/Bizuayeu/TensorFold commit 146e113f (Apache-2.0); local integration carries local integration's reimplementation through to 16 total rows while retaining each stream's own <=4-row State window, with no code of his copied.
+- **design**, [https://github.com/Bizuayeu/TensorFold](https://github.com/Bizuayeu/TensorFold/tree/d3cc052c554790c7767b126ab61c1831cd14fc7a) at `d3cc052c554790c7767b126ab61c1831cd14fc7a` (Apache-2.0). Related study/test-package or later candidate; not newly adopted in v3.0. Bizuayeu (@Bizuayeu) authored the concurrent streams on their own sequence by slot in github.com/Bizuayeu/TensorFold commit d3cc052c (Apache-2.0); local integration carries local integration's reimplementation through to 16 total rows while retaining each stream's own <=4-row State window, with no code of his copied.
+
+## BlivionIaG (@BlivionIaG)
+
+Profile: https://github.com/BlivionIaG
+
+- **code-ported**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/d7b134cdf86a02b7c91d0d137ce733c04ae53cfd) at `d7b134cdf86a02b7c91d0d137ce733c04ae53cfd` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. @BlivionIaG authored TensorFold #623 (head d7b134cd): the lane core's optional prefill_step / fillStream and the host's filling queue; Ash Hart merged it as 1184cdbb. local integration ported it (9263173e, picked as cd9627dc).
+
+## BobClawblaw (@BobClawblaw)
+
+Profile: https://github.com/BobClawblaw
+
+- **dependency**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/8ced20188b70fe301d4c9f320430b182a68d216f) at `8ced20188b70fe301d4c9f320430b182a68d216f` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. @BobClawblaw authored TensorFold #596 (head 8ced2018, merged d7d5f6f1, in v1.0.6 c080a18e): libtfgrammar and the lane-core grammar that local integration's external grammar library builds.
+
+## chaog992 (@chaog992)
+
+Profile: https://github.com/chaog992
+
+- **code-copied**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/2193d145397500f7b661dd4697240024e1089b68) at `2193d145397500f7b661dd4697240024e1089b68` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. chaog992 authored TensorFold #560 (ashhart/TensorFold 2193d145, merged 17a75f55): a request keeps its own local integration of its key label; local integration picked it as 7eab6148.
+- **code-copied**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/1b0268954745802a3ee9b0d1828a51f5bdee0c1d) at `1b0268954745802a3ee9b0d1828a51f5bdee0c1d` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. chaog992 authored TensorFold #594 (711bacf2): nested completion prompt ids past u32 decode as unknown ids; Ash Hart's merge 1b026895 was picked as 647941a3.
+
+## data-angel (@data-angel)
+
+Profile: https://github.com/data-angel
+
+- **reference**, [https://github.com/Enntity/sparkglm](https://github.com/Enntity/sparkglm/pull/46) at `PR #46` (unknown). Research/benchmark reference only; no code taken for v3.0. @data-angel / Enntity's sparkglm PR #46 (RC4.1) was read only by local integration; nothing was taken.
+
+## DLPack contributors (dmlc)
+
+Profile: https://github.com/dmlc
+
+- **dependency**, [https://github.com/dmlc/dlpack](https://github.com/dmlc/dlpack/tree/bbd2f4d32427e548797929af08cfe2a9cbb3cf12) at `bbd2f4d32427e548797929af08cfe2a9cbb3cf12` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. The DLPack contributors authored DLPack (dmlc/dlpack bbd2f4d3), XGrammar's submodule inside local integration's libtfgrammar.so.
+
+## Enntity (@Enntity)
+
+Profile: https://github.com/Enntity
+
+- **reference**, [https://github.com/Enntity/atlas](https://github.com/Enntity/atlas/tree/ade7b012) at `ade7b012` (AGPL-3.0). Research/benchmark reference only; no code taken for v3.0. Atlas (AGPL-3.0) was read only by local integration; nothing was taken.
+
+## ezoushen (@ezoushen)
+
+Profile: https://github.com/ezoushen
+
+- **design**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/3fd60dfc836fab0f1ed0fd4f0afaf2a1d62b2aab) at `3fd60dfc836fab0f1ed0fd4f0afaf2a1d62b2aab` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. ezoushen authored the compaction rule of patch 0074-glm-compact-before-evict (pull request #62, issue #61) in Mia's GLM-5.3-Flash recipe, read at 3fd60dfc; cuda_afd_pool.zig reimplements it with no code copied.
+
+## fly9i (@fly9i)
+
+Profile: https://github.com/fly9i
+
+- **reference**, [https://github.com/fly9i/spark-engine](https://github.com/fly9i/spark-engine/tree/b09a53e) at `b09a53e` (MIT). Research/benchmark reference only; no code taken for v3.0. fly9i's spark-engine v0.1.1 (b09a53e) was studied and benchmarked by local integration; nothing of it is in this tree.
+
+## Hugh Madden (@dangerm00se)
+
+Profile: https://github.com/hughmadden
+
+- **code-copied**, [https://github.com/hughmadden/glm53f-afd](https://github.com/hughmadden/glm53f-afd/tree/91db3cc6fe672e2724efa3464f63bd31493f63f6) at `91db3cc6fe672e2724efa3464f63bd31493f63f6` (MIT). Native source, reimplemented design or build/runtime dependency. Hugh Madden (@dangerm00se) authored glm53f-afd's large-M expert kernels and KT3 schedule (hughmadden/glm53f-afd 91db3cc), whose device lines zig/kernels/cuda/g53/ carries as python 2.15 ports them (e5fb7183).
+- **design**, [https://github.com/hughmadden/glm53f-afd](https://github.com/hughmadden/glm53f-afd/tree/91db3cc6fe672e2724efa3464f63bd31493f63f6) at `91db3cc6fe672e2724efa3464f63bd31493f63f6` (MIT). Native source, reimplemented design or build/runtime dependency. Hugh Madden (@dangerm00se) and T.J. Purtell (@wrldsuksgo2mars) authored the AFD attention/expert split (glm53f-afd 91db3cc, as our Python TF-AFD 2.15 lane runs it), which the three-node exchange (2b6703d7), the attention role on a GPU (cf594679), prompt lanes (29b1e487) and pairs (a3143b83) reimplement with no code copied.
+- **design**, [https://github.com/tpurtell/cuteafd](https://github.com/tpurtell/cuteafd/tree/c05d9939a38e3db66767291b500c97933df6497b) at `c05d9939a38e3db66767291b500c97933df6497b` (MIT). Native source, reimplemented design or build/runtime dependency. Hugh Madden authored cuteafd #22 (merged as c05d9939 in T.J. Purtell's tpurtell/cuteafd): decode graphs keyed by what their launches read, which cuda_afd_graphs.zig reimplements with no code copied (1aee087e).
+- **reference**, [https://github.com/tpurtell/sparkinfer-glmrt](https://github.com/tpurtell/sparkinfer-glmrt/tree/dc9c26192375a80b1de7bb28b182fc5bbdbf67c4) at `dc9c26192375a80b1de7bb28b182fc5bbdbf67c4` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. Hugh Madden (@hughmadden; X @dangerm00se) authored the sequence-CTA and BF16 projection-tile contributions in SparkInfer PRs #9/#10; T.J. Purtell (@tpurtell) reviewed and merged them, with the inherited SparkInfer/b12x contributors retained.
+- **reference**, [https://github.com/tpurtell/cuteafd](https://github.com/tpurtell/cuteafd/tree/b1755f59b43c94d163e7f5e5ea8d823fa981c0d8) at `b1755f59b43c94d163e7f5e5ea8d823fa981c0d8` (MIT). Research/benchmark reference only; no code taken for v3.0. T.J. Purtell (@tpurtell) authored cuteafd draft #137 integrating Hugh Madden (@hughmadden)'s KDA scheduling and rejecting repeated nonnegative recurrent slots.
+
+## iegamo (@ahinore)
+
+Profile: https://github.com/ahinore
+
+- **reference**, [https://github.com/ahinore/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/ahinore/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/2636c1cb3019ede4ab27191299d5ad6843344942) at `2636c1cb3019ede4ab27191299d5ad6843344942` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. iegamo (@ahinore) authored PR164 input literal-added-token marking in this fork/commit; its commit preserves Claude Opus 5.5 as co-author, and all Mia/TensorFold/inherited notices remain intact.
+
+## Jay Leaton (@jayleaton)
+
+Profile: https://github.com/jayleaton
+
+- **code-ported**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/4284048d1aca2799e543a7400b3f07519befb515) at `4284048d1aca2799e543a7400b3f07519befb515` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Jay Leaton (@jayleaton) authored the incomplete-UTF8-tail bounds repair of TensorFold #634 (4284048d), adapted into zig/src/server/json_write.zig (419164dc, picked as e3c490e2).
+- **design**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/986c996041e25e8b4a0341a8b54524a9d2248c12) at `986c996041e25e8b4a0341a8b54524a9d2248c12` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Jay Leaton authored the CUDA launch-failure context design of TensorFold #635 (986c9960), adapted as the opt-in bounded launch failure context (59f1310e, picked as 3202352c).
+- **design**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/5fa8ad0fd9c53131c599c39f8885117d5a582fda) at `5fa8ad0fd9c53131c599c39f8885117d5a582fda` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Jay Leaton authored the CUDA launch-failure context design of TensorFold #635 (5fa8ad0f), adapted as the opt-in bounded launch failure context (59f1310e, picked as 3202352c).
+- **reference**, [https://github.com/jayleaton/glm53-tensorfold-spark](https://github.com/jayleaton/glm53-tensorfold-spark) at `unversioned reference` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. Jay Leaton authored inherited parser/cancellation work and patch 0620 in jayleaton/glm53-tensorfold-spark, credited through Mia's recipe NOTICE; no file of that repo is in this tree (his TensorFold #634/#635 have their own entries).
+
+## jundot (@jundot)
+
+Profile: https://github.com/jundot
+
+- **reference**, [https://github.com/jundot/omlx](https://github.com/jundot/omlx) at `unversioned reference` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. jundot's oMLX vendored the mlx-vlm GLM implementation that upstream TensorFold's Python engine follows; nothing from it is in this tree.
+
+## Jürgen Schmied (@jschmied)
+
+Profile: https://github.com/jschmied
+
+- **reference**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/60626dc1b2505375854dc94c06718f7ae67ebda9) at `60626dc1b2505375854dc94c06718f7ae67ebda9` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. Mia (@MiaAI_lab/MiaAI-Lab) authored the native GLM EXL3 recipe/port in this pinned repository; Ash Hart and TensorFold contributors authored the engine/arithmetic, Jürgen Schmied authored native CUDA serving/registry, and local-inference-lab authored b12x/RoCEnante.
+
+## Kazuho Oku (@kazuho)
+
+Profile: https://github.com/kazuho
+
+- **dependency**, [https://github.com/kazuho/picojson](https://github.com/mlc-ai/xgrammar/tree/97787376faee5ed8466cfad57c99855e4ce2f6aa/3rdparty/picojson) at `mlc-ai/xgrammar@97787376faee5ed8466cfad57c99855e4ce2f6aa:3rdparty/picojson (tree 0d9c226c2e13bada877cd092048988070ac5d232)` (BSD-2-Clause). Native source, reimplemented design or build/runtime dependency. Kazuho Oku authored picojson (Copyright 2009-2010 Cybozu Labs, Inc. and 2011-2014 Kazuho Oku), vendored in XGrammar's 3rdparty/picojson and built into local integration's libtfgrammar.so.
+
+## kky42 (@kky42)
+
+Profile: https://github.com/kky42
+
+- **design**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/c66a6cfd9ae16226b30f29df877b0194ae8b3945) at `c66a6cfd9ae16226b30f29df877b0194ae8b3945` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. @kky42 authored the quoted-tag examples of PR134 (c66a6cfd) in Mia's recipe, used as test cases by local integration (19db3dba).
+
+## Lazarus-931
+
+Profile: https://github.com/Lazarus-931
+
+- **reference**, [https://github.com/Blaizzy/mlx-vlm](https://github.com/Blaizzy/mlx-vlm) at `unversioned reference` (MIT). Research/benchmark reference only; no code taken for v3.0. Prince Canuma's mlx-vlm and its PRs #2030 (Lazarus-931), #2105/#2107 (avlp12) and #2245 (raullenchai) are credited by upstream TensorFold for its Python/Metal GLM engine; none of that Python code is in this tree.
+
+## local-inference-lab (@local-inference-lab)
+
+Profile: https://github.com/local-inference-lab
+
+- **design**, [https://github.com/local-inference-lab/b12x](https://github.com/local-inference-lab/b12x/tree/2cc7f66aaef76a9c7cbb660a1efb865cf3f26c88) at `2cc7f66aaef76a9c7cbb660a1efb865cf3f26c88` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. local-inference-lab authored b12x's RoCEnante one-shot all-gather protocol, which Mia's fn_roce.cu and roce_proxy.c implement in new code (ported by local integration, b5adb25e).
+
+## local-inference-lab contributors (@local-inference-lab)
+
+Profile: https://github.com/local-inference-lab
+
+- **reference**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/60626dc1b2505375854dc94c06718f7ae67ebda9) at `60626dc1b2505375854dc94c06718f7ae67ebda9` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. Mia (@MiaAI_lab/MiaAI-Lab) authored the native GLM EXL3 recipe/port in this pinned repository; Ash Hart and TensorFold contributors authored the engine/arithmetic, Jürgen Schmied authored native CUDA serving/registry, and local-inference-lab authored b12x/RoCEnante.
+
+## Mathieu Fenniak
+
+Profile: https://github.com/py-pdf/pypdf
+
+- **dependency**, [https://github.com/py-pdf/pypdf](https://github.com/py-pdf/pypdf/tree/6.20.0) at `6.20.0` (BSD-3-Clause). Verification-only dependency; not used or shipped by v3.0. Mathieu Fenniak, Ashish Kulkarni and Steve Witham are the copyright authors named by pypdf's BSD-3-Clause LICENSE; local integration uses installed pypdf 6.20.0 (github.com/py-pdf/pypdf) only to read back the own-code PDF artifact and verify its six pages and complete text. No pypdf code is copied into the TensorFold engine, kit or package.
+
+## mikolaj92 (@mikolaj92)
+
+Profile: https://github.com/mikolaj92
+
+- **code-ported**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/b3b8a39119f8da02026b3f2601e02eb411be1339) at `b3b8a39119f8da02026b3f2601e02eb411be1339` (MIT). Native source, reimplemented design or build/runtime dependency. mikolaj92 (github.com/mikolaj92) authored sparse.py's skip of invisible pool tiles (ashhart/TensorFold b3b8a391), compiled into the Triton kernel set (ed10d2f4).
+- **code-ported**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/f119334d79981225bc103fae0d25e9ecc477b08f) at `f119334d79981225bc103fae0d25e9ecc477b08f` (MIT). Native source, reimplemented design or build/runtime dependency. mikolaj92 authored sparse.py's radix selection bounded to the visible pools (ashhart/TensorFold f119334d), compiled into the Triton kernel set (ed10d2f4).
+
+## Prince Canuma (@Blaizzy)
+
+Profile: https://github.com/Blaizzy
+
+- **reference**, [https://github.com/Blaizzy/mlx-vlm](https://github.com/Blaizzy/mlx-vlm) at `unversioned reference` (MIT). Research/benchmark reference only; no code taken for v3.0. Prince Canuma's mlx-vlm and its PRs #2030 (Lazarus-931), #2105/#2107 (avlp12) and #2245 (raullenchai) are credited by upstream TensorFold for its Python/Metal GLM engine; none of that Python code is in this tree.
+
+## PyTorch contributors (pytorch)
+
+Profile: https://github.com/pytorch
+
+- **dependency**, [https://github.com/pytorch/pytorch](https://github.com/pytorch/pytorch/tree/9186a08b2c) at `9186a08b2c` (BSD-3-Clause). Native source, reimplemented design or build/runtime dependency. The PyTorch contributors authored PyTorch (NVIDIA's container build 2.13.0a0+9186a08b2c), which tools/zig's CPU recorders and fixtures use at build time; it is not shipped.
+
+## raullenchai
+
+Profile: https://github.com/raullenchai
+
+- **reference**, [https://github.com/Blaizzy/mlx-vlm](https://github.com/Blaizzy/mlx-vlm) at `unversioned reference` (MIT). Research/benchmark reference only; no code taken for v3.0. Prince Canuma's mlx-vlm and its PRs #2030 (Lazarus-931), #2105/#2107 (avlp12) and #2245 (raullenchai) are credited by upstream TensorFold for its Python/Metal GLM engine; none of that Python code is in this tree.
+
+## Raymond Lucke (@rwl4)
+
+Profile: https://github.com/rwl4
+
+- **design**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/029a852f14bcf604ffe9a55bfbd6ce7f50ec57be) at `029a852f14bcf604ffe9a55bfbd6ce7f50ec57be` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Raymond Lucke (@rwl4) authored the literal-closer design and its test cases (Mia's GLM PR #158, 029a852f), which local integration reimplemented with no code copied (174f4e63, picked as edccdfec).
+
+## SparkInfer/b12x contributors
+
+Profile: https://github.com/tpurtell/sparkinfer-glmrt
+
+- **reference**, [https://github.com/tpurtell/sparkinfer-glmrt](https://github.com/tpurtell/sparkinfer-glmrt/tree/dc9c26192375a80b1de7bb28b182fc5bbdbf67c4) at `dc9c26192375a80b1de7bb28b182fc5bbdbf67c4` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. Hugh Madden (@hughmadden; X @dangerm00se) authored the sequence-CTA and BF16 projection-tile contributions in SparkInfer PRs #9/#10; T.J. Purtell (@tpurtell) reviewed and merged them, with the inherited SparkInfer/b12x contributors retained.
+
+## Steve Witham
+
+Profile: https://github.com/py-pdf/pypdf
+
+- **dependency**, [https://github.com/py-pdf/pypdf](https://github.com/py-pdf/pypdf/tree/6.20.0) at `6.20.0` (BSD-3-Clause). Verification-only dependency; not used or shipped by v3.0. Mathieu Fenniak, Ashish Kulkarni and Steve Witham are the copyright authors named by pypdf's BSD-3-Clause LICENSE; local integration uses installed pypdf 6.20.0 (github.com/py-pdf/pypdf) only to read back the own-code PDF artifact and verify its six pages and complete text. No pypdf code is copied into the TensorFold engine, kit or package.
+
+## stevehansen (@stevehansen)
+
+Profile: https://github.com/stevehansen
+
+- **design**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/90ccb49215d58161f9c6017e9106aeecc45fe762) at `90ccb49215d58161f9c6017e9106aeecc45fe762` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. BadAd84 authored the all-route SSE extension and tests (90ccb492) in Mia's GLM-5.3-Flash recipe, after stevehansen's issue106 diagnosis, design and patch; local integration's native SSE transport reimplements them (139aa26f, picked as aa39deb2).
+
+## T.J. Purtell (@wrldsuksgo2mars)
+
+Profile: https://github.com/tpurtell
+
+- **design**, [https://github.com/hughmadden/glm53f-afd](https://github.com/hughmadden/glm53f-afd/tree/91db3cc6fe672e2724efa3464f63bd31493f63f6) at `91db3cc6fe672e2724efa3464f63bd31493f63f6` (MIT). Native source, reimplemented design or build/runtime dependency. Hugh Madden (@dangerm00se) and T.J. Purtell (@wrldsuksgo2mars) authored the AFD attention/expert split (glm53f-afd 91db3cc, as our Python TF-AFD 2.15 lane runs it), which the three-node exchange (2b6703d7), the attention role on a GPU (cf594679), prompt lanes (29b1e487) and pairs (a3143b83) reimplement with no code copied.
+- **design**, [https://github.com/tpurtell/cuteafd](https://github.com/tpurtell/cuteafd/tree/c05d9939a38e3db66767291b500c97933df6497b) at `c05d9939a38e3db66767291b500c97933df6497b` (MIT). Native source, reimplemented design or build/runtime dependency. Hugh Madden authored cuteafd #22 (merged as c05d9939 in T.J. Purtell's tpurtell/cuteafd): decode graphs keyed by what their launches read, which cuda_afd_graphs.zig reimplements with no code copied (1aee087e).
+- **reference**, [https://github.com/tpurtell/sparkinfer-glmrt](https://github.com/tpurtell/sparkinfer-glmrt/tree/dc9c26192375a80b1de7bb28b182fc5bbdbf67c4) at `dc9c26192375a80b1de7bb28b182fc5bbdbf67c4` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. Hugh Madden (@hughmadden; X @dangerm00se) authored the sequence-CTA and BF16 projection-tile contributions in SparkInfer PRs #9/#10; T.J. Purtell (@tpurtell) reviewed and merged them, with the inherited SparkInfer/b12x contributors retained.
+- **reference**, [https://github.com/tpurtell/cuteafd](https://github.com/tpurtell/cuteafd/tree/b1755f59b43c94d163e7f5e5ea8d823fa981c0d8) at `b1755f59b43c94d163e7f5e5ea8d823fa981c0d8` (MIT). Research/benchmark reference only; no code taken for v3.0. T.J. Purtell (@tpurtell) authored cuteafd draft #137 integrating Hugh Madden (@hughmadden)'s KDA scheduling and rejecting repeated nonnegative recurrent slots.
+- **reference**, [https://github.com/tpurtell/cuteafd](https://github.com/tpurtell/cuteafd/tree/d1c1e5527deea9b96c43863979e57022f8eacc2d) at `d1c1e5527deea9b96c43863979e57022f8eacc2d` (none). Research/benchmark reference only; no code taken for v3.0. T.J. Purtell (@tpurtell) authored the #131 report on row-dependent two-RTX context-split attention planning and its speculative-equality failure.
+- **reference**, [https://github.com/tpurtell/cuteafd](https://github.com/tpurtell/cuteafd/tree/bda0efc81ef43b9aad9fe3f265f5ed92e32a0842) at `bda0efc81ef43b9aad9fe3f265f5ed92e32a0842` (none). Research/benchmark reference only; no code taken for v3.0. T.J. Purtell (@tpurtell) authored the #135 diagnostic report locating the first captured GLM attention-output divergence before the experts.
+- **reference**, [https://github.com/tpurtell/cuteafd](https://github.com/tpurtell/cuteafd/tree/b2c52c9a14a0c8acc4bf29fa30a0dd6c15c13040) at `b2c52c9a14a0c8acc4bf29fa30a0dd6c15c13040` (MIT). Research/benchmark reference only; no code taken for v3.0. T.J. Purtell (@tpurtell, X @wrldsuksgo2mars) authored cuteafd and the draft-attention/head work read at https://github.com/tpurtell/cuteafd/commit/b2c52c9a14a0c8acc4bf29fa30a0dd6c15c13040; this study reads saved evidence only and ports no implementation.
+- **reference**, [https://github.com/tpurtell/cuteafd](https://github.com/tpurtell/cuteafd/tree/95c996632dc9de9eb673284831ea57307d7e0292) at `95c996632dc9de9eb673284831ea57307d7e0292` (none). Research/benchmark reference only; no code taken for v3.0. T.J. Purtell (@tpurtell, X @wrldsuksgo2mars) authored cuteafd and the draft-attention/head work read at https://github.com/tpurtell/cuteafd/commit/95c996632dc9de9eb673284831ea57307d7e0292; this study reads saved evidence only and ports no implementation.
+- **reference**, [https://github.com/tpurtell/cuteafd](https://github.com/tpurtell/cuteafd/tree/bf3052e2b2495c4067d1e9c63a9084c43c5973bc) at `bf3052e2b2495c4067d1e9c63a9084c43c5973bc` (none). Research/benchmark reference only; no code taken for v3.0. T.J. Purtell (@tpurtell, X @wrldsuksgo2mars) authored cuteafd and the draft-attention/head work read at https://github.com/tpurtell/cuteafd/commit/bf3052e2b2495c4067d1e9c63a9084c43c5973bc; this study reads saved evidence only and ports no implementation.
+- **reference**, [https://github.com/tpurtell/cuteafd](https://github.com/tpurtell/cuteafd/tree/c5a5c25a9bece0e8fb0fb0e6c633b2ed1c9b13dc) at `c5a5c25a9bece0e8fb0fb0e6c633b2ed1c9b13dc` (none). Research/benchmark reference only; no code taken for v3.0. T.J. Purtell (@tpurtell, X @wrldsuksgo2mars) authored cuteafd and the draft-attention/head work read at https://github.com/tpurtell/cuteafd/commit/c5a5c25a9bece0e8fb0fb0e6c633b2ed1c9b13dc; this study reads saved evidence only and ports no implementation.
+- **reference**, [https://github.com/tpurtell/cuteafd](https://github.com/tpurtell/cuteafd/tree/c4fd52f6233a92f963bed940d0c27eb2d4764fda) at `c4fd52f6233a92f963bed940d0c27eb2d4764fda` (none). Research/benchmark reference only; no code taken for v3.0. T.J. Purtell (@tpurtell, X @wrldsuksgo2mars) authored cuteafd and the draft-attention/head work read at https://github.com/tpurtell/cuteafd/commit/c4fd52f6233a92f963bed940d0c27eb2d4764fda; this study reads saved evidence only and ports no implementation.
+- **reference**, [https://github.com/tpurtell/cuteafd](https://github.com/tpurtell/cuteafd/tree/d6bb0772e33e6039e70f788843c363a55aeb00d8) at `d6bb0772e33e6039e70f788843c363a55aeb00d8` (MIT). Research/benchmark reference only; no code taken for v3.0. T.J. Purtell (@tpurtell/@wrldsuksgo2mars) authored cuteafd PR124 fixed canonical BF16 TARGET-head selection at this exact commit.
+- **reference**, [https://github.com/tpurtell/cuteafd](https://github.com/tpurtell/cuteafd/tree/63f425447017cf7fec2c3ad540b520f758a76718) at `63f425447017cf7fec2c3ad540b520f758a76718` (MIT). Research/benchmark reference only; no code taken for v3.0. T.J. Purtell (@tpurtell/@wrldsuksgo2mars) authored the cuteafd PR144 diagnostic and retained the fixed-head change at this exact never-merge diagnostic commit.
+
+## taussoe (@taussoe)
+
+Profile: https://github.com/taussoe
+
+- **code-copied**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/fb985b8649c8b42c2ac2aba1fd7c6f905bc8413c) at `fb985b8649c8b42c2ac2aba1fd7c6f905bc8413c` (MIT). Native source, reimplemented design or build/runtime dependency. taussoe (github.com/taussoe) authored the latent MLA cache and kda.cu's three-kernel wide path (prep/step/out) in ashhart/TensorFold fb985b8, copied into zig/kernels/cuda/glm_kda.cu (dd7de994).
+- **code-ported**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/fb985b8649c8b42c2ac2aba1fd7c6f905bc8413c) at `fb985b8649c8b42c2ac2aba1fd7c6f905bc8413c` (MIT). Native source, reimplemented design or build/runtime dependency. taussoe authored latent.py's latent MLA cache (ashhart/TensorFold fb985b8), compiled into the Triton kernel set (ed10d2f4).
+- **code-ported**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/d6ce24fead9d9cc165728941e3f2aabf8c994553) at `d6ce24fead9d9cc165728941e3f2aabf8c994553` (MIT). Native source, reimplemented design or build/runtime dependency. taussoe authored sparse.py's DSA scores for any index head count (ashhart/TensorFold d6ce24fe), compiled into the Triton kernel set (ed10d2f4).
+
+## tonyd2wild (@tonyd2wild)
+
+Profile: https://github.com/tonyd2wild
+
+- **reference**, [https://github.com/tonyd2wild/GLM-5.3-Flash-TensorFold-DGX-Spark](https://github.com/tonyd2wild/GLM-5.3-Flash-TensorFold-DGX-Spark/tree/062b6ce13e0fa9bead00f58d1cb0cfec7bcc080b) at `062b6ce13e0fa9bead00f58d1cb0cfec7bcc080b` (none). Research/benchmark reference only; no code taken for v3.0. tonyd2wild's GLM-5.3-Flash TensorFold repo has no licence; it was read only, and no code or design of it is in this tree.
+
+## Triton contributors (triton-lang)
+
+Profile: https://github.com/triton-lang
+
+- **dependency**, [https://github.com/triton-lang/triton](https://github.com/triton-lang/triton/tree/v3.7.1) at `v3.7.1` (MIT). Native source, reimplemented design or build/runtime dependency. The Triton contributors authored the Triton compiler (3.7.1), which builds the AOT Triton kernel set; the compiler is not shipped.
+
+## Turboderp (@turboderp)
+
+Profile: https://github.com/turboderp
+
+- **design**, [https://github.com/turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3/tree/f45b84512ba65bca77f7d394399d4b68821fc71b) at `f45b84512ba65bca77f7d394399d4b68821fc71b` (MIT). Native source, reimplemented design or build/runtime dependency. Turboderp authored ExLlamaV3's EXL3 format (trellis bitstream, codebooks, fragment order), which TensorFold's kernels and this tree's EXL3 reader (7cecb415) implement separately.
+
+## XGrammar Contributors (mlc-ai)
+
+Profile: https://github.com/mlc-ai
+
+- **dependency**, [https://github.com/mlc-ai/xgrammar](https://github.com/mlc-ai/xgrammar/tree/97787376faee5ed8466cfad57c99855e4ce2f6aa) at `97787376faee5ed8466cfad57c99855e4ce2f6aa` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. The XGrammar Contributors (MLC) authored XGrammar v0.2.8 (mlc-ai/xgrammar 97787376), statically built into local integration's libtfgrammar.so, which the AFD attention role loads from TF_AFD_GRAMMAR_LIB.
+
+## XGrammar contributors (MLC)
+
+Profile: https://github.com/mlc-ai/xgrammar
+
+- **reference**, [https://github.com/mlc-ai/xgrammar](https://github.com/mlc-ai/xgrammar/tree/97787376faee5ed8466cfad57c99855e4ce2f6aa) at `97787376faee5ed8466cfad57c99855e4ce2f6aa` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. The XGrammar contributors (MLC) authored XGrammar; local integration read v0.2.8 (commit 97787376, Apache-2.0) to establish that a one-string guided_choice grammar can emit GLM's non-special markup tokens and that its JSON escape covers the forced text; nothing was taken.
+- **code-copied**, [https://github.com/mlc-ai/xgrammar](https://github.com/mlc-ai/xgrammar/tree/97787376faee5ed8466cfad57c99855e4ce2f6aa) at `97787376faee5ed8466cfad57c99855e4ce2f6aa` (Apache-2.0). Related study/test-package or later candidate; not newly adopted in v3.0. The XGrammar contributors (MLC) authored XGrammar; local integration read v0.2.8 (commit 97787376, Apache-2.0) to establish that a one-string guided_choice grammar can emit GLM's non-special markup tokens and that its JSON escape covers the forced text; nothing was taken.
+
+## Z Lab (z-lab)
+
+Profile: https://github.com/z-lab
+
+- **reference**, [https://github.com/z-lab/dflash](https://github.com/z-lab/dflash) at `unversioned reference` (MIT). Research/benchmark reference only; no code taken for v3.0. Z Lab authored dflash/model_mlx.py, which upstream TensorFold's Python engine vendors; that file is not in this tree.
+
+## Z.ai
+
+Profile: https://huggingface.co/zai-org
+
+- **weights**, [https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold/tree/078455ffe6472f9a52fbc1139f58b9db2881b25c) at `078455ffe6472f9a52fbc1139f58b9db2881b25c` (MIT). Pinned runtime weights, not shipped. Mia's AI Lab (@MiaAI_lab) made the EXL3 quantization Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold (revision 078455ff), with exllamav3, of Z.ai's GLM-5.3-Flash: the weights the GLM-5.3-Flash lane reads (7cecb415). Never shipped.
+- **weights**, [https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold/tree/078455ffe6472f9a52fbc1139f58b9db2881b25c) at `078455ffe6472f9a52fbc1139f58b9db2881b25c` (MIT). Pinned runtime weights, not shipped. Mia's AI Lab (@MiaAI_lab) made the EXL3 quantization Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold (revision 078455ff), with exllamav3, of Z.ai's GLM-5.3-Flash: the weights every local integration lab boot loads on attention-host/expert1-host/expert0-host (local integration head e7c960e8). Never copied or shipped.
+- **weights**, [https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold/tree/078455ffe6472f9a52fbc1139f58b9db2881b25c) at `078455ffe6472f9a52fbc1139f58b9db2881b25c` (MIT). Pinned runtime weights, not shipped. Mia's AI Lab (@MiaAI_lab) made the EXL3 quantization Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold (revision 078455ff), with exllamav3, of Z.ai's GLM-5.3-Flash: the weights every local integration lab boot loads on attention-host/expert1-host/expert0-host (local integration's final head 6b0d285a). Never copied or shipped.
+- **weights**, [https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold/tree/078455ffe6472f9a52fbc1139f58b9db2881b25c) at `078455ffe6472f9a52fbc1139f58b9db2881b25c` (MIT). Pinned runtime weights, not shipped. Mia (@MiaAI_lab) authored the EXL3 quantization of GLM-5.3-Flash by Z.ai in Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold revision 078455ff; its exact published licence and card are MIT, with Copyright (c) 2026 Z.AI Co., Ltd.
+- **weights**, [https://huggingface.co/zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash/tree/91b69215804f2d2036a8867f6ce44848e278dcda) at `91b69215804f2d2036a8867f6ce44848e278dcda` (MIT). Other weight revision documented for licence history; not selected. Z.ai (zai-org, https://huggingface.co/zai-org) authored the base GLM-5.3-Flash model; its exact published licence at revision 91b69215 is MIT, Copyright (c) 2026 Z.AI Co., Ltd.
+- **weights**, [https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold/tree/41ba3c2b82eff6ef5b93debff02f47ae4681d824) at `41ba3c2b82eff6ef5b93debff02f47ae4681d824` (Apache-2.0). Other weight revision documented for licence history; not selected. Mia (@MiaAI_lab) authored the EXL3 quantization of Z.ai GLM-5.3-Flash; at revision 41ba3c2b its published terms are Apache-2.0 for the quantization, with Z.ai MIT retained for the base model in LICENSE-GLM-5.3-Flash.
+- **weights**, [https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold/tree/078455ffe6472f9a52fbc1139f58b9db2881b25c) at `078455ffe6472f9a52fbc1139f58b9db2881b25c` (MIT). Pinned runtime weights, not shipped. Mia's AI Lab (@MiaAI_lab) made the EXL3 quantization Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold (revision 078455ff), with exllamav3, of Z.ai's GLM-5.3-Flash: the weights every local integration lab boot loads on attention-host/expert1-host/expert0-host (local integration's final head 6b0d285a, local integration's kit). Never copied or shipped.
+
+## Z.ai (Zhipu AI) (zai-org)
+
+Profile: https://huggingface.co/zai-org
+
+- **reference**, [https://huggingface.co/zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) at `tokenizer.json sha256 19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d` (NOASSERTION). Research/benchmark reference only; no code taken for v3.0. Z.ai (zai-org) authored the GLM-5.3-Flash tokenizer; local integration read its added tokens (<tool_call> 154843 ... </arg_value> 154850, special false) to design the forced local integration probes; nothing was taken.
+
+## Previous version (v2.15)
+
+Scott Quarrier ([@squarrier](https://github.com/squarrier)) authored the previous public recipe documentation with the AI assistance it records, at [this repository's v2.15 commit dc49f5f180a9f91f3c45d1e225499dd1437b058c](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/tree/dc49f5f180a9f91f3c45d1e225499dd1437b058c), Apache-2.0. The retained authorship of its engine, designs, weights and upstreams is stated below, not reassigned to the recipe author.
+
+The following v2.15 NOTICE body is retained verbatim, including its v1.0 sections. References to this version, scripts and dependencies below mean v2.15. The current-v3 notices above are not replaced.
 
 GLM-5.3-Flash on 1x RTX 5090 + 2x DGX Spark, version 2.15: TensorFold with MiaAI-Lab's GLM work
 Copyright 2026 Scott Quarrier
@@ -372,3 +1528,126 @@ NVIDIA CUDA Toolkit container images (`nvidia/cuda:*-devel`; NVIDIA Deep Learnin
 #### AGENTS.md (rules for agents that edit this repo)
 
 `AGENTS.md` is "AGENTS.md - credit and attribution" by Mia ([@MiaAI_lab](https://x.com/MiaAI_lab), [MiaAI-Lab](https://github.com/MiaAI-Lab)), included unchanged (sha256 `81a6dd958181aa1d`) from <https://mia-ai.net/lab/downloads/agents-md-credit-and-attribution> (added 4 October 2026). Her page publishes it for use in other projects: "Drop this file in a project as AGENTS.md."
+
+Source-only provenance addendum (2026-10-13; original text, no code change):
+XGrammar Contributors (MLC, https://github.com/mlc-ai) authored XGrammar at
+https://github.com/mlc-ai/xgrammar revision
+97787376faee5ed8466cfad57c99855e4ce2f6aa (Apache-2.0). Ash Hart (@ashhart,
+X @ashxhart, https://github.com/ashhart) authored TensorFold at
+https://github.com/ashhart/TensorFold revision
+c080a18eeae970a742135ee86325115b0387a1c8 (Apache-2.0), including its
+libtfgrammar C ABI. The native CPU/client construction proof exercises that
+existing ABI and XGrammar's Token(id) facility through an original ctypes
+caller. This proof adds no engine dependency and redistributes no library;
+the inherited external-library notice and all source/runtime pins remain.
+
+Hugging Face tokenizers contributors (https://github.com/huggingface) authored
+https://github.com/huggingface/tokenizers revision
+7f1623b90b5adfb9bc327d4c3468d2f70bbce262 (v0.23.1, Apache-2.0). The same
+CPU/client proof uses the installed encoder unmodified. No tokenizer source,
+binary or assets are newly shipped; no checkpoint or tokenizer pin changes.
+
+Hugh Madden / Turquoise Bay AI (@dangerm00se, https://github.com/hughmadden)
+authored https://github.com/hughmadden/mimo26f-afd at
+bab9fa2f2fc1e22ae67b56fbc1c209278f6a9d79 (MIT). The g53 rank_kernels.cuh
+route planner carries his plan_parallel adaptation through glm53f-afd at
+91db3cc6fe672e2724efa3464f63bd31493f63f6; it is not just a reference.
+The existing glm53f-afd MIT text retains Copyright (c) 2026 Turquoise Bay AI
+Pty Ltd and the same permission. No MiMo shell, transport or model is added.
+
+T.J. Purtell (@tpurtell, @wrldsuksgo2mars, https://github.com/tpurtell)
+authored https://github.com/tpurtell/glmrt-5.3-1rtx-4spark at
+dc6d9b8e1600e001cb1d4228bd911f4df8091f99 (v9, MIT), the intermediate-channel
+expert split retained through glm53f-afd, without glmrt code copied. He also
+authored https://github.com/tpurtell/ds41rt at
+3067d0684a0b572d88a17d38ca3f7d10599619b4 (MIT), credited for the AFD/wire
+designs through MiMo; no historical DS41RT kernel body is newly attributed
+as the source of the native g53 port.
+
+linux-rdma/rdma-core contributors (https://github.com/linux-rdma) authored
+https://github.com/linux-rdma/rdma-core. The recorded Ubuntu
+50.0-2ubuntu0.2 arm64 headers/libraries were historical CPU link inputs,
+not a revision pin for running hosts. Native RoCE uses host-provided verbs
+headers and libibverbs: real build/runtime dependencies, not references.
+The historical verbs.h receipt retains Topspin Communications, Intel
+Corporation, Cisco Systems, Inc. and PathScale, Inc. as copyright authors,
+and its choice of GPL-2.0 or OpenIB.org BSD terms. No header/library binary
+ships and no blanket licence or unrecorded host revision is asserted.
+
+Scott Quarrier (@squarrier, https://github.com/squarrier) authored the
+packaging/docs at https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks
+revision 1bff49e94deb717bd7711480188539d315af89e6 (v2.0, Apache-2.0;
+v1.0 remains MIT). Historical notices retain every original author and AI
+credit; their preservation is not adoption of that runtime or its weights.
+This original text: GPT-6.1 Sol (OpenAI Codex; planning and execution), via Hermes.
+
+The retained historical rdma-core verbs-header copyright authors are:
+Topspin Communications.
+Intel Corporation.
+Cisco Systems, Inc.
+PathScale, Inc.
+These are the original header's authors, not a new grant for other components.
+This additional original authorship text: GPT-6.1 Sol (OpenAI Codex), via Hermes.
+
+## Shipping-source additions, retained authorship
+
+The following source notes describe when their CPU changes were authored; their historical hardware-NOT-RUN statements are not the later shipping soak verdict. Earlier notices remain intact.
+
+ping_pong_qualified private attribution reconciliation (text only; no new runtime imports).
+Z.AI (@Zai_org, https://huggingface.co/zai-org) authored GLM-5.3-Flash at 91b69215804f2d2036a8867f6ce44848e278dcda (MIT). Mia (@MiaAI_lab) authored its EXL3 quantization in https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold at 078455ffe6472f9a52fbc1139f58b9db2881b25c (MIT); later 41ba3c2b Apache-2.0 terms do not change the served pin.
+XGrammar Contributors (MLC, https://github.com/mlc-ai/xgrammar) authored the retained matcher/rollback API and fixed-w1 grammar at 97787376faee5ed8466cfad57c99855e4ce2f6aa (Apache-2.0). Hugging Face tokenizers contributors (https://github.com/huggingface/tokenizers) authored the unchanged tokenizer at 7f1623b90b5adfb9bc327d4c3468d2f70bbce262 (Apache-2.0). Hugging Face authored the referenced transformers GLM semantics at 7cd73d9df0c14b151c684b708a9f27d8d0349dfe (Apache-2.0).
+linux-rdma/rdma-core contributors, Topspin Communications, Intel Corporation, Cisco Systems, Inc., and PathScale, Inc. authored the retained verbs/header components of https://github.com/linux-rdma/rdma-core v50.0 (selected BSD-2-Clause/OpenIB.org terms; individual-file alternatives retained). Scott Quarrier (@squarrier, https://github.com/squarrier) authored packaging/documentation of GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks at 1bff49e94deb717bd7711480188539d315af89e6 (Apache-2.0).
+Zig contributors (https://github.com/ziglang/zig) authored the pinned 0.17.0 compiler and standard library (MIT). Claude Opus 5.5 via Hermes authored the retained shared_verify recorder and CPU runner; GPT-6.1 Sol (OpenAI Codex), via Hermes, authored this qualification and private kit adaptation.
+Shared-ledger cross-card design disclosures, NOT code imported here: Yaniv Leviathan, Matan Kalman and Yossi Matias authored speculative acceptance/residual correction (https://arxiv.org/abs/2211.17192v2, CC-BY-4.0). Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste Lespiau, Laurent Sifre and John Jumper authored speculative sampling correction (https://arxiv.org/abs/2302.01318v1, CC-BY-4.0). No sampled helper or instrumentation branch is included in ping_pong_qualified.
+Every inherited NOTICE paragraph and licence below is preserved verbatim.
+
+ping_pong_fixture local CPU causal fixture work (2026-10-14): per-Harness preallocated
+scalar tracing and per-proxy initial-doorbell-cursor acknowledgement. The
+observer never reads the watcher's non-atomic Rule and is not its step input.
+Ash Hart (@ashhart / @ashxhart, https://github.com/ashhart) authored TensorFold
+at https://github.com/ashhart/TensorFold commit
+f8fe17d24629aedabf90bbf78279dd776e6d62e7 (Apache-2.0); the inherited exchange,
+Mia, Bizuayeu, Hugh Madden, tpurtell, Turboderp, NVIDIA and XGrammar notices
+remain unchanged. This fixture instrumentation and acknowledgement repair:
+GPT-6.1 Sol (OpenAI Codex; planning and execution), via Hermes. No product
+watcher, CUDA kernel, wire or mathematical change; historical failures remain
+FAIL and broad/final acceptance is not authorized by this observation.
+
+ping_pong local CPU change (2026-10-13), default OFF:
+TF_AFD_USERS_PING_PONG=1 needs shared drafts, TF_AFD_PAIRS=1 and
+TF_AFD_INFLIGHT=2. Two independent user micro-batches run on one CUDA stream
+in the existing mode-7 pair protocol, each at <=8 rows, with independent
+State, acceptance and rollback; the halves' source/wire definitions do not
+change. Bizuayeu (@Bizuayeu, https://github.com/Bizuayeu) authored the
+shared-window design at https://github.com/Bizuayeu/TensorFold commit
+75131b66c39fdcf55dbd130ccaec166b65394f3d (Apache-2.0), used here through
+shared_verify. Hugh Madden (@dangerm00se, https://github.com/hughmadden) authored
+the inherited AFD exchange design at https://github.com/hughmadden/glm53f-afd
+commit 91db3cc6fe672e2724efa3464f63bd31493f63f6 (MIT), used through qualification_c533375f's
+scheduler. Ash Hart (@ashhart / @ashxhart) authored TensorFold, its lane
+core and MCDMA; Mia (@MiaAI_lab) authored the GLM EXL3 recipe and MTP
+drafter; T.J. Purtell (tpurtell, @wrldsuksgo2mars, cuteafd, MIT) authored
+the disaggregated inference implementation; Turboderp authored EXL3.
+No outside code copied. GPT-6.1 Sol (OpenAI Codex; planning and execution),
+via Hermes, authored this change. Hardware NOT RUN; no adoption. All
+inherited notices remain verbatim.
+
+batched_drafts local CPU extension (2026-10-13) on 6b0d285a: default-off
+TF_AFD_USERS_BATCHED_DRAFTS=1 batches active users' MTP rows into one forward
+per draft depth, with bounded eight-row absorb waves, private MTP hidden per
+slot and each user's own backlog/cache/DSA state. Requires
+TF_AFD_USERS_SHARED_DRAFTS=1; verification, acceptance and backbone rollback
+are unchanged. Bizuayeu (@Bizuayeu, https://github.com/Bizuayeu) authored the
+shared verify design this extends through shared_verify, in
+https://github.com/Bizuayeu/TensorFold at 75131b66c39fdcf55dbd130ccaec166b65394f3d
+(Apache-2.0); his drafting is per stream, and this batched-MTP extension copies
+none of his code. Ash Hart (@ashhart / @ashxhart) authored TensorFold and MTP;
+Mia (@MiaAI_lab) authored the EXL3 weights and MTP drafter; tpurtell
+(@wrldsuksgo2mars, cuteafd, MIT) and Hugh Madden (@dangerm00se) authored the
+AFD split; Turboderp authored EXL3. Earlier user_drafts/shared_verify work: Claude Opus 5.5
+(Anthropic), via Hermes. batched_drafts initial receipt analysis/worktree: Claude Opus
+5.5 (Anthropic), via Hermes; this implementation and qualification: GPT-6.1
+Sol (OpenAI Codex), via Hermes. CPU only; hardware NOT RUN; no adoption or
+public/production authority. Every earlier notice and licence is retained.
+
+Scope note for historical ledger entries: the entry describing the new batched-MTP extension is an authorship-phase receipt for code now included/enabled at 1fab9035. Entries describing the separate 16-physical-row extension remain excluded. Their source authors and original entry text are retained.

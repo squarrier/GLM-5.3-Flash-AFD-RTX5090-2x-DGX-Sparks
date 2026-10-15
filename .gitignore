@@ -1,4 +1,13 @@
 .env
-*.log
+.build/
 __pycache__/
-/build/
+*.py[cod]
+.zig-cache/
+zig-out/
+*.cubin
+*.fatbin
+*.so
+*.so.*
+*.a
+*.safetensors
+*.gguf

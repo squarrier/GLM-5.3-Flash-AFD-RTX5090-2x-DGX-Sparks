@@ -1,0 +1,339 @@
+X1, the four prompt switches TensorFold-AFD's python lane runs by default on windows of 64 rows and more (python 2.15
+0849f3f, glm5_next/cuda/exl3_generic.py): IMP2's 896e05a on python 0.6.5 9080db9, whose src/tensorfold/cuda/exl3/
+experts_grouped.cuh and experts.cu equal python-0.6's (ed78d6f) byte for byte. IMP2 adapted three of Mia's GLM-5.3-Flash
+recipe patches (MiaAI-Lab, https://github.com/MiaAI-Lab, X @MiaAI_lab; recipe @ 1576746, Apache-2.0, Copyright 2026
+MiaAI-Lab) onto TensorFold's universal grouped kernel: 0001 (NFIRST, and PA, the register prefetch), 0020 (ORDER and its
+prompt_order_kernel), 0009 (XROW and rot_rows). Each switch changes which block runs which item and where it loads
+from, never an output's arithmetic (HW0: byte-equal outputs on GB10 at 1-2,048 rows). exl3_copies.py applies its
+hunks in memory to write exl3/x1/; python-0.6 + this patch (patch -p1) is the kernels' oracle.
+
+--- a/src/tensorfold/cuda/exl3/experts.cu
++++ b/src/tensorfold/cuda/exl3/experts.cu
+@@ -90,14 +90,17 @@ template <> __device__ __forceinline__ float to_f<__nv_bfloat16>(__nv_bfloat16 v
+ template <> __device__ __forceinline__ float to_f<half>(half v) { return __half2float(v); }
+ 
+ // Program (member row, 128-block of K, matrix): Xh = fp16((x * suh) @ H) for gate and up of every routed slot (pick < E).
+-template <typename TIN>
++// ROWS (rot_rows, the prompt switch TF_GLM_EXL3_ROWROT; adapted from MiaAI-Lab recipe patch 0009): program (row,
++// 128-block) writes Xh[row] = the same arithmetic with suh0, one vector every expert's gate and up share bit for bit,
++// so each pair's fp16 input of that row has the same bits, computed once a row instead of 2 x top_k times.
++template <typename TIN, bool ROWS = false>
+ __global__ void rot_in_kernel(const TIN* __restrict__ x, int x_stride, const int* __restrict__ pick,
+                               const half* __restrict__ suh0, const half* __restrict__ suh1, half* __restrict__ out0,
+                               half* __restrict__ out1, int K, int slots, int E) {
+     const int p = blockIdx.x, blk = blockIdx.y, mat = blockIdx.z;
+-    const int row = p / slots;
+-    const int e = pick[p];
+-    if (e < 0 || e >= E) return;
++    const int row = ROWS ? p : p / slots;
++    const int e = ROWS ? 0 : pick[p];
++    if (!ROWS && (e < 0 || e >= E)) return;
+     const int lane = threadIdx.x;
+     const half* suh = (mat ? suh1 : suh0) + (size_t)e * K + blk * 128 + 4 * lane;
+     const TIN* xr = x + (size_t)row * x_stride + blk * 128 + 4 * lane;
+@@ -236,6 +239,80 @@ __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __re
+     for (int j = 0; j < 4; ++j) out[(size_t)r * D + n + j] = acc[j];
+ }
+ 
++// The launch order of a prompt window's items for grouped_kernel<.., ORDER> (TF_GLM_EXL3_ORDER; adapted from
++// MiaAI-Lab recipe patch 0020's prompt_order_kernel onto this path's grouping). An item is (u, member tile) for
++// u < ucount and tile < ceil(u's members / 16), coded u * MT + tile. The items of experts with one item (their weights
++// come from DRAM for at most 16 rows: few mma) and of experts with several (the weights stay in L2 across their
++// items: mostly mma) are merged evenly, each list in plan order (expert id, then tile), so DRAM and the tensor cores
++// stay busy together instead of in turns. Only which block runs which item changes: every output keeps its bits.
++// The grouping counts routed picks only (< E), so the shared expert has no items; a uid >= E would be left out all
++// the same. order[slot] = an item for slot < items, -1 up to cap (the grid's slots, an upper bound). One block.
++__global__ void __launch_bounds__(1024) prompt_order_kernel(const int* __restrict__ uids,
++                                                            const int* __restrict__ ucount,
++                                                            const int* __restrict__ members, int* __restrict__ order,
++                                                            int maxm, int cap, int E) {
++    __shared__ int hsum[32], lsum[32];
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    const int U = ucount[0], MT = (maxm + 15) / 16;
++    const int per = (U + 1023) / 1024;
++    const int lo = min(U, tid * per), hi = min(U, lo + per);
++    auto items_of = [&](int u) {                           // members come first, -1 after: find the first -1
++        if (uids[u] >= E) return 0;
++        const int* m = members + (size_t)u * maxm;
++        int a = 0, b = maxm;
++        while (a < b) {
++            const int c = (a + b) >> 1;
++            if (m[c] >= 0) a = c + 1; else b = c;
++        }
++        return (a + 15) >> 4;
++    };
++    int h = 0, l = 0;                                      // this thread's heavy and light items
++    for (int u = lo; u < hi; ++u) {
++        const int n = items_of(u);
++        if (n >= 2) h += n; else l += n;
++    }
++    int vh = h, vl = l;                                    // inclusive scans over the block
++#pragma unroll
++    for (int o = 1; o < 32; o <<= 1) {
++        const int uh = __shfl_up_sync(0xffffffffu, vh, o), ul = __shfl_up_sync(0xffffffffu, vl, o);
++        if (lane >= o) { vh += uh; vl += ul; }
++    }
++    if (lane == 31) { hsum[warp] = vh; lsum[warp] = vl; }
++    __syncthreads();
++    if (warp == 0) {
++        int wh = hsum[lane], wl = lsum[lane];
++#pragma unroll
++        for (int o = 1; o < 32; o <<= 1) {
++            const int uh = __shfl_up_sync(0xffffffffu, wh, o), ul = __shfl_up_sync(0xffffffffu, wl, o);
++            if (lane >= o) { wh += uh; wl += ul; }
++        }
++        hsum[lane] = wh;
++        lsum[lane] = wl;
++    }
++    __syncthreads();
++    const int nh = hsum[31], nl = lsum[31];
++    if (nh + nl > cap) __trap();                           // cap bounds every grouping's items: never
++    int rh = (warp ? hsum[warp - 1] : 0) + vh - h;         // heavy items before this thread's first expert
++    int rl = (warp ? lsum[warp - 1] : 0) + vl - l;         // light items before it
++    for (int u = lo; u < hi; ++u) {
++        const int n = items_of(u);
++        for (int q = 0; q < n; ++q) {
++            if (n >= 2) {                                  // heavy rank r sits at (r + 1/2) / nh; lights before it: strictly
++                const int r = rh++;
++                const long long X = (2LL * r + 1) * nl;
++                const int cl = X > nh ? (int)min((long long)nl, (X - nh + 2LL * nh - 1) / (2LL * nh)) : 0;
++                order[r + cl] = u * MT + q;
++            } else {                                       // light rank l at (l + 1/2) / nl; heavies at or before it
++                const int lr = rl++;
++                const long long Y = (2LL * lr + 1) * nh;
++                const int ch = Y >= nl ? (int)min((long long)nh, (Y - nl) / (2LL * nl) + 1) : 0;
++                order[lr + ch] = u * MT + q;
++            }
++        }
++    }
++    for (int s = nh + nl + tid; s < cap; s += 1024) order[s] = -1;
++}
++
+ }  // namespace
+ 
+ // ---------------------------------------------------------------------------------------------------------------
+@@ -253,7 +330,7 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
+                         const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
+                         const at::Tensor& members, at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P,
+                         int64_t SK, int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo,
+-                        int64_t hi) {
++                        int64_t hi, bool nfirst, const int* order, int64_t max_items, bool pa, bool xrow) {
+     TORCH_CHECK(K % (16 * SK * warps) == 0 && N % (16 * nt) == 0, "K and N must split evenly");
+     tf_exl3x::GroupedArgs a;
+     a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
+@@ -269,6 +346,7 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
+     a.K = (int)K; a.N = (int)N; a.P = (int)P; a.SK = (int)SK; a.maxm = (int)members.size(1); a.slots = (int)slots;
+     a.nexp_max = (int)uids.size(0);
+     a.mats = (int)mats; a.nt = (int)nt; a.warps = (int)warps; a.pf = (int)pf; a.lo = (int)lo; a.hi = (int)hi;
++    a.nfirst = nfirst; a.order = order; a.max_items = (int)max_items; a.pa = pa; a.xrow = xrow;
+     auto stream = at::cuda::getCurrentCUDAStream();
+     if (cb == 0) tf_exl3x::grouped_launch<0>(a, stream);
+     else if (cb == 1) tf_exl3x::grouped_launch<1>(a, stream);
+@@ -329,6 +407,29 @@ void exl3x_rot_in_cuda(const at::Tensor& x, int64_t x_stride, const at::Tensor&
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
++void exl3x_rot_rows_cuda(const at::Tensor& x, int64_t x_stride, const at::Tensor& suh, at::Tensor& out, int64_t rows,
++                         int64_t K) {
++    dim3 grid((unsigned)rows, (unsigned)(K / 128), 1);
++    auto stream = at::cuda::getCurrentCUDAStream();
++    auto s = reinterpret_cast<const half*>(suh.data_ptr());
++    auto o = reinterpret_cast<half*>(out.data_ptr());
++    if (x.scalar_type() == at::kBFloat16)
++        rot_in_kernel<__nv_bfloat16, true><<<grid, 32, 0, stream>>>(
++            reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), (int)x_stride, nullptr, s, s, o, o, (int)K, 1, 1);
++    else
++        rot_in_kernel<half, true><<<grid, 32, 0, stream>>>(reinterpret_cast<const half*>(x.data_ptr()), (int)x_stride,
++                                                           nullptr, s, s, o, o, (int)K, 1, 1);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++void exl3x_order_cuda(const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members, at::Tensor& order,
++                      int64_t cap, int64_t E) {
++    prompt_order_kernel<<<1, 1024, 0, at::cuda::getCurrentCUDAStream()>>>(
++        uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(), order.data_ptr<int>(),
++        (int)members.size(1), (int)cap, (int)E);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
+ void exl3x_gateup_epilogue_cuda(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_g,
+                                 const at::Tensor& svh_u, const at::Tensor& suh_d, at::Tensor& xd, int64_t rows,
+                                 int64_t P, int64_t N, int64_t SK, int64_t slots, int64_t E, double limit,
+--- a/src/tensorfold/cuda/exl3/experts_grouped.cuh
++++ b/src/tensorfold/cuda/exl3/experts_grouped.cuh
+@@ -135,8 +135,10 @@ __device__ __forceinline__ void load_words(uint32_t (&dst)[Fmt<K2>::LW], const u
+     }
+ }
+ 
+-// One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc, PF tiles in flight.
+-template <int CB, int K2, int NT, int PF>
++// One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc, PF tiles in flight. PA (the prompt switch
++// TF_GLM_EXL3_PF; adapted from MiaAI-Lab recipe patch 0001's register prefetch): the next k step's A fragments load
++// with its words, before this step decodes and multiplies; the same values go into the same mma order.
++template <int CB, int K2, int NT, int PF, bool PA = false>
+ __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt, int nt0,
+                                            const half* x0, const half* x1, bool ok0, bool ok1, int lane,
+                                            float (&acc)[NT][2][4]) {
+@@ -151,6 +153,14 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int N
+         if (d < nkt)
+ #pragma unroll
+             for (int i = 0; i < NT; ++i) load_words<K2>(pf[d][i], tp + d * kstride + i * TW, lane);
++    uint32_t an[4] = {0u, 0u, 0u, 0u};                   // PA: the next k step's A fragments
++    if constexpr (PA) {
++        if (nkt > 0) {
++            const int k = kt0 * 16;
++            an[0] = load_pair(x0 + k, ok0); an[1] = load_pair(x1 + k, ok1);
++            an[2] = load_pair(x0 + k + 8, ok0); an[3] = load_pair(x1 + k + 8, ok1);
++        }
++    }
+ 
+     for (int ib = 0; ib < nkt; ib += PF) {
+ #pragma unroll
+@@ -167,8 +177,15 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int N
+                     for (int i = 0; i < NT; ++i)
+                         load_words<K2>(pf[d][i], tp + (size_t)(it + PF) * kstride + i * TW, lane);
+                 const int k = (kt0 + it) * 16;
+-                uint32_t a[4] = {load_pair(x0 + k, ok0), load_pair(x1 + k, ok1), load_pair(x0 + k + 8, ok0),
+-                                 load_pair(x1 + k + 8, ok1)};
++                // PA: this step's A fragments came with the previous step's words; the next step's load now
++                uint32_t a[4] = {PA ? an[0] : load_pair(x0 + k, ok0), PA ? an[1] : load_pair(x1 + k, ok1),
++                                 PA ? an[2] : load_pair(x0 + k + 8, ok0), PA ? an[3] : load_pair(x1 + k + 8, ok1)};
++                if constexpr (PA) {
++                    if (it + 1 < nkt) {
++                        an[0] = load_pair(x0 + k + 16, ok0); an[1] = load_pair(x1 + k + 16, ok1);
++                        an[2] = load_pair(x0 + k + 24, ok0); an[3] = load_pair(x1 + k + 24, ok1);
++                    }
++                }
+ #pragma unroll
+                 for (int i = 0; i < NT; ++i) {
+                     uint32_t b0[2], b1[2];
+@@ -187,18 +204,40 @@ __host__ __device__ constexpr bool k2_supported(int k2) {
+ }
+ 
+ // Program (expert u, n block, split and member tile): up to 16 members times W_q over the split's K range; warps added in order.
+-template <int CB, int NT, int W, int PF, int LO, int HI>
++// The prompt switches (adapted from MiaAI-Lab recipe patches 0001, 0020 and 0009 onto this kernel; only GLM's call
++// sites set them, for prompt windows) change which block runs which (expert, member tile) and where it loads from,
++// never an output's arithmetic; every other launch is <.., false, false, false, false>, today's kernel:
++//   NFIRST: grid x is the n block, so an item's n blocks are adjacent in launch order and read its member rows while
++//           L2 still holds them (0001);
++//   ORDER:  the item axis is a slot of `order` (prompt_order_kernel's items u * MT + member tile, single-item and
++//           multi-item experts' items merged evenly) and grid z holds only (mat, split) (0020);
++//   PA:     the next k step's A fragments are prefetched into registers (0001's PF);
++//   XROW:   X holds one rotated row a token (rot_rows: a layer whose experts share one gate/up suh), so member
++//           row * 32 + slot reads X row `row` and still writes Z row `row * slots + slot` (0009's ROWROT).
++template <int CB, int NT, int W, int PF, int LO, int HI, bool NFIRST = false, bool ORDER = false, bool PA = false,
++          bool XROW = false>
+ __global__ void __launch_bounds__(W * 32) grouped_kernel(
+     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
+     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
+     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
+-    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
+-    const int u = blockIdx.x;
+-    if (u >= ucount[0]) return;
+-    const int MT = (maxm + 15) / 16;
+-    const int mtile = blockIdx.z % MT;
+-    const int split = (blockIdx.z / MT) % SK;
+-    const int mat = blockIdx.z / MT / SK;
++    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, const int* __restrict__ order) {
++    int u, mtile, split, mat;
++    if constexpr (ORDER) {
++        const int MT = (maxm + 15) / 16;
++        const int item = order[NFIRST ? blockIdx.y : blockIdx.x];   // the item's launch slot
++        if (item < 0) return;                                     // a slot past the routed items
++        u = item / MT;
++        mtile = item - u * MT;
++        split = blockIdx.z % SK;
++        mat = blockIdx.z / SK;
++    } else {
++        u = NFIRST ? blockIdx.y : blockIdx.x;
++        if (u >= ucount[0]) return;
++        const int MT = (maxm + 15) / 16;
++        mtile = blockIdx.z % MT;
++        split = (blockIdx.z / MT) % SK;
++        mat = blockIdx.z / MT / SK;
++    }
+     const half* X = mat ? X1 : X0;
+     const int e = uids[u];
+     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
+@@ -216,12 +255,13 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
+     __syncthreads();
+     if (rows_sh[0] < 0) return;                           // members come first, so this tile is empty
+     const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
+-    const half* x0 = X + (size_t)(r0 < 0 ? 0 : r0) * K + 2 * t;
+-    const half* x1 = X + (size_t)(r1 < 0 ? 0 : r1) * K + 2 * t;
++    // XROW: pair row * slots + slot reads its token row (slot < slots)
++    const half* x0 = X + (size_t)(r0 < 0 ? 0 : (XROW ? r0 / slots : r0)) * K + 2 * t;
++    const half* x1 = X + (size_t)(r1 < 0 ? 0 : (XROW ? r1 / slots : r1)) * K + 2 * t;
+ 
+     const int per_split = KT / SK, per_warp = per_split / W;
+     const int kt0 = split * per_split + warp * per_warp;
+-    const int nt0 = blockIdx.y * NT;
++    const int nt0 = (NFIRST ? blockIdx.x : blockIdx.y) * NT;     // the n block
+ 
+     float acc[NT][2][4];
+ #pragma unroll
+@@ -235,7 +275,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
+ #define TF_EXL3X_CASE(K2_)                                                                                      \
+     case K2_:                                                                                                   \
+         if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
+-            warp_tiles<CB, K2_, NT, PF>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);    \
++            warp_tiles<CB, K2_, NT, PF, PA>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc); \
+         else                                                                                                    \
+             __trap();                                                                                           \
+         break;
+@@ -319,16 +359,53 @@ struct GroupedArgs {
+     int K, N, P, SK, maxm, slots;
+     int nexp_max;        // grid.x (upper bound of distinct experts)
+     int mats, nt, warps, pf, lo, hi;
++    // the prompt switches (GLM's call sites only; all off = today's launch)
++    bool nfirst = false, pa = false, xrow = false;
++    const int* order = nullptr;   // ORDER: prompt_order_kernel's slots
++    int max_items = 0;            // ORDER: the slots (an upper bound of the items)
+ };
+ 
++// The prompt switches' launch: GLM's 4-bit mcg experts at GLM's tile setting (8 n tiles, 4 warps, 1 tile in flight),
++// the scope of MiaAI-Lab's dedicated kernel; grid (n block, item, z) with NFIRST, else (item, n block, z), where the
++// items are the experts (z = mat, split, member tile) or with ORDER the order slots (z = mat, split).
++template <int CB>
++void prompt_grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
++    const int MT = (a.maxm + 15) / 16;
++    const unsigned items = (unsigned)(a.order ? a.max_items : a.nexp_max);
++    const unsigned nbs = (unsigned)(a.N / (16 * a.nt));
++    const unsigned zdim = (unsigned)(a.order ? a.mats * a.SK : a.mats * a.SK * MT);
++    const dim3 grid = a.nfirst ? dim3(nbs, items, zdim) : dim3(items, nbs, zdim);
++    TORCH_CHECK(grid.y <= 65535u && grid.z <= 65535u, "prompt expert grid ", grid.x, " x ", grid.y, " x ", grid.z,
++                " is past the y/z limits");
++    const int sel = (a.nfirst ? 8 : 0) | (a.order ? 4 : 0) | (a.pa ? 2 : 0) | (a.xrow ? 1 : 0);
++#define TF_PROMPT(S_)                                                                                            \
++    case S_:                                                                                                     \
++        grouped_kernel<CB, 8, 4, 1, 8, 8, (S_ & 8) != 0, (S_ & 4) != 0, (S_ & 2) != 0, (S_ & 1) != 0>             \
++            <<<grid, 4 * 32, 0, stream>>>(a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, \
++                                          a.z, a.K, a.N, a.P, a.SK, a.maxm, a.slots, a.order);                  \
++        break;
++    switch (sel) {
++        TF_PROMPT(1) TF_PROMPT(2) TF_PROMPT(3) TF_PROMPT(4) TF_PROMPT(5) TF_PROMPT(6) TF_PROMPT(7) TF_PROMPT(8)
++        TF_PROMPT(9) TF_PROMPT(10) TF_PROMPT(11) TF_PROMPT(12) TF_PROMPT(13) TF_PROMPT(14) TF_PROMPT(15)
++        default: TORCH_CHECK(false, "no prompt switch set");
++    }
++#undef TF_PROMPT
++}
++
+ template <int CB>
+ void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
++    if (a.nfirst || a.pa || a.xrow || a.order) {
++        TORCH_CHECK(CB == 1 && a.nt == 8 && a.warps == 4 && a.pf == 1 && a.lo == 8 && a.hi == 8,
++                    "the prompt switches take 4-bit mcg experts at the (8 n tiles, 4 warps, 1 in flight) setting");
++        if constexpr (CB == 1) prompt_grouped_launch<CB>(a, stream);
++        return;
++    }
+     const int MT = (a.maxm + 15) / 16;
+     dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MT));
+ #define TF_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                       \
+     grouped_kernel<CB, NT_, W_, PF_, LO_, HI_><<<grid, W_ * 32, 0, stream>>>(                                   \
+         a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm, \
+-        a.slots)
++        a.slots, nullptr)
+ #define TF_RANGES(NT_, W_, PF_)                                                                                 \
+     if (a.lo == 8 && a.hi == 8) TF_LAUNCH(NT_, W_, PF_, 8, 8);                                                  \
+     else if (a.lo >= 2 && a.hi <= 10) TF_LAUNCH(NT_, W_, PF_, 2, 10);                                           \

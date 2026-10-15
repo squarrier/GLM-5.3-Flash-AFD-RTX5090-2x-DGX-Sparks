@@ -1,0 +1,91 @@
+qualification_3e1f1105: TF_GLM_EXL3_PGROUP, the parallel grouping of bertholomus (Albert Lee, BertholomusAI;
+https://github.com/bertholomus/TensorFold, branch glm-dsa-tp4, commit dbe0773 "perf(exl3 experts): prompt chunks decode
+each weight tile once for up to 64 member rows", Apache-2.0; his commits name Claude Opus 5.5 as co-author): his
+experts.cu lines 74-145 (PLACE_THREADS, block_sum, group_count_kernel, group_place_kernel) inserted after
+group_kernel, unchanged. group_count_kernel counts each expert's members (a 256-thread block an expert);
+group_place_kernel puts each used expert at its place in id order and lists its members in row order with the same
+(i / slots) * 32 + (i % slots) encoding, -1 after the last up to maxm: group_kernel's lists byte for byte, for any
+number of rows (no shared-memory staging). python-0.6's experts.cu equals dbe0773's through line 73. exl3_copies.py
+applies this hunk in memory to write exl3/experts.cu, and after exl3_x1.patch's hunks to write exl3/x1/experts.cu.
+
+--- a/src/tensorfold/cuda/exl3/experts.cu
++++ b/src/tensorfold/cuda/exl3/experts.cu
+@@ -69,6 +69,78 @@
+         for (; j < maxm; ++j) members[place * maxm + j] = -1;
+         ++place;
+     }
++}
++
++// The same grouping for any number of rows (prompt chunks; group_kernel stages every pick in one block's shared memory):
++// a block per expert counts its members, then a block per used expert takes its place in id order and lists its
++// members in row order, -1 after the last.
++constexpr int PLACE_THREADS = 256;
++
++__device__ __forceinline__ int block_sum(int v, int* sh) {
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
++    __syncthreads();
++    if (lane == 0) sh[warp] = v;
++    __syncthreads();
++    int s = 0;
++    for (int w = 0; w < (int)(blockDim.x >> 5); ++w) s += sh[w];
++    return s;
++}
++
++__global__ void __launch_bounds__(PLACE_THREADS) group_count_kernel(const int* __restrict__ pick,
++                                                                    int* __restrict__ counts, int n) {
++    __shared__ int sh[PLACE_THREADS / 32];
++    const int e = blockIdx.x;
++    int c = 0;
++    for (int i = threadIdx.x; i < n; i += PLACE_THREADS) c += pick[i] == e;
++    c = block_sum(c, sh);
++    if (threadIdx.x == 0) counts[e] = c;
++}
++
++__global__ void __launch_bounds__(PLACE_THREADS) group_place_kernel(const int* __restrict__ pick,
++                                                                    const int* __restrict__ counts,
++                                                                    int* __restrict__ uids, int* __restrict__ ucount,
++                                                                    int* __restrict__ members, int n, int slots, int E,
++                                                                    int maxm) {
++    __shared__ int sh[PLACE_THREADS / 32];
++    __shared__ int warp_tot[PLACE_THREADS / 32];
++    const int e = blockIdx.x;
++    int before = 0;                                   // used experts with a smaller id: this one's place
++    for (int i = threadIdx.x; i < e; i += PLACE_THREADS) before += counts[i] > 0;
++    const int u = block_sum(before, sh);
++    if (e == 0) {
++        int used = 0;
++        for (int i = threadIdx.x; i < E; i += PLACE_THREADS) used += counts[i] > 0;
++        used = block_sum(used, sh);
++        if (threadIdx.x == 0) ucount[0] = used;
++    }
++    if (counts[e] == 0) return;
++    if (threadIdx.x == 0) uids[u] = e;
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    int base = 0;
++    for (int start = 0; start < n; start += PLACE_THREADS) {
++        const int i = start + threadIdx.x;
++        const int hit = i < n && pick[i] == e;
++        int inc = hit;                                // inclusive scan of hits in thread order
++#pragma unroll
++        for (int o = 1; o < 32; o <<= 1) {
++            const int v = __shfl_up_sync(0xffffffffu, inc, o);
++            if (lane >= o) inc += v;
++        }
++        __syncthreads();
++        if (lane == 31) warp_tot[warp] = inc;
++        __syncthreads();
++        int prior = 0, total = 0;
++        for (int w = 0; w < PLACE_THREADS / 32; ++w) {
++            prior += w < warp ? warp_tot[w] : 0;
++            total += warp_tot[w];
++        }
++        const int j = base + prior + inc - hit;
++        if (hit && j < maxm) members[u * maxm + j] = (i / slots) * 32 + (i % slots);
++        base += total;
++    }
++    for (int j = base + threadIdx.x; j < maxm; j += PLACE_THREADS) members[u * maxm + j] = -1;
+ }
+ 
+ // Walsh-Hadamard transform of 128 values, 4 a lane, fixed butterfly order (strides 1, 2 in registers, 4..64 across lanes).
