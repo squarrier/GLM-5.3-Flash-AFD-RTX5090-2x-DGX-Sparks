@@ -1,6 +1,9 @@
+// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
 // The host half of the one-shot RoCE all-gather between two ranks (two DGX Sparks): a proxy thread that RDMA-writes each staged shard to the peer.
 // Source: Mia's patch 0006, MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold @ cbfc429, patches/0006-two-ranks.patch, zig/src/cuda/roce_proxy.c (Apache-2.0, Copyright 2026 MiaAI-Lab).
 // Changed here: the header comments condensed to one line each; tf_roce_proxy_built added. The proxy's code is unchanged but for qualification_17c70e37's stripes (tf_roce_set_stripes, post_striped; off unless set, and then post's one write a port as before) and qualification_9e49592e's: the slots a source a count given at open (tf_roce_open_slots, 2 to ROCE_SLOTS_MAX; tf_roce_open keeps ROCE_SLOTS).
+// Direct-port change by Helios: bounded1MiB payload WRs; full actual-row message/flag ordering retained.
 // Protocol: b12x's "RoCEnante" (https://github.com/local-inference-lab/b12x, b12x/comm/roce, by local-inference-lab, Apache-2.0), in new code.
 // A rank stages its shard into a pinned send slot and rings a doorbell; this thread writes it into the peer's receive slot over every port, each stripe then its flag.
 // The peer's kernel (zig/kernels/cuda/fn_roce.cu) waits for every port's flag, then reads the shard; zig/src/cuda/roce.zig drives both halves.
@@ -79,6 +82,7 @@ typedef struct {
 typedef struct tf_roce {
   struct verbs v;
   int rank, world, ports, gid_index;
+  uint8_t traffic_class;
   port_t port[ROCE_PORTS_MAX];
   uint8_t *region;
   uint64_t region_bytes, slot_bytes;
@@ -88,7 +92,8 @@ typedef struct tf_roce {
   uint32_t peer_rkey[ROCE_PORTS_MAX];
   pthread_t thread;
   int thread_started;
-  atomic_int running, failed;
+  atomic_int running, failed, thread_done;
+  _Atomic uint64_t close_deadline;
   uint32_t posted_seq;
   _Atomic uint64_t ops;
   uint64_t writes;
@@ -327,6 +332,7 @@ int tf_roce_connect(tf_roce *r, const void *peer_blob) {
     memcpy(a.ah_attr.grh.dgid.raw, b.gid[i], 16);
     a.ah_attr.grh.sgid_index = (uint8_t)r->gid_index;
     a.ah_attr.grh.hop_limit = 64;
+    a.ah_attr.grh.traffic_class = r->traffic_class;
     int rc = r->v.modify_qp(p->qp, &a,
                             IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
                                 IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
@@ -372,6 +378,33 @@ static int reap(tf_roce *r, int i) {
   return 0;
 }
 
+// Helios direct-V3 adapter: keep actual-R slots, but every native RDMA payload write is <=1MiB.
+// Each signalled chunk is counted until reaped; a partial submit never publishes the final message flag.
+#define TF_AFD_MAX_POST (1u << 20)
+static int post_payload(tf_roce *r, int i, uint64_t send, uint64_t recv, uint32_t bytes) {
+  port_t *p = &r->port[i];
+  for (uint32_t off = 0; off < bytes;) {
+    while (p->outstanding >= ROCE_DEPTH / 4) {
+      if (reap(r, i) != 0) return -1;
+      if (!atomic_load_explicit(&r->running, memory_order_relaxed)) {
+        snprintf(r->err, sizeof(r->err), "stopped with partial V3 payload on port %d", i);
+        return -1;
+      }
+    }
+    const uint32_t n = bytes - off > TF_AFD_MAX_POST ? TF_AFD_MAX_POST : bytes - off;
+    struct ibv_sge sg = {.addr = send + off, .length = n, .lkey = p->mr->lkey};
+    struct ibv_send_wr wr; memset(&wr, 0, sizeof(wr));
+    wr.wr_id = (uint64_t)i; wr.sg_list = &sg; wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_WRITE; wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = recv + off; wr.wr.rdma.rkey = r->peer_rkey[i];
+    struct ibv_send_wr *bad = NULL;
+    const int rc = ibv_post_send(p->qp, &wr, &bad);
+    if (rc != 0) { fail(r, "ibv_post_send partial V3 payload", rc); return -1; }
+    p->outstanding++; off += n;
+  }
+  return 0;
+}
+
 static int post_striped(tf_roce *r, uint32_t seq, uint32_t bytes, uint32_t nst);  // qualification_17c70e37, below
 
 // Sequence `seq`'s shard (`bytes`, a multiple of 16) into the peer's recv[rank][seq % slots], over the ports in 16-byte units: each stripe, then its flag.
@@ -410,23 +443,8 @@ static int post(tf_roce *r, uint32_t seq, uint32_t bytes) {
     fw.wr.rdma.remote_addr = r->peer_region + r->flag_off +
                              (((uint64_t)r->rank * r->slots + slot) * ROCE_PORTS_MAX + (uint64_t)i) * ROCE_FLAG_STRIDE;
     fw.wr.rdma.rkey = r->peer_rkey[i];
-    struct ibv_sge ds;
-    struct ibv_send_wr dw;
+    if (share && post_payload(r, i, (uint64_t)(uintptr_t)(send + off), recv + off, share * 16) != 0) return -1;
     struct ibv_send_wr *first = &fw;
-    if (share) {
-      ds.addr = (uint64_t)(uintptr_t)(send + off);
-      ds.length = share * 16;
-      ds.lkey = p->mr->lkey;
-      memset(&dw, 0, sizeof(dw));
-      dw.wr_id = (uint64_t)i;
-      dw.next = &fw;
-      dw.sg_list = &ds;
-      dw.num_sge = 1;
-      dw.opcode = IBV_WR_RDMA_WRITE;
-      dw.wr.rdma.remote_addr = recv + off;
-      dw.wr.rdma.rkey = r->peer_rkey[i];
-      first = &dw;
-    }
     struct ibv_send_wr *bad = NULL;
     const int rc = ibv_post_send(p->qp, first, &bad);
     if (rc != 0) {
@@ -461,47 +479,20 @@ static int post_striped(tf_roce *r, uint32_t seq, uint32_t bytes, uint32_t nst) 
     const uint32_t share = units / r->ports + ((uint32_t)i < units % r->ports ? 1u : 0u);
     const uint64_t flag = r->peer_region + r->flag_off +
                           (((uint64_t)r->rank * r->slots + slot) * ROCE_PORTS_MAX + (uint64_t)i) * ROCE_FLAG_STRIDE;
-    struct ibv_sge ds[ROCE_STRIPES_MAX], fs[ROCE_STRIPES_MAX];
-    struct ibv_send_wr dw[ROCE_STRIPES_MAX], fw[ROCE_STRIPES_MAX];
-    struct ibv_send_wr *first = NULL, **link = &first;
     for (uint32_t j = 0; j < nst; j++) {
       const uint32_t lo = (uint32_t)((uint64_t)share * j / nst), hi = (uint32_t)((uint64_t)share * (j + 1) / nst);
-      if (hi > lo) {
-        ds[j].addr = (uint64_t)(uintptr_t)(send + (uint64_t)(done + lo) * 16);
-        ds[j].length = (hi - lo) * 16;
-        ds[j].lkey = p->mr->lkey;
-        memset(&dw[j], 0, sizeof(dw[j]));
-        dw[j].wr_id = (uint64_t)i;
-        dw[j].sg_list = &ds[j];
-        dw[j].num_sge = 1;
-        dw[j].opcode = IBV_WR_RDMA_WRITE;
-        dw[j].wr.rdma.remote_addr = recv + (uint64_t)(done + lo) * 16;
-        dw[j].wr.rdma.rkey = r->peer_rkey[i];
-        *link = &dw[j];
-        link = &dw[j].next;
-      }
-      fs[j].addr = (uint64_t)(uintptr_t)&value;
-      fs[j].length = 4;
-      fs[j].lkey = 0;
-      memset(&fw[j], 0, sizeof(fw[j]));
-      fw[j].wr_id = (uint64_t)i;
-      fw[j].sg_list = &fs[j];
-      fw[j].num_sge = 1;
-      fw[j].opcode = IBV_WR_RDMA_WRITE;
-      fw[j].send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
-      fw[j].wr.rdma.remote_addr = flag + 4u * (j + 1 == nst ? 0u : 1u + j);
-      fw[j].wr.rdma.rkey = r->peer_rkey[i];
-      *link = &fw[j];
-      link = &fw[j].next;
+      if (hi > lo && post_payload(r, i, (uint64_t)(uintptr_t)(send + (uint64_t)(done + lo) * 16), recv + (uint64_t)(done + lo) * 16, (hi - lo) * 16) != 0) return -1;
+      struct ibv_sge fs = {.addr = (uint64_t)(uintptr_t)&value, .length = 4, .lkey = 0};
+      struct ibv_send_wr fw; memset(&fw, 0, sizeof(fw));
+      fw.wr_id = (uint64_t)i; fw.sg_list = &fs; fw.num_sge = 1;
+      fw.opcode = IBV_WR_RDMA_WRITE; fw.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+      fw.wr.rdma.remote_addr = flag + 4u * (j + 1 == nst ? 0u : 1u + j);
+      fw.wr.rdma.rkey = r->peer_rkey[i];
+      struct ibv_send_wr *bad = NULL;
+      const int rc = ibv_post_send(p->qp, &fw, &bad);
+      if (rc != 0) { fail(r, "ibv_post_send V3 stripe flag", rc); return -1; }
+      p->outstanding++;
     }
-    *link = NULL;
-    struct ibv_send_wr *bad = NULL;
-    const int rc = ibv_post_send(p->qp, first, &bad);
-    if (rc != 0) {
-      fail(r, "ibv_post_send", rc);
-      return -1;
-    }
-    p->outstanding += nst;
     done += share;
   }
   atomic_fetch_add_explicit(&r->ops, 1, memory_order_relaxed);
@@ -511,6 +502,10 @@ static int post_striped(tf_roce *r, uint32_t seq, uint32_t bytes, uint32_t nst) 
 }
 
 // qualification_17c70e37: this pair's messages of stripes x stripe_min bytes or more go in stripes (2 to ROCE_STRIPES_MAX; 0 or 1: one write a port); before tf_roce_start
+int tf_roce_set_traffic_class(tf_roce *r, uint8_t traffic_class) {
+  if(r->thread_started)return -1;
+  r->traffic_class=traffic_class;return 0;
+}
 int tf_roce_set_stripes(tf_roce *r, uint32_t stripes, uint64_t stripe_min) {
   if (stripes > ROCE_STRIPES_MAX || (stripes >= 2 && (stripe_min < 16 || stripe_min % 16 != 0)) || r->thread_started) {
     snprintf(r->err, sizeof(r->err), "RoCE stripes %u of %llu bytes (2-%d of a positive multiple of 16, set before the start)",
@@ -559,9 +554,11 @@ static void *proxy(void *arg) {
       r->posted_seq = s;
     }
   }
+  atomic_store_explicit(&r->thread_done, 1, memory_order_release);
   return NULL;
 failed:
   atomic_store(&r->failed, 1);
+  atomic_store_explicit(&r->thread_done, 1, memory_order_release);
   return NULL;
 }
 
@@ -585,6 +582,35 @@ int tf_roce_proxy_built(void) { return 1; }
 int tf_roce_failed(tf_roce *r) { return atomic_load(&r->failed); }
 const char *tf_roce_error(tf_roce *r) { return r->err; }
 uint64_t tf_roce_ops(tf_roce *r) { return atomic_load_explicit(&r->ops, memory_order_relaxed); }
+
+/* Helios: only a typed, deadline-bound quiet proof permits registered-memory release.
+ * The CUDA consumer must be complete BEFORE this call. Failure/unknown partial writes
+ * keep the proxy, QP and MR owned; stopping a thread is not a quiet proof. */
+#define TF_AFD_TYPED_QUIESCENCE 1
+#define TF_AFD_QUIET_OK 0
+#define TF_AFD_QUIET_FAILED 1
+#define TF_AFD_QUIET_DEADLINE 2
+int tf_roce_quiesce(tf_roce *r, uint64_t until) {
+  uint64_t unset = 0;
+  atomic_compare_exchange_strong(&r->close_deadline, &unset, until);
+  const uint64_t bound = atomic_load_explicit(&r->close_deadline, memory_order_acquire);
+  if (until > bound) until = bound; /* close cannot renew its first deadline */
+  if (now_ns() >= until) return TF_AFD_QUIET_DEADLINE;
+  atomic_store_explicit(&r->running, 0, memory_order_release);
+  while (r->thread_started && !atomic_load_explicit(&r->thread_done, memory_order_acquire)) {
+    if (now_ns() >= until) return TF_AFD_QUIET_DEADLINE;
+    const struct timespec nap = {0, 50000}; nanosleep(&nap, NULL);
+  }
+  if (r->thread_started) { pthread_join(r->thread, NULL); r->thread_started = 0; }
+  const volatile uint32_t *ctrl = (const volatile uint32_t *)(r->region + r->ctrl_off);
+  if (atomic_load_explicit(&r->failed, memory_order_acquire) ||
+      __atomic_load_n(&ctrl[0], __ATOMIC_ACQUIRE) != r->posted_seq) return TF_AFD_QUIET_FAILED;
+  for (int i = 0; i < r->ports; i++) while (r->port[i].outstanding) {
+    if (now_ns() >= until) return TF_AFD_QUIET_DEADLINE;
+    if (reap(r, i) != 0) { atomic_store(&r->failed, 1); return TF_AFD_QUIET_FAILED; }
+  }
+  return now_ns() < until ? TF_AFD_QUIET_OK : TF_AFD_QUIET_DEADLINE;
+}
 
 void tf_roce_close(tf_roce *r) {
   if (!r) return;

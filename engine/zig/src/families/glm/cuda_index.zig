@@ -1,147 +1,131 @@
-//! A checkpoint folder's index and shard headers as the split reads them: names, dtypes, shapes and byte ranges, no weights.
+//! A prompt chunk's DSA indexer in CUDA (glm_index.cu): the bytes of tf_glm_scores and tf_glm_select_rows.
+
 const std = @import("std");
-const core = @import("core");
-const split = @import("cuda_split.zig");
+const cuda = @import("cuda");
 
-const st = core.safetensors;
+const sparse = @import("cuda_sparse.zig");
 
-/// The language model's tensors (`model.language_model.*`, `lm_head.*`), the shard files and what else they hold.
-pub const Index = struct {
-    arena: std.heap.ArenaAllocator,
-    shards: []const [:0]const u8 = &.{},
-    sizes: []const u64 = &.{}, // each shard's length
-    names: split.Names = .empty,
-    others: u32 = 0, // the vision tower's tensors (`model.visual.*`), never read
-    other_bytes: u64 = 0,
-    strays: u32 = 0, // tensors of no known part: counted as unread, so a renamed tensor is never dropped in silence
+pub const topk = sparse.topk_pools;
+/// glm_index_scores: rows a CTA (a warp each), 64-pool tiles a CTA, threads a CTA.
+pub const score_rows = 8;
+pub const score_tiles = 16;
+pub const threads = score_rows * 32;
+/// glm_index_pools' block: glm_index::T.
+pub const pool_threads = 256;
+/// The rows a launch must have to take it: where tf_glm_scores' `loop` tiling starts.
+pub const rows_from = sparse.score_loop_from;
+pub const cap_max = 4096;
 
-    pub fn deinit(ix: *Index) void {
-        ix.arena.deinit();
+/// TF_GLM_INDEX_CUDA: unset or 0 (today's launches), 1 (both kernels), scores (only the scores, to bisect).
+pub const Mode = enum {
+    off,
+    both,
+    scores,
+
+    pub fn parse(text: ?[]const u8) !Mode {
+        const t = text orelse return .off;
+        if (t.len == 0 or std.mem.eql(u8, t, "0")) return .off;
+        if (std.mem.eql(u8, t, "1")) return .both;
+        if (std.mem.eql(u8, t, "scores")) return .scores;
+        return error.BadIndexMode;
     }
 
-    /// Language-model tensors the plan does not read, and stray ones, logged (the first five) and counted.
-    pub fn unread(ix: *const Index, used: *const std.StringHashMapUnmanaged(void)) usize {
-        var n: usize = ix.strays;
-        var it = ix.names.keyIterator();
-        while (it.next()) |k| {
-            if (used.contains(k.*)) continue;
-            if (n < 5) std.log.err("glm: checkpoint tensor {s} is not read", .{k.*});
-            n += 1;
-        }
-        return n;
+    pub fn read() !Mode {
+        const v = std.c.getenv("TF_GLM_INDEX_CUDA") orelse return .off;
+        return parse(std.mem.span(v));
     }
 };
 
-fn dtypeOf(d: st.DType) split.DType {
-    return switch (d) {
-        .u32 => .u32,
-        .bf16 => .bf16,
-        .f32 => .f32,
-        .f16 => .f16, // EXL3's scales
-        .i16 => .i16, // EXL3's trellises
-        .i32 => .i32, // EXL3's codebook markers
-        else => .other,
-    };
+/// glm_index_scores' grid: rows in CTAs of 8, the `nb` pool blocks in runs of score_tiles.
+pub fn scoresGrid(rows: usize, nb: usize) [2]u32 {
+    return .{ @intCast(cdiv(rows, score_rows)), @intCast(@max(1, cdiv(nb, score_tiles))) };
 }
 
-/// `len` bytes at `at` of an open file, all of them or an error.
-fn preadAll(fd: std.c.fd_t, out: []u8, at: u64) !void {
-    var done: usize = 0;
-    while (done < out.len) {
-        const n = std.c.pread(fd, out.ptr + done, out.len - done, @intCast(at + done));
-        if (n <= 0) return error.ShortRead;
-        done += @intCast(n);
-    }
+/// The candidates a row of the pools kernel keeps and the floor's target (speed only; the pools are the same).
+pub const Tile = struct { cap: usize, target: usize };
+
+pub fn tile(np: usize) Tile {
+    if (np <= 12288) return .{ .cap = 1024, .target = 724 };
+    if (np <= 32768) return .{ .cap = 2048, .target = 1024 };
+    return .{ .cap = cap_max, .target = 2048 };
 }
 
-fn readFile(a: std.mem.Allocator, path: [:0]const u8, most: usize) ![]u8 {
-    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
-    if (fd < 0) return error.FileNotFound;
-    defer _ = std.c.close(fd);
-    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
-    if (end < 0 or end > most) return error.BadIndex;
-    const out = try a.alloc(u8, @intCast(end));
-    try preadAll(fd, out, 0);
-    return out;
+pub const Kernels = struct {
+    module: cuda.Module,
+    scores_fn: cuda.Function,
+    pools_fn: cuda.Function,
+    /// Whether the pools kernel replaces tf_glm_select_rows (Mode.both).
+    select: bool,
+
+    /// `image`: cuda.kernels.glm_index.
+    pub fn load(d: *const cuda.Driver, image: []const u8, mode: Mode) !Kernels {
+        if (image.len == 0) return error.NoIndexKernels;
+        var m = try cuda.Module.load(d, image);
+        errdefer m.unload();
+        return .{ .module = m, .scores_fn = try m.function("tf_glm_index_scores"), .pools_fn = try m.function("tf_glm_index_pools"), .select = mode == .both };
+    }
+
+    pub fn unload(k: *Kernels) void {
+        k.module.unload();
+    }
+
+    /// Whether `rows` rows over `np` pools with this key cache layout go through the kernels.
+    pub fn takes(k: *const Kernels, rows: usize, np: usize, pk: u64, ps: u64) bool {
+        _ = k;
+        return rows >= rows_from and np >= topk and pk % 16 == 0 and ps % 16 == 0;
+    }
+
+    /// tf_glm_scores' launch for `rows` rows at `at` into out [rows][np]; the first `nb` 64-pool blocks are written.
+    pub fn scores(k: *const Kernels, s: cuda.Stream, qi: u64, wts: u64, w_stride: usize, pk: u64, out: u64, at: u64, rows: usize, np: usize, nb: usize, scale: f32, wscale: f32, heads: usize, pt: u64, ps: u64) !void {
+        const g = scoresGrid(rows, nb);
+        var a: cuda.Args = .{};
+        inline for (.{ qi, wts, @as(i64, @intCast(w_stride)), pk, out, at, @as(i64, @intCast(rows)), @as(i64, @intCast(np)), @as(i64, @intCast(nb)), scale, wscale, @as(i64, @intCast(heads)), @as(c_int, score_tiles), pt, @as(i64, @intCast(ps)) }) |v| a.add(v);
+        try cuda.launch.launch(k.scores_fn, .{ .grid = .{ .x = g[0], .y = g[1] }, .block = .{ .x = threads } }, s, &a);
+    }
+
+    /// tf_glm_select_rows' launch: each row's 512 best pools of scores [rows][np] ascending into out [rows][512] int64.
+    pub fn pools(k: *const Kernels, s: cuda.Stream, scores_ptr: u64, out: u64, at: u64, rows: usize, np: usize, path: u64) !void {
+        const t = tile(np);
+        var a: cuda.Args = .{};
+        inline for (.{ scores_ptr, out, @as(i64, @intCast(np)), at, @as(c_int, topk), @as(c_int, @intCast(t.cap)), @as(c_int, @intCast(t.target)), path }) |v| a.add(v);
+        try cuda.launch.launch(k.pools_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = pool_threads } }, s, &a);
+    }
+};
+
+fn cdiv(a: usize, b: usize) usize {
+    return (a + b - 1) / b;
 }
 
-/// `dir`'s model.safetensors.index.json and every shard it names (sorted), headers parsed and checked against each file's length.
-pub fn open(gpa: std.mem.Allocator, dir: []const u8) !Index {
-    var ix: Index = .{ .arena = .init(gpa) };
-    errdefer ix.deinit();
-    const a = ix.arena.allocator();
-    const index_path = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors.index.json", .{dir}, 0);
-    const doc = try std.json.parseFromSliceLeaky(std.json.Value, a, try readFile(a, index_path, 1 << 26), .{});
-    const map = (doc.object.get("weight_map") orelse return error.BadIndex).object;
-    var files: std.StringArrayHashMapUnmanaged(void) = .empty;
-    var it = map.iterator();
-    while (it.next()) |kv| try files.put(a, kv.value_ptr.string, {});
-    const names = try a.dupe([]const u8, files.keys());
-    std.mem.sort([]const u8, names, {}, struct {
-        fn lt(_: void, x: []const u8, y: []const u8) bool {
-            return std.mem.order(u8, x, y) == .lt;
-        }
-    }.lt);
-    const shards = try a.alloc([:0]const u8, names.len);
-    const sizes = try a.alloc(u64, names.len);
-    for (names, shards, sizes, 0..) |name, *path, *size, si| {
-        path.* = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, name }, 0);
-        size.* = try addShard(&ix, path.*, @intCast(si));
-    }
-    ix.shards = shards;
-    ix.sizes = sizes;
-    return ix;
+test "GLM index: TF_GLM_INDEX_CUDA is off unless 1 or scores, and a typo is refused" {
+    try std.testing.expectEqual(Mode.off, try Mode.parse(null));
+    try std.testing.expectEqual(Mode.off, try Mode.parse(""));
+    try std.testing.expectEqual(Mode.off, try Mode.parse("0"));
+    try std.testing.expectEqual(Mode.both, try Mode.parse("1"));
+    try std.testing.expectEqual(Mode.scores, try Mode.parse("scores"));
+    try std.testing.expectError(error.BadIndexMode, Mode.parse("on"));
 }
 
-/// One shard's header: its language-model tensors into `names`, the rest counted; returns the file's length.
-fn addShard(ix: *Index, path: [:0]const u8, si: u32) !u64 {
-    const a = ix.arena.allocator();
-    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
-    if (fd < 0) {
-        std.log.err("glm: cannot open shard {s}", .{path});
-        return error.FileNotFound;
-    }
-    defer _ = std.c.close(fd);
-    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
-    if (end < 8) return error.BadSafetensors;
-    const size: u64 = @intCast(end);
-    var head: [8]u8 = undefined;
-    try preadAll(fd, &head, 0);
-    const hlen = std.mem.readInt(u64, &head, .little);
-    if (hlen > size - 8 or hlen > 1 << 28) return error.BadSafetensors;
-    const json = try a.alloc(u8, @intCast(hlen));
-    try preadAll(fd, json, 8);
-    const data = 8 + hlen;
-    const doc = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
-    if (doc != .object) return error.BadSafetensors;
-    var all = doc.object.iterator();
-    while (all.next()) |kv| {
-        const k = kv.key_ptr.*;
-        if (std.mem.eql(u8, k, "__metadata__") or std.mem.startsWith(u8, k, "model.language_model.") or std.mem.startsWith(u8, k, "lm_head.")) continue;
-        if (!std.mem.startsWith(u8, k, "model.visual.")) {
-            if (ix.strays < 5) std.log.warn("glm: checkpoint tensor {s} belongs to no part the loader knows", .{k});
-            ix.strays += 1;
-            continue;
-        }
-        ix.others += 1;
-        if (kv.value_ptr.* == .object) if (kv.value_ptr.object.get("data_offsets")) |o| if (o == .array and o.array.items.len == 2) {
-            ix.other_bytes += @intCast(o.array.items[1].integer - o.array.items[0].integer);
-        };
-    }
-    for ([_][]const u8{ "model.language_model.", "lm_head." }) |p| {
-        const h = try st.parseHeaderPrefix(a, json, @intCast(size - data), p);
-        var hi = h.iterator();
-        while (hi.next()) |e| {
-            const v = e.value_ptr.*;
-            var src: split.Src = .{ .shard = si, .off = data + v.begin, .len = v.end - v.begin, .dtype = dtypeOf(v.dtype), .rank = v.rank };
-            @memcpy(src.shape[0..], v.shape[0..]);
-            const got = try ix.names.getOrPut(a, e.key_ptr.*);
-            if (got.found_existing) {
-                std.log.err("glm: tensor {s} is in two shards", .{e.key_ptr.*});
-                return error.DuplicateTensor;
-            }
-            got.value_ptr.* = src;
-        }
-    }
-    return size;
+test "GLM index: the scores grid covers 8 rows a CTA and 16 pool blocks a CTA" {
+    // a 512-row chunk over 147,456 pools: 2,304 blocks
+    try std.testing.expectEqual([2]u32{ 64, 144 }, scoresGrid(512, 2304));
+    try std.testing.expectEqual([2]u32{ 9, 1 }, scoresGrid(65, 16));
+    try std.testing.expectEqual([2]u32{ 8, 2 }, scoresGrid(64, 17));
+    try std.testing.expectEqual([2]u32{ 1, 1 }, scoresGrid(1, 0));
+}
+
+test "GLM index: the candidate cap follows the pool count and stays in shared memory" {
+    try std.testing.expectEqual(Tile{ .cap = 1024, .target = 724 }, tile(12288));
+    try std.testing.expectEqual(Tile{ .cap = 2048, .target = 1024 }, tile(12289));
+    try std.testing.expectEqual(Tile{ .cap = 2048, .target = 1024 }, tile(32768));
+    try std.testing.expectEqual(Tile{ .cap = 4096, .target = 2048 }, tile(32769));
+    try std.testing.expect(tile(1 << 30).cap <= cap_max);
+}
+
+test "GLM index: only prompt-sized launches on aligned key caches take the kernels" {
+    const k: Kernels = undefined;
+    try std.testing.expect(k.takes(rows_from, 1024, 0x1000, 32768));
+    try std.testing.expect(!k.takes(rows_from - 1, 1024, 0x1000, 32768));
+    try std.testing.expect(!k.takes(512, 1024, 0x1008, 32768));
+    try std.testing.expect(!k.takes(512, 1024, 0x1000, 32760));
+    try std.testing.expect(!k.takes(512, topk - 1, 0x1000, 32768));
 }

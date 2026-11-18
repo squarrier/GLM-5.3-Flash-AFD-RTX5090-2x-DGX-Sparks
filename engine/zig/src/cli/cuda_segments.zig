@@ -1,4 +1,4 @@
-//! `tensorfold segments`: prompts prefilled at 1-4 segments a call, interleaved, every result hashed against one segment's.
+//! `tensorfold segments`: prompts prefilled at 1-4 segments a call, interleaved, results hashed against one segment's.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -19,7 +19,7 @@ const max_repeat = 16;
 const checks = 2; // hashed prefills an arm
 const R = nemotron.state.prefill_rows;
 
-/// What a prefill leaves: hashes of the caches and states, the head's caches, the last logits and hidden states; the token.
+/// What a prefill leaves: cache and state hashes, the head's caches, the last logits and hidden states; the token.
 const Digest = struct {
     state: [64]u8,
     head: [64]u8,
@@ -175,7 +175,7 @@ fn hex(h: *std.crypto.hash.sha2.Sha256) [64]u8 {
 fn digest(gpa: std.mem.Allocator, e: *nemotron.Engine, head: ?*nemotron.Head, token: u32, rows: usize) !Digest {
     const Sha = std.crypto.hash.sha2.Sha256;
     var st = Sha.init(.{});
-    try hashDevice(&st, gpa, e, e.b.k_cache, e.b.stateBytes());
+    for (e.b.planes(), e.b.state_bytes) |p, n| try hashDevice(&st, gpa, e, p, n);
     var hd = Sha.init(.{});
     if (head) |h| {
         const sizes = h.seqSizes();
@@ -185,7 +185,7 @@ fn digest(gpa: std.mem.Allocator, e: *nemotron.Engine, head: ?*nemotron.Head, to
     var lg = Sha.init(.{});
     try hashDevice(&lg, gpa, e, e.b.p_logits, e.c.vocab * 2);
     var hi = Sha.init(.{});
-    try hashDevice(&hi, gpa, e, e.b.p_hidden, rows * e.c.hidden * 2);
+    try hashDevice(&hi, gpa, e, e.b.p_hidden + (e.pos - e.last_chunk - rows) * e.c.hidden * 2, rows * e.c.hidden * 2); // the rows of the last 2,048-row chunk
     return .{ .state = hex(&st), .head = hex(&hd), .logits = hex(&lg), .hidden = hex(&hi), .token = token };
 }
 

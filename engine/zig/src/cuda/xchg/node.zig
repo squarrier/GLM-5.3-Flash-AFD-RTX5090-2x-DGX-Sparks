@@ -1,3 +1,5 @@
+// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
 //! One node of the three-node exchange (qualification_12f4270a): the attention rank (both experts' pairs over one region) or an expert rank (one pair), the control-link handshake, the attention's watcher, the experts' heartbeat, and the status a request checks.
 //! Each pair is roce_proxy.c (Mia's patch 0006, unchanged) behind `Proxy`, or a test's stand-in; the GPU half is fn_xchg.cu (`Gpu`), or its CPU build in tests and tf-xchg's no-GPU mode.
 const std = @import("std");
@@ -34,6 +36,8 @@ pub const Proxy = struct {
         failure: *const fn (ctx: *anyopaque) ?[]const u8,
         ops: *const fn (ctx: *anyopaque) u64,
         close: *const fn (ctx: *anyopaque) void,
+        /// Helios: typed CQ/thread/accepted-doorbell proof; null cannot release a live runtime owner.
+        quiesce: ?*const fn (ctx: *anyopaque, until: u64) anyerror!void = null,
         /// qualification_17c70e37: the settings' stripes, before the start (null: a proxy without stripes)
         stripes: ?*const fn (ctx: *anyopaque, k: u32, min: u64) anyerror!void = null,
     };
@@ -76,15 +80,18 @@ extern fn tf_roce_blob_of(r: *RoceC, out: *anyopaque) c_int;
 extern fn tf_roce_connect(r: *RoceC, peer: *const anyopaque) c_int;
 extern fn tf_roce_start(r: *RoceC) c_int;
 extern fn tf_roce_set_stripes(r: *RoceC, stripes: u32, stripe_min: u64) c_int;
+extern fn tf_roce_set_traffic_class(r: *RoceC, traffic_class: u8) c_int;
 extern fn tf_roce_failed(r: *RoceC) c_int;
 extern fn tf_roce_error(r: *RoceC) [*:0]const u8;
 extern fn tf_roce_ops(r: *RoceC) u64;
+extern fn tf_roce_quiesce(r: *RoceC, until: u64) c_int;
 extern fn tf_roce_close(r: *RoceC) void;
 
 /// roce_proxy.c over the named RDMA devices (one a port, the peer's in the same order) with one GID index; two instances may share a region.
 pub const Roce = struct {
     ports: []const []const u8,
     gid: c_int,
+    traffic_class: u8 = 0,
 
     pub fn opener(r: *Roce) Opener {
         return .{ .ctx = r, .open = open };
@@ -106,10 +113,17 @@ pub const Roce = struct {
             log.err("RoCE: {s}", .{std.mem.sliceTo(&err, 0)});
             return error.RoceUnavailable;
         };
+        if(tf_roce_set_traffic_class(r,self.traffic_class)!=0){tf_roce_close(r);return error.RoceUnavailable;}
         return .{ .ctx = r, .vt = &vt };
     }
 
-    const vt: Proxy.VTable = .{ .blob = blobOf, .connect = connectTo, .start = startIt, .failure = failureOf, .ops = opsOf, .close = closeIt, .stripes = stripesOf };
+    const vt: Proxy.VTable = .{ .blob = blobOf, .connect = connectTo, .start = startIt, .failure = failureOf, .ops = opsOf, .close = closeIt, .stripes = stripesOf, .quiesce = quiesceIt };
+
+    fn quiesceIt(ctx: *anyopaque, until: u64) anyerror!void {
+        return switch (tf_roce_quiesce(@ptrCast(ctx), until)) {
+            0 => {}, 2 => error.Timeout, else => error.HybridQuarantined,
+        };
+    }
 
     fn stripesOf(ctx: *anyopaque, k: u32, min: u64) anyerror!void {
         if (tf_roce_set_stripes(@ptrCast(ctx), k, min) != 0) {
@@ -274,7 +288,7 @@ pub const Node = struct {
     /// The attention rank: accepts both experts on `server`, agrees the settings, opens both pairs over the one region, connects and starts them, then runs the watcher.
     pub fn attend(n: *Node, server: link.Server, opener: Opener) !void {
         if (n.role != .attn) return error.Invalid;
-        var buf: [256]u8 = undefined;
+        var buf: [512]u8 = undefined;
         const mine = try n.settingsText(&buf);
         for (0..proto.EXPERTS) |_| {
             const l = try server.accept(@intCast(n.cfg.setup_timeout_ms));
@@ -309,7 +323,7 @@ pub const Node = struct {
         const l = try link.Link.join(n.io, master, n.cfg.setup_timeout_ms);
         n.links[0] = l;
         watch.keepalive(l.fd);
-        var buf: [4 + 256]u8 = undefined;
+        var buf: [4 + 512]u8 = undefined;
         std.mem.writeInt(u32, buf[0..4], n.role.expert, .little);
         const mine = try n.settingsText(buf[4..]);
         try l.send(tag_hello, buf[0 .. 4 + mine.len]);
@@ -434,11 +448,16 @@ pub const Node = struct {
     }
 
     /// Expert: request `seq`'s header once its flag lands on every port; a stop frame, a closed link, a failed proxy, a lost heartbeat or a flag past `seq` end the wait instead.
-    pub fn waitRequest(n: *Node, seq: u32) Wait {
+    pub fn waitRequest(n: *Node, seq: u32) Wait {return n.waitRequestControlled(seq,null);}
+
+    /// Current-native TERM token: an idle expert must not wait for new model traffic to close.
+    pub fn waitRequestControlled(n: *Node, seq: u32, requested:?*const std.atomic.Value(bool)) Wait {
         const s = n.src(0);
         const flag = n.word(n.reg.flag(s, n.reg.slotOf(seq), 0));
         var spins: u64 = 0;
         while (true) {
+            if(n.stopping.load(.acquire))return .stopped;
+            if(requested)|flag_requested|if(flag_requested.load(.acquire))return .stopped;
             const v = @atomicLoad(u32, flag, .acquire);
             if (v == seq and n.landedFrom(s, seq)) {
                 const hdr = n.received(s, seq, proto.HDR_BYTES);
@@ -488,6 +507,17 @@ pub const Node = struct {
     pub fn stopExperts(n: *Node) void {
         if (n.role != .attn) return;
         for (n.links) |l| if (l) |x| x.send(tag_stop, &.{}) catch {};
+    }
+
+    /// Helios: GPU consumers must already be proved complete. Failed/unknown/partial
+    /// proxies retain every handle and the registered frame; no deinit on refusal.
+    pub fn closeChecked(n: *Node, until: u64) !void {
+        try n.check();
+        for (n.proxies) |p| if (p) |x| {
+            const settle = x.vt.quiesce orelse return error.UnprovenProxyQuiescence;
+            try settle(x.ctx, until);
+        };
+        n.deinit();
     }
 
     /// Stops the node's thread, then closes its proxies and links (the attention's experts see the close).

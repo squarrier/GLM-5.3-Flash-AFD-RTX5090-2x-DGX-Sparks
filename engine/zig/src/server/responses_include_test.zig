@@ -1,7 +1,6 @@
-//! Responses' include: OpenAI's values accepted and ignored, anything else refused as the 2.x line refuses it. tool_response_fixes:
-//! @Bizuayeu's be17a101 test (pr/glm53-flash-cuda, Apache-2.0; the 2.x line's, after MiaAI-Lab's patch 0093).
+//! Responses' include: OpenAI's values accepted and ignored, anything else refused by name.
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const errors = @import("errors.zig");
 const responses_translate = @import("responses_translate.zig");
 

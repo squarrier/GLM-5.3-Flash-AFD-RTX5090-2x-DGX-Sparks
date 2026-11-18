@@ -1,6 +1,6 @@
 //! Anthropic's Messages routes over the chat handler: typed SSE events, tool_use blocks, count_tokens.
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const errors = @import("errors.zig");
 const http_body = @import("http_body.zig");
 const fields = @import("fields.zig");
@@ -12,24 +12,12 @@ const sse = @import("sse.zig");
 const tool_specs = @import("tool_specs.zig");
 const ids = @import("ids.zig");
 const auth = @import("auth.zig");
-const translate = @import("anthropic_translate.zig").translate;
+const translate_mod = @import("anthropic_translate.zig");
 const Server = @import("server.zig").Server;
 const Conn = @import("http_conn.zig").Conn;
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
-
-/// Private-owner fixture only; no namespace or factory in ordinary builds.
-pub const TestFixture = if (@import("builtin").is_test) struct {
-    pub fn withWire(srv: *Server, conn: *Conn, a: Allocator, drive: *const fn (openai.Out) anyerror!void) anyerror!void {
-        var reply: Reply = .{ .a = a, .conn = conn, .model = openai.replyModel(srv, .null) };
-        try reply.init();
-        var wire: Wire = .{ .reply = &reply };
-        const out = wire.out();
-        try out.vt.open(out.ctx);
-        try drive(out);
-    }
-} else void;
 
 pub fn route(path: []const u8) bool {
     const p = auth.routePath(path);
@@ -42,7 +30,7 @@ fn errorValue(a: Allocator, message: []const u8, status: u16) Allocator.Error!Va
     const kind = switch (status) {
         400 => "invalid_request_error",
         404 => "not_found_error",
-        429 => "overloaded_error", // a capacity refusal, as 0084 maps it
+        503 => "overloaded_error",
         else => "api_error",
     };
     const inner = try json.newObject(a);
@@ -59,12 +47,14 @@ fn sendError(conn: *Conn, a: Allocator, message: []const u8, status: u16) void {
 }
 
 /// Rendered like the chat route renders, without generating: the prompt's token count.
-fn countTokens(srv: *Server, cx: *Cx, chat: Value) errors.Refused!usize {
+fn countTokens(srv: *Server, cx: *Cx, chat: Value, client_thinking: bool) errors.Refused!usize {
     const thinking = try fields.thinkingFields(cx, chat, srv.effort_levels);
     const on = thinking.enable orelse srv.config.enable_thinking;
+    cx.clear_thinking = thinking.clear;
     const tools = try tool_specs.active(cx, chat.get("tools"), chat.get("tool_choice"));
-    const msgs = try messages_mod.normalize(cx, chat.get("messages"), "system", srv.needs_user_after_tool);
-    const ids_ = prompt.renderIds(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), true) catch |e| switch (e) {
+    const msgs = try messages_mod.normalizeWith(cx, chat.get("messages"), "system", srv.needs_user_after_tool, srv.media());
+    const explicit_off = client_thinking and !(thinking.enable orelse true);
+    const ids_ = prompt.renderRequest(srv, cx, msgs, tools, on, srv.effortFor(thinking.effort), true, explicit_off) catch |e| switch (e) {
         error.Refused => return cx.other(cx.message),
         else => |x| return x,
     };
@@ -83,9 +73,9 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
             .ok => |v| v,
             .err => |m| return sendError(conn, a, m, 400),
         };
-        const chat = translate(&cx, body, count) catch return sendError(conn, a, cx.message, cx.status());
+        const chat = translate_mod.translate(&cx, body, count) catch return sendError(conn, a, cx.message, cx.status());
         if (count) {
-            const n = countTokens(srv, &cx, chat) catch return sendError(conn, a, cx.message, if (cx.kind == .capacity) 429 else 400);
+            const n = countTokens(srv, &cx, chat, translate_mod.thinkingSent(body)) catch return sendError(conn, a, cx.message, cx.status());
             const o = json.newObject(a) catch return;
             o.put(a, "input_tokens", json.intValue(a, n) catch return) catch return;
             return routes.sendValue(conn, a, 200, .{ .object = o });
@@ -95,7 +85,8 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
     var reply: Reply = .{ .a = a, .conn = conn, .model = openai.replyModel(srv, prepared[1]) };
     reply.init() catch return;
     var wire: Wire = .{ .reply = &reply };
-    openai.run(srv, a, wire.out(), .{ .conn = conn }, true, prepared[0]);
+    const format_name = translate_mod.formatName(prepared[1]);
+    openai.runNamed(srv, a, wire.out(), .{ .conn = conn }, true, prepared[0], format_name, translate_mod.thinkingSent(prepared[1]));
     if (wire.opened or wire.status == null or conn.broken) return;
     const payload = wire.payload;
     if (wire.status.? != 200) {
@@ -117,20 +108,23 @@ const Wire = struct {
     payload: Value = .null,
 
     fn out(w: *Wire) openai.Out {
-        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole } };
+        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole, .keepalive = ping } };
     }
 
-    fn open(ctx: *anyopaque) error{Closed}!void {
+    fn open(ctx: *anyopaque, prompt_len: usize) error{Closed}!void {
         const w: *Wire = @ptrCast(@alignCast(ctx));
         w.opened = true;
+        // the head counts the whole prompt; message_delta's usage splits it into input and cache_read
+        if (prompt_len > 0) {
+            const n = json.intValue(w.reply.a, prompt_len) catch return error.Closed;
+            w.reply.tokens.object.put(w.reply.a, "input_tokens", n) catch return error.Closed;
+        }
         try sse.open(w.reply.conn);
         try w.reply.start();
     }
 
     fn event(ctx: *anyopaque, payload: ?Value) error{Closed}!void {
         const w: *Wire = @ptrCast(@alignCast(ctx));
-        if (comptime @import("builtin").is_test) @import("sse_test_observe.zig").Test.record(.{ .translated = .{ .route = .messages, .phase = .enter, .sequence_or_index = w.reply.index, .terminal = w.reply.finished } });
-        defer if (comptime @import("builtin").is_test) @import("sse_test_observe.zig").Test.record(.{ .translated = .{ .route = .messages, .phase = .exit, .sequence_or_index = w.reply.index, .terminal = w.reply.finished } });
         return w.reply.chunk(payload);
     }
 
@@ -138,6 +132,10 @@ const Wire = struct {
         const w: *Wire = @ptrCast(@alignCast(ctx));
         w.status = status;
         w.payload = payload;
+    }
+    fn ping(ctx: *anyopaque) error{Closed}!void {
+        const w: *Wire = @ptrCast(@alignCast(ctx));
+        return w.reply.send("ping", try w.reply.obj("ping"));
     }
 };
 
@@ -255,6 +253,7 @@ const Reply = struct {
             r.finished = true;
             return;
         };
+        if (p.has("error") and std.mem.eql(u8, r.finish, "refusal")) return; // --loop-guard-stop: the refusal says it
         if (p.has("error")) {
             try r.close();
             const problem = p.get("error").?;
@@ -358,12 +357,14 @@ const Reply = struct {
             try b.put(a, "text", t);
             try content.append(a, .{ .object = b });
         };
-        if (message.get("tool_calls")) |calls| if (calls == .array) for (calls.array) |call| {
+        const cut = std.mem.eql(u8, json.strOr(choice.get("finish_reason")), "length");
+        if (message.get("tool_calls")) |calls| if (calls == .array) for (calls.array, 0..) |call, i| {
             const function = call.get("function").?;
             const raw = function.get("arguments").?;
             const args = if (raw == .string) switch (try json.parseText(a, raw.string)) {
                 .ok => |v| v,
-                .err => |m| {
+                .err => |m| blk: { // max_tokens cut the last call: its input closed as far as written, as the stream's
+                    if (cut and i + 1 == calls.array.len) if (try @import("tool_args_close.zig").close(a, raw.string)) |v| break :blk v;
                     r.problem = m;
                     return error.InvalidResponse;
                 },
@@ -392,6 +393,7 @@ const Reply = struct {
 fn finishOf(reason: []const u8) []const u8 {
     if (std.mem.eql(u8, reason, "tool_calls")) return "tool_use";
     if (std.mem.eql(u8, reason, "length")) return "max_tokens";
+    if (std.mem.eql(u8, reason, @import("loop_stop.zig").finish_reason)) return "refusal";
     return "end_turn";
 }
 

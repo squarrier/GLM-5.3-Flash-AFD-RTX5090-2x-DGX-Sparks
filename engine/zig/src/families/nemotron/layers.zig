@@ -6,6 +6,9 @@ const st = @import("state.zig");
 const fwd = @import("forward.zig");
 const kern = @import("kernels.zig");
 const tree = @import("tree.zig");
+const kvp = @import("kv_pages.zig");
+const lesson_route = @import("living").lesson_route;
+const max_blocks = @import("learn_shape.zig").max_blocks;
 
 const Buffer = mtl.Buffer;
 const Enc = fwd.Enc;
@@ -56,7 +59,7 @@ pub const Tables = struct {
         return t;
     }
 
-    /// A place's parent: the previous place in a chain or replay; a tree row's parent (its root after the replayed rows).
+    /// A place's parent: the previous place in a chain or replay; a tree row's parent (its root after replayed rows).
     fn parentOf(g: fwd.Seg, k: i32, loc: i32) i32 {
         if (loc < k) return loc - 1;
         const p = g.parents orelse return loc - 1;
@@ -131,6 +134,8 @@ pub fn mamba(f: Forward, e: *Enc, m: wts.Mamba, index: usize, t: *const Tables, 
     e.run(.{ group / 4 * c.groups, Forward.mp(rows), 1 }, .{ group / 4, 1, 1 });
 
     f.coop(e, "out", m.out_proj, s.yn, 0, s.ys, s.delta, rows);
+    if (m.slide) |r| rest(f, e, r, s.yn, s.delta, rows, f.c.inner());
+    if (m.adapter) |ad| adapt(f, e, ad, s.yn, s.delta, rows);
 }
 
 fn groupNorm(f: Forward, rows: usize) mtl.Pipeline {
@@ -161,6 +166,8 @@ pub fn moe(f: Forward, e: *Enc, m: wts.Moe, next: anytype, rows: usize, eps: f32
     // the shared expert's up + relu2 (+ its down input sums) beside the router: both read only x and xs
     e.alongside();
     upRelu2(f, e, m.shared_up, rows);
+    // and the pocket's relu2 products beside them: they read only x and the pocket's own weights
+    if (m.pocket) |p| if (p.used > 0) runs(f, e, p, s.x, s.sh, rows, pocketIn);
 
     const scaling: f32 = c.routed_scaling;
     var groups: usize = pairs;
@@ -196,33 +203,17 @@ pub fn moe(f: Forward, e: *Enc, m: wts.Moe, next: anytype, rows: usize, eps: f32
 
     // the shared expert's down projection first, the routed experts' up projection beside it
     f.coop(e, "down", m.shared_down, s.sh_act, 0, s.sh_xs, s.sh, rows);
+    if (m.slide) |r| rest(f, e, r, s.sh_act, s.sh, rows, f.c.shared_width);
+    if (m.adapter) |ad| adapt(f, e, ad, s.sh_act, s.sh, rows);
     inline for (.{ "expert_up", "expert_down" }, 0..) |key, j| {
         if (j == 0) e.alongside();
-        const fc = if (j == 0) m.fc1 else m.fc2;
-        const many = rows > 1 and f.members > 0;
-        const geo: [2]usize = if (f.geometry > 0 and !many) kern.geometries[f.geometry - 1] else .{ 4, 2 };
-        e.pipe(if (many) expertRows(f, j, f.members) else if (f.geometry > 0) expertGeo(f, j, f.geometry - 1) else f.k.get(key));
-        e.buf(if (j == 0) s.x else s.act, 0, 0);
-        if (rows == 1) {
-            e.buf(s.idx, 0, 1);
-            e.bytes(ints8(&.{ 0, 1, 2, 3, 4, 5 }), 2);
-            e.bytes(ints8(&.{ 1, 1, 1, 1, 1, 1 }), 3);
-            e.bytes(ints8(&.{ 0, 1, 2, 3, 4, 5 }), 4);
-            e.bytes(@as(i32, @intCast(pairs)), 5);
-        } else {
-            e.buf(s.uids, 0, 1);
-            e.buf(s.start, 0, 2);
-            e.buf(s.count, 0, 3);
-            e.buf(s.members, 0, 4);
-            e.buf(s.ucount, 0, 5);
-        }
-        e.buf(fc[0].buffer, fc[0].offset, 6);
-        e.buf(fc[1].buffer, fc[1].offset, 7);
-        e.buf(fc[2].buffer, fc[2].offset, 8);
-        e.buf(if (j == 0) s.act else s.ey, 0, 9);
-        const n = if (j == 0) c.expert_width else c.hidden;
-        e.run(.{ 32 * geo[1], n / (geo[0] * geo[1]), groups }, .{ 32 * geo[1], 1, 1 });
+        if (m.routed) |r| {
+            // by pair: fc1 reads each token's row once a pick, fc2 its pair's activations
+            if (j == 0) f.indexed(e, r[0], c.top_k, pairs, true, s.x, s.idx, s.act) else f.indexed(e, r[1], 1, pairs, false, s.act, s.idx, s.ey);
+        } else experts4(f, e, m, key, j, rows, pairs, groups);
     }
+    // the pocket's output beside the routed experts' down: its products and the shared expert's sum were done before it
+    if (m.pocket) |p| if (p.used > 0) runs(f, e, p, s.x, s.sh, rows, pocketOut);
 
     // combine (routed in route order) + shared + residual, then the next input norm and its sums
     e.pipe(f.k.get("add_norm_moe_xs"));
@@ -239,8 +230,170 @@ pub fn moe(f: Forward, e: *Enc, m: wts.Moe, next: anytype, rows: usize, eps: f32
     e.run(.{ 896 * Forward.mp(rows), 1, 1 }, .{ 896, 1, 1 });
 }
 
-/// The routed-expert kernel (j 0: up, 1: down) taking `mb` member rows a pass.
+/// y [rows, D] += x [rows, width] times a projection's bf16 residual [D, width], its weight beyond its 4-bit codes.
+pub fn rest(f: Forward, e: *Enc, r: Buffer, x: Buffer, y: Buffer, rows: usize, width: usize) void {
+    e.pipe(f.k.get("tf_residual"));
+    e.buf(x, 0, 0);
+    e.buf(r, 0, 1);
+    e.buf(y, 0, 2);
+    e.bytes([3]u32{ @intCast(rows), @intCast(f.c.hidden), @intCast(width) }, 3);
+    e.run(.{ 32 * f.c.hidden, (rows + 7) / 8, 1 }, .{ 256, 1, 1 });
+}
+
+/// The pocket over the rows of streams that read what was learned: every row, or the runs between untaught streams'.
+pub fn taught(f: Forward, e: *Enc, p: wts.Pocket, x: Buffer, y: Buffer, rows: usize) void {
+    runs(f, e, p, x, y, rows, pocket);
+}
+
+/// `step` (the pocket or one of its halves) over the rows of streams that read what was learned, a run at a time.
+fn runs(f: Forward, e: *Enc, p: wts.Pocket, x: Buffer, y: Buffer, rows: usize, comptime step: fn (Forward, *Enc, wts.Pocket, Buffer, Buffer, usize, usize) void) void {
+    if (!f.untaught) return step(f, e, p, x, y, 0, rows);
+    var open: lesson_route.Runs = .{};
+    for (f.segs) |g| if (open.next(g.rows, g.cache.untaught)) |r| step(f, e, p, x, y, r[0], r[1]);
+    if (open.last()) |r| step(f, e, p, x, y, r[0], r[1]);
+}
+
+/// y [rows, D] += relu(x up^T)^2 down from row `first` over the pocket's neurons in use (beside the shared expert's).
+pub fn pocket(f: Forward, e: *Enc, p: wts.Pocket, x: Buffer, y: Buffer, first: usize, rows: usize) void {
+    const d: u32 = @intCast(f.c.hidden);
+    const n: u32 = @intCast(p.used);
+    const row = f.c.hidden * 2; // x and y hold bf16 rows
+    e.pipe(f.k.get("tf_train_lora_in"));
+    e.buf(x, first * row, 0);
+    e.buf(p.up, 0, 1);
+    e.buf(p.z, first * p.used * 4, 2);
+    e.bytes([4]u32{ @intCast(rows), d, n, 0 }, 3);
+    e.buf(p.zn, first * 4, 4);
+    e.run(.{ 32 * p.used, rows, 1 }, .{ 256, 1, 1 });
+    e.pipe(f.k.get("tf_pocket_relu2"));
+    e.buf(p.z, first * p.used * 4, 0);
+    e.bytes(@as(u32, @intCast(rows)) * n, 1);
+    e.run(.{ rows * p.used, 1, 1 }, .{ 256, 1, 1 });
+    e.pipe(f.k.get("tf_train_lora_out"));
+    e.buf(p.z, first * p.used * 4, 0);
+    e.buf(p.down, 0, 1);
+    e.buf(y, first * row, 2);
+    e.bytes([4]u32{ @intCast(rows), d, n, 0 }, 3);
+    e.bytes(@as(f32, 1), 4);
+    e.run(.{ f.c.hidden, rows, 1 }, .{ 256, 1, 1 });
+}
+
+/// pocket()'s first two dispatches as one, beside those since the last barrier: z = relu(x up^T)^2 from `first`.
+fn pocketIn(f: Forward, e: *Enc, p: wts.Pocket, x: Buffer, _: Buffer, first: usize, rows: usize) void {
+    e.alongside();
+    e.pipe(f.k.get("tf_pocket_in"));
+    e.buf(x, first * f.c.hidden * 2, 0);
+    e.buf(p.up, 0, 1);
+    e.buf(p.z, first * p.used * 4, 2);
+    e.bytes([4]u32{ @intCast(rows), @intCast(f.c.hidden), @intCast(p.used), 0 }, 3);
+    e.run(.{ 32 * p.used, rows, 1 }, .{ 256, 1, 1 });
+}
+
+/// pocket()'s last dispatch, y += z down from `first`, beside those since the last barrier (none touch z or y).
+fn pocketOut(f: Forward, e: *Enc, p: wts.Pocket, _: Buffer, y: Buffer, first: usize, rows: usize) void {
+    e.alongside();
+    e.pipe(f.k.get("tf_train_lora_out"));
+    e.buf(p.z, first * p.used * 4, 0);
+    e.buf(p.down, 0, 1);
+    e.buf(y, first * f.c.hidden * 2, 2);
+    e.bytes([4]u32{ @intCast(rows), @intCast(f.c.hidden), @intCast(p.used), 0 }, 3);
+    e.bytes(@as(f32, 1), 4);
+    e.run(.{ f.c.hidden, rows, 1 }, .{ 256, 1, 1 });
+}
+
+/// y [rows, out] += scale (x a^T) b over the blocks open on each row: a layer's learned change after its projection.
+pub fn adapt(f: Forward, e: *Enc, ad: wts.Adapter, x: Buffer, y: Buffer, rows: usize) void {
+    project(f.k, e, ad, x, rows, &f.route);
+    e.pipe(f.k.get("tf_train_lora_out"));
+    e.buf(ad.xa, 0, 0);
+    e.buf(ad.b, 0, 1);
+    e.buf(y, 0, 2);
+    e.bytes([4]u32{ @intCast(rows), @intCast(ad.out), @intCast(ad.rank), 0 }, 3);
+    e.bytes(ad.scale, 4);
+    e.run(.{ ad.out, rows, 1 }, .{ 256, 1, 1 });
+}
+
+/// xa = x a^T over every block, zeroed where `route` gives a row no lesson (their gates 0); decision rows vote.
+pub fn project(k: *const kern.Kernels, e: *Enc, ad: wts.Adapter, x: Buffer, rows: usize, route: *const lesson_route.Route) void {
+    e.pipe(k.get("tf_train_lora_in"));
+    e.buf(x, 0, 0);
+    e.buf(ad.a, 0, 1);
+    e.buf(ad.xa, 0, 2);
+    e.bytes([4]u32{ @intCast(rows), @intCast(ad.in), @intCast(ad.rank), 0 }, 3);
+    e.buf(ad.xn, 0, 4);
+    e.run(.{ 32 * ad.rank, rows, 1 }, .{ 256, 1, 1 });
+    e.pipe(k.get("tf_train_gate"));
+    e.buf(ad.xa, 0, 0);
+    e.buf(ad.xn, 0, 1);
+    e.buf(ad.tau, 0, 2);
+    e.buf(ad.gates, 0, 3);
+    e.bytes([4]u32{ @intCast(rows), @intCast(ad.rank), @intCast(ad.rank / 16), max_blocks }, 4);
+    e.bytes(ad.unit, 5);
+    var r = route.*;
+    if (ad.whole) r.whole = 1;
+    e.bytes(r, 6);
+    e.buf(ad.latch, 0, 7);
+    e.buf(ad.score, 0, 8);
+    e.run(.{ ad.rank / 16, rows, 1 }, .{ ad.rank / 16, 1, 1 });
+}
+
+/// Any layer's change, for the buffers every layer shares (null: no lesson is attached).
+pub fn firstAdapter(w: *const wts.Weights) ?wts.Adapter {
+    for (w.layers) |l| switch (l) {
+        inline else => |x| if (x.adapter) |ad| return ad,
+    };
+    return null;
+}
+
+/// Each stream whose decision row is in the pass `route` describes: cleared before it, latched (`set`) after it.
+pub fn latchAll(k: *const kern.Kernels, e: *Enc, ad: wts.Adapter, route: *const lesson_route.Route, set: bool) void {
+    for (0..route.count) |s| if (route.decision(s) != null) latch(k, e, ad.need, ad.latch, ad.score, @intCast(route.seg[s][3]), set);
+}
+
+/// A stream's lessons at its decision row (slot): cleared before the pass that holds it, latched (`set`) after it.
+pub fn latch(k: *const kern.Kernels, e: *Enc, need: Buffer, latches: Buffer, score: Buffer, slot: u32, set: bool) void {
+    e.pipe(k.get("tf_lesson_latch"));
+    e.buf(score, 0, 0);
+    e.buf(need, 0, 1);
+    e.buf(latches, 0, 2);
+    e.bytes([4]u32{ slot, max_blocks, @intFromBool(set), max_blocks }, 3);
+    e.run(.{ 1, 1, 1 }, .{ 1, 1, 1 });
+}
+
+/// The routed experts' 4-bit kernels (j 0: up into act, 1: down into ey): one row's pairs, else each expert's members.
+fn experts4(f: Forward, e: *Enc, m: wts.Moe, comptime key: []const u8, comptime j: usize, rows: usize, pairs: usize, groups: usize) void {
+    const c = f.c;
+    const s = f.s;
+    const fc = if (j == 0) m.fc1 else m.fc2;
+    const many = rows > 1 and f.members > 0;
+    const r8 = many and rows >= f.k.wide_rows; // over any `members`: each member row's dot in tf_qdot16's order
+    const geo: [2]usize = if (r8) .{ 8, 2 } else if (f.geometry > 0 and !many) kern.geometries[f.geometry - 1] else if (many and f.members == 3) .{ 4, 4 } else .{ 4, 2 };
+    e.pipe(if (r8) (if (j == 0) f.k.get("tf_xup_rows2r8") else f.k.get("tf_xdown_rows2r8")) else if (many) expertRows(f, j, f.members) else if (f.geometry > 0) expertGeo(f, j, f.geometry - 1) else f.k.get(key));
+    e.buf(if (j == 0) s.x else s.act, 0, 0);
+    if (rows == 1) {
+        e.buf(s.idx, 0, 1);
+        e.bytes(ints8(&.{ 0, 1, 2, 3, 4, 5 }), 2);
+        e.bytes(ints8(&.{ 1, 1, 1, 1, 1, 1 }), 3);
+        e.bytes(ints8(&.{ 0, 1, 2, 3, 4, 5 }), 4);
+        e.bytes(@as(i32, @intCast(pairs)), 5);
+    } else {
+        e.buf(s.uids, 0, 1);
+        e.buf(s.start, 0, 2);
+        e.buf(s.count, 0, 3);
+        e.buf(s.members, 0, 4);
+        e.buf(s.ucount, 0, 5);
+    }
+    e.buf(fc[0].buffer, fc[0].offset, 6);
+    e.buf(fc[1].buffer, fc[1].offset, 7);
+    e.buf(fc[2].buffer, fc[2].offset, 8);
+    e.buf(if (j == 0) s.act else s.ey, 0, 9);
+    const n = if (j == 0) c.expert_width else c.hidden;
+    e.run(.{ 32 * geo[1], n / (geo[0] * geo[1]), groups }, .{ 32 * geo[1], 1, 1 });
+}
+
+/// The routed-expert kernel (j 0: up, 1: down) taking `mb` member rows a pass (3: tf_experts_w, four simdgroups).
 fn expertRows(f: Forward, j: usize, mb: usize) mtl.Pipeline {
+    if (mb == 3) return if (j == 0) f.k.get("tf_xup_w3") else f.k.get("tf_xdown_w3");
     if (mb >= 4) return if (j == 0) f.k.get("tf_xup_rows4") else f.k.get("tf_xdown_rows4");
     return if (j == 0) f.k.get("tf_xup_rows2") else f.k.get("tf_xdown_rows2");
 }
@@ -265,8 +418,8 @@ fn upRelu2(f: Forward, e: *Enc, lin: wts.Linear, rows: usize) void {
     e.pipe(if (tmr == 1) f.k.get("up_relu2_1_0") else if (!edge) f.k.get("up_relu2_2_0") else f.k.get("up_relu2_2_1"));
     e.buf(s.x, 0, 0);
     e.buf(s.xs, 0, 1);
-    e.buf(lin.w, 0, 2);
-    e.buf(lin.sbt, 0, 3);
+    e.buf(lin.tiles.?.w, 0, 2);
+    e.buf(lin.tiles.?.sbt, 0, 3);
     e.bytes(Forward.mdims(rows), 4);
     e.buf(s.sh_act, 0, 5);
     e.buf(s.sh_xs, 0, 6);
@@ -322,10 +475,10 @@ pub fn attend(f: Forward, e: *Enc, a: wts.Attention, segs: []const Kvs, rows: us
                     chainAttend(f, e, sg, qp, qp_off);
                     var tree_gate = d.gate(sg.layer, 1);
                     e.gate = &tree_gate;
-                    tree.attentionGpu(f, e, sg.kv, t, partial(f, @min(t, 16)), gt);
+                    tree.attentionGpu(f, e, sg.kv, t, partialFor(f, sg.kv, @min(t, 16)), gt);
                     e.gate = null;
-                } else tree.attentionGpu(f, e, sg.kv, t, partial(f, @min(t, 16)), gt);
-            } else tree.attention(f, e, sg.kv, sg.len, t, sg.deepest, partial(f, @min(t, 16)), sg.tables);
+                } else tree.attentionGpu(f, e, sg.kv, t, partialFor(f, sg.kv, @min(t, 16)), gt);
+            } else tree.attention(f, e, sg.kv, sg.len, t, sg.deepest, partialFor(f, sg.kv, @min(t, 16)), sg.tables);
             e.pipe(f.k.get("tf_attn_out"));
             e.buf(s.att, 0, 0);
             e.buf(s.ax, r0 * c.heads * hd * 2, 1);
@@ -340,17 +493,17 @@ pub fn attend(f: Forward, e: *Enc, a: wts.Attention, segs: []const Kvs, rows: us
         const dims = [5]i32{ @intCast(keys), @intCast(chunks), @intCast(t), 1, @intCast(sga) };
         const grid_chunks = if (sg.gpu) |ga| ga.chunks else chunks;
         const strides = [4]i64{ @intCast(c.kv_heads * sg.kv.capacity * hd), @intCast(sg.kv.capacity * hd), @intCast(hd), 1 };
-        e.pipe(partial(f, tiles));
+        e.pipe(partialFor(f, sg.kv, tiles));
         e.buf(qp, qp_off, 0);
-        e.buf(sg.kv.k, 0, 1);
+        kvp.bindKv(e, sg.kv, 1, 3);
         e.bytes(strides, 2);
-        e.buf(sg.kv.v, 0, 3);
         e.bytes(strides, 4);
         e.bytes(@as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(hd))))), 5);
         if (sg.gpu) |ga| e.buf(ga.buffer, ga.attn, 6) else e.bytes(dims, 6);
         e.buf(s.po, 0, 7);
         e.buf(s.pm, 0, 8);
         e.buf(s.pl, 0, 9);
+        if (sg.kv.paged) |pg| kvp.bindTable(e, pg, 10);
         e.run(.{ c.kv_heads * 32 * tiles, grid_chunks, (sga + tiles - 1) / tiles }, .{ 32 * tiles, 1, 1 });
 
         e.pipe(f.k.get("attn_merge"));
@@ -371,6 +524,8 @@ pub fn attend(f: Forward, e: *Enc, a: wts.Attention, segs: []const Kvs, rows: us
     const o_in = if (lone) s.att else s.ax;
     f.xsum(e, "xsum_4096", c.heads * hd, o_in, 0, s.axs, rows);
     f.coop(e, "out", a.o_proj, o_in, 0, s.axs, s.delta, rows);
+    if (a.slide) |r| rest(f, e, r, o_in, s.delta, rows, f.c.heads * f.c.head_dim);
+    if (a.adapter) |ad| adapt(f, e, ad, o_in, s.delta, rows);
 }
 
 /// A GPU round's chain attention over its window (dims written on the GPU), into scratch.att.
@@ -384,17 +539,17 @@ fn chainAttend(f: Forward, e: *Enc, sg: Kvs, qp: Buffer, qp_off: usize) void {
     const sga = g * t / 16;
     const tiles: usize = @min(sga, 16);
     const strides = [4]i64{ @intCast(c.kv_heads * sg.kv.capacity * hd), @intCast(sg.kv.capacity * hd), @intCast(hd), 1 };
-    e.pipe(partial(f, tiles));
+    e.pipe(partialFor(f, sg.kv, tiles));
     e.buf(qp, qp_off, 0);
-    e.buf(sg.kv.k, 0, 1);
+    kvp.bindKv(e, sg.kv, 1, 3);
     e.bytes(strides, 2);
-    e.buf(sg.kv.v, 0, 3);
     e.bytes(strides, 4);
     e.bytes(@as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(hd))))), 5);
     e.buf(ga.buffer, ga.attn, 6);
     e.buf(s.po, 0, 7);
     e.buf(s.pm, 0, 8);
     e.buf(s.pl, 0, 9);
+    if (sg.kv.paged) |pg| kvp.bindTable(e, pg, 10);
     e.run(.{ c.kv_heads * 32 * tiles, ga.chunks, (sga + tiles - 1) / tiles }, .{ 32 * tiles, 1, 1 });
     e.pipe(f.k.get("attn_merge"));
     e.buf(s.po, 0, 0);
@@ -408,23 +563,29 @@ fn chainAttend(f: Forward, e: *Enc, sg: Kvs, qp: Buffer, qp_off: usize) void {
 /// kvWrite with its (QKV, KOFF, capacity, start) read from a GPU buffer at `at`.
 pub fn kvWriteAt(f: Forward, e: *Enc, kv: st.Kv, args: Buffer, at: usize, row0: usize, rows: usize) void {
     const c = f.c;
-    e.pipe(f.k.get("tf_kv_write"));
+    e.pipe(if (kv.paged != null) f.k.paged.?.glue[0] else f.k.get("tf_kv_write"));
     e.buf(f.s.qkv, row0 * c.qkvDim() * 2, 0);
-    e.buf(kv.k, 0, 1);
-    e.buf(kv.v, 0, 2);
+    kvp.bindKv(e, kv, 1, 2);
     e.buf(args, at, 3);
+    if (kv.paged) |pg| kvp.bindTable(e, pg, 4);
     e.run(.{ c.head_dim, c.kv_heads, rows }, .{ c.head_dim, 1, 1 });
 }
 
 /// The stacked q/k/v rows from `row0` (their keys and values) into a cache after its `len` rows.
 pub fn kvWrite(f: Forward, e: *Enc, kv: st.Kv, len: usize, row0: usize, rows: usize) void {
     const c = f.c;
-    e.pipe(f.k.get("tf_kv_write"));
+    kvp.holds(kv, len + rows);
+    e.pipe(if (kv.paged != null) f.k.paged.?.glue[0] else f.k.get("tf_kv_write"));
     e.buf(f.s.qkv, row0 * c.qkvDim() * 2, 0);
-    e.buf(kv.k, 0, 1);
-    e.buf(kv.v, 0, 2);
+    kvp.bindKv(e, kv, 1, 2);
     e.bytes([4]u32{ @intCast(c.qkvDim()), @intCast(c.heads * c.head_dim), @intCast(kv.capacity), @intCast(len) }, 3);
+    if (kv.paged) |pg| kvp.bindTable(e, pg, 4);
     e.run(.{ c.head_dim, c.kv_heads, rows }, .{ c.head_dim, 1, 1 });
+}
+
+/// attn_partial at `tiles` tiles, or its paged twin for a paged cache.
+pub fn partialFor(f: Forward, kv: st.Kv, tiles: usize) mtl.Pipeline {
+    return if (kv.paged != null) f.k.paged.?.partial[tiles - 1] else partial(f, tiles);
 }
 
 fn partial(f: Forward, tiles: usize) mtl.Pipeline {

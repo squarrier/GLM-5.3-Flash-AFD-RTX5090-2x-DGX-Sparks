@@ -172,7 +172,7 @@ inline float mul_add(float acc, float a, float b) { return a * b + acc; }
 inline float add_nc(float a, float b) { return a + b; }
 #pragma clang fp contract(on)
 template <int D, int TOPK>
-[[kernel]] void custom_kernel_tf_glm5_fused_moe_combine_splilocal integration55__4096_8_bfloat16_t_bfloat16_t_float_bfloat16_t(
+[[kernel]] void custom_kernel_tf_glm5_fused_moe_combine_split_101a658555__4096_8_bfloat16_t_bfloat16_t_float_bfloat16_t(
   const device bfloat16_t* YS [[buffer(0)]],
   const device bfloat16_t* Y [[buffer(1)]],
   const device float* WTS [[buffer(2)]],
@@ -190,4 +190,4 @@ template <int D, int TOPK>
 
 }
 
-template [[host_name("custom_kernel_tf_glm5_fused_moe_combine_splilocal integration55__4096_8_bfloat16_t_bfloat16_t_float_bfloat16_t")]] [[kernel]] decltype(custom_kernel_tf_glm5_fused_moe_combine_splilocal integration55__4096_8_bfloat16_t_bfloat16_t_float_bfloat16_t<4096, 8>) custom_kernel_tf_glm5_fused_moe_combine_splilocal integration55__4096_8_bfloat16_t_bfloat16_t_float_bfloat16_t<4096, 8>;
+template [[host_name("custom_kernel_tf_glm5_fused_moe_combine_split_101a658555__4096_8_bfloat16_t_bfloat16_t_float_bfloat16_t")]] [[kernel]] decltype(custom_kernel_tf_glm5_fused_moe_combine_split_101a658555__4096_8_bfloat16_t_bfloat16_t_float_bfloat16_t<4096, 8>) custom_kernel_tf_glm5_fused_moe_combine_split_101a658555__4096_8_bfloat16_t_bfloat16_t_float_bfloat16_t<4096, 8>;

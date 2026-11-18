@@ -1,0 +1,179 @@
+{
+  "AI_credit_completeness": "Historical missing Assisted-by trailers and unrecorded model identities remain unknown; author display name is not sole-authorship proof.",
+  "agent_models": [
+    {
+      "agent": "Helios",
+      "model": "GPT-6.1 Sol",
+      "platform": "Hermes Agent",
+      "provider": "openai-codex",
+      "role": "Current upstream-first implementation, integration, qualification and release evidence"
+    },
+    {
+      "agent": "Workerbee",
+      "model": "Recorded local execution route; underlying checkpoint not established",
+      "role": "Earlier packaging, evaluation harness and release research; not new device operator"
+    },
+    {
+      "agent": "Claude",
+      "model": "Opus 5.5, Anthropic via Hermes",
+      "role": "Retained earlier hybrid/recorder/CPU-fixture work"
+    },
+    {
+      "agent": "Earlier self-hosted execution agent",
+      "model": "GLM-5.3-Flash",
+      "role": "Previous published version only"
+    }
+  ],
+  "all_final_import_authorship_resolved": false,
+  "all_recorded_names_retained": true,
+  "historical_exclusions_superseded": "Russell Marr and Bizuayeu host-KV are incorporated native-upstream on v1.2.8; old exclusion applies only to earlier v1.2.7 candidate.",
+  "historical_human_records": [
+    {
+      "github": "squarrier",
+      "name": "Scott Quarrier",
+      "scope": "owner",
+      "work": "Authored recipe packaging and directed the work across v1.0->v4; retains deployment/publication approval; repo copyright 'Copyright 2026 Scott Quarrier', own packaging Apache-2.0 (v1.0 tag MIT).",
+      "x_status": "consistent with retained published credits"
+    },
+    {
+      "github": "ashhart",
+      "name": "Ash Hart",
+      "scope": "engine",
+      "verified_historical_X": "@ashxhart",
+      "work": "Authored TensorFold (engine, pinned v1.2.7 93a2e93e; v3 base f8fe17d2) and MCDMA/RDMA wire; EXL3/GLM device kernels and Triton sources; fixes cherry-picked into fork; engine stable loader/dtype work.",
+      "x_status": "VERIFIED via api.github.com/users/ashhart twitter_username"
+    },
+    {
+      "github": "MiaAI-Lab",
+      "name": "Mia (Mia's AI Lab)",
+      "scope": "recipe/checkpoint/drafter-integration/attribution-template",
+      "work": "Authored current recipe+patch adaptations (1104 @80be4d6, patch0092 import), old recipe patch0113 (2x @3906ac66, pooled HTTP body isolation), the EXL3 4bpw quantization checkpoint 078455ff with drafter (built-in MTP) integration, EXL3 prompt/attention kernels, KDA chunked kernel, TensorFold PRs #243/#285/#301, AGENTS.md attribution guide, README layout.",
+      "x_status": "SELF-DECLARED ONLY \u2014 GitHub API twitter_username is null; remains unverified until actual post QA"
+    },
+    {
+      "github": "taussoe",
+      "name": "taussoe",
+      "scope": "kernel",
+      "work": "Authored retained KDA wide prep/step/out work in TensorFold at fb985b8649c8b42c2ac2aba1fd7c6f905bc8413c, used by the v4 F32-tap adaptation.",
+      "x_status": "no X handle in GitHub profile"
+    },
+    {
+      "github": "SvangenStudios",
+      "name": "SvangenStudios",
+      "scope": "server feature",
+      "verified_historical_X": "@SvangenStudios",
+      "work": "Authored structured-JSON response-channel work in DeepSeek recipe PR31; actual imported adaptation is Mia patch0092 at exact 80be4d6 (original author distinguished from adapter).",
+      "x_status": "VERIFIED via api.github.com/users/SvangenStudios twitter_username"
+    },
+    {
+      "github": "tpurtell",
+      "name": "T.J. Purtell",
+      "scope": "engine/design + staged new import",
+      "work": "Authored glmrt expert-channel split (dc6d9b8), ds41rt (3067d06), cuteafd (c05d9939; graph-key design authored by Hugh Madden); staged candidate adds CuteAFD GLM typed-schema argument policy at 26447123ea83c54a5bc103530ea44892b08eb97b, reimplemented for native TensorFold.",
+      "x_status": "UNVERIFIED \u2014 GitHub API twitter_username null; handle appears only in retained ledger text"
+    },
+    {
+      "github": "hughmadden",
+      "name": "Hugh Madden / Turquoise Bay AI",
+      "scope": "kernels",
+      "work": "Authored glm53f-afd split and expert prompt kernels at 91db3cc6 (incl. tiered schedule) and cuteafd's graph-key design.",
+      "x_status": "UNVERIFIED \u2014 GitHub API twitter_username null; handle appears only in retained ledger text"
+    },
+    {
+      "github": "Bizuayeu",
+      "name": "Bizuayeu",
+      "scope": "verify-window/server fixes (NOT host-KV in v4)",
+      "verified_historical_X": "@Bizuayeu",
+      "work": "Authored shared verify-window design (75131b66c39fdcf55dbd130ccaec166b65394f3d), GLM key repair (b952862585cf1bb564c297926c0072db2b48bc71), end-token close (557011805a64639ff5730aa980f7a100ab3ee7d9), Responses include fixes (be17a101c47c6f20ac2295ea59922ad777d02252) on his TensorFold fork branch pr/glm53-flash-cuda. v4/3a9e15b7 reimplements the shared verify forward. Host KV (PR2173) is v4.5-scope and NOT incorporated at v4 pins.",
+      "x_status": "VERIFIED via api.github.com/users/Bizuayeu twitter_username"
+    },
+    {
+      "github": "rwl4",
+      "name": "Raymond Lucke",
+      "scope": "server feature",
+      "work": "Authored literal tool-closer design and cases at MiaAI-Lab/GLM-5.3-Flash-EXL3-2x @029a852f14bcf604ffe9a55bfbd6ce7f50ec57be (PR158).",
+      "x_status": "no X handle in GitHub profile (name 'Raymond Lucke' verified)"
+    },
+    {
+      "github": "bertholomus",
+      "name": "Albert Lee / bertholomus",
+      "scope": "kernels",
+      "verified_historical_X": "@bertholomusai",
+      "work": "Authored group-count/place kernel (dbe0773) and MMA work-list kernels (90b68e063a0b8bba59aaf13340ef16619e751195).",
+      "x_status": "VERIFIED via api.github.com/users/bertholomus twitter_username"
+    },
+    {
+      "github": "turboderp",
+      "name": "turboderp",
+      "scope": "format/tooling",
+      "verified_historical_X": "@turboderp_",
+      "work": "Authored ExLlamaV3 / the EXL3 format (pinned ref f45b8451) that produced Mia's checkpoint.",
+      "x_status": "VERIFIED via api.github.com/users/turboderp twitter_username"
+    },
+    {
+      "github": "devopsfortunato",
+      "name": "Alfonso Fortunato",
+      "scope": "staged upstream fix",
+      "verified_historical_X": "@devopsfortunato",
+      "work": "Authored malformed GLM argument-boundary fix TensorFold #2831, ported from stable 93a2e93e (staged candidate).",
+      "x_status": "VERIFIED via api.github.com/users/devopsfortunato twitter_username (name verified)"
+    },
+    {
+      "github": "zai-org (HF)",
+      "name": "Z.ai (Zhipu AI)",
+      "scope": "model/drafter",
+      "work": "Authored GLM-5.3-Flash base model (MIT) including its built-in MTP layer \u2014 the v4 drafter (checkpoint built-in MTP drafting with per-user acceptance/rollback; no external DFlash2 dependency).",
+      "x_status": "as published in retained ledger"
+    },
+    {
+      "github": null,
+      "name": "NVIDIA",
+      "scope": "toolchain (authored; not redistributed)",
+      "work": "Authored CUDA and libdevice (Triton may link libdevice into generated objects). Must keep."
+    },
+    {
+      "github": "ashhart/TensorFold contributors",
+      "name": "TensorFold contributors",
+      "scope": "engine guards + PR-level fixes",
+      "work": "Authored failed-round, tokenizer-ID and regex-work guards (staged, implemented natively); plus merged engine work (akol1 #650 86134886, BobClawblaw #596 8ced2018, BlivionIaG merged 71447a01 for d7b134cd, chaog992 2193d145, mikolaj92 #140 b3b8a391, Aditya Thyagarajan #200, Philip Mossop #445 dce62cf/--name-priority, m-naoki-m TensorFold#421, Petrus Pennanen MCDMA#5)."
+    },
+    {
+      "name": "Recipe patch contributors (retained, names must stay)",
+      "scope": "Mia-recipe patches ported/kept",
+      "work": "E-Zou Shen (@ezoushen; X VERIFIED as published) patches 0071/0074 reimplementation (her PRs #44/#62); desy0305 patch 0073 (#51); johnwhited patches 0081/0082/0083 (#48); m-naoki-m patch 0078 (#71); meleesciony issue #75 diagnosis; Lukas-tek-no-logic issue #60 report; Jay Leaton glm53-tensorfold-spark (Apache-2.0, code Mia adapted in 0017/0020); BadAd84, stevehansen, kky42, jschmied, Andrey Kolesnikov (akol1)."
+    },
+    {
+      "name": "fla-org flash-linear-attention",
+      "scope": "algorithm reference",
+      "work": "MIT; implements the chunkwise gated-delta/KDA algorithm that Mia's own chunked KDA kernel computes; her kernel is her own code."
+    }
+  ],
+  "new_native_host_KV_authors": [
+    {
+      "PR": 1795,
+      "author": "russellmm",
+      "body_sha256": "65a2a9fd870f4e695867127be54f0da648bdbe1ac66ccc33cf25eb66d96299fc",
+      "head": "adc001b4bdf9fcdde38647ae5a46fbafd3e829f3",
+      "merge": "c0e6daf56a3ec20116f02d41ab0a727108359bee",
+      "repo": "https://github.com/russellmm/TensorFold",
+      "url": "https://github.com/ashhart/TensorFold/pull/1795",
+      "wrapper_sha256": "73f8a0ef86ade4531b86b6820081111b225d53424bb09f05a9a4f694a7ff4d27"
+    },
+    {
+      "PR": 2173,
+      "author": "Bizuayeu",
+      "body_sha256": "110b491b4907e5207e0f5b9d5ab7275c7e671b794d4af5e19486f937bdf8ebf6",
+      "head": "b0e1cdcbab3b6ebc183129f9b26c9887ed22ff3e",
+      "merge": "08553be02a5f174243ae66583b50cd6333fc5f0c",
+      "repo": "https://github.com/Bizuayeu/TensorFold",
+      "url": "https://github.com/ashhart/TensorFold/pull/2173",
+      "wrapper_sha256": "1a268d4634e25675b231b6730058b2540d1d2a8b76dc7aab823f8a3b46af0b9c"
+    }
+  ],
+  "schema": "V4.scoped-credit-register.v1",
+  "unverified_X_handles": [
+    "MiaAI_lab",
+    "dangerm00se",
+    "wrldsuksgo2mars"
+  ]
+}

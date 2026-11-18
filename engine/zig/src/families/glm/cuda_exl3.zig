@@ -1,207 +1,222 @@
-//! TensorFold's EXL3 on CUDA for GLM-5.3-Flash: the kernels (copies of python-0.6's cuda/exl3 module and GLM's exl3.cu,
-//! built as the exl3_* and glm_exl3 fatbins) with each wrapper's launch, and the reading of Mia's EXL3 checkpoint.
-//!
-//! The EXL3 format and its kernels follow ExLlamaV3 by turboderp (github.com/turboderp-org/exllamav3, MIT); TensorFold's
-//! EXL3 module is by Ash Hart (github.com/ashhart) and the TensorFold contributors (python-0.6, ed78d6f).
+// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
+//! GLM-5.3-Flash's EXL3 routed experts on CUDA (Mia-AiLab's checkpoint: 4-bit mcg trellis experts, the rest bf16).
 
 const std = @import("std");
+const modelopt = @import("core").modelopt;
+const Span = @import("cuda_shard.zig").Span;
+const cuda = @import("cuda");
+const experts = @import("cuda_experts.zig");
 
-pub const kernels = @import("cuda_exl3_kernels.zig");
-pub const experts = @import("cuda_exl3_experts.zig");
-pub const linear = @import("cuda_exl3_linear.zig");
-pub const glm = @import("cuda_exl3_glm.zig");
-pub const split = @import("cuda_exl3_split.zig");
-pub const check = @import("cuda_exl3_check.zig");
-/// qualification_3e1f1105: TF_GLM_EXL3_PGROUP's CPU side (bertholomus's parallel grouping): the placement rule and the launches run on host memory
-pub const pgroup = @import("cuda_exl3_pgroup.zig");
-/// K4 (qualification_e4ad04cd, TF_GLM_HALVES_KERNEL=k4): MiaAI-Lab's EXL3 prompt kernel for prompt windows, python 2.15's port
-pub const k4 = @import("cuda_exl3_k4.zig");
-/// tf-exl3-check's K4 table (qualification_e4ad04cd)
-pub const check_k4 = @import("cuda_exl3_check_k4.zig");
-
-const Launch = kernels.Launch;
-const Launches = kernels.Launches;
-
-test {
-    _ = kernels;
-    _ = experts;
-    _ = linear;
-    _ = glm;
-    _ = split;
-    _ = check;
-    _ = pgroup;
-    _ = k4;
-    _ = check_k4;
-    _ = @import("cuda_exl3_test.zig");
-    _ = @import("cuda_exl3_split_test.zig");
+/// config.json's quantization_config (top level, else text_config's), when it has one.
+fn block(root: std.json.Value) ?std.json.ObjectMap {
+    if (root != .object) return null;
+    if (root.object.get("quantization_config")) |q| if (q == .object) return q.object;
+    if (root.object.get("text_config")) |t| if (t == .object) if (t.object.get("quantization_config")) |q| if (q == .object) return q.object;
+    return null;
 }
 
-const Table = struct {
-    arena: std.heap.ArenaAllocator,
-    by_image: std.json.ObjectMap,
+/// Whether config.json names EXL3 (quant_method "exl3"): `admit` then says whether this family reads it.
+pub fn isExl3(gpa: std.mem.Allocator, config_json: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, config_json, .{}) catch return false;
+    defer parsed.deinit();
+    const q = block(parsed.value) orelse return false;
+    const m = q.get("quant_method") orelse return false;
+    return m == .string and std.mem.eql(u8, m.string, "exl3");
+}
 
-    fn load() !Table {
-        var t: Table = .{ .arena = .init(std.testing.allocator), .by_image = undefined };
-        const v = try std.json.parseFromSliceLeaky(std.json.Value, t.arena.allocator(), @embedFile("exl3_kernels.json"), .{});
-        t.by_image = v.object;
-        return t;
+/// The EXL3 checkpoints the kernels read: 4-bit routed experts on the "mcg" codebook (everything else bf16).
+pub fn admit(gpa: std.mem.Allocator, config_json: []const u8, why: *modelopt.Why) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, config_json, .{});
+    defer parsed.deinit();
+    const q = block(parsed.value) orelse {
+        why.set("no quantization_config", .{});
+        return error.UnsupportedQuant;
+    };
+    const bits = q.get("bits") orelse std.json.Value{ .null = {} };
+    if (bits != .integer or bits.integer != 4) {
+        why.set("EXL3 at {f} bits: the CUDA family reads 4-bit EXL3 experts", .{std.json.fmt(bits, .{})});
+        return error.UnsupportedQuant;
     }
+    const book = q.get("codebook") orelse std.json.Value{ .null = {} };
+    if (book != .string or !std.mem.eql(u8, book.string, "mcg")) {
+        why.set("EXL3 codebook {f}: the CUDA family reads \"mcg\"", .{std.json.fmt(book, .{})});
+        return error.UnsupportedQuant;
+    }
+}
 
-    fn deinit(t: *Table) void {
-        t.arena.deinit();
-    }
-
-    /// The cubins' entry for `symbol` in `image`: its parameters (offset, size) and static shared bytes.
-    fn entry(t: *const Table, image: kernels.Image, symbol: []const u8) ?std.json.ObjectMap {
-        for (t.by_image.get(@tagName(image)).?.array.items) |e| {
-            if (std.mem.eql(u8, e.object.get("symbol").?.string, symbol)) return e.object;
-        }
-        return null;
-    }
+/// One layer's EXL3 experts on a rank: trellis words [E][K/16][N/16][32] and fp16 scales (suh [E][K], svh [E][N]).
+pub const Experts = struct {
+    gt: u64,
+    ut: u64,
+    dt: u64,
+    suh_g: u64,
+    suh_u: u64,
+    svh_g: u64,
+    svh_u: u64,
+    suh_d: u64,
+    svh_d: u64,
+    k2: u64, // independent per-expert projection widths in the common module
+    shx: bool, // every expert's gate and up share one input rotation: a prompt rotates a row once, not once a pick
 };
 
-/// One launch of every kernel the bindings can pick, at shapes each wrapper accepts.
-fn everyLaunch(out: *std.ArrayList(Launch), gpa: std.mem.Allocator) !void {
-    var ls: Launches = .{};
-    const sh: experts.Shared = .{ .optin = 101376 };
-    try experts.group(&ls, 1, 2, 3, 4, 1536, 9, 288, 1536, sh); // past 48 KiB: the attribute is raised first
-    try experts.rotIn(&ls, 1, 4096, true, 2, 3, 4, 5, 6, 1, 4096, 9, 288);
-    try experts.rotIn(&ls, 1, 4096, false, 2, 3, 4, 5, 6, 1, 4096, 9, 288);
-    try experts.gateupEpilogue(&ls, 1, 2, 3, 4, 5, 6, 1, 9, 1024, 4, 9, 288, 7.0, .bf16);
-    try experts.downEpilogue(&ls, 1, 2, 3, 4, 1, 9, 4096, 1, 9, 288);
-    experts.combine(&ls, 1, 2, 3, 1, 4096, 9);
-    try experts.downCombine(&ls, 1, 2, 3, 4, 5, 6, 1, 9, 4096, 1, 9, 288);
-    try experts.gateupEpilogueSched(&ls, 1, 2, 3, 4, 5, 6, 1, 9, 1024, 4, 9, 288, 7.0, .bf16, .{ .l2d = 4, .pdl = true }); // 0128's
-    try out.appendSlice(gpa, ls.slice());
-    ls = .{}; // qualification_3e1f1105: the parallel grouping, group_count then group_place
-    try experts.groupPar(&ls, 1, 7, 2, 3, 4, 2048, 9, 288, 2048);
-    try out.appendSlice(gpa, ls.slice());
-    ls = .{}; // X1's own kernels (qualification_ae31a4aa): the items' order, one rotation a row, and the 15 switch instances
-    experts.order(&ls, 1, 2, 3, 4, 2048, 1422, 288);
-    try experts.rotRows(&ls, 1, 4096, true, 2, 3, 2048, 4096);
-    try experts.rotRows(&ls, 1, 4096, false, 2, 3, 2048, 4096);
-    try out.appendSlice(gpa, ls.slice());
-    for (1..16) |sel| {
-        ls = .{};
-        const p: experts.Prompt = .{ .nfirst = sel & 8 != 0, .pa = sel & 2 != 0, .xrow = sel & 1 != 0 };
-        try experts.groupedX1(&ls, .{ .x0 = 1, .x1 = 2, .tp0 = 3, .tp1 = 4, .k2_0 = 5, .k2_1 = 6, .uids = 7, .ucount = 8, .members = 9, .z = 10, .mats = 2, .K = 4096, .N = 1024, .P = 18432, .SK = 4, .slots = 9, .maxm = 2048, .nexp_max = 288, .cb = .mcg, .nt = 8, .warps = 4, .pf = 1, .lo = 8, .hi = 8 }, p, if (sel & 4 != 0) 11 else 0, 1422);
-        var q = p; // qualification_b3fba1da: SEQ's instance of the same selector
-        q.seq = true;
-        try experts.groupedX1(&ls, .{ .x0 = 1, .x1 = 2, .tp0 = 3, .tp1 = 4, .k2_0 = 5, .k2_1 = 6, .uids = 7, .ucount = 8, .members = 9, .z = 10, .mats = 2, .K = 4096, .N = 1024, .P = 18432, .SK = 4, .slots = 9, .maxm = 2048, .nexp_max = 288, .cb = .mcg, .nt = 8, .warps = 4, .pf = 1, .lo = 8, .hi = 8 }, q, if (sel & 4 != 0) 11 else 0, 1422);
-        try out.appendSlice(gpa, ls.slice());
-    }
-    ls = .{}; // qualification_8724e161: MMA's work list and grouped_mma's three instances (gate/up folded, with and without rowrot; down)
-    try experts.mma.workList(&ls, 12, 7, 8, 288, 13, 571);
-    const gm: experts.Grouped = .{ .x0 = 1, .x1 = 2, .tp0 = 3, .tp1 = 4, .k2_0 = 5, .k2_1 = 6, .uids = 7, .ucount = 8, .members = 9, .z = 10, .mats = 2, .K = 4096, .N = 1024, .P = 18432, .SK = 4, .slots = 9, .maxm = 2048, .nexp_max = 288, .cb = .mcg, .nt = 8, .warps = 4, .pf = 1, .lo = 8, .hi = 8 };
-    try experts.mma.grouped(&ls, gm, true, false, 13, 571);
-    try experts.mma.grouped(&ls, gm, true, true, 13, 571);
-    var gd = gm;
-    gd.mats = 1;
-    gd.K = 1024;
-    gd.N = 4096;
-    gd.SK = 1;
-    try experts.mma.grouped(&ls, gd, false, false, 13, 571);
-    try out.appendSlice(gpa, ls.slice());
-    ls = .{}; // K4's own kernels (qualification_e4ad04cd): the plan, her order, gate/up at both passes with and without SHX, down at both
-    k4.plan(&ls, 1, 2, 3, 2048, 64, 545, 256, 4, 5);
-    k4.order(&ls, 4, 5, 6, 545, 256);
-    try out.appendSlice(gpa, ls.slice());
-    for (k4.passes) |pass| {
-        ls = .{};
-        for ([_]bool{ false, true }) |shx| try k4.gateup(&ls, .{ .xg = 1, .xu = if (shx) 1 else 2, .tg = 3, .tu = 4, .items = 5, .counts = 6, .members = 7, .svh_g = 8, .svh_u = 9, .suh_d = 10, .xd = 11, .D = 4096, .N = 1024, .E = 256, .limit = 7.0, .slots = 9, .ord = 12, .cap = 545, .pass = pass, .shx = shx });
-        try k4.down(&ls, .{ .xd = 1, .td = 2, .items = 3, .counts = 4, .members = 5, .svh_d = 6, .y = 7, .N = 1024, .D = 4096, .E = 256, .slots = 9, .ord = 8, .cap = 545, .pass = pass });
-        try out.appendSlice(gpa, ls.slice());
-    }
-    for ([_]kernels.Codebook{ .@"3inst", .mcg, .mul1 }) |cb| {
-        for (kernels.grouped_tiles) |t| for (kernels.grouped_ranges) |r| {
-            ls = .{};
-            try experts.grouped(&ls, .{ .x0 = 1, .x1 = 2, .tp0 = 3, .tp1 = 4, .k2_0 = 5, .k2_1 = 6, .uids = 7, .ucount = 8, .members = 9, .z = 10, .mats = 2, .K = 4096, .N = 1024, .P = 9, .SK = 1, .slots = 9, .maxm = 1, .nexp_max = 9, .cb = cb, .nt = t[0], .warps = t[1], .pf = t[2], .lo = r[0], .hi = r[1] });
-            try out.appendSlice(gpa, ls.slice());
-        };
-        for (kernels.grouped_tiles_l2d) |t| for (kernels.grouped_ranges) |r| { // 0128's, l2d last
-            ls = .{};
-            try experts.grouped(&ls, .{ .x0 = 1, .x1 = 2, .tp0 = 3, .tp1 = 4, .k2_0 = 5, .k2_1 = 6, .uids = 7, .ucount = 8, .members = 9, .z = 10, .mats = 2, .K = 4096, .N = 1024, .P = 9, .SK = 1, .slots = 9, .maxm = 1, .nexp_max = 9, .cb = cb, .nt = t[0], .warps = t[1], .pf = t[2], .lo = r[0], .hi = r[1], .sched = .{ .l2d = 4 } });
-            try out.appendSlice(gpa, ls.slice());
-        };
-        for (2..17) |k2| {
-            ls = .{};
-            try experts.dequant(&ls, 1, 2, 4096, 1024, @intCast(k2), cb);
-            try out.appendSlice(gpa, ls.slice());
-        }
-    }
-    ls = .{};
-    try linear.rotIn(&ls, 1, .bf16, 2, 3, 1, 4096);
-    try out.appendSlice(gpa, ls.slice());
-    for (kernels.linear_widths) |p| {
-        for (kernels.linear_warps) |wk| {
-            ls = .{};
-            const l: linear.Layer = .{ .words = 1, .suh = 2, .svh = 3, .bias = null, .counters = 4, .k = 4096, .n = 1024, .k2 = p[0], .cb = @fromBackingInt(@intCast(p[1])), .split = .{ 1, wk } };
-            try linear.linear(&ls, 5, l, 6, .bf16, null, 1);
-            try linear.unpack(&ls, l, 7);
-            try out.appendSlice(gpa, ls.slice());
-        }
-    }
-    for (kernels.glm_tiles) |t| {
-        ls = .{};
-        try glm.grouped(&ls, 1, 2, 3, 4, .{ .items = 5, .counts = 6, .members = 7, .experts = 288 }, 8, 2, 4096, 1024, 9, 1, 9, t[0], t[1], 288);
-        try out.appendSlice(gpa, ls.slice());
-    }
-    ls = .{};
-    try glm.rotIn(&ls, 1, 4096, 2, 3, 4, 5, 6, 1, 4096, 9);
-    try glm.gateupEpilogue(&ls, 1, 2, 3, 4, 5, 6, 1, 9, 1024, 4, 9, 7.0);
-    try glm.downEpilogue(&ls, 1, 2, 3, 4, 1, 9, 4096, 1, 9);
-    try out.appendSlice(gpa, ls.slice());
-}
+const tile = 128; // a 16 x 16 tile's bytes at 4 bits
 
-test "the bindings name exactly the kernels each fatbin holds" {
-    var t = try Table.load();
-    defer t.deinit();
-    const a = t.arena.allocator();
-    inline for (kernels.images_all ++ kernels.images_l2d ++ kernels.images_x1 ++ kernels.images_x1s ++ kernels.images_mma ++ kernels.images_k4) |img| {
-        var ours: std.ArrayList([:0]const u8) = .empty;
-        try kernels.all(img, &ours, a);
-        const cubin = t.by_image.get(@tagName(img)).?.array.items;
-        try std.testing.expectEqual(cubin.len, ours.items.len);
-        for (ours.items) |s| if (t.entry(img, s) == null) {
-            std.debug.print("{t}: {s} is not in the cubins\n", .{ img, s });
-            return error.UnknownSymbol;
-        };
-    }
-}
-
-test "every launch's arguments sit where the cubins' parameter tables put them, and every kernel is launched" {
-    var t = try Table.load();
-    defer t.deinit();
-    const a = t.arena.allocator();
-    var ls: std.ArrayList(Launch) = .empty;
-    try everyLaunch(&ls, a);
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    for (ls.items) |l| {
-        const e = t.entry(l.image, l.symbol) orelse {
-            std.debug.print("{t}: {s} is not in the cubins\n", .{ l.image, l.symbol });
-            return error.UnknownSymbol;
-        };
-        const ps = e.get("params").?.array.items;
-        try std.testing.expectEqual(ps.len, l.args.count);
-        for (ps, 0..) |p, i| {
-            try std.testing.expectEqual(p.array.items[0].integer, l.args.offsets[i]);
-            try std.testing.expectEqual(p.array.items[1].integer, l.args.sizes[i]);
-        }
-        try seen.put(a, try std.fmt.allocPrint(a, "{t}/{s}", .{ l.image, l.symbol }), {});
-    }
-    var total: usize = 0;
-    var it = t.by_image.iterator();
-    while (it.next()) |img| for (img.value_ptr.array.items) |e| {
-        // exl3/l2d/'s images: only 0128's own kernels launch from them (the others are today's SASS: sass-check.sh)
-        const s = e.object.get("symbol").?.string;
-        if (std.mem.startsWith(u8, img.key_ptr.*, "exl3_l2d_") and !std.mem.startsWith(u8, s, "_ZN8tf_exl3x14grouped_kernel") and !std.mem.eql(u8, s, kernels.sym.gateup_epilogue)) continue;
-        // exl3/x1/'s images: only X1's own kernels launch from them (its stock kernels launch from today's images)
-        const x1_own = std.mem.startsWith(u8, s, "_ZN8tf_exl3x14grouped_kernel") or std.mem.eql(u8, s, kernels.sym.x1_order) or std.mem.eql(u8, s, kernels.sym.x1_rot_rows_bf16) or std.mem.eql(u8, s, kernels.sym.x1_rot_rows_f16);
-        if (std.mem.startsWith(u8, img.key_ptr.*, "exl3_x1_") and !x1_own) continue;
-        total += 1;
+/// Layer `i`'s EXL3 experts through `L` (cuda_weights' loader): gate, up by `cut`'s tile columns, down by its rows.
+pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Span) !Experts {
+    if (dims % 128 != 0 or cut.lo % 128 != 0 or cut.hi % 128 != 0) return error.NotExl3Mcg4;
+    const width = cut.len();
+    var out: Experts = undefined;
+    out.shx = true;
+    const Mat = struct { k: usize, n: usize, by_cols: bool };
+    const mats = [_]Mat{
+        .{ .k = dims, .n = inter, .by_cols = true },
+        .{ .k = dims, .n = inter, .by_cols = true },
+        .{ .k = inter, .n = dims, .by_cols = false },
     };
-    try std.testing.expectEqual(total, seen.count());
-    const g = t.entry(.exl3_experts, kernels.sym.group).?;
-    try std.testing.expectEqual(@as(i64, experts.group_static), g.get("shared").?.integer);
-    try std.testing.expectEqual(@as(?u32, 101376 - experts.group_static), ls.items[0].max_dynamic);
+    var first_suh: ?[]const u8 = null;
+    inline for (mats, .{ "gate_proj", "up_proj", "down_proj" }, .{ "gt", "ut", "dt" }, .{ "suh_g", "suh_u", "suh_d" }, .{ "svh_g", "svh_u", "svh_d" }) |m, proj, tw, su, sv| {
+        const kt = (if (m.by_cols) m.k else width) / 16; // the rank's tiles
+        const nt = (if (m.by_cols) width else m.n) / 16;
+        for (0..count) |e| {
+            const t = try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".trellis", .{ i, e });
+            if (t.dtype != .i16 or t.rank != 3 or t.dim(0) != m.k / 16 or t.dim(1) != m.n / 16 or t.dim(2) != 64) return error.NotExl3Mcg4;
+            const marker = L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".mcg", .{ i, e }) catch return error.NotExl3Mcg4;
+            if (marker.dtype != .i32 or marker.numel() != 1 or marker.bytes.len != 4 or
+                std.mem.readInt(u32, marker.bytes[0..4], .little) != @import("core").exl3_load.markers[0].value)
+                return error.NotExl3Mcg4;
+            if (m.by_cols) { // every tile row, the rank's tile columns
+                const row = (m.n / 16) * tile;
+                for (0..kt) |r| try L.host.appendSlice(L.gpa, t.bytes[r * row + (cut.lo / 16) * tile ..][0 .. nt * tile]);
+            } else try L.host.appendSlice(L.gpa, t.bytes[(cut.lo / 16) * nt * tile ..][0 .. kt * nt * tile]); // its tile rows
+        }
+        const base = try L.put("layers.{d}.moe.exl3." ++ tw, .{i});
+        for (0..count) |e| {
+            const ptr = base + e * kt * nt * tile;
+            try L.host.appendSlice(L.gpa, std.mem.asBytes(&ptr));
+        }
+        @field(out, tw) = try L.put("layers.{d}.moe.exl3." ++ tw ++ "_ptrs", .{i});
+        for (0..count) |e| { // suh: the input's scales (gate, up: every input; down: the rank's)
+            const t = try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".suh", .{ i, e });
+            if (t.dtype != .f16 or t.numel() != m.k) return error.NotExl3Mcg4;
+            const mine = if (m.by_cols) t.bytes else t.bytes[cut.lo * 2 .. cut.hi * 2];
+            if (m.by_cols) { // one rotation shared by the layer's every gate and up input?
+                if (first_suh) |f| (if (!std.mem.eql(u8, f, mine)) {
+                    out.shx = false;
+                }) else first_suh = mine;
+            }
+            try L.host.appendSlice(L.gpa, mine);
+        }
+        @field(out, su) = try L.put("layers.{d}.moe.exl3." ++ su, .{i});
+        for (0..count) |e| { // svh: the output's scales (gate, up: the rank's; down: every output)
+            const t = try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".svh", .{ i, e });
+            if (t.dtype != .f16 or t.numel() != m.n) return error.NotExl3Mcg4;
+            try L.host.appendSlice(L.gpa, if (m.by_cols) t.bytes[cut.lo * 2 .. cut.hi * 2] else t.bytes);
+        }
+        @field(out, sv) = try L.put("layers.{d}.moe.exl3." ++ sv, .{i});
+    }
+    for (0..count) |_| {
+        const bits: i32 = 8;
+        try L.host.appendSlice(L.gpa, std.mem.asBytes(&bits));
+    }
+    out.k2 = try L.put("layers.{d}.moe.exl3.k2", .{i});
+    return out;
+}
+
+/// The selected common EXL3 owner. This file adapts the family's checkpoint shard and slot layout only.
+pub const Kernels = cuda.exl3_experts.Experts;
+const common = cuda.exl3_experts;
+pub const Scratch = struct { picks: u64, xg: u64, xu: u64, z: u64 };
+pub const top_k = 8;
+/// Rows a call to the common experts takes: each call reads every expert's weights, so a prompt pass needs few calls.
+pub const chunk_rows = 1024;
+/// The prompt item plan has no decode grouper's shared-memory cap; one call covers a supported whole prompt pass.
+pub const prompt_rows = 4096;
+fn layer(w: Experts, count: usize, dims: usize, width: usize, limit: f32) common.Layer {
+    return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.k2, .up_k2 = w.k2, .down_k2 = w.k2, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = count, .dims = dims, .width = width, .codebook = .mcg, .limit = limit, .act_mode = 0, .uniform_k2 = 8, .shared_input = w.shx };
+}
+fn shape(dims: usize, width: usize) common.Layer {
+    const w: Experts = .{ .gt = 0, .ut = 0, .dt = 0, .k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .shx = false };
+    return layer(w, cuda.grouped.max_experts, dims, width, 0);
+}
+/// A chunk's compacted picks ahead of the common scratch, 256-aligned; the usize keeps @min from narrowing to u7.
+fn picksBytes(rows: usize) usize {
+    const cap: usize = @min(rows, chunk_rows);
+    return std.mem.alignForward(usize, cap * top_k * 4, 256);
+}
+pub fn scratchBytes(rows: usize, dims: usize, width: usize, prefill: bool, shx: bool) [4]usize {
+    var l = shape(dims, width);
+    l.shared_input = shx;
+    if (prefill and common.prompt.eligible(l)) return .{ common.prompt.bytes(l, @min(rows, prompt_rows), top_k + 1) catch unreachable, 4, 4, 4 };
+    const n: usize = @min(rows, chunk_rows);
+    return .{ picksBytes(rows) + (common.scratchBytes(shape(dims, width), n, top_k) catch unreachable), 4, 4, 4 };
+}
+/// `height` rows of `width` bytes, `spitch` apart at `src`, to `dpitch` apart at `dst`, in one call.
+fn copyRows(stream: cuda.Stream, dst: u64, dpitch: usize, src: u64, spitch: usize, width: usize, height: usize, what: []const u8) !void {
+    const m: cuda.abi.Memcpy2D = .{ .src = src, .src_pitch = spitch, .dst = dst, .dst_pitch = dpitch, .width = width, .height = height };
+    try stream.d.check(stream.d.api.cuMemcpy2DAsync_v2(&m, stream.handle), what);
+}
+pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, plan_buf: cuda.grouped.Plan, x: u64, x_stride: usize, picks: u64, slots: usize, rows: usize, count: usize, dims: usize, width: usize, limit: f32, prompt: bool, ey: u64, xd: u64) !void {
+    return runRouter(k,ek.router,stream,w,sc,plan_buf,x,x_stride,picks,slots,rows,count,dims,width,limit,prompt,ey,xd);
+}
+/// Expert-only ownership needs the native plan router, not unused NVFP4 kernel/module owners.
+pub fn runRouter(k: *const Kernels, router: cuda.grouped.Router, stream: cuda.Stream, w: Experts, sc: Scratch, plan_buf: cuda.grouped.Plan, x: u64, x_stride: usize, picks: u64, slots: usize, rows: usize, count: usize, dims: usize, width: usize, limit: f32, prompt: bool, ey: u64, xd: u64) !void {
+    _ = xd;
+    if (slots != top_k + 1) return error.UnsupportedTopK;
+    if (dims % 256 != 0 or width % 128 != 0) return error.NotExl3Mcg4;
+    const l = layer(w, count, dims, width, limit);
+    if (prompt and common.prompt.eligible(l)) {
+        const scratch = try common.prompt.scratch(sc.picks, l, @min(rows, prompt_rows), slots);
+        var at: usize = 0;
+        while (at < rows) : (at += prompt_rows) {
+            const n: usize = @min(prompt_rows, rows - at);
+            try k.prompt.run(k, router, stream, l, x + at * x_stride * 2, x_stride, picks + at * slots * 4, n, scratch, plan_buf, ey + at * slots * dims * 4, count);
+        }
+        return;
+    }
+    return compact(k, stream, w, sc, x, x_stride, picks, slots, rows, count, dims, width, limit, ey);
+}
+
+/// Compact routed picks and output for decode or prompt layers without the whole-pass kernel.
+fn compact(k: *const Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, x: u64, x_stride: usize, picks: u64, slots: usize, rows: usize, count: usize, dims: usize, width: usize, limit: f32, ey: u64) !void {
+    const l = layer(w, count, dims, width, limit);
+    const cap: usize = @min(rows, chunk_rows);
+    const arena = sc.picks + picksBytes(rows);
+    var at: usize = 0;
+    while (at < rows) : (at += chunk_rows) {
+        const n: usize = @min(chunk_rows, rows - at);
+        try copyRows(stream, sc.picks, top_k * 4, picks + at * slots * 4, slots * 4, top_k * 4, n, "EXL3 compact route rows");
+        const scratch = try common.scratch(arena, l, cap, top_k);
+        try k.runSlots(stream, l, x + at * x_stride * 2, x_stride, .bf16, sc.picks, n, scratch);
+        const output = scratch.y;
+        try copyRows(stream, ey + at * slots * dims * 4, slots * dims * 4, output, top_k * dims * 4, top_k * dims * 4, n, "EXL3 routed output slots");
+    }
+}
+
+test "EXL3 admission: Mia-AiLab's block passes; other widths and codebooks are refused by name" {
+    const gpa = std.testing.allocator;
+    const mia =
+        \\{"quantization_config": {"quant_method": "exl3", "bits": 4, "codebook": "mcg", "head_bits": 16}}
+    ;
+    try std.testing.expect(isExl3(gpa, mia));
+    var why: modelopt.Why = .{};
+    try admit(gpa, mia, &why);
+    try std.testing.expect(!isExl3(gpa, "{\"quantization_config\": {\"quant_method\": \"modelopt\"}}"));
+    try std.testing.expect(!isExl3(gpa, "{}"));
+    try std.testing.expectError(error.UnsupportedQuant, admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 3, \"codebook\": \"mcg\"}}", &why));
+    try std.testing.expectEqualStrings("EXL3 at 3 bits: the CUDA family reads 4-bit EXL3 experts", why.text());
+    try std.testing.expectError(error.UnsupportedQuant, admit(gpa, "{\"text_config\": {\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mul1\"}}}", &why));
+    try std.testing.expectEqualStrings("EXL3 codebook \"mul1\": the CUDA family reads \"mcg\"", why.text());
+}
+
+test "a chunk's compacted picks end before the common scratch at every row count" {
+    for (1..3 * chunk_rows) |rows| {
+        const cap: usize = @min(rows, chunk_rows);
+        try std.testing.expect(picksBytes(rows) >= cap * top_k * 4);
+        try std.testing.expectEqual(@as(usize, 0), picksBytes(rows) % 256);
+    }
+}
+
+test "GLM's routed experts run on the common EXL3 module's kernels" {
+    try std.testing.expect(Kernels == cuda.exl3_experts.Experts);
 }

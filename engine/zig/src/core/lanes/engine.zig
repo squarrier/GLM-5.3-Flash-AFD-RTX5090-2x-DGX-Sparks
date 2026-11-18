@@ -12,34 +12,47 @@ const shape = @import("shape.zig");
 const plan_lanes = @import("plan_lanes.zig");
 const fill = @import("fill.zig");
 const trail = @import("trail.zig");
+const lone_costs = @import("lone_costs.zig");
 const open = @import("open.zig");
+const handover = @import("handover.zig");
+const trim = @import("trim.zig");
 const Stream = sm.Stream;
 const Feed = be.Feed;
+const LogRow = @import("logprob.zig").Row;
 const Plan = win.Plan;
 const f = ev.f;
 const str = trail.str;
 const int = trail.int;
-
 const Outcome = struct { got: []const u32, path: []const u32, cut: ?usize, follow: []const u32 };
 const Result = struct { rows: u32, keep: u32, got: []const u32 };
 const Unread = struct { event: usize, handle: u64 };
-
 pub const Engine = struct {
+    const pieces_ = @import("pieces.zig");
+    pub const beginStream = pieces_.beginStream;
+    pub const piece = pieces_.piece;
+    pub const pieces = pieces_.pieces;
+    pub const prepareFinals = pieces_.prepareFinals;
+    pub const finishStream = pieces_.finishStream;
+    pub const finishStreams = pieces_.finishStreams;
     gpa: Allocator,
     cfg: *const Config,
     backend: be.Backend,
     clock: be.Clock,
     log: ?*ev.Log = null,
+    trim: ?trim.Trim = null, // a family's row policy in place of the built-in allocation (lanes/trim.zig)
     rule: depth.Rule,
     live: std.ArrayList(*Stream) = .empty, // admitted streams in admission order (Python `_live`)
     drafted: u64 = 0,
     accepted: u64 = 0,
     shared_rounds: u64 = 0,
+    late: @import("late_draft.zig").State = .{},
     alone: bool = true, // this step has one live stream: its copies may take their ramp
+    lone_kept: [2][lone_costs.bands]?lone_costs.Kept = @splat(@splat(null)), // the newest lone calibrations, greedy then sampled, a band each
     steps: u64 = 0,
+    grammar_round: @import("grammar_time.zig").Round = .{},
+    grammar_workers: @import("grammar_parallel.zig").State = .{},
     arena: std.heap.ArenaAllocator, // a round's temporaries
     unread: std.ArrayList(Unread) = .empty, // queued draws the log reads at the step's end
-
     pub fn init(gpa: Allocator, cfg: *const Config, backend: be.Backend, clock: be.Clock) Engine {
         return .{
             .gpa = gpa,
@@ -55,17 +68,24 @@ pub const Engine = struct {
                 .family_costs = &cfg.family_costs,
                 .shared_costs = &cfg.shared_costs,
                 .mtp_step_ms = cfg.mtp_step_ms,
+                .draft_step_ms = cfg.draft_step_ms,
                 .plain_guard = cfg.plain_guard,
                 .node_probabilities = cfg.node_probabilities,
+                .granted_depth = cfg.granted_depth,
+                .confidence_floor = cfg.draft_confidence,
+                .plain_streams = cfg.plain_streams,
                 .batch_rows = cfg.batch_rows,
+                .batched_heads = cfg.draft_streams,
             },
         };
     }
 
     pub fn deinit(e: *Engine) void {
+        e.grammar_workers.deinit(e.gpa);
         e.live.deinit(e.gpa);
         e.unread.deinit(e.gpa);
         e.rule.deinit();
+        for (&e.lone_kept) |*mode| for (mode) |*k| if (k.*) |*x| x.deinit(e.gpa);
         e.arena.deinit();
     }
 
@@ -75,47 +95,27 @@ pub const Engine = struct {
         for (e.live.items) |s| n += @intFromBool(!s.finished);
         return n;
     }
-
     pub const addStream = open.add;
+    pub const addStreamCommitted = open.addCommitted;
+    pub const addStreams = open.addStreams;
+    pub const batchable = open.batchable;
+    pub const max_together = open.max_together;
+
+    /// Whether the backend prefills several prompts in one pass (addStreams batches them).
+    pub fn batchesPrompts(e: *const Engine) bool {
+        return e.backend.vtable.prefill_many != null;
+    }
     pub const opened = open.opened;
     pub const fills = open.fills;
     pub const fillStream = open.fillStream;
-
-    /// Take over a stream another driver decoded so far: its cache settled, `pending` and `cache_len` set, no drafts held.
-    pub fn adopt(e: *Engine, s: *Stream) !void {
-        try e.live.append(e.gpa, s);
-    }
-
-    /// user_drafts: hand a live stream to a backend's lone driver between rounds (LaneHost's resume): off the live list,
-    /// nothing released (its cache, its backend slot and `pending` stay); `adopt` takes it back.
-    pub fn detach(e: *Engine, s: *Stream) void {
-        for (e.live.items, 0..) |x, i| if (x == s) {
-            _ = e.live.orderedRemove(i);
-            return;
-        };
-    }
-
-    /// Release a cancelled stream between rounds: no pending draws or drafts.
-    pub fn discard(e: *Engine, s: *Stream) void {
-        e.discardAs(s, .cancelled);
-    }
-
-    /// Release a stream between rounds as `reason` ends it (a failed round's: `.@"error"`): no pending draws or drafts.
-    pub fn discardAs(e: *Engine, s: *Stream, reason: sm.Reason) void {
-        s.finished = true;
-        s.reason = reason;
-        for (e.live.items, 0..) |x, i| {
-            if (x == s) {
-                _ = e.live.orderedRemove(i);
-                break;
-            }
-        }
-        e.release(s);
-    }
+    pub const fillStreamCommitted = open.fillStreamCommitted;
+    pub const adopt = handover.adopt;
+    pub const detach = handover.detach;
+    pub const discard = handover.discard;
+    pub const sweep = handover.sweep;
 
     /// One round for every live stream (Python `_family_step`).
     pub fn step(e: *Engine) !void {
-        if (try @import("structured.zig").step(e)) return;
         _ = e.arena.reset(.retain_capacity);
         const a = e.arena.allocator();
         try trail.event(e, &.{ f("ev", str("step")), f("index", int(e.steps)) });
@@ -138,6 +138,9 @@ pub const Engine = struct {
             live.shrinkRetainingCapacity(kept);
         }
         e.alone = live.items.len == 1;
+        if (!e.alone) for (live.items) |s| {
+            s.shared_round = true;
+        };
         if (live.items.len > 1 and e.cfg.family_streams) {
             const chosen = try e.takeTurns(live.items);
             e.shared_rounds += 1;
@@ -145,22 +148,14 @@ pub const Engine = struct {
             try e.roundStreams(chosen);
         } else {
             for (live.items) |s| {
-                const r = if ((e.cfg.family_mtp and s.drafts) or !e.cfg.pipelined) try e.familyRound(s, null) else try e.pipelinedRound(s);
+                // logprobs and grammars take verify windows: rows' logits are read, or bits made, before a forward
+                const windowed = (e.cfg.family_mtp and s.drafts) or !e.cfg.pipelined or s.logprobs != null or s.grammar != null;
+                const r = if (windowed) try e.familyRound(s, null) else try e.pipelinedRound(s);
                 s.min_rows = if (s.min_rows == 0) r.rows else @min(s.min_rows, r.rows);
             }
         }
         try trail.resolve(e);
-        var kept: usize = 0;
-        for (e.live.items) |s| {
-            if (s.finished) {
-                try trail.finish(e, s);
-                e.release(s);
-                continue;
-            }
-            e.live.items[kept] = s;
-            kept += 1;
-        }
-        e.live.shrinkRetainingCapacity(kept);
+        try e.sweep();
         try trail.state(e);
     }
 
@@ -186,7 +181,8 @@ pub const Engine = struct {
         for (order) |i| {
             const s = live[i];
             const need: u64 = if (s.drafts) @min(@min(e.cfg.base_width, e.cfg.batch_rows), 1 + s.force.items.len) else 1;
-            if (chosen.items.len == e.cfg.batch_streams or (chosen.items.len > 0 and rows + need > e.cfg.batch_rows)) break;
+            if (chosen.items.len == e.cfg.batch_streams) break;
+            if (chosen.items.len > 0 and rows + need > e.cfg.batch_rows) continue;
             try chosen.append(a, i);
             rows += need;
         }
@@ -202,27 +198,24 @@ pub const Engine = struct {
     }
 
     /// One stream's round: verify pending and drafted tokens together, keep drafts to the first mismatch.
-    fn familyRound(e: *Engine, s: *Stream, copied: ?[]const u32) !Result {
+    fn familyRound(e: *Engine, s: *Stream, copied: ?win.Copy) !Result {
         e.clock.start();
+        try e.late.flush(e, Engine.askDrafts);
         const priced = s.priced;
         s.priced = null;
         const a = e.arena.allocator();
         var plans = [_]Plan{try win.plan(e, s, copied)};
-        if (plans[0].kind == .head and e.cfg.node_probabilities) try win.allocate(e, &plans);
+        if (plans[0].kind == .head and (e.cfg.node_probabilities or e.trim != null or lone_costs.enabled(e, plans[0]))) try win.allocate(e, &plans);
+        try win.constrain(e, &plans[0]);
         const plan = plans[0];
-        const early = e.cfg.family_mtp and s.drafts and plan.kind != .forced and e.cfg.speculate_early and plan.parents == null;
+        const early = e.cfg.family_mtp and s.drafts and plan.kind != .forced and e.cfg.speculate_early and plan.parents == null and s.grammar == null;
         const windows = [_]be.Window{try win.build(e, plan, early)};
         const rows = windows[0].rows();
-        var out = [_]be.Verified{.{ .sampled = try a.alloc(u32, rows), .drafts = try a.alloc(u32, rows - 1) }};
+        var out = [_]be.Verified{.{ .sampled = try a.alloc(u32, rows), .drafts = try a.alloc(u32, rows - 1), .rows = if (s.logprobs != null) try a.alloc(LogRow, rows) else &.{} }};
         try e.backend.verify(&windows, &out);
-        if (e.cfg.single_row_streams and s.isCancelled()) {
-            s.finished = true;
-            s.reason = .cancelled;
-            return .{ .rows = 1, .keep = 0, .got = &.{} };
-        }
         const tokens = try win.tokens(e, windows[0], out[0]);
         const parents = try win.rowParents(e, windows[0]);
-        const o = try e.conclude(s, plan, out[0].sampled, tokens, parents, windows[0].positions);
+        const o = try e.conclude(s, plan, out[0].sampled, out[0].rows, tokens, parents, windows[0].positions);
         if (o.path.len < rows or plan.parents != null) try e.backend.keep(&windows, &.{o.path});
         const held_levels = s.held_levels;
         if (e.cfg.family_mtp and s.drafts) {
@@ -234,14 +227,15 @@ pub const Engine = struct {
                 if (early) if (e.backend.vtable.unspeculate) |undo| try undo(e.backend.ptr, s);
                 try e.draftLate(s, plan.position, o.follow, o.path, null);
             }
-            if (plan.kind == .head or (plan.kind == .none and e.cfg.plain_guard)) {
+            if (e.cfg.timed and (plan.kind == .head or (plan.kind == .none and e.cfg.plain_guard))) {
                 const ms = e.clock.elapsedMs(.cost);
                 const first = s.rounds == 1; // a stream's first round carries the prefill-to-decode switch
                 try trail.event(e, &.{ f("ev", str("cost")), f("stream", str(s.id)), f("drafts", int(rows - 1)), f("init", .{ .bool = first }), f("ms", ev.bits(ms)) });
                 try e.rule.observeCost(@intCast(rows - 1), ms, first, win.who(s));
+                lone_costs.observe(s, plan.cost_probe_rows, rows, ms);
             }
         }
-        if (s.graft_room != null and s.rounds > 1) {
+        if (e.cfg.timed and s.graft_room != null and s.rounds > 1) {
             // the stream's round time beyond its window and head levels, for the lane planner
             if (e.cfg.lane_costs.get(@intCast(rows))) |w| {
                 const over = e.clock.elapsedMs(.cost) - w - e.cfg.mtp_step_ms * @as(f64, @floatFromInt(held_levels));
@@ -251,54 +245,38 @@ pub const Engine = struct {
             // the pick that shaped this round, priced from its own measured rounds next time
             if (priced) |p| s.measured[p.choice].add(e.clock.elapsedMs(.cost) - p.ms);
         }
-        if (plan.kind == .head) {
+        if (e.cfg.timed and plan.kind == .head) {
             const ms = e.clock.elapsedMs(.overhead);
             try trail.event(e, &.{ f("ev", str("overhead")), f("streams", int(1)), f("rows", int(rows)), f("ms", ev.bits(ms)) });
-            try e.rule.observeOverhead(1, rows, ms);
+            try e.rule.observeOverhead(1, rows, ms, s.sampling != null, 0.0);
         }
+        if (e.backend.round_observer != null) e.backend.observed(&.{o.path});
         return .{ .rows = @intCast(rows), .keep = @intCast(o.path.len), .got = o.got };
     }
 
     /// The stream windows of a shared round in one forward, then each verified, committed and drafted on its own.
-    fn roundStreams(e: *Engine, chosen: []*Stream) !void {
+    fn roundStreams(e: *Engine, entries: []*Stream) !void {
         e.clock.start();
+        try e.late.flush(e, Engine.askDrafts);
         const a = e.arena.allocator();
-        // structured_users: each structured stream's row mask (structured.rows; null without one: the round as before)
-        const masked = try @import("structured.zig").rows(e, chosen);
-        const entries = if (masked) |m| m.streams else chosen;
-        if (entries.len == 0) return;
         const plans = try a.alloc(Plan, entries.len);
         for (entries, plans) |s, *p| p.* = try win.plan(e, s, null);
         try win.allocate(e, plans);
+        try @import("grammar_parallel.zig").constrain(e, plans);
         const windows = try a.alloc(be.Window, plans.len);
         const out = try a.alloc(be.Verified, plans.len);
         var total: u64 = 0;
-        for (plans, windows, out, 0..) |p, *w, *o, i| {
+        for (plans, windows, out) |p, *w, *o| {
             w.* = try win.build(e, p, false);
-            if (masked) |m| w.masks = m.masks[i];
-            o.* = .{ .sampled = try a.alloc(u32, w.rows()), .drafts = try a.alloc(u32, w.rows() - 1) };
+            o.* = .{ .sampled = try a.alloc(u32, w.rows()), .drafts = try a.alloc(u32, w.rows() - 1), .rows = if (p.stream.logprobs != null) try a.alloc(LogRow, w.rows()) else &.{} };
             total += w.rows();
         }
         try e.backend.verify(windows, out);
         const outcomes = try a.alloc(Outcome, plans.len);
         const paths = try a.alloc([]const u32, plans.len);
         for (plans, windows, out, outcomes, paths) |p, w, o, *oc, *path| {
-            if (e.cfg.single_row_streams and p.stream.isCancelled()) {
-                p.stream.finished = true;
-                p.stream.reason = .cancelled;
-                oc.* = .{ .got = &.{}, .path = &.{}, .cut = null, .follow = &.{} };
-                path.* = &.{};
-                continue;
-            }
             const tokens = try win.tokens(e, w, o);
-            oc.* = e.conclude(p.stream, p, o.sampled, tokens, try win.rowParents(e, w), w.positions) catch |err| {
-                if (p.stream.rules == null) return err;
-                // structured_users: a structured stream whose grammar refused its committed token ends alone; the others go on
-                @import("structured.zig").end(p.stream, err);
-                oc.* = .{ .got = &.{}, .path = &.{}, .cut = null, .follow = &.{} };
-                path.* = &@import("structured.zig").row0;
-                continue;
-            };
+            oc.* = try e.conclude(p.stream, p, o.sampled, o.rows, tokens, try win.rowParents(e, w), w.positions);
             path.* = oc.path;
             const rows: u32 = @intCast(w.rows());
             p.stream.min_rows = if (p.stream.min_rows == 0) rows else @min(p.stream.min_rows, rows);
@@ -310,7 +288,11 @@ pub const Engine = struct {
         const whos = try a.alloc(depth.Who, heads.items.len);
         for (whos, heads.items) |*w, i| w.* = win.who(plans[i].stream);
         const budgets = try a.alloc(i64, heads.items.len);
-        try e.rule.budgets(whos, win.probe(e), budgets);
+        const sampled = win.anySampled(plans);
+        if (e.cfg.allocate_shared_drafts)
+            try @import("shared_drafts.zig").budgets(e, plans, heads.items, budgets)
+        else
+            try e.rule.budgets(whos, win.probe(e), sampled, budgets);
         const ids = try a.alloc(ev.Value, heads.items.len);
         for (ids, heads.items) |*id, i| id.* = str(plans[i].stream.id);
         try trail.event(e, &.{ f("ev", str("budgets")), f("streams", .{ .list = ids }), f("depths", .{ .i64s = budgets }) });
@@ -325,14 +307,25 @@ pub const Engine = struct {
         } else {
             for (heads.items, budgets) |i, d| try e.draftLate(plans[i].stream, plans[i].position, outcomes[i].follow, outcomes[i].path, d);
         }
+        if (e.cfg.root_copies) for (heads.items, budgets) |i, *d| {
+            if (plans[i].stream.next) |held| if (held.count == 0) {
+                d.* = 0;
+            };
+        };
         try e.backend.keep(windows, paths);
-        const ms = e.clock.elapsedMs(.overhead);
-        try trail.event(e, &.{ f("ev", str("overhead")), f("streams", int(plans.len)), f("rows", int(total)), f("ms", ev.bits(ms)) });
-        try e.rule.observeOverhead(@intCast(plans.len), total, ms);
+        if (e.cfg.timed) {
+            // the drafts budgets priced past each stream's first are no part of the round's overhead
+            var steps: i64 = 0;
+            for (budgets) |d| steps = if (e.cfg.draft_streams and depth.pricedBatched()) @max(steps, d - 1) else steps + @max(0, d - 1);
+            const ms = e.clock.elapsedMs(.overhead) - e.cfg.draft_step_ms * @as(f64, @floatFromInt(steps));
+            try trail.event(e, &.{ f("ev", str("overhead")), f("streams", int(plans.len)), f("rows", int(total)), f("ms", ev.bits(ms)) });
+            try e.rule.observeOverhead(@intCast(plans.len), total, ms, sampled, e.rule.headMs(budgets));
+        }
+        if (e.backend.round_observer != null) e.backend.observed(paths);
     }
 
-    /// Commit the target-sampled path (after the thinking budget's cut); the kept rows and their following tokens.
-    fn conclude(e: *Engine, s: *Stream, p: Plan, sampled: []const u32, tokens: []const u32, parents: []const i32, positions: []const u64) !Outcome {
+    /// Commit the target-sampled path (after the thinking budget's cut), each token with its path row's logprob row.
+    fn conclude(e: *Engine, s: *Stream, p: Plan, sampled: []const u32, rows_lp: []const LogRow, tokens: []const u32, parents: []const i32, positions: []const u64) !Outcome {
         const a = e.arena.allocator();
         const rows = tokens.len;
         var path: []u32 = undefined;
@@ -344,40 +337,70 @@ pub const Engine = struct {
             try committed.append(a, s.popForce() orelse sampled[rows - 1]);
         } else {
             path = try accept.acceptPath(a, tokens, parents, sampled);
-            for (path[1..]) |r| try committed.append(a, tokens[r]);
+            for (path[1..]) |r| try committed.append(a, accept.targetPick(sampled, parents, r));
             try committed.append(a, sampled[path[path.len - 1]]);
+            if (s.proposer) |pr| pr.round(@intCast(rows), @intCast(path.len - 1));
             if (rows > 1) {
                 const kept = path.len - 1;
                 e.drafted += rows - 1;
                 e.accepted += kept;
                 s.drafted += rows - 1;
                 s.accepted += kept;
+                // the proposal's own rows: the grammar's drafts after them are neither the proposer's nor the head's
+                const own_end = if (p.grammar_from > 0) p.grammar_from else rows;
+                var own_kept: usize = 0;
+                for (path[1..]) |r| own_kept += @intFromBool(r < own_end);
+                const own: usize = own_end - 1;
                 if (p.kind == .copy) {
-                    if (s.proposer) |pr| pr.observe(@intCast(rows - 1), @intCast(kept));
+                    win.observeCopied(e, s, p.recalled, own_kept, own);
                     if (e.alone) {
                         const width = s.copy_width orelse e.cfg.first_copy;
-                        s.copy_width = if (kept == rows - 1) @min(e.cfg.max_copy, 2 * width + 1) else e.cfg.first_copy;
+                        s.copy_width = if (own_kept == own) @min(e.cfg.max_copy, 2 * width + 1) else e.cfg.first_copy;
                     }
                 } else if (p.kind == .head) {
-                    if (p.lanes) |l| if (s.odds != null) observeLanes(s, l, path);
+                    if (p.lanes) |l| if (s.odds != null) s.observeLanes(l, path);
                     const ds = try accept.depths(a, parents);
-                    const chain = if (p.branch_from > 0) ds[0..p.branch_from] else ds;
+                    const chain = if (p.branch_from > 0) ds[0..p.branch_from] else ds[0..own_end];
                     var chain_kept: usize = 0;
-                    for (path[1..]) |r| chain_kept += @intFromBool(p.branch_from == 0 or r < p.branch_from);
+                    for (path[1..]) |r| chain_kept += @intFromBool((p.branch_from == 0 or r < p.branch_from) and r < own_end);
                     try e.rule.observeDepth(win.who(s), std.mem.max(u32, chain), @intCast(chain_kept));
                 }
-                var kept_branch: u64 = 0;
-                if (p.branch_from > 0) {
+                var kept_branch: u64 = 0; // the context's graft rows kept, then Recall's
+                var kept_recall: u64 = 0;
+                var recall_rows: u64 = 0;
+                if (p.branch_from > 0 and p.branch_from < rows) {
                     s.branch_rows += rows - p.branch_from;
-                    for (path[1..]) |r| kept_branch += @intFromBool(r >= p.branch_from);
-                    s.branch_accepted += kept_branch;
+                    for (@as(usize, p.branch_from)..rows) |r| recall_rows += @intFromBool(p.recallRow(r));
+                    for (path[1..]) |r| if (r >= p.branch_from) {
+                        if (p.recallRow(r)) kept_recall += 1 else kept_branch += 1;
+                    };
+                    s.branch_accepted += kept_branch + kept_recall;
+                    if (p.context_copy) if (s.proposer) |pr| pr.observe(@intCast(rows - p.branch_from), @intCast(kept_branch));
+                    // a copy whose anchor row landed: its kept run, and whether it broke before its end
+                    const anchor = parents[p.branch_from];
+                    if (p.context_copy and (anchor <= 0 or std.mem.indexOfScalar(u32, path, @intCast(anchor)) != null))
+                        win.observeCopy(e, s, p.copy_trusted, kept_branch, rows - p.branch_from);
                 }
                 if (p.tried) {
-                    const tried: f64 = @floatFromInt(if (p.branch_from > 0) rows - p.branch_from else 1);
-                    s.graft_hit = 0.75 * s.graft_hit + 0.25 * @as(f64, @floatFromInt(kept_branch)) / tried;
+                    // grafting nothing is the context's miss; rows Recall grafted count for Recall alone
+                    const grafted: u64 = if (p.branch_from > 0) rows - p.branch_from else 0;
+                    if (grafted == 0 or grafted > recall_rows) {
+                        const tried: f64 = @floatFromInt(@max(1, grafted - recall_rows));
+                        s.graft_hit = 0.75 * s.graft_hit + 0.25 * @as(f64, @floatFromInt(kept_branch)) / tried;
+                    }
+                    if (recall_rows > 0) {
+                        const share = @as(f64, @floatFromInt(kept_recall)) / @as(f64, @floatFromInt(recall_rows));
+                        s.recall_hit = 0.75 * s.recall_hit + 0.25 * share;
+                    }
                 }
             }
+            if (s.recall) |r| if (p.kind != .copy) r.noteHead(path.len); // its own rounds: the bar a copy must beat
         }
+        if (e.trim) |t| if (p.kind != .forced) {
+            const chain = parents.len == 0 or accept.isChain(parents);
+            try t.commit(.{ .stream = s, .drafted = p.kind == .head, .rows = @intCast(rows), .parents = if (chain) null else parents, .path = path, .bonus = sampled[path[path.len - 1]] });
+        };
+        if (e.cfg.root_copies) s.root_copy_miss = p.kind == .copy and path.len < rows;
         const budget_cut = s.thinkCut(committed.items);
         const loop_cut = sm.loopCut(s, committed.items);
         const loop_wins = if (loop_cut) |c| budget_cut == null or c < budget_cut.? else false;
@@ -393,7 +416,12 @@ pub const Engine = struct {
             try committed.append(a, try s.startClose(e.gpa));
         }
         s.rounds += 1;
-        const landed = try s.commit(e.gpa, committed.items);
+        var committed_rows: []LogRow = &.{};
+        if (rows_lp.len > 0) {
+            committed_rows = try a.alloc(LogRow, committed.items.len);
+            for (committed_rows, committed.items, path[0..committed.items.len]) |*r, t, row| r.* = rows_lp[row].forToken(t);
+        }
+        const landed = try s.commit(e.gpa, committed.items, committed_rows);
         const got = committed.items[0..landed];
         if (s.finished and got.len < path.len) path = path[0 .. got.len + 1];
         const keep = path.len;
@@ -415,10 +443,16 @@ pub const Engine = struct {
     fn draftLate(e: *Engine, s: *Stream, start: u64, follow: []const u32, path: []const u32, budget: ?i64) !void {
         var w = win.who(s);
         const d: u32 = @intCast(try e.rule.headDepth(&w, budget, win.probe(e)));
-        try e.askDrafts(&.{.{ .stream = s, .follow = follow, .rows = path, .start = start, .position = s.cache_len + 1, .depth = d }});
+        const request: be.DraftRequest = .{ .stream = s, .follow = follow, .rows = path, .start = start, .position = s.cache_len + 1, .depth = d };
+        if (!e.late.put(e.backend.defer_lone_draft and e.alone, request)) try e.askDrafts(&.{request});
     }
 
-    fn askDrafts(e: *Engine, requests: []const be.DraftRequest) !void {
+    pub const testing = if (@import("builtin").is_test) struct {
+        pub const askDrafts = Engine.askDrafts;
+    } else struct {};
+
+    fn askDrafts(e: *Engine, original: []const be.DraftRequest) !void {
+        const requests = try @import("root_copy.zig").prepare(e, original);
         for (requests) |r| try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(r.stream.id)), f("depth", int(r.depth)), f("position", int(r.position)), f("follow", .{ .u32s = r.follow }), f("rows", if (r.rows) |x| .{ .u32s = x } else .null) });
         // a lone stream's lanes: the head tree or chain + grafts with the most expected tokens a round time
         var lone: ?shape.Shape = null;
@@ -429,9 +463,9 @@ pub const Engine = struct {
             const s = requests[0].stream;
             if (s.odds == null) s.odds = shape.Odds.init(shape.start_odds, shape.start_weight);
             const cap: usize = @intCast(@max(1, @min(@min(shape.max_depth, e.cfg.head_depth), s.draftRoom() - 1)));
-            const costs = plan_lanes.Costs{ .window = &e.cfg.lane_costs, .head_ms = e.cfg.mtp_step_ms, .over_ms = s.round_over orelse 0, .tree_over_ms = s.tree_over, .measured = if (e.cfg.own_prices) &s.measured else null };
+            const costs = plan_lanes.Costs{ .window = &e.cfg.lane_costs, .head_ms = e.cfg.mtp_step_ms, .over_ms = s.round_over orelse 0, .tree_over_ms = s.tree_over, .measured = if (e.cfg.own_prices and e.cfg.timed) &s.measured else null };
             // every eighth round one size wider than the best, so the odds of deeper lanes stay measured
-            const p = try plan_lanes.pick(e.gpa, s.odds.?, costs, e.cfg.head_lanes, cap, try e.graftProspect(s), s.rounds % 8 == 4);
+            const p = try plan_lanes.pick(e.gpa, s.odds.?, costs, e.cfg.head_lanes, cap, try win.graftProspect(e, s), s.rounds % 8 == 4);
             s.picks[p.choice] += 1;
             s.graft_room = p.grafts;
             if (plan_lanes.tablePrice(costs, p)) |ms| s.priced = .{ .choice = p.choice, .ms = ms };
@@ -440,7 +474,7 @@ pub const Engine = struct {
                 // a chain-shaped tree drafts and verifies as the head's chain
                 lone = t;
                 if (t.isChain()) one[0].depth = @intCast(t.parents.len) else one[0].lanes = &lone.?;
-                s.held_levels = levelsOf(t);
+                s.held_levels = t.levels();
             } else {
                 one[0].depth = p.depth;
                 one[0].ranks = true;
@@ -448,68 +482,35 @@ pub const Engine = struct {
             }
             asked = &one;
         } else if (requests.len == 1) requests[0].stream.held_levels = requests[0].depth;
-        try e.backend.draft(asked);
+        try e.backend.draftIn(e.arena.allocator(), asked);
         for (asked) |r| {
             r.stream.dropHeld(e.gpa);
-            r.stream.next = .{ .count = r.depth };
-            if (lone) |l| {
+            r.stream.next = .{ .count = r.heldDepth(e.backend) };
+            if (r.heldDepth(e.backend) == 0 and e.backend.proposals()) {
+                if (lone) |l| l.deinit(e.gpa);
+                lone = null;
+            } else if (lone) |l| {
                 if (r.lanes != null) r.stream.next = .{ .count = @intCast(l.parents.len), .parents = try e.gpa.dupe(i32, l.parents) };
                 r.stream.lanes = l;
                 lone = null;
-            } else if (e.backend.vtable.tree) |tree| {
+            } else if (r.heldDepth(e.backend) > 0) if (e.backend.vtable.tree) |tree| {
                 if (try tree(e.backend.ptr, r.stream, e.gpa)) |held| r.stream.next = held;
-            }
-        }
-    }
-
-    /// The rows a stream's suffix matches would graft this round and the share of grafted rows it keeps (null: none).
-    fn graftProspect(e: *Engine, s: *Stream) !?plan_lanes.Grafts {
-        if (e.cfg.fill_lanes == 0) return null;
-        const probe_round = s.rounds % 8 == 0;
-        if (s.graft_hit < e.cfg.fill_floor and !probe_round) return null;
-        const a = e.arena.allocator();
-        const room = e.cfg.fill_lanes -| 1;
-        const found = try fill.suffixCandidates(a, s.context.items, 16, e.cfg.fill_match, room, 8);
-        if (found.len == 0) return null;
-        const b = try fill.graft(a, .{}, found, room);
-        // the stream's recent share of grafted rows kept; every eighth round at least the floor, so grafts get retried
-        const hit = if (probe_round) @max(s.graft_hit, e.cfg.fill_floor) else s.graft_hit;
-        return .{ .rows = @intCast(b.tokens.len), .hit = hit };
-    }
-
-    fn levelsOf(t: shape.Shape) u32 {
-        var most: u32 = 0;
-        for (t.depths) |d| most = @max(most, d);
-        return most + 1;
-    }
-
-    /// Each held tree lane whose parent row the round reached: the target took it or not (its depth and rank).
-    fn observeLanes(s: *Stream, l: *const shape.Shape, path: []const u32) void {
-        var on: [256]bool = @splat(false);
-        for (path) |r| if (r < on.len) {
-            on[r] = true;
-        };
-        for (l.parents, l.depths, l.ranks, 0..) |par, d, r, i| {
-            const parent_row: usize = if (par < 0) 0 else 1 + @as(usize, @intCast(par));
-            if (!on[parent_row]) continue;
-            const took = on[1 + i];
-            s.odds.?.observe(d, r, took);
-            if (d < shape.max_depth and r < shape.ranks) {
-                s.landed[d][r][0] += 1;
-                s.landed[d][r][1] += @intFromBool(took);
-            }
+            };
         }
     }
 
     /// One token, the next forward queued first; a copied continuation ahead switches to verify windows.
     fn pipelinedRound(e: *Engine, s: *Stream) !Result {
         const before = s.mode;
-        const mode = s.mode orelse .pipe;
+        // an adopted stream holds neither a mode nor a queued step: it starts where a drain step leaves one
+        const mode: sm.Mode = s.mode orelse if (s.inflight == null) .verify else .pipe;
         var result: Result = .{ .rows = 1, .keep = 1, .got = &.{} };
         if (mode == .verify or mode == .exit) {
-            const proposal = if (mode == .verify and e.cfg.family_width >= 2) try win.copyProposal(e, s) else &.{};
-            if (proposal.len > 0) {
-                result = try e.familyRound(s, try e.arena.allocator().dupe(u32, proposal));
+            const verifying = mode == .verify and e.cfg.family_width >= 2;
+            const proposal: win.Copy = if (verifying) try win.copyProposal(e, s) else .{};
+            if (proposal.tokens.len > 0) {
+                const copied = try e.arena.allocator().dupe(u32, proposal.tokens);
+                result = try e.familyRound(s, .{ .tokens = copied, .recalled = proposal.recalled });
                 if (result.keep == 1 or s.force.items.len > 0) s.mode = .exit;
             } else {
                 // nothing to copy: back to steps queued ahead (this one lands next round)
@@ -531,9 +532,12 @@ pub const Engine = struct {
             token = try e.readFeed(current);
         }
         s.rounds += 1;
-        const landed = try s.commit(e.gpa, &.{token});
+        const landed = try s.commit(e.gpa, &.{token}, &.{});
         s.pending = token;
-        if (e.cfg.family_width >= 2 and (s.mode orelse .pipe) == .pipe and !s.finished and s.drafts and (try win.copyProposal(e, s)).len > 0)
+        if (s.recall) |r| r.noteHead(1); // a step lands one token: the bar a copy must beat
+        if (e.cfg.root_copies) s.root_copy_miss = false;
+        const piping = e.cfg.family_width >= 2 and (s.mode orelse .pipe) == .pipe and !s.finished and s.drafts;
+        if (piping and (try win.copyProposal(e, s)).tokens.len > 0)
             s.mode = .drain; // a copy window is ahead: land the queued step
         result.got = try e.arena.allocator().dupe(u32, s.emitted()[s.emitted().len - landed ..]);
         try trail.pipe(e, s, before, result.got);
@@ -547,10 +551,18 @@ pub const Engine = struct {
         if (try e.forcedNext(s)) |t| current = .{ .value = t };
         const token = try e.readFeed(current);
         s.rounds += 1;
-        const landed = try s.commit(e.gpa, &.{token});
+        const landed = try s.commit(e.gpa, &.{token}, &.{});
         s.pending = token;
         s.mode = .verify;
         try trail.event(e, &.{ f("ev", str("land")), f("stream", str(s.id)), f("got", .{ .u32s = s.emitted()[s.emitted().len - landed ..] }) });
+    }
+
+    /// The first token's draw: among the grammar's allowed tokens when the stream has one that constrains it.
+    pub fn drawFirst(e: *Engine, s: *Stream, position: u64) !u64 {
+        const g = s.grammar orelse return e.backend.first(s, position);
+        const mask = try g.next(e.arena.allocator()) orelse return e.backend.first(s, position);
+        const masked = e.backend.vtable.first_masked orelse return error.StructuresUnsupported;
+        return masked(e.backend.ptr, s, position, mask);
     }
 
     /// Feed a token and queue the draw of the next at the new cache length.
@@ -579,7 +591,9 @@ pub const Engine = struct {
     }
 
     pub fn release(e: *Engine, s: *Stream) void {
-        if (s.rules != null) return @import("structured.zig").release(e, s);
+        e.late.cancel(s);
+        if (e.cfg.lone_cost_tile > 0) lone_costs.keep(e.gpa, lone_costs.slot(&e.lone_kept, s), s) catch {};
+        if (s.inflight) |h| _ = e.backend.read(h) catch 0; // the handle frees the backend's ring slot
         s.dropRoundState(e.gpa);
         e.backend.release(s);
     }

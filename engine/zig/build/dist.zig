@@ -2,6 +2,7 @@
 const std = @import("std");
 const root = @import("../../build.zig");
 const cuda = @import("cuda.zig");
+const grammar = @import("grammar.zig");
 
 pub fn validVersion(v: []const u8) bool {
     var it = std.mem.splitScalar(u8, v, '.');
@@ -15,9 +16,28 @@ pub fn validVersion(v: []const u8) bool {
     return count == 3;
 }
 
-pub fn targets(b: *std.Build, ids: *std.Build.Module, options: *std.Build.Step.Options, version: ?[]const u8) void {
+pub const Platform = struct { label: []const u8, query: std.Target.Query };
+pub const platforms = [_]Platform{
+    .{ .label = "macos-arm64", .query = .{
+        .cpu_arch = .aarch64,
+        .os_tag = .macos,
+        .cpu_model = .{ .explicit = &std.Target.aarch64.cpu.apple_m1 },
+        .os_version_min = .{ .semver = .{ .major = 13, .minor = 0, .patch = 0 } },
+    } },
+    .{ .label = "linux-x86_64", .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 28, .patch = 0 } } },
+    .{ .label = "linux-aarch64", .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 28, .patch = 0 } } },
+};
+
+/// The server binary an archive ships: Metal over the macOS SDK, else CUDA with the given fatbins (null: host-only).
+pub fn server(b: *std.Build, target: std.Build.ResolvedTarget, ids: *std.Build.Module, options: *std.Build.Step.Options, sdk: []const u8, fatbins: ?[]const u8) *std.Build.Step.Compile {
+    return if (target.result.os.tag == .macos) root.distMetalServer(b, target, ids, options, sdk) else cuda.distServer(b, target, ids, options, fatbins);
+}
+
+pub fn targets(b: *std.Build, ids: *std.Build.Module, options: *std.Build.Step.Options, version: ?[]const u8, xgrammar: ?[]const u8) void {
+    const privacy = @import("cuda_release_paths.zig").checker(b);
     const package_tests = b.addSystemCommand(&.{"python3"});
-    package_tests.addFileArg(b.path("tools/release/test_package.py"));
+    package_tests.addFileArg(b.path("tools/release/check_package.py"));
+    package_tests.addPrefixedFileArg("--path-checker=", privacy.getEmittedBin());
     package_tests.has_side_effects = true;
     b.step("test-dist-package", "CPU regression for repeated same-version archives and bundled notices").dependOn(&package_tests.step);
     const step = b.step("dist", "Package macOS arm64 (M1 CPU) and Linux x86_64/aarch64 CUDA servers");
@@ -27,6 +47,7 @@ pub fn targets(b: *std.Build, ids: *std.Build.Module, options: *std.Build.Step.O
     const sdk_override = b.option([]const u8, "dist-macos-sdk", "macOS SDK path, default xcrun macosx SDK on a Mac");
     const aot = b.option([]const u8, "dist-cuda-aot", "Optional CUDA capture root with sm<capability>/aot.json and cubins/");
     const host_only = b.option(bool, "dist-host-only", "Verification only: build unusable CUDA archives labelled host-only") orelse false;
+    @import("release_paths_step.zig").steps(b, privacy, ids, options, sdk_override);
     if (version == null) {
         step.dependOn(&b.addFail("dist requires -Dversion=MAJOR.MINOR.PATCH; the release owner chooses the version").step);
         return;
@@ -43,29 +64,20 @@ pub fn targets(b: *std.Build, ids: *std.Build.Module, options: *std.Build.Step.O
         step.dependOn(&b.addFail("dist-cuda-aot requires inference fatbins; it cannot be combined with dist-host-only").step);
         return;
     }
-    const fatbin_check = if (fatbins) |dir| cuda.checkDistFatbins(b, dir) else null;
+    if (xgrammar == null and !host_only) {
+        step.dependOn(&b.addFail("dist requires -Dxgrammar=DIR (structured output's libtfgrammar): " ++ grammar.clone).step);
+        return;
+    }
+    const fatbin_check = if (fatbins) |dir| cuda.checkDistFatbins(b, dir, privacy) else null;
     const sdk = sdk_override orelse if (b.graph.host.result.os.tag == .macos)
         std.mem.trim(u8, b.run(&.{ "xcrun", "--sdk", "macosx", "--show-sdk-path" }), "\r\n")
     else {
         step.dependOn(&b.addFail("the macOS archive requires a macOS SDK; use a Mac builder or -Ddist-macos-sdk=DIR").step);
         return;
     };
-    const platforms = [_]struct { label: []const u8, query: std.Target.Query }{
-        .{ .label = "macos-arm64", .query = .{
-            .cpu_arch = .aarch64,
-            .os_tag = .macos,
-            .cpu_model = .{ .explicit = &std.Target.aarch64.cpu.apple_m1 },
-            .os_version_min = .{ .semver = .{ .major = 13, .minor = 0, .patch = 0 } },
-        } },
-        .{ .label = "linux-x86_64", .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 28, .patch = 0 } } },
-        .{ .label = "linux-aarch64", .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 28, .patch = 0 } } },
-    };
     for (platforms) |p| {
         const target = b.resolveTargetQuery(p.query);
-        const exe = if (p.query.os_tag == .macos)
-            root.distMetalServer(b, target, ids, options, sdk)
-        else
-            cuda.distServer(b, target, ids, options, fatbins);
+        const exe = server(b, target, ids, options, sdk, fatbins);
         if (p.query.os_tag == .linux) if (fatbin_check) |check| exe.step.dependOn(check);
         const label = if (host_only and p.query.os_tag == .linux) b.fmt("{s}-host-only", .{p.label}) else p.label;
         const pack = b.addSystemCommand(&.{"sh"});
@@ -78,7 +90,13 @@ pub fn targets(b: *std.Build, ids: *std.Build.Module, options: *std.Build.Step.O
         pack.addDirectoryArg(b.path("LICENSES"));
         pack.addFileArg(b.path("THIRD_PARTY_NOTICES.md"));
         const archives = pack.addOutputDirectoryArg("archives");
+        pack.addPrefixedFileArg("--path-checker=", privacy.getEmittedBin());
+        pack.addArg(b.fmt("--build-root={s}", .{@import("cuda_release_paths.zig").absoluteRoot(b)}));
         if (aot != null and p.query.os_tag == .linux and !host_only) pack.addDirectoryArg(b.graph.cwdRelativePath(aot.?));
+        if (xgrammar) |dir| pack.addPrefixedDirectoryArg("--overlay=", grammar.overlay(b, target, dir) orelse {
+            step.dependOn(&b.addFail(b.fmt("-Dxgrammar={s} is not an xgrammar " ++ grammar.pinned ++ " checkout: " ++ grammar.clone, .{dir})).step);
+            return;
+        });
         step.dependOn(&b.addInstallDirectory(.{ .source_dir = archives, .install_dir = .prefix, .install_subdir = "dist" }).step);
         if (b.graph.host.result.os.tag == p.query.os_tag and b.graph.host.result.cpu.arch == p.query.cpu_arch) {
             const check = b.addSystemCommand(&.{"sh"});

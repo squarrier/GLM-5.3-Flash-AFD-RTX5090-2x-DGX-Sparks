@@ -1,3 +1,113 @@
+V4 source-only lab release
+Copyright 2026 Scott Quarrier
+
+[Ash Hart / @ashhart](https://github.com/ashhart) authored [TensorFold and its MCDMA/native engine](https://github.com/ashhart/TensorFold/tree/09a9eb33176df8c3f56c86fceb9af94c3ac1618f). [Russell Marr / @russellmm](https://github.com/russellmm) authored [active pinned-host KV](https://github.com/russellmm/TensorFold/commit/adc001b4bdf9fcdde38647ae5a46fbafd3e829f3), merged [c0e6daf5](https://github.com/ashhart/TensorFold/commit/c0e6daf56a3ec20116f02d41ab0a727108359bee). [Bizuayeu / @Bizuayeu](https://github.com/Bizuayeu) authored [pooled-key/MTP correction](https://github.com/Bizuayeu/TensorFold/commit/b0e1cdcbab3b6ebc183129f9b26c9887ed22ff3e), merged [08553be0](https://github.com/ashhart/TensorFold/commit/08553be02a5f174243ae66583b50cd6333fc5f0c), and the retained shared-verification/server work.
+
+[Mia / Mia's AI Lab / @MiaAI-Lab](https://github.com/MiaAI-Lab) authored the [recipe and native RoCE adaptations](https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104/tree/80be4d6882837d8e0840827ae2aab6124fd48da3), [EXL3 quantization at078455ff](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold/tree/078455ffe6472f9a52fbc1139f58b9db2881b25c), drafter integration, README layout and the byte-identical [attribution AGENTS.md](AGENTS.md). [Hugh Madden / @hughmadden](https://github.com/hughmadden) authored [glm53f-afd's split/prompt kernels at91db3cc6](https://github.com/hughmadden/glm53f-afd/tree/91db3cc6fe672e2724efa3464f63bd31493f63f6); [T.J. Purtell / @tpurtell](https://github.com/tpurtell) authored the [expert-channel split](https://github.com/tpurtell/glmrt-5.3-1rtx-4spark/tree/dc6d9b8) and [CuteAFD](https://github.com/tpurtell/cuteafd/tree/b4818a73371788aa3b9dd54023c017646d109f01); Hugh Madden authored its graph-key design. These works are not reassigned to Scott or the porting agents.
+
+[taussoe / @taussoe](https://github.com/taussoe) authored [KDA work atfb985b86](https://github.com/ashhart/TensorFold/tree/fb985b8649c8b42c2ac2aba1fd7c6f905bc8413c). [Turboderp / @turboderp](https://github.com/turboderp) authored [ExLlamaV3/EXL3 atf45b8451](https://github.com/turboderp-org/exllamav3/tree/f45b84512ba65bca77f7d394399d4b68821fc71b). [Z.ai](https://huggingface.co/zai-org) authored [GLM-5.3-Flash and built-in MTP](https://huggingface.co/zai-org/GLM-5.3-Flash/tree/91b69215804f2d2036a8867f6ce44848e278dcda). [NVIDIA](https://github.com/NVIDIA) authored CUDA/libdevice; no compiled CUDA object is supplied here. [Scott Quarrier / @squarrier](https://github.com/squarrier) directed the recipe packaging; Helios (GPT-6.1 Sol via Hermes/openai-codex), Workerbee (recorded local execution route) and Claude Opus5.5 retain their distinct roles below. Exact per-file and previous-version authors remain in [CREDITS.md](CREDITS.md), [CREDIT-REGISTER.json](CREDIT-REGISTER.json) and every preserved notice.
+
+[Raymond Lucke / @rwl4](https://github.com/rwl4) authored the [literal tool-closer cases at029a852f](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/029a852f14bcf604ffe9a55bfbd6ce7f50ec57be). [Albert Lee / @bertholomus](https://github.com/bertholomus) authored [group-count/place and MMA work-list kernels](https://github.com/bertholomus/TensorFold/commit/90b68e063a0b8bba59aaf13340ef16619e751195). [SvangenStudios / @SvangenStudios](https://github.com/SvangenStudios) authored the [structured response-channel work in PR31](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/31), with the recorded Mia adapter at80be4d6 distinguished from original authorship. [Alfonso Fortunato / @devopsfortunato](https://github.com/devopsfortunato) authored [the malformed GLM argument-boundary fix](https://github.com/ashhart/TensorFold/pull/2831); its exact original merge SHA is not invented. Their earlier-candidate roles are retained, not assertions that each old patch was recopied onto the native base.
+
+
+TensorFold
+Copyright 2026 TensorFold contributors
+https://github.com/ashhart/TensorFold
+
+TensorFold is licensed under the Apache License, Version 2.0 (LICENSE) from 0.6.0.
+Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
+MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
+THIRD_PARTY_NOTICES.md.
+
+The historical documentary NOTICE below is retained verbatim, not a description of the new source membership. Current membership is manifests/engine-source.json.
+
+# NOTICE — unpublished documentary V4 preview
+
+Copyright 2026 Scott Quarrier
+
+TensorFold
+Copyright 2026 TensorFold contributors
+https://github.com/ashhart/TensorFold
+
+[Ash Hart / @ashhart](https://github.com/ashhart) authored [TensorFold and its MCDMA/native engine](https://github.com/ashhart/TensorFold/tree/09a9eb33176df8c3f56c86fceb9af94c3ac1618f). [Russell Marr / @russellmm](https://github.com/russellmm) authored [active pinned-host KV](https://github.com/russellmm/TensorFold/commit/adc001b4bdf9fcdde38647ae5a46fbafd3e829f3), merged [c0e6daf5](https://github.com/ashhart/TensorFold/commit/c0e6daf56a3ec20116f02d41ab0a727108359bee). [Bizuayeu / @Bizuayeu](https://github.com/Bizuayeu) authored [pooled-key/MTP correction](https://github.com/Bizuayeu/TensorFold/commit/b0e1cdcbab3b6ebc183129f9b26c9887ed22ff3e), merged [08553be0](https://github.com/ashhart/TensorFold/commit/08553be02a5f174243ae66583b50cd6333fc5f0c), and the retained shared-verification/server work.[3][7]
+
+[Mia / Mia's AI Lab / @MiaAI-Lab](https://github.com/MiaAI-Lab) authored the [recipe and native RoCE adaptations](https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104/tree/80be4d6882837d8e0840827ae2aab6124fd48da3), [EXL3 quantization at078455ff](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold/tree/078455ffe6472f9a52fbc1139f58b9db2881b25c), drafter integration, README layout and the byte-identical [attribution AGENTS.md](AGENTS.md). [Hugh Madden / @hughmadden](https://github.com/hughmadden) authored [glm53f-afd's split/prompt kernels at91db3cc6](https://github.com/hughmadden/glm53f-afd/tree/91db3cc6fe672e2724efa3464f63bd31493f63f6); [T.J. Purtell / @tpurtell](https://github.com/tpurtell) authored the [expert-channel split](https://github.com/tpurtell/glmrt-5.3-1rtx-4spark/tree/dc6d9b8) and [CuteAFD](https://github.com/tpurtell/cuteafd/tree/b4818a73371788aa3b9dd54023c017646d109f01); Hugh Madden authored its graph-key design. These works are not reassigned to Scott or the porting agents.[3][7]
+
+[taussoe / @taussoe](https://github.com/taussoe) authored [KDA work atfb985b86](https://github.com/ashhart/TensorFold/tree/fb985b8649c8b42c2ac2aba1fd7c6f905bc8413c). [Turboderp / @turboderp](https://github.com/turboderp) authored [ExLlamaV3/EXL3 atf45b8451](https://github.com/turboderp-org/exllamav3/tree/f45b84512ba65bca77f7d394399d4b68821fc71b). [Z.ai](https://huggingface.co/zai-org) authored [GLM-5.3-Flash and built-in MTP](https://huggingface.co/zai-org/GLM-5.3-Flash/tree/91b69215804f2d2036a8867f6ce44848e278dcda). [NVIDIA](https://github.com/NVIDIA) authored CUDA/libdevice; no compiled CUDA object is supplied here. [Scott Quarrier / @squarrier](https://github.com/squarrier) directed the recipe packaging; Helios (GPT-6.1 Sol via Hermes/openai-codex), Workerbee (recorded local execution route) and Claude Opus5.5 retain their distinct roles below. Exact per-file and previous-version authors remain in [CREDITS.md](CREDITS.md), [CREDIT-REGISTER.json](CREDIT-REGISTER.json) and every preserved notice.[3][7]
+
+[Raymond Lucke / @rwl4](https://github.com/rwl4) authored the [literal tool-closer cases at029a852f](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/029a852f14bcf604ffe9a55bfbd6ce7f50ec57be). [Albert Lee / @bertholomus](https://github.com/bertholomus) authored [group-count/place and MMA work-list kernels](https://github.com/bertholomus/TensorFold/commit/90b68e063a0b8bba59aaf13340ef16619e751195). [SvangenStudios / @SvangenStudios](https://github.com/SvangenStudios) authored the [structured response-channel work in PR31](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/31), with the recorded Mia adapter at80be4d6 distinguished from original authorship. [Alfonso Fortunato / @devopsfortunato](https://github.com/devopsfortunato) authored [the malformed GLM argument-boundary fix](https://github.com/ashhart/TensorFold/pull/2831); its exact original merge SHA is not invented. Their earlier-candidate roles are retained, not assertions that each old patch was recopied onto the native base.[3][7]
+
+## AI-assisted development
+
+| Agent / model | Authored work and scope |
+|---|---|
+| Helios / GPT-6.1 Sol / openai-codex / Hermes Agent | Current upstream-first port/adapters, integration, CPU regressions, original sole-owner qualification and documentary release work; not authorship of upstream mechanisms |
+| Workerbee / recorded local execution route | Earlier packaging, matched-evaluation harness and release research; underlying checkpoint identity is not established by a route alias |
+| Claude / Opus5.5 / Anthropic via Hermes | Retained earlier hybrid, recorder and CPU-fixture work; not a claim that Claude executed the current native runs |
+| Earlier self-hosted GLM-5.3-Flash execution agent | Previous published version only |
+| Model under test / GLM-5.3-Flash built-in MTP | Evaluated model/drafter, not a new code-author claim |
+
+Historical missing Assisted-by trailers and unrecorded route/model identities remain unknown. Git author names alone do not prove complete AI attribution or sole ownership. No model/provider/route was changed by this preview.[3][7]
+
+## Previous version
+
+All prior credits, copyright lines and per-pin terms are preserved in notices/previous-NOTICE.md and notices/previous-THIRD_PARTY_NOTICES.md; upstream selected stable notices and docs credits remain verbatim in notices/. Every previous licence and all13 native licence surfaces are in LICENSES/ and LICENSE-INDEX.json. Their old performance, drafter and feature statements are historical, not active dependencies.[3][7]
+
+## Licence and release boundaries
+
+The proposed derivative/document code licence is Apache-2.0, matching selected TensorFold v1.2.8 and the Apache adaptations; [LICENSE](LICENSE) is the verbatim native Apache text with no appended notes. Older MIT source and every per-file licence keep their terms; the old v1.0 tag retains MIT. This documentary preview contains no engine implementation, executable, model weights, compiled library, image, CUDA fatbin/cubin or dependency payload. Its135 indexed licence texts and6 inherited notice surfaces are retained for author/obligation continuity, not a statement that every dependency executes in this GLM profile.[3][7]
+
+Concrete unresolved release issues are carried forward, not replaced by a DONE label:[3][7]
+
+- If exact Mia80be4d6 or3906ac66 patch code ships, carry each pinned revision's actual Apache text. Those two per-pin texts were absent from the inherited122-file set; another revision's text is not a substitute.
+- The intended078455ff checkpoint's historical MIT-text versus later Apache quantization boundary and the actual payload revision audit remain incomplete here. Z.ai base-model and Mia quantization obligations are separate; no label is promoted into a per-shard audit.
+- glmrt dc6d9b8's licence and any copied-code versus attributed-design boundary remain unresolved. Never infer its licence from CuteAFD or silently delete T.J. Purtell's credit.
+- Exact inspected CuteAFD b4818a73 donor-code/licence status must follow actual imports; older MIT labels do not settle every new file. Mixed third-party mechanisms are not Scott-only contributions.
+- NVIDIA/libdevice binary redistribution is not approved by a source licence. No binary payload is bundled here.
+- Final source-export provenance JOIN/LEDGER, per-unit author closure and complete agent identities are not established for an outgoing source release. This local documentary Git tree is not that source head.
+- Per-GPU measured power-limit and clock-cap versus stock are unverified. Do not attach historical caps to current measurements.
+- Social handles with missing official profile-field evidence remain unverified; this preview sends no outreach. MiaAI_lab, dangerm00se and wrldsuksgo2mars are not newly verified tags.
+
+These are existing factual/public-release limits, not requests for a new hardware baseline, four-hour soak, reviewer framework or owner. Public/main pushes, posts, PRs, ATC claims, AEON and promotion stay OFF. Only the existing exact-package approval lane can authorize a later public transaction; no such approval is represented here.[3][7]
+
+Data and tables: [3][7]
+
+## Sources
+
+[3] CREDIT-REGISTER.json — CREDIT-REGISTER.json
+[7] LICENSE-INDEX.json — LICENSE-INDEX.json
+
+
+## External preparation/build tool authors (retained)
+
+[Hugging Face tokenizers contributors](https://github.com/huggingface) authored [tokenizers](https://github.com/huggingface/tokenizers/tree/7f1623b90b5adfb9bc327d4c3468d2f70bbce262), used by qualification/preparation; Hugging Face contributors authored the [transformers GLM semantics](https://github.com/huggingface/transformers/tree/7cd73d9df0c14b151c684b708a9f27d8d0349dfe), a reference, not a newly vendored runtime. [linux-rdma/rdma-core contributors](https://github.com/linux-rdma/rdma-core/tree/v50.0), including Topspin Communications, Intel Corporation, Cisco Systems, Inc. and PathScale, Inc., authored the verbs components used as external build/runtime inputs under their individual retained terms. [Zig contributors](https://github.com/ziglang/zig) authored the pinned 0.17.0 compiler and standard library (MIT). Their full notices and exact scope remain in NOTICE and THIRD_PARTY_NOTICES.md; no generated library/compiler is bundled.[3][7]
+
+
+## V4 native port: source origin and terms
+
+The V4 fast path ports the device exchange from the public V3 source at cd50fe4d4094a4b1e6d9dc93209feac8fc2257ef. The Layer descriptor in engine/zig/src/families/glm/cuda_v3_g53_types.zig reproduces the layout from V3's engine/zig/src/families/glm/cuda_exl3_experts.zig; V4 adapts the codebook type. Preserve the V3 contributor and notice chain below. The g53 kernel's explicit FP32 fused multiply-add is a V4 change relative to the V3 expression. It is not attributed to the original donor.
+
+T.J. Purtell authored the CuteAFD design examples used to review prompt-lane dependencies, bounded assembly, and buffer lifetime. Shipping launch/admission and wire structures are Zig adaptations of native TensorFold and V3 interfaces, not Rust host-staged CuteAFD code. The compared first-party CuteAFD code at b4818a73371788aa3b9dd54023c017646d109f01 is MIT; the complete stated permission text is retained. The separate chat-argument parser is not the native checkpoint metadata schema. Earlier reference and licence uncertainty statements are historical; see the scope correction below. No general claim about unrelated nested components is made.
+
+## V4 source-only scope correction (successor to historical documentary limits)
+
+This package contains native source, not weights, CUDA objects, libraries or compiler payloads. The earlier documentary membership and unresolved-license paragraphs above are retained as history, not the current source inventory. Current membership is manifests/engine-source.json.
+
+Mia / MiaAI-Lab (https://github.com/MiaAI-Lab) authored the recipe/adaptations at https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104/tree/80be4d6882837d8e0840827ae2aab6124fd48da3 and https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/3906ac664bab3f2410ce03d8d941544a80da81a0. Their exact LICENSE texts are Apache-2.0, byte-identical to this package's LICENSE. Copyright 2026 Mia's AI Lab (MiaAI-Lab); Copyright 2026 MiaAI-Lab. Their retained notices and original patch-author chain are not reassigned to Scott. The two donor notices are retained in notices/ with exact revision names; historical patch references do not assert their Python code was ported to this native tree.
+
+T.J. Purtell (https://github.com/tpurtell) authored the expert-channel split design at https://github.com/tpurtell/glmrt-5.3-1rtx-4spark/tree/dc6d9b8e1600e001cb1d4228bd911f4df8091f99 and CuteAFD at https://github.com/tpurtell/cuteafd/tree/b4818a73371788aa3b9dd54023c017646d109f01. Both exact root grants are MIT, Copyright (c) 2026 T.J. Purtell; the identical full permission text is LICENSES/previous/tpurtell__cuteafd__c05d9939.txt. Nested third-party terms remain their own. The g53 header records glmrt design with no copied code. CuteAFD's b4818 transport/lifetime source study is distinct from GLM argument policy at26447123ea83c54a5bc103530ea44892b08eb97b/rust/crates/cuteafd-api/src/openai/chat/glm5/parser.rs; cuda_hybrid_schema.zig is native checkpoint metadata, not that parser. No newly ported argument parser is claimed.
+
+Hugh Madden / Turquoise Bay AI (https://github.com/hughmadden) authored the expert prompt kernels at https://github.com/hughmadden/glm53f-afd/tree/91db3cc6fe672e2724efa3464f63bd31493f63f6. Preserve his MIT grant and Ash Hart/TensorFold's MIT decoder grant in LICENSES/previous/glm53f-afd-MIT.txt and LICENSES/previous/glm53f-afd-LICENSE.tensorfold.txt. In rank_math.cuh the V4 fold uses explicit __fmaf_rn where V3 used an add/multiply expression; this is an arithmetic modification, not a claim of data-movement-only byte equivalence.
+
+Mia's selected EXL3 checkpoint revision078455ffe6472f9a52fbc1139f58b9db2881b25c has a historical HF MIT card/LICENSE; the two recipe notices separately state Apache-2.0 for quantization and MIT for Z.ai's base. Preserve both statements without inventing an exclusive or retroactive grant. No model payload or external DFlash2 is redistributed. Base and quantizer obligations remain distinct.
+
+Unchanged upstream native files retain their original notices. The supplemental manifests/release-contexts.jsonl distinguishes inherited source, design, external dependencies and historical references; it is not a declaration that all named repositories were copied or that the substantive provenance gate passed. Original authors, template and all previous credits remain.
+
+
+## Previous public V3 NOTICE retained verbatim
+
+The following is the historical V3 notice, not a statement that its old deployment or dependency scope describes V4. Current corrections above remain separate.
+
 # NOTICE — v3.0 native Zig AFD
 
 Copyright 2026 Scott Quarrier. Own packaging is Apache-2.0, unchanged from v2.0. Ash Hart authored TensorFold and MCDMA; Mia authored the GLM recipe, EXL3 quantization, drafter integration and attribution AGENTS.md. All named source authors below keep their original roles, profiles, source revisions and licence texts. The upstream TensorFold copyright line is retained verbatim below.

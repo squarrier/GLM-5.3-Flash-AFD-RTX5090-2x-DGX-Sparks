@@ -1,7 +1,7 @@
-//! Nested token ids in a completion prompt reach the model as the text they decode to.
+//! Token ids in a completion prompt, top-level or nested: ids in the vocabulary are served, other values get a 400.
 const std = @import("std");
 const api = @import("engine_api");
-const json = @import("json.zig");
+const json = @import("json");
 const model_text = @import("model_text.zig");
 const openai = @import("openai.zig");
 const Server = @import("server.zig").Server;
@@ -42,8 +42,8 @@ const ByteText = struct {
         return &.{};
     }
 
-    fn render(_: *anyopaque, a: Allocator, _: json.Value, _: model_text.RenderOptions, _: *[]const u8) model_text.Error![]u8 {
-        return a.dupe(u8, "prompt");
+    fn render(_: *anyopaque, a: Allocator, _: json.Value, _: model_text.RenderOptions, _: *[]const u8) model_text.Error!model_text.Rendered {
+        return .{ .text = try (a.dupe(u8, "prompt")) };
     }
 
     fn templateSource(_: *anyopaque) []const u8 {
@@ -91,7 +91,7 @@ const Reply = struct {
         return .{ .ctx = r, .vt = &.{ .open = open, .event = event, .reply = reply } };
     }
 
-    fn open(_: *anyopaque) error{Closed}!void {}
+    fn open(_: *anyopaque, _: usize) error{Closed}!void {}
 
     fn event(_: *anyopaque, _: ?json.Value) error{Closed}!void {}
 
@@ -101,10 +101,9 @@ const Reply = struct {
     }
 };
 
-fn checkPrompt(prompt: []const u8, status: u16, expected: []const u32) !void {
+/// The status of a completion whose prompt is the JSON ``prompt``; ``backend.prompt`` keeps the ids it submitted.
+fn complete(backend: *Capture, prompt: []const u8) !?u16 {
     var text: ByteText = .{};
-    var backend: Capture = .{};
-    defer std.testing.allocator.free(backend.prompt);
     const srv = try Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
         .served_name = "m",
         .model_ids = &.{"m"},
@@ -115,31 +114,39 @@ fn checkPrompt(prompt: []const u8, status: u16, expected: []const u32) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const body = try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"max_tokens\":2,\"prompt\":{s}}}", .{prompt});
-    const raw = (try json.parse(a, body)).ok;
+    const raw = (try json.parse(a, try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"max_tokens\":2,\"prompt\":{s}}}", .{prompt}))).ok;
     var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
     var reply: Reply = .{};
     openai.run(srv, a, reply.out(), .{ .conn = &conn }, false, raw);
-    try std.testing.expectEqual(@as(?u16, status), reply.status);
-    try std.testing.expectEqualSlices(u32, expected, backend.prompt);
+    return reply.status;
 }
 
-test "a completion prompt's nested u32 ids preserve unknown-id decoding" {
-    try checkPrompt("[[104,4294967295,105]]", 200, &.{ 'h', 'i' });
-    try checkPrompt("[[104],[105]]", 200, &.{ 'h', '\n', 'i' });
-    try checkPrompt("[104,105]", 200, &.{ 'h', 'i' });
-    try checkPrompt("\"hi\"", 200, &.{ 'h', 'i' });
+test "a completion prompt's ids up to the vocabulary's last id are served, nested or not" {
+    var backend: Capture = .{};
+    defer std.testing.allocator.free(backend.prompt);
+    for ([_][]const u8{ "[0,104,105,255]", "[[0,104,105,255]]" }) |prompt| {
+        try std.testing.expectEqual(@as(?u16, 200), try complete(&backend, prompt));
+        try std.testing.expectEqualSlices(u32, &.{ 0, 'h', 'i', 255 }, backend.prompt);
+    }
 }
 
-test "a completion prompt's nested ids outside u32 return 400 without submitting" {
-    for ([_][]const u8{
-        "[[4294967296]]",
-        "[[104,4294967296,105]]",
-        "[[9223372036854775807]]",
-        "[[9223372036854775808]]",
-        "[[18446744073709551616]]",
-        "[[[4294967296]]]",
-        "[\"prefix\",[4294967296]]",
-        "[4294967296]",
-    }) |prompt| try checkPrompt(prompt, 400, &.{});
+test "a completion prompt's ids outside the vocabulary get a 400, nested or not" {
+    var backend: Capture = .{};
+    defer std.testing.allocator.free(backend.prompt);
+    // one past the vocabulary, below zero, 2^32, i64's largest and one past it
+    for ([_][]const u8{ "256", "-1", "4294967296", "9223372036854775807", "9223372036854775808" }) |id| {
+        var buf: [64]u8 = undefined;
+        try std.testing.expectEqual(@as(?u16, 400), try complete(&backend, try std.fmt.bufPrint(&buf, "[{s}]", .{id})));
+        try std.testing.expectEqual(@as(?u16, 400), try complete(&backend, try std.fmt.bufPrint(&buf, "[[104,{s}]]", .{id})));
+    }
+    try std.testing.expectEqual(@as(usize, 0), backend.prompt.len);
+}
+
+test "a completion prompt's boolean ids get a 400, nested or not" {
+    var backend: Capture = .{};
+    defer std.testing.allocator.free(backend.prompt);
+    for ([_][]const u8{ "[true]", "[false]", "[[104,true]]", "[[104,false]]" }) |prompt| {
+        try std.testing.expectEqual(@as(?u16, 400), try complete(&backend, prompt));
+    }
+    try std.testing.expectEqual(@as(usize, 0), backend.prompt.len);
 }

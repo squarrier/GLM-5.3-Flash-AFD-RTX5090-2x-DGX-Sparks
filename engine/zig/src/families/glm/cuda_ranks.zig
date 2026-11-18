@@ -1,243 +1,510 @@
-//! Two TP ranks in lockstep (qualification_qualification_44ba554e.5 B3), in python-0.6 GlmEngine's bring-up order (glm5_next/cuda/engine.py, ed78d6f):
-//! the communicator (open_comm: here the control link, then NCCL and RoCE over it, cuda/comm.zig) and a barrier; the
-//! settings both ranks must share (python's `mine`) agreed; the rank's weights; `ready("loading")` and a barrier; then
-//! the Engine. Both ranks then make the same calls (the run's request is part of the agreed settings), each armed on
-//! the watchdog (cuda/watch.zig): a lost peer, or a call past TF_TP_TIMEOUT_S, ends the process at once with exit 3.
+// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
+//! A TP rank's settings fingerprint, all-gathered before weights load: a mismatch stops every rank.
+
 const std = @import("std");
 const cuda = @import("cuda");
-const net = std.Io.net;
-const Allocator = std.mem.Allocator;
-const Watch = cuda.watch.Watch;
+const heat = @import("heat");
+const l2pf = @import("cuda_l2pf.zig");
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
-/// python's `mine` (what both ranks must share, in its order), then `run`: the verb and the request's digest.
+/// The forward's knobs a rank reads from its environment (the Python family's names and defaults).
 pub const Settings = struct {
-    drafter: bool = false,
-    capacity: usize,
-    long_context: bool,
-    serial_only: bool = false,
-    latent: bool = true,
-    prefill_rows: usize,
-    mtp: bool,
-    ring: usize = 0,
-    run: []const u8 = "",
-    /// rank_fingerprint: TF_GLM_FINGERPRINT=1 on this rank: the text ends ` fp=1`, so a rank without it disagrees; off, today's text
-    fp: bool = false,
+    kv8: bool = false, // --kv-cache fp8, supplied by the native options rather than an environment override
+    pages: bool = false, // TF_KV_PAGES as `open` resolves it (with the world and --kv-cache): every sequence on pages
+    prompt_fixed_k: bool = false, // TF_GLM_PROMPT_K: one (default) or shape (experimental fixed K slices)
+    tiled: bool = true, // TF_GLM_MM: 1 (the bf16 linears on glm_mm, tiled at load) or 0
+    split: bool = true, // TF_GLM_PREFILL_REDUCE: split (each rank glues its own rows), ring or gather
+    ring: bool = false, // TF_GLM_PREFILL_REDUCE=ring: split, its exchanges passed along the ring (cuda_relay)
+    kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE: 1 (decode windows on KDA's three-kernel chain) or 0
+    kda_pad: bool = false, // TF_GLM_KDA_PAD: 1 (the fused KDA input padded to eight columns at load, for glm_mm) or 0
+    pieces: u32 = 3, // TF_GLM_OVERLAP_PIECES: a prompt chunk's exchanges in this many row pieces (1: whole); unset, 8 under solo on the wire.
+    solo: bool = false, // TF_GLM_CHUNK_SOLO: 4096 (prompt buffers for two chunks a pass, while no stream decodes) or 2048
+    pair: bool = true, // TF_GLM_PROMPT_PAIR: 1 (while no stream decodes, a prompt step takes two chunks, each one's exchanges under the other's sites) or 0
+    index_split: u32 = 2048, // TF_GLM_INDEX_SPLIT: from this position on, rank 0 splits a prompt chunk's indexer rows (0: never)
+    heat: ?heat.Bands = null, // TF_HEAT_HIGH and TF_HEAT_LOW (upstream's names): a prompt chunk waits on every rank's hottest zone
+    layers: u32 = 0, // TF_GLM_LAYERS: the first this many layers only, a thin model for one-GPU checks (0: all)
+    dense_bits: u8 = 16, // TF_GLM_DENSE_BITS: the dense linears packed at load to 4, 6 or 8 bits (16: bf16)
+    head_bits: u8 = 16, // TF_GLM_HEAD_BITS: the head, likewise
+    roce_multi: bool = false, // TF_GLM_ROCE_MULTI: 1 (three ranks or more: small all-gathers on fabric/tp's multirank RoCE beside NCCL) or 0
+    roce_wide: bool = false, // TF_ROCE=1: at three ranks or more the RoCE gather and the drafter MLP split (two ranks: always)
+    kv_host: u8 = 0, // TF_GLM_KV_HOST=1: KV pages in host memory (1); with TF_GLM_KV_HOST_SHARED=1, one copy a host (2)
+    kv_host_gib: f64 = 0, // TF_GLM_KV_HOST_GIB: the host pages' GiB (0: one full window)
+    l2pf: l2pf.Options = .{}, // TF_GLM_L2PF and its knobs: a decode window's next weights read into L2 beside it
+    kv_live_half: bool = false, // TF_GLM_KV_LIVE_HALF=1: a keep carries the live KDA half alone (cuda_snapshot_layout.zig)
 
-    pub fn text(s: Settings, buf: []u8) ![]const u8 {
-        const t = try std.fmt.bufPrint(buf, "drafter={d} capacity={d} long_context={d} serial_only={d} latent={d} prefill_rows={d} mtp={d} ring={d} run={s}", .{
-            @intFromBool(s.drafter), s.capacity,     @intFromBool(s.long_context), @intFromBool(s.serial_only),
-            @intFromBool(s.latent),  s.prefill_rows, @intFromBool(s.mtp),          s.ring,
-            s.run,
-        });
-        if (!s.fp) return t;
-        const fp = " fp=1";
-        if (t.len + fp.len > buf.len) return error.NoSpaceLeft;
-        @memcpy(buf[t.len..][0..fp.len], fp);
-        return buf[0 .. t.len + fp.len];
-    }
-};
-
-/// GlmEngine.__init__'s bring-up in python's order, each step `h`'s (a GPU rank's Pair and loader, or a recorder). rank_fingerprint:
-/// with TF_GLM_FINGERPRINT=1 (`h.fingerprint()`, where `h` has the step) the ranks' identities are agreed before the load.
-pub fn bringUp(h: anytype) !void {
-    try h.comm();
-    try h.barrier("comm");
-    try h.settings();
-    if (comptime hasIdentity(@TypeOf(h))) if (h.fingerprint()) try h.identity();
-    try h.load();
-    try h.ready("loading");
-    try h.barrier("loaded");
-    try h.engine();
-}
-
-/// rank_fingerprint: whether a bring-up's `h` has the identity step (the GPU rank, a recorder that records it).
-fn hasIdentity(comptime H: type) bool {
-    const T = switch (@typeInfo(H)) {
-        .pointer => |p| p.child,
-        else => H,
-    };
-    return @hasDecl(T, "identity");
-}
-
-/// How long python's comm.ready waits for a rank still loading before it names it (seconds).
-pub const ready_s = 3600;
-
-/// One rank's side of the pair: the control link, the communicator over it, and the watchdog.
-pub const Pair = struct {
-    gpa: Allocator,
-    io: std.Io,
-    rank: u32,
-    server: ?cuda.link.Server = null,
-    link: ?cuda.link.Link = null,
-    comm: ?cuda.comm.Comm = null,
-    watch: ?Watch = null,
-    /// rank_fingerprint (TF_GLM_FINGERPRINT=1): what this rank concluded from both ranks' identity lines (null without the switch)
-    fp_verdict: ?cuda.fingerprint.Verdict = null,
-
-    /// The control link: rank 0 serves `master` and accepts rank 1, which joins (retrying while rank 0 starts).
-    pub fn openLink(p: *Pair, master: net.IpAddress, timeout_ms: u32) !void {
-        if (p.rank == 0) {
-            p.server = try cuda.link.Server.open(master);
-            p.link = try p.server.?.accept(@intCast(timeout_ms));
-        } else p.link = try cuda.link.Link.join(p.io, master, timeout_ms);
+    /// The settings `get` gives, blank text as unset; `problem` names a value that is not one of the choices.
+    pub fn read(comptime get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
+        return readSet(&struct {
+            fn set(name: [:0]const u8) ?[]const u8 {
+                const v = get(name) orelse return null;
+                return if (std.mem.trim(u8, v, " \t\r\n").len == 0) null else v; // environment.parse's blank
+            }
+        }.set, problem);
     }
 
-    /// open_comm's collectives: NCCL on every rail (its id over the link), RoCE where both ranks open it.
-    pub fn openComm(p: *Pair) !void {
-        p.comm = try cuda.comm.Comm.init(p.gpa, p.link.?, p.rank, 2, cuda.comm.Options.fromEnv());
-    }
-
-    /// The watchdog on the link (tf-tp2-gather's): from here a lost peer exits 3.
-    pub fn startWatch(p: *Pair) !void {
-        p.watch = .{ .io = p.io, .fd = p.link.?.fd, .rank = p.rank };
-        try p.watch.?.start();
-    }
-
-    /// A call both ranks make, armed for `seconds` (the watch's TF_TP_TIMEOUT_S at least).
-    pub fn arm(p: *Pair, seconds: u64) void {
-        if (p.watch) |*w| w.arm(@max(seconds, w.base_s));
-    }
-
-    pub fn disarm(p: *Pair) void {
-        if (p.watch) |*w| w.disarm();
-    }
-
-    /// A call's error: with the other rank gone, the watchdog's exit 3 (whichever rank saw it first); else `e`.
-    pub fn lost(p: *Pair, e: anyerror) anyerror {
-        if (p.watch) |*w| if (Watch.isLoss(e) or w.peerGone(1000)) w.fail("the other rank is gone (this rank's link or collective failed)");
-        return e;
-    }
-
-    /// comm.barrier and comm.ready(label): both ranks reach `label` (a wrong label is error.RanksDisagree), armed.
-    pub fn barrier(p: *Pair, label: []const u8, seconds: u64) !void {
-        p.arm(seconds);
-        defer p.disarm();
-        p.link.?.agree(p.gpa, p.rank, label) catch |e| return p.lost(e);
-    }
-
-    /// Both ranks run with the same settings, or neither starts (error.RanksDisagree on both).
-    pub fn agree(p: *Pair, s: Settings) !void {
-        var buf: [512]u8 = undefined;
-        const text = try s.text(&buf);
-        p.link.?.agree(p.gpa, p.rank, text) catch |e| {
-            if (e == error.RanksDisagree) std.log.warn("rank {d}: the ranks' settings differ; this rank: {s}", .{ p.rank, text });
-            return p.lost(e);
+    /// `read` from a lookup with no blank text, so every name below and in l2pf's reader is unset when blank.
+    fn readSet(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
+        var s: Settings = .{};
+        if (get("TF_GLM_PROMPT_K")) |v| {
+            if (std.mem.eql(u8, v, "shape")) s.prompt_fixed_k = true else if (!std.mem.eql(u8, v, "one")) {
+                problem.* = "TF_GLM_PROMPT_K: one or shape";
+                return error.BadSetting;
+            }
+        }
+        // TF_GLM_PROMPT_TAIL: rank 0's prompt cache reads it (cuda_snaps' cacheRules); a typo is refused on every rank
+        if (get("TF_GLM_PROMPT_TAIL")) |v| {
+            if (!std.mem.eql(u8, v, "0") and !std.mem.eql(u8, v, "1")) {
+                problem.* = "TF_GLM_PROMPT_TAIL: 0 or 1";
+                return error.BadSetting;
+            }
+        }
+        if (get("TF_GLM_MM")) |v| {
+            if (std.mem.eql(u8, v, "0")) s.tiled = false else if (!std.mem.eql(u8, v, "1")) {
+                problem.* = "TF_GLM_MM: 0 or 1";
+                return error.BadSetting;
+            }
+        }
+        if (get("TF_GLM_KDA_PAD")) |v| {
+            if (std.mem.eql(u8, v, "1")) s.kda_pad = true else if (!std.mem.eql(u8, v, "0")) {
+                problem.* = "TF_GLM_KDA_PAD: 0 or 1";
+                return error.BadSetting;
+            }
+        }
+        if (get("TF_GLM_PREFILL_REDUCE")) |v| {
+            if (std.mem.eql(u8, v, "split")) s.split = true else if (std.mem.eql(u8, v, "ring")) {
+                s.split = true;
+                s.ring = true;
+            } else if (std.mem.eql(u8, v, "gather")) s.split = false else {
+                problem.* = "TF_GLM_PREFILL_REDUCE: split, ring or gather";
+                return error.BadSetting;
+            }
+        }
+        if (get("TF_GLM_KDA_DECODE_WIDE")) |v| {
+            if (std.mem.eql(u8, v, "1")) s.kda_wide = true else if (std.mem.eql(u8, v, "0")) s.kda_wide = false else {
+                problem.* = "TF_GLM_KDA_DECODE_WIDE: 0 or 1";
+                return error.BadSetting;
+            }
+        }
+        if (get("TF_GLM_ROCE_MULTI")) |v| {
+            if (std.mem.eql(u8, v, "1")) s.roce_multi = true else if (std.mem.eql(u8, v, "0")) s.roce_multi = false else {
+                problem.* = "TF_GLM_ROCE_MULTI: 0 or 1";
+                return error.BadSetting;
+            }
+        }
+        if (get("TF_ROCE")) |v| s.roce_wide = std.mem.eql(u8, v, "1");
+        if (get("TF_GLM_CHUNK_SOLO")) |v| {
+            if (std.mem.eql(u8, v, "4096")) s.solo = true else if (std.mem.eql(u8, v, "2048")) s.solo = false else {
+                problem.* = "TF_GLM_CHUNK_SOLO: 2048 or 4096";
+                return error.BadSetting;
+            }
+        }
+        s.l2pf = try l2pf.Options.read(get, problem);
+        if (get("TF_GLM_PROMPT_PAIR")) |v| {
+            if (std.mem.eql(u8, v, "1")) s.pair = true else if (std.mem.eql(u8, v, "0")) s.pair = false else {
+                problem.* = "TF_GLM_PROMPT_PAIR: 0 or 1";
+                return error.BadSetting;
+            }
+        }
+        if (get("TF_GLM_OVERLAP_PIECES")) |v| {
+            s.pieces = std.fmt.parseInt(u32, v, 10) catch 0;
+            if (s.pieces < 1 or s.pieces > 8) {
+                problem.* = "TF_GLM_OVERLAP_PIECES: 1 to 8";
+                return error.BadSetting;
+            }
+        } else if (s.solo and s.roce_multi and wireOpens(get)) {
+            s.pieces = 8; // TF_GLM_CHUNK_SOLO=4096 with TF_GLM_ROCE_MULTI=1: solo's doubled passes on the wire
+        }
+        if (get("TF_GLM_INDEX_SPLIT")) |v| {
+            s.index_split = std.fmt.parseInt(u32, v, 10) catch {
+                problem.* = "TF_GLM_INDEX_SPLIT: the position a prompt chunk's indexer rows split from, or 0 for never";
+                return error.BadSetting;
+            };
+        }
+        if (get("TF_GLM_LAYERS")) |v| {
+            s.layers = std.fmt.parseInt(u32, v, 10) catch 0;
+            if (s.layers == 0) {
+                problem.* = "TF_GLM_LAYERS: the first how many layers, 1 or more";
+                return error.BadSetting;
+            }
+        }
+        inline for (.{ .{ "TF_GLM_DENSE_BITS", "dense_bits" }, .{ "TF_GLM_HEAD_BITS", "head_bits" } }) |e| if (get(e[0])) |v| {
+            const b = std.fmt.parseInt(u8, v, 10) catch {
+                problem.* = e[0] ++ ": 4, 6, 8 or 16";
+                return error.BadSetting;
+            };
+            @field(s, e[1]) = switch (b) {
+                4, 6, 8, 16 => b,
+                0 => 16, // the old family's spelling of bf16
+                else => {
+                    problem.* = e[0] ++ ": 4, 6, 8 or 16";
+                    return error.BadSetting;
+                },
+            };
         };
-    }
-
-    /// rank_fingerprint (TF_GLM_FINGERPRINT=1, after `agree`): this rank's identity line swapped for the other's (rank 0 first, as
-    /// link.agree), then the same judgement on both ranks (fingerprint.judge over rank-0 and rank-1): a mismatch is
-    /// error.RanksDisagree on both, its words naming the field and both values.
-    pub fn agreeIdentity(p: *Pair, mine: []const u8) !void {
-        const l = p.link.?;
-        const fp = cuda.fingerprint;
-        if (p.rank == 0) l.send(fp.tag, mine) catch |e| return p.lost(e);
-        const theirs = l.expect(p.gpa, fp.tag) catch |e| return p.lost(e);
-        defer p.gpa.free(theirs);
-        if (p.rank != 0) l.send(fp.tag, mine) catch |e| return p.lost(e);
-        var tb: [fp.table_max]u8 = undefined;
-        const table = try fp.tableOf(&tb, &.{ .{ "rank-0", if (p.rank == 0) mine else theirs }, .{ "rank-1", if (p.rank == 0) theirs else mine } });
-        p.fp_verdict = fp.verdictOf(table, null);
-        const v = &p.fp_verdict.?;
-        if (v.warning()) |w| std.log.warn("rank {d}: {s}", .{ p.rank, w });
-        if (!v.refused) return;
-        std.log.warn("rank {d}: {s}", .{ p.rank, v.why() });
-        return p.lost(error.RanksDisagree);
-    }
-
-    /// The end (tf-tp2-gather's): both watches quiet, rank 0 says stop and rank 1 acknowledges, then each closes.
-    pub fn close(p: *Pair) void {
-        if (p.watch) |*w| w.quiet();
-        if (p.link) |l| {
-            if (p.rank == 0) {
-                if (l.send(.stop, "")) |_| {
-                    if (l.expect(p.gpa, .ack)) |b| p.gpa.free(b) else |_| {}
-                } else |_| {}
-            } else if (l.expect(p.gpa, .stop)) |b| {
-                p.gpa.free(b);
-                l.send(.ack, "") catch {};
-            } else |_| {}
+        s.heat = heat.bandsFrom(get("TF_HEAT_HIGH"), get("TF_HEAT_LOW")) catch {
+            problem.* = "TF_HEAT_HIGH and TF_HEAT_LOW: both or neither, in degrees, with low at or under high";
+            return error.BadSetting;
+        };
+        if (s.prompt_fixed_k and !s.tiled) {
+            problem.* = "TF_GLM_PROMPT_K=shape requires TF_GLM_MM=1";
+            return error.BadSetting;
         }
-        if (p.watch) |*w| w.deinit();
-        if (p.comm) |*c| c.deinit();
-        if (p.link) |l| l.close();
-        if (p.server) |s| s.close();
-        p.* = .{ .gpa = p.gpa, .io = p.io, .rank = p.rank };
+        if (get("TF_GLM_KV_HOST")) |v| {
+            if (std.mem.eql(u8, v, "1")) s.kv_host = 1 else if (!std.mem.eql(u8, v, "0")) {
+                problem.* = "TF_GLM_KV_HOST: 0 or 1";
+                return error.BadSetting;
+            }
+        }
+        if (get("TF_GLM_KV_HOST_SHARED")) |v| {
+            if (std.mem.eql(u8, v, "1") and s.kv_host == 1) s.kv_host = 2 else if (!std.mem.eql(u8, v, "0")) {
+                problem.* = if (std.mem.eql(u8, v, "1")) "TF_GLM_KV_HOST_SHARED=1 requires TF_GLM_KV_HOST=1" else "TF_GLM_KV_HOST_SHARED: 0 or 1";
+                return error.BadSetting;
+            }
+        }
+        if (get("TF_GLM_KV_HOST_GIB")) |v| {
+            s.kv_host_gib = std.fmt.parseFloat(f64, v) catch 0;
+            if (!(s.kv_host_gib > 0) or s.kv_host == 0) {
+                problem.* = "TF_GLM_KV_HOST_GIB: the host pages' GiB, more than 0, with TF_GLM_KV_HOST=1";
+                return error.BadSetting;
+            }
+        }
+        if (get("TF_GLM_KV_LIVE_HALF")) |v| {
+            if (std.mem.eql(u8, v, "1")) s.kv_live_half = true else if (!std.mem.eql(u8, v, "0")) {
+                problem.* = "TF_GLM_KV_LIVE_HALF: 0 or 1";
+                return error.BadSetting;
+            }
+        }
+        // refused here, before the weights load: the wire's bootstrap meets at rank 0, its kernel comes from the image
+        if (s.roce_multi and (get("TF_TP_MASTER") == null or get("TF_TP_KERNEL_IMAGE") == null)) {
+            problem.* = "TF_GLM_ROCE_MULTI=1 requires TF_TP_MASTER and TF_TP_KERNEL_IMAGE";
+            return error.BadSetting;
+        }
+        if (s.kda_pad and !s.tiled) {
+            problem.* = "TF_GLM_KDA_PAD=1 requires TF_GLM_MM=1 (glm_mm is what reads the padded rows)";
+            return error.BadSetting;
+        }
+        return s;
     }
 };
 
-test "GlmEngine's bring-up order" {
-    const Rec = struct {
-        steps: [8][]const u8 = undefined,
-        n: usize = 0,
-        fn add(r: *@This(), s: []const u8) void {
-            r.steps[r.n] = s;
-            r.n += 1;
-        }
-        pub fn comm(r: *@This()) !void {
-            r.add("open_comm");
-        }
-        pub fn barrier(r: *@This(), label: []const u8) !void {
-            r.add(if (std.mem.eql(u8, label, "comm")) "barrier" else "barrier (loaded)");
-        }
-        pub fn settings(r: *@This()) !void {
-            r.add("settings");
-        }
-        pub fn load(r: *@This()) !void {
-            r.add("load");
-        }
-        pub fn ready(r: *@This(), label: []const u8) !void {
-            r.add(label);
-        }
-        pub fn engine(r: *@This()) !void {
-            r.add("Engine");
-        }
-    };
-    var r: Rec = .{};
-    try bringUp(&r);
-    try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "open_comm", "barrier", "settings", "load", "loading", "barrier (loaded)", "Engine" }), r.steps[0..r.n]);
-    var buf: [256]u8 = undefined;
-    try std.testing.expectEqualStrings("drafter=0 capacity=2560 long_context=1 serial_only=0 latent=1 prefill_rows=2048 mtp=1 ring=0 run=first", try (Settings{ .capacity = 2560, .long_context = true, .prefill_rows = 2048, .mtp = true, .run = "first" }).text(&buf));
+/// The most ranks a world holds: rank 0's greedy pick gathers every rank's top-1 into one host array of this size.
+pub const max_world = 16;
+
+/// A setting by name (null when unset): a registered switch through the profile registry, the rest as before.
+pub fn environment(name: [:0]const u8) ?[]const u8 {
+    return @import("profile").lookup(name);
 }
 
-const Lost = struct {
-    var why: ?[]const u8 = null;
-    fn record(_: *Watch, reason: []const u8) void {
-        why = reason;
+/// Whether the group brings up its own RoCE path: not where TF_GLM_ROCE_MULTI=1 lends fabric/tp's wire (3+ ranks).
+pub fn ownRoce(s: Settings, world: usize) bool {
+    return !(s.roce_multi and world >= 3);
+}
+
+/// Whether TF_GLM_ROCE_MULTI's wire opens at TF_GLM_WORLD: three ranks or more (cuda_roce_multi); TP=2 stays on NCCL.
+fn wireOpens(get: *const fn ([:0]const u8) ?[]const u8) bool {
+    const v = get("TF_GLM_WORLD") orelse return false;
+    return (std.fmt.parseInt(usize, v, 10) catch 0) >= 3;
+}
+
+/// What every rank must agree on, as bytes the communicator carries.
+pub const Fingerprint = extern struct {
+    layout: u32 = 21, // this struct's version (20, main's kv_live_half, plus roce_wide)
+    world: u32,
+    rank: u32,
+    kv8: u32 = 0,
+    pages: u32 = 0, // TF_KV_PAGES: the engine's own sequence is made on pages at init, so every rank pages alike
+    prompt_fixed_k: u32,
+    tiled: u32,
+    split: u32, // TF_GLM_PREFILL_REDUCE: 0 gather, 1 split, 2 ring
+    kda_wide: u32,
+    kda_pad: u32 = 0, // TF_GLM_KDA_PAD: every rank's KDA input rows carry one width
+    kv_live_half: u32 = 0, // TF_GLM_KV_LIVE_HALF: every rank keeps the live KDA half alone (1) or the head whole (0)
+    pieces: u32,
+    pair: u32, // TF_GLM_PROMPT_PAIR: rank 0's paired steps need the second chunk's buffers on every rank
+    layers: u32, // TF_GLM_LAYERS (0: all)
+    mtp: u32, // 1: the MTP head loads and runs (drafts on); 2: and DFlash2 (--drafter), whose rounds gather
+    vision: u32 = 0, // --vision's image tokens (0: off): rank 0 sends image rows every rank must hold
+    video_tokens: u32 = 0,
+    max_images: u32 = 0,
+    max_videos: u32 = 0,
+    max_frames: u32 = 0,
+    roce_multi: u32 = 0, // TF_GLM_ROCE_MULTI: every rank opens the borrowed wire or none does (a lone rank would wait on it)
+    roce_wide: u32 = 0, // TF_ROCE=1: three ranks or more split the drafter MLP and gather by RoCE, or none does
+    kv_host: u32 = 0, // TF_GLM_KV_HOST(_SHARED): every rank sizes the pool alike and maps the shared file, or none does
+    solo: u32 = 0, // TF_GLM_CHUNK_SOLO: rank 0's solo passes need the wider prompt buffers on every rank
+    l2pf: [4]u32 = @splat(0), // TF_GLM_L2PF's words: every rank prefetches alike, so none waits on a slower one's windows
+    bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
+    capacity: u64, // tokens a sequence holds
+    heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
+    heat_low: f64,
+    kv_host_gib: f64 = 0, // TF_GLM_KV_HOST_GIB: each rank's row marks span the host pages rank 0 counts
+    config: [32]u8, // sha256 of config.json
+    program: [32]u8, // sha256 of this executable
+    checkpoint: [64]u8, // hex digest of the checkpoint's metadata and every shard byte, through the digest cache
+
+    pub const Field = enum {
+        layout,
+        rank,
+        world,
+        kv8,
+        pages,
+        prompt_fixed_k,
+        tiled,
+        split,
+        kda_wide,
+        kda_pad,
+        kv_live_half,
+        pieces,
+        pair,
+        layers,
+        mtp,
+        vision,
+        video_tokens,
+        max_images,
+        max_videos,
+        max_frames,
+        roce_multi,
+        roce_wide,
+        kv_host,
+        solo,
+        l2pf,
+        bits,
+        capacity,
+        heat_high,
+        heat_low,
+        kv_host_gib,
+        config,
+        program,
+        checkpoint,
+    };
+
+    pub fn of(
+        world: usize,
+        rank: usize,
+        s: Settings,
+        capacity: usize,
+        mtp: bool,
+        config: [32]u8,
+        program: [32]u8,
+        checkpoint_digest: [32]u8,
+    ) Fingerprint {
+        const f: Fingerprint = .{
+            .kv8 = @intFromBool(s.kv8),
+            .pages = @intFromBool(s.pages),
+            .world = @intCast(world),
+            .rank = @intCast(rank),
+            .prompt_fixed_k = @intFromBool(s.prompt_fixed_k),
+            .tiled = @intFromBool(s.tiled),
+            .split = if (!s.split) 0 else if (s.ring) 2 else 1,
+            .kda_wide = @intFromBool(s.kda_wide),
+            .kda_pad = @intFromBool(s.kda_pad),
+            .kv_live_half = @intFromBool(s.kv_live_half),
+            .pieces = s.pieces,
+            .pair = @intFromBool(s.pair),
+            .layers = s.layers,
+            .mtp = @intFromBool(mtp),
+            .roce_multi = @intFromBool(s.roce_multi),
+            .roce_wide = @intFromBool(s.roce_wide and world >= 3), // two ranks ask by default, so a lone TF_ROCE=1 there is no difference
+            .kv_host = s.kv_host,
+            .kv_host_gib = s.kv_host_gib,
+            .solo = @intFromBool(s.solo),
+            .l2pf = s.l2pf.words(),
+            .bits = @as(u32, s.dense_bits) << 8 | s.head_bits,
+            .capacity = capacity,
+            .heat_high = if (s.heat) |b| b.high_c else 0,
+            .heat_low = if (s.heat) |b| b.low_c else 0,
+            .config = config,
+            .program = program,
+            .checkpoint = std.fmt.bytesToHex(checkpoint_digest, .lower),
+        };
+        return f;
     }
 };
 
-test "two ranks over a local link: barriers and settings in step, different settings refused, a lost peer is the watchdog's" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var p0: Pair = .{ .gpa = gpa, .io = io, .rank = 0 };
-    p0.server = try cuda.link.Server.open(try net.IpAddress.parse("127.0.0.1", 0));
-    const port = p0.server.?.port();
-    const Peer = struct {
-        fn run(io2: std.Io, at: u16, ok: *bool) void {
-            var p1: Pair = .{ .gpa = std.testing.allocator, .io = io2, .rank = 1 };
-            p1.openLink(net.IpAddress.parse("127.0.0.1", at) catch return, 5000) catch return;
-            p1.barrier("comm", 0) catch return;
-            p1.agree(.{ .capacity = 2560, .long_context = true, .prefill_rows = 2048, .mtp = true, .run = "first" }) catch return;
-            const refused = if (p1.agree(.{ .capacity = 4096, .long_context = true, .prefill_rows = 2048, .mtp = true })) |_| false else |e| e == error.RanksDisagree;
-            p1.link.?.close(); // rank 1 dies mid-run
-            p1.link = null;
-            ok.* = refused;
+pub const Mismatch = struct { field: Fingerprint.Field, rank: usize };
+
+/// The first field where rank `r`'s fingerprint differs from rank 0's (or holds the wrong rank), null when all agree.
+pub fn mismatch(all: []const Fingerprint) ?Mismatch {
+    for (all, 0..) |f, r| {
+        if (f.layout != all[0].layout) return .{ .field = .layout, .rank = r };
+        if (f.rank != r) return .{ .field = .rank, .rank = r };
+        const fields = .{
+            "kv8",
+            "pages",
+            "prompt_fixed_k",
+            "world",
+            "tiled",
+            "split",
+            "kda_wide",
+            "kda_pad",
+            "kv_live_half",
+            "pieces",
+            "pair",
+            "layers",
+            "mtp",
+            "vision",
+            "video_tokens",
+            "max_images",
+            "max_videos",
+            "max_frames",
+            "roce_multi",
+            "roce_wide",
+            "kv_host",
+            "solo",
+            "l2pf",
+            "bits",
+            "capacity",
+            "heat_high",
+            "heat_low",
+            "kv_host_gib",
+            "config",
+            "program",
+            "checkpoint",
+        };
+        inline for (fields) |name| {
+            if (!std.mem.eql(u8, std.mem.asBytes(&@field(f, name)), std.mem.asBytes(&@field(all[0], name))))
+                return .{ .field = @field(Fingerprint.Field, name), .rank = r };
         }
+    }
+    return null;
+}
+
+/// sha256 of a file's bytes (read whole: config.json, the executable).
+pub fn hashFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![32]u8 {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 30));
+    defer gpa.free(bytes);
+    return hashBytes(bytes);
+}
+
+pub fn hashBytes(bytes: []const u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    Sha256.hash(bytes, &out, .{});
+    return out;
+}
+
+/// Every rank's `mine` in rank order, over one ncclAllGather.
+pub fn gather(
+    comptime T: type,
+    d: *const cuda.Driver,
+    lib: *const cuda.nccl.Library,
+    comm: cuda.nccl.Comm,
+    stream: cuda.Stream,
+    rank: usize,
+    mine: T,
+    out: []T,
+) !void {
+    const size = @sizeOf(T);
+    var dev = try cuda.DeviceBuffer.alloc(d, size * out.len);
+    defer dev.free();
+    try dev.uploadAsync(rank * size, std.mem.asBytes(&mine), stream.handle);
+    const gathered = lib.api.ncclAllGather(dev.ptr + rank * size, dev.ptr, size, .u8, comm, stream.handle);
+    try lib.check(gathered, "ncclAllGather");
+    try stream.synchronize();
+    try dev.download(0, std.mem.sliceAsBytes(out));
+}
+
+/// All-gathers `mine` over `comm`; any disagreement is error.RankMismatch on every rank, printing what differs.
+pub fn agree(
+    d: *const cuda.Driver,
+    lib: *const cuda.nccl.Library,
+    comm: cuda.nccl.Comm,
+    stream: cuda.Stream,
+    mine: Fingerprint,
+    out: []Fingerprint,
+) !void {
+    try gather(Fingerprint, d, lib, comm, stream, mine.rank, mine, out);
+    if (mismatch(out)) |m| {
+        std.debug.print("REFUSE rank settings: rank {d}'s {s} differs from rank 0's ({s})\n", .{ m.rank, @tagName(m.field), explain(m.field) });
+        return error.RankMismatch;
+    }
+}
+
+/// Before loading: direct split reaches every rank, so each pair is probed; the ring only passes rows to neighbours.
+pub fn probeStart(d: *const cuda.Driver, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, stream: cuda.Stream, s: Settings, rank: usize, world: usize) !void {
+    if (s.split and !s.ring) try probeSplit(d, lib, comm, stream, rank, world);
+}
+
+/// Before loading, split's peers: one value each way with each, in rank order (no pair waits on a later one).
+fn probeSplit(d: *const cuda.Driver, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, stream: cuda.Stream, rank: usize, world: usize) !void {
+    var dev = try cuda.DeviceBuffer.alloc(d, 8);
+    defer dev.free();
+    for (0..world) |peer| if (peer != rank) {
+        try lib.check(lib.api.ncclGroupStart(), "ncclGroupStart");
+        try lib.check(lib.api.ncclSend(dev.ptr, 1, .f32, @intCast(peer), comm, stream.handle), "ncclSend");
+        try lib.check(lib.api.ncclRecv(dev.ptr + 4, 1, .f32, @intCast(peer), comm, stream.handle), "ncclRecv");
+        lib.check(lib.api.ncclGroupEnd(), "ncclGroupEnd") catch return unreachablePeer(rank, peer);
+        stream.synchronize() catch return unreachablePeer(rank, peer);
     };
-    var ok = false;
-    const t = try std.Thread.spawn(.{}, Peer.run, .{ io, port, &ok });
-    p0.link = try p0.server.?.accept(5000);
-    try p0.barrier("comm", 0);
-    try p0.agree(.{ .capacity = 2560, .long_context = true, .prefill_rows = 2048, .mtp = true, .run = "first" });
-    try std.testing.expectError(error.RanksDisagree, p0.agree(.{ .capacity = 2560, .long_context = true, .prefill_rows = 2048, .mtp = true }));
-    t.join();
-    try std.testing.expect(ok);
-    p0.watch = .{ .io = io, .fd = p0.link.?.fd, .rank = 0, .lost = Lost.record };
-    if (p0.barrier("loading", ready_s)) |_| return error.NoLoss else |e| try std.testing.expect(Watch.isLoss(e));
-    try std.testing.expect(Lost.why != null);
-    p0.watch = null;
-    p0.close();
+}
+
+/// The latest pair split refused, which a test build keeps for its test instead of printing the refusal.
+pub var refused_pair: ?[2]usize = null;
+
+fn unreachablePeer(rank: usize, peer: usize) error{SplitUnreachable} {
+    if (@import("builtin").is_test) {
+        refused_pair = .{ rank, peer };
+        return error.SplitUnreachable;
+    }
+    std.debug.print("REFUSE TF_GLM_PREFILL_REDUCE=split: rank {d} cannot exchange with rank {d}; split sends every rank's rows to every other, and a fabric where some ranks reach only their neighbours (a ring of four without a switch) needs TF_GLM_PREFILL_REDUCE=ring or gather\n", .{ rank, peer });
+    return error.SplitUnreachable;
+}
+
+fn explain(f: Fingerprint.Field) []const u8 {
+    return switch (f) {
+        .layout => "a different build of this check",
+        .rank => "a rank number given twice or out of order",
+        .world => "the ranks were started with different world sizes",
+        .kv8 => "--kv-cache fp8",
+        .pages => "TF_KV_PAGES (unset or auto pages from two ranks)",
+        .prompt_fixed_k => "TF_GLM_PROMPT_K",
+        .tiled => "TF_GLM_MM",
+        .split => "TF_GLM_PREFILL_REDUCE",
+        .kda_wide => "TF_GLM_KDA_DECODE_WIDE",
+        .kda_pad => "TF_GLM_KDA_PAD",
+        .kv_live_half => "TF_GLM_KV_LIVE_HALF",
+        .pieces => "TF_GLM_OVERLAP_PIECES",
+        .pair => "TF_GLM_PROMPT_PAIR",
+        .layers => "TF_GLM_LAYERS",
+        .mtp => "--no-drafts given to some ranks and not others",
+        .vision => "--vision (or its image tokens) given to some ranks and not others",
+        .video_tokens => "--vision-video-tokens",
+        .max_images => "the image count limit",
+        .max_videos => "the video count limit",
+        .max_frames => "the frame limit",
+        .roce_multi => "TF_GLM_ROCE_MULTI",
+        .roce_wide => "TF_ROCE=1 at three ranks or more (the RoCE gather and the drafter split)",
+        .kv_host => "TF_GLM_KV_HOST or TF_GLM_KV_HOST_SHARED",
+        .kv_host_gib => "TF_GLM_KV_HOST_GIB",
+        .solo => "TF_GLM_CHUNK_SOLO",
+        .l2pf => "TF_GLM_L2PF, _MB, _CTAS or _PACE_GBPS",
+        .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
+        .capacity => "the sequence capacity (the context)",
+        .heat_high => "TF_HEAT_HIGH",
+        .heat_low => "TF_HEAT_LOW",
+        .config => "config.json",
+        .program => "the executable",
+        .checkpoint => "checkpoint metadata or shard bytes",
+    };
+}
+
+pub fn mediaFingerprint(f: *Fingerprint, limits: @import("cuda_images.zig").Limits) void {
+    f.vision = limits.image_tokens;
+    f.video_tokens = limits.video_tokens;
+    f.max_images = limits.max_images;
+    f.max_videos = limits.max_videos;
+    f.max_frames = limits.max_frames;
+}
+
+/// The checkpoint digest a rank sends: its metadata and every shard byte, read again only for a file that changed.
+pub fn artifact(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ![32]u8 {
+    return @import("core").checkpoint_identity.fullIdentity(gpa, io, dir);
+}
+
+// Helios: test-only access to the actual checkpoint worker seams.
+pub const IdentityTest=if(@import("builtin").is_test)@import("core").checkpoint_identity.Content.Test else struct{};
+
+/// The same full checkpoint fingerprint with the process-owned startup stop token.
+pub fn artifactControlled(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, requested: ?*const std.atomic.Value(bool)) ![32]u8 {
+    return @import("core").checkpoint_identity.fullIdentityControlled(gpa, io, dir, requested);
 }

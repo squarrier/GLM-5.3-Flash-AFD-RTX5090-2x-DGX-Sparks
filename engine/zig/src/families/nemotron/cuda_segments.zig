@@ -1,4 +1,4 @@
-//! Nemotron's prompt as staggered segments (cuda/segments.zig): each segment is a whole serial chunk, so the bits match.
+//! Nemotron's prompt as staggered segments (cuda/segments.zig): each segment a whole serial chunk, so the bits match.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -61,7 +61,7 @@ const Hooks = struct {
     }
 };
 
-/// The prompt from a reset state, `parts` chunks a call (`cancel` asked between calls); leaves the head and prompt buffers as serial does.
+/// Prompt from a reset state, `parts` chunks a call (`cancel` asked between); head and prompt buffers end as in serial.
 pub fn prefill(e: *Engine, s: *Segments, prompt: []const u32, head: ?*Head, parts: usize, cancel: ?Cancel) !void {
     if (parts < 2 or parts > s.n) return error.Segments;
     const R = state.prefill_rows;
@@ -76,6 +76,7 @@ pub fn prefill(e: *Engine, s: *Segments, prompt: []const u32, head: ?*Head, part
     var last_rows: usize = 0;
     while (at < prompt.len) {
         if (Cancel.now(cancel)) return error.Cancelled;
+        try e.beforeChunk(cancel);
         const c = segs.chunked(prompt.len - at, R, parts);
         var seg: [MAX]Seg = undefined;
         try e.copied.synchronize();
@@ -84,8 +85,11 @@ pub fn prefill(e: *Engine, s: *Segments, prompt: []const u32, head: ?*Head, part
         for (0..c.parts) |k| { // every segment's ids go up on the caller's stream, ahead of the call's fork
             const rows = segs.chunkRows(c.rows, R, k);
             try e.ops().upload(bufs[k].p_ids, std.mem.sliceAsBytes(host[k * R ..][0..rows]));
-            const ops: kern.Ops = .{ .k = &e.k, .s = s.runner.stream(e.stream, k) };
-            const f = fwd.Forward.init(e.c, &e.w, bufs[k], ops, e.max_len, e.nch, e.sampling != null);
+            const ops = segmentOps(e, s, bufs[k], k);
+            var f = fwd.Forward.init(e.c, &e.w, bufs[k], ops, e.max_len, e.nch, e.sampling != null);
+            f.page_elems = e.pageBytes() / 2;
+            f.untaught = e.bound.untaught;
+            f.vision = e.vision;
             seg[k] = .{ .f = f, .walk = .{ .rows = rows, .pos = e.pos + k * R } };
         }
         try e.copied.record(e.stream);
@@ -101,9 +105,14 @@ pub fn prefill(e: *Engine, s: *Segments, prompt: []const u32, head: ?*Head, part
         e.pos += c.rows;
         at += c.rows;
     }
+    e.last_chunk = prompt.len - last_rows;
     if (last == 0) return;
     const o = e.ops();
     try o.copy(e.b.p_hidden, bufs[last].p_hidden, last_rows * e.c.hidden * 2);
     try o.copy(e.b.p_logits, bufs[last].p_logits, e.c.vocab * 2);
     try o.copy(e.b.p_sampled, bufs[last].p_sampled, 4);
+}
+
+pub fn segmentOps(e: *const Engine, s: *const Segments, b: *const state.Buffers, k: usize) kern.Ops {
+    return .{ .k = &e.k, .s = s.runner.stream(e.stream, k), .part = b.lane_part };
 }

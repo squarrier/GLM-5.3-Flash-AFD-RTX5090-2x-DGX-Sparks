@@ -136,14 +136,15 @@ pub fn crossMarks(p: *fz.Prompt, m: *fz.Model, tp: *fz.Tp2, gpa: std.mem.Allocat
                 try ws.append(gpa, .{ .src = bytesOf(mk.so_at(li, j)), .len = fz.SO_ROW, .dst = tpm.MARK + li * tpm.DN_SLOT + fz.CS_ROW });
             }
             try ws.append(gpa, .{ .src = tail.ptr, .len = tail_bytes, .dst = tpm.MARK + 36 * tpm.DN_SLOT });
-            tp.hostWait(tpm.MARK_READY, seq);
+            try tp.hostWait(tpm.MARK_READY, seq);
             try tp.sendNow(ws.items, tpm.MARK_FLAG, seq);
         } else { // the peer's: free MARK, wait for the bytes, copy them into this mark's slot
             try tp.markReady(seq);
-            tp.hostWait(tpm.MARK_FLAG, seq);
+            try tp.hostWait(tpm.MARK_FLAG, seq);
             const w = tp.window();
             const cb = p.r.queue.commandBuffer();
-            p.r.enc = cb.compute(if (p.r.serial) .serial else .concurrent);
+            p.r.begin(cb, if (p.r.serial) .serial else .concurrent);
+            errdefer if (p.r.fsr != null) p.r.abort();
             for (0..36) |li| {
                 p.copyWords(.{ .b = w, .off = tpm.MARK + li * tpm.DN_SLOT }, mk.cs_at(li, j), fz.CS_ROW / 4);
                 p.copyWords(.{ .b = w, .off = tpm.MARK + li * tpm.DN_SLOT + fz.CS_ROW }, mk.so_at(li, j), fz.SO_ROW / 4);

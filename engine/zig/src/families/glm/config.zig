@@ -5,11 +5,16 @@ pub const max_layers = 46;
 
 pub const Kind = enum { kda, mla };
 
+/// List entries a decode attention block takes: the same at every window width, so every row's sums keep one order.
+pub const attn_span = 128;
+
 pub const Config = struct {
     hidden: u32 = 4096,
     layers: u32 = 45,
     run: u32 = 45, // backbone layers loaded and run: all, or the first few for a check that must fit (GLM_LAYERS)
     vocab: u32 = 154880,
+    head_unit: u32 = 64, // the vocabulary's TP cut in whole units: 128 for EXL3, whose matrices split at 128 columns
+    exl3: bool = false, // routed experts in EXL3 (quant_method "exl3", Mia-AiLab's checkpoint), the rest bf16
     eps: f32 = 1e-5,
     dense_layers: u32 = 3,
     dense_inter: u32 = 12288, // this Mac's dense MLP rows: all, or its half in TP2
@@ -18,7 +23,9 @@ pub const Config = struct {
     inter: [2]u32 = .{ 0, 2048 }, // each routed expert's intermediate rows [lo, hi) this Mac holds (half by rows)
     topk: u32 = 8,
     moe_inter: u32 = 2048,
+    shared_inter: u32 = 2048, // the shared expert's width: moe_intermediate_size x n_shared_experts
     routed_scale: f32 = 2.5,
+    norm_topk: bool = true, // norm_topk_prob: the routed weights renormalized over the top-k
     swiglu_limit: f32 = 10.0,
     kda_heads: u32 = 64, // this Mac's KDA heads: all, or its share in TP2 (heads [tp_rank kda_heads, ...))
     kda_dim: u32 = 128,
@@ -81,6 +88,11 @@ pub const Config = struct {
         return c.i_topk + c.kpool - 1;
     }
 
+    /// A decode row's key list in blocks of `attn_span`, each block's softmax its own, combined in block order.
+    pub fn attnBlocks(c: *const Config) u32 {
+        return (c.keyWidth() + attn_span - 1) / attn_span;
+    }
+
     /// The head's rows [lo, hi) this Mac computes: the whole vocabulary, or its half in TP2.
     pub fn vocabPart(c: *const Config) [2]u32 {
         const n = c.vocab / c.tp;
@@ -126,18 +138,44 @@ fn float(o: std.json.ObjectMap, key: []const u8) !f64 {
     };
 }
 
-/// The checkpoint's text_config, refused unless it is GLM-5.3-Flash's shape (the kernels are built for it).
+/// The activation dtype the native engine serves; `tensorfold_activation_dtype` is refused by name otherwise.
+const served_activation = "bfloat16";
+
+/// A refused dtype's value for the log line: its string, or its JSON type.
+fn dtypeName(v: std.json.Value) []const u8 {
+    return if (v == .string) v.string else @tagName(v);
+}
+
+/// quantization_config at the top level, else text_config's: where and in what order cuda_exl3.zig's `block` reads it.
+fn quantBlock(root: std.json.ObjectMap) ?std.json.ObjectMap {
+    if (root.get("quantization_config")) |q| if (q == .object) return q.object;
+    if (root.get("text_config")) |t| if (t == .object) if (t.object.get("quantization_config")) |q| if (q == .object) return q.object;
+    return null;
+}
+
+/// text_config with GLM-5.3-Flash's widths; smaller counts pass (synthetic), experts >= top-k, vocab a multiple of 128.
 pub fn parse(gpa: std.mem.Allocator, json: []const u8) !Config {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
     const t = (root.get("text_config") orelse parsed.value).object;
+    for ([_]?std.json.Value{ t.get("tensorfold_activation_dtype"), root.get("tensorfold_activation_dtype") }) |maybe| if (maybe) |v| {
+        if (v != .string or !std.mem.eql(u8, v.string, served_activation)) {
+            if (!@import("builtin").is_test) // the tests check the error; the line is for whoever starts the server
+                std.debug.print("config.json: tensorfold_activation_dtype = {s}: the native engine serves bfloat16 activations only\n", .{dtypeName(v)});
+            return error.UnsupportedActivationDtype;
+        }
+    };
     var c = Config{};
     const want = c;
     c.hidden = @intCast(try int(t, "hidden_size"));
     c.layers = @intCast(try int(t, "num_hidden_layers"));
     c.run = c.layers;
     c.vocab = @intCast(try int(t, "vocab_size"));
+    if (quantBlock(root)) |q| if (q.get("quant_method")) |m| if (m == .string and std.mem.eql(u8, m.string, "exl3")) {
+        c.head_unit = 128;
+        c.exl3 = true;
+    };
     c.eps = @floatCast(try float(t, "rms_norm_eps"));
     c.dense_layers = @intCast(try int(t, "first_k_dense_replace"));
     c.dense_inter = @intCast(try int(t, "intermediate_size"));
@@ -146,6 +184,8 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) !Config {
     c.inter = .{ 0, c.moe_inter };
     c.topk = @intCast(try int(t, "num_experts_per_tok"));
     c.moe_inter = @intCast(try int(t, "moe_intermediate_size"));
+    c.shared_inter = c.moe_inter * @as(u32, @intCast(if (t.get("n_shared_experts")) |v| v.integer else 1));
+    if (t.get("norm_topk_prob")) |v| c.norm_topk = v != .bool or v.bool;
     c.routed_scale = @floatCast(try float(t, "routed_scaling_factor"));
     c.swiglu_limit = @floatCast(try float(t, "swiglu_limit"));
     c.mla_heads = @intCast(try int(t, "num_attention_heads"));
@@ -179,19 +219,29 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) !Config {
     };
     const rope = t.get("qk_rope_head_dim");
     const plain = (if (t.get("n_group")) |v| v.integer else 1) == 1 and (if (t.get("topk_group")) |v| v.integer else 1) == 1;
-    const same = c.hidden == want.hidden and c.layers == want.layers and c.vocab == want.vocab and
-        c.dense_layers == want.dense_layers and c.dense_inter == want.dense_inter and c.experts == want.experts and
-        c.topk == want.topk and c.moe_inter == want.moe_inter and c.mla_heads == want.mla_heads and
+    const widths = c.hidden == want.hidden and c.dense_inter == want.dense_inter and c.topk == want.topk and
+        c.moe_inter == want.moe_inter and c.shared_inter == want.shared_inter and c.mla_heads == want.mla_heads and
         c.nope == want.nope and c.v_dim == want.v_dim and c.q_lora == want.q_lora and c.kv_lora == want.kv_lora and
         c.i_heads == want.i_heads and c.i_dim == want.i_dim and c.i_topk == want.i_topk and c.kpool == want.kpool and
         c.hc == want.hc and c.sinkhorn == want.sinkhorn and c.kda_heads == want.kda_heads and
-        c.kda_dim == want.kda_dim and c.conv == want.conv and c.mla.eql(want.mla) and plain and
+        c.kda_dim == want.kda_dim and c.conv == want.conv and plain and
         (rope == null or (rope.? == .integer and rope.?.integer == 0));
-    if (!same) return error.NotGlm53Flash;
+    var eos_in = true;
+    for (c.eos[0..c.eos_n]) |id| eos_in = eos_in and id < c.vocab;
+    const counts = c.layers >= 1 and c.layers <= want.layers and c.dense_layers <= c.layers and
+        c.experts >= c.topk and c.experts <= want.experts and c.vocab <= want.vocab and c.vocab % 128 == 0 and eos_in;
+    if (!widths or !counts) return error.NotGlm53Flash;
     return c;
 }
 
-/// The first `n` backbone layers only (the MTP layer stays): a check whose weights must fit where the whole model does not.
+/// GLM-5.3-Flash's own counts, the shapes the Metal kernels are built for (parse also passes smaller synthetic ones).
+pub fn whole(c: Config) bool {
+    const want = Config{};
+    return c.layers == want.layers and c.vocab == want.vocab and c.dense_layers == want.dense_layers and
+        c.experts == want.experts and c.mla.eql(want.mla);
+}
+
+/// Only the first `n` backbone layers (the MTP layer stays): for a check that must fit where the whole model does not.
 pub fn subset(c: *Config, n: u32) !void {
     if (n == 0 or n > c.layers) return error.BadLayerCount;
     c.run = n;
@@ -235,6 +285,88 @@ test "GLM-5.3-Flash's layer kinds: 34 KDA and 11 MLA in the backbone, the MTP la
     try std.testing.expectEqual(@as(u32, 2208), c.xProj());
     try std.testing.expectEqual(@as(u32, 20480), c.qrProj());
     try std.testing.expectEqual(@as(u32, 10), c.kindIndex(43));
+}
+
+/// The same JSON with `tensorfold_activation_dtype` set to `value` in its text_config.
+fn withDtype(gpa: std.mem.Allocator, base: []const u8, value: []const u8) ![]u8 {
+    const to = try std.fmt.allocPrint(gpa, "\"text_config\": {{\"tensorfold_activation_dtype\": \"{s}\", ", .{value});
+    defer gpa.free(to);
+    return std.mem.replaceOwned(u8, gpa, base, "\"text_config\": {", to);
+}
+
+/// GLM-5.3-Flash's text_config with the counts given (the widths as the checkpoint has them), for the tests.
+pub fn textConfig(gpa: std.mem.Allocator, layers: u32, dense: u32, mla: []const u32, experts: u32, vocab: u32, hidden: u32) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    for (mla, 0..) |l, i| try list.print(gpa, "{s}{d}", .{ if (i > 0) ", " else "", l });
+    return std.fmt.allocPrint(gpa,
+        \\{{"model_type": "glm5_next", "text_config": {{"hidden_size": {d}, "num_hidden_layers": {d}, "vocab_size": {d},
+        \\"rms_norm_eps": 1e-05, "first_k_dense_replace": {d}, "intermediate_size": 12288, "n_routed_experts": {d},
+        \\"num_experts_per_tok": 8, "moe_intermediate_size": 2048, "n_shared_experts": 1, "norm_topk_prob": true,
+        \\"routed_scaling_factor": 2.5, "swiglu_limit": 10.0, "num_attention_heads": 64, "qk_nope_head_dim": 256,
+        \\"v_head_dim": 256, "q_lora_rank": 1536, "kv_lora_rank": 512, "index_n_heads": 32, "index_head_dim": 128,
+        \\"index_topk": 2048, "index_kpool": 4, "hc_mult": 4, "hc_eps": 1e-06, "hc_sinkhorn_iters": 20,
+        \\"num_nextn_predict_layers": 1, "eos_token_id": [{d}], "linear_attn_config": {{"num_heads": 64, "head_dim": 128,
+        \\"short_conv_kernel_size": 4, "gate_lower_bound": -5.0, "full_attn_layers": [{s}]}}}}}}
+    , .{ hidden, layers, vocab, dense, experts, vocab - 2, list.items });
+}
+
+test "the real counts parse to the defaults; smaller counts parse, other widths do not" {
+    const gpa = std.testing.allocator;
+    const real = try textConfig(gpa, 45, 3, &.{ 3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43 }, 288, 154880, 4096);
+    defer gpa.free(real);
+    const c = try parse(gpa, real);
+    try std.testing.expect(c.mla.eql((Config{}).mla));
+    try std.testing.expectEqual(@as(u32, 45), c.layers);
+    const small = try textConfig(gpa, 2, 1, &.{1}, 16, 8192, 4096);
+    defer gpa.free(small);
+    const s = try parse(gpa, small);
+    try std.testing.expect(whole(c) and !whole(s)); // the Metal engine refuses the synthetic one
+    try std.testing.expectEqual(Kind.kda, s.kind(0));
+    try std.testing.expectEqual(Kind.mla, s.kind(1));
+    try std.testing.expectEqual(Kind.mla, s.kind(2)); // the MTP layer
+    try std.testing.expectEqual(@as(u32, 16), s.experts);
+    const wide = try textConfig(gpa, 2, 1, &.{1}, 16, 8192, 2048);
+    defer gpa.free(wide);
+    try std.testing.expectError(error.NotGlm53Flash, parse(gpa, wide));
+    const few = try textConfig(gpa, 2, 1, &.{1}, 4, 8192, 4096);
+    defer gpa.free(few);
+    try std.testing.expectError(error.NotGlm53Flash, parse(gpa, few));
+}
+
+test "quantization_config: EXL3 at the top level or inside text_config parses as EXL3, the top level first" {
+    const gpa = std.testing.allocator;
+    const real = try textConfig(gpa, 45, 3, &.{ 3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43 }, 288, 154880, 4096);
+    defer gpa.free(real);
+    try std.testing.expect(!(try parse(gpa, real)).exl3);
+    const exl3 = "\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4}, ";
+    const top = try std.mem.replaceOwned(u8, gpa, real, "{\"model_type\"", "{" ++ exl3 ++ "\"model_type\"");
+    defer gpa.free(top);
+    const nested = try std.mem.replaceOwned(u8, gpa, real, "\"text_config\": {", "\"text_config\": {" ++ exl3);
+    defer gpa.free(nested);
+    for ([_][]const u8{ top, nested }) |json| {
+        const c = try parse(gpa, json);
+        try std.testing.expect(c.exl3 and c.head_unit == 128);
+    }
+    const fp8 = try std.mem.replaceOwned(u8, gpa, nested, "{\"model_type\"", "{\"quantization_config\": {\"quant_method\": \"fp8\"}, \"model_type\"");
+    defer gpa.free(fp8);
+    try std.testing.expect(!(try parse(gpa, fp8)).exl3); // another method at the top level: text_config's is not read
+}
+
+test "tensorfold_activation_dtype: absent and bfloat16 parse; float32 and float16 refuse by name" {
+    const gpa = std.testing.allocator;
+    const real = try textConfig(gpa, 45, 3, &.{ 3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43 }, 288, 154880, 4096);
+    defer gpa.free(real);
+    _ = try parse(gpa, real);
+    const bf16 = try withDtype(gpa, real, "bfloat16");
+    defer gpa.free(bf16);
+    try std.testing.expectEqual(@as(u32, 45), (try parse(gpa, bf16)).layers);
+    const act32 = try withDtype(gpa, real, "float32");
+    defer gpa.free(act32);
+    try std.testing.expectError(error.UnsupportedActivationDtype, parse(gpa, act32));
+    const act16 = try withDtype(gpa, real, "float16");
+    defer gpa.free(act16);
+    try std.testing.expectError(error.UnsupportedActivationDtype, parse(gpa, act16));
 }
 
 test "a layer subset keeps the MTP layer's place and refuses an empty or oversized count" {

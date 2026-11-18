@@ -1,14 +1,21 @@
 //! Kernel launches: argument values packed where cuLaunchKernel reads them, plus the extended launch attributes.
-//! qualification_b95086f6 modifies only failed-call context (default OFF); Jay Leaton's #635 design, locally adapted by GPT-6.1 Sol via Hermes.
-//! Source: ashhart/TensorFold 986c996041e25e8b4a0341a8b54524a9d2248c12 / 5fa8ad0fd9c53131c599c39f8885117d5a582fda, Apache-2.0 and retained notices.
 
 const std = @import("std");
 const abi = @import("abi.zig");
 const Function = @import("module.zig").Function;
 const Stream = @import("stream.zig").Stream;
-const Error = @import("driver.zig").Error;
+const driver = @import("driver.zig");
+const Error = driver.Error;
 
 pub const Dim3 = abi.Dim3;
+
+/// Rows a row kernel's call takes as decode-sized: one row spread over small blocks, as Triton's tuned glue does.
+pub const few_rows = 16;
+
+/// Threads a block for a row kernel: `few` for decode-sized calls, `many` for prompt rows (bits never depend on it).
+pub fn rowThreads(rows: usize, many: u32, few: u32) u32 {
+    return if (rows <= few_rows) few else many;
+}
 
 /// Argument values in kernel order; each must have exactly the C type of its kernel parameter.
 pub const Args = struct {
@@ -82,7 +89,7 @@ pub fn launch(f: Function, cfg: Config, stream: Stream, args: *Args) Error!void 
     const g = cfg.grid;
     const b = cfg.block;
     if (cfg.plain()) {
-        return checked(f, cfg, d.api.cuLaunchKernel(f.handle, g.x, g.y, g.z, b.x, b.y, b.z, cfg.shared, stream.handle, args.pointers(), null), "cuLaunchKernel");
+        return launched(f, cfg, d.api.cuLaunchKernel(f.handle, g.x, g.y, g.z, b.x, b.y, b.z, cfg.shared, stream.handle, args.pointers(), null), "cuLaunchKernel");
     }
     var attrs: [4]abi.LaunchAttribute = undefined;
     const n = fillAttributes(cfg, &attrs);
@@ -98,35 +105,38 @@ pub fn launch(f: Function, cfg: Config, stream: Stream, args: *Args) Error!void 
         .attrs = &attrs,
         .num_attrs = @intCast(n),
     };
-    try checked(f, cfg, d.api.cuLaunchKernelEx(&lc, f.handle, args.pointers(), null), "cuLaunchKernelEx");
+    try launched(f, cfg, d.api.cuLaunchKernelEx(&lc, f.handle, args.pointers(), null), "cuLaunchKernelEx");
 }
 
-// Keep Driver.check's mapping, original log and call order; diagnostics are an additional failure-only line.
-fn checked(f: Function, cfg: Config, res: abi.Result, what: []const u8) Error!void {
-    f.d.check(res, what) catch |e| {
-        const flag = std.c.getenv("TF_CUDA_LAUNCH_DIAG");
-        if (flag != null and std.mem.eql(u8, std.mem.span(flag.?), "1")) {
-            var buf: [320]u8 = undefined;
-            std.log.err("{s} launch context: {s}", .{ what, describe(&buf, f.d.functionName(f.handle), cfg) });
-        }
-        return e;
-    };
+/// A launch's result; a failure names the kernel and its configuration with the code.
+fn launched(f: Function, cfg: Config, res: abi.Result, what: []const u8) Error!void {
+    if (res == abi.success) return;
+    if (res == abi.error_not_ready) return error.NotReady;
+    const d = f.d;
+    _ = d.result(res) catch {};
+    var buf: [160]u8 = undefined;
+    std.log.err("{s}: {s} ({d}) {s}; {s}{s}", .{ what, d.errorName(res), res, d.errorText(res), describe(&buf, d.functionName(f.handle), cfg), driver.shutdownNote(res) });
+    return driver.Driver.errorOf(res);
 }
 
-/// Bounded failure context; a long symbol never consumes the configuration's space.
+/// "kernel <name>, grid XxYxZ, block XxYxZ, shared N B" (+ cluster / PDL / cooperative when set).
 pub fn describe(buf: []u8, name: []const u8, cfg: Config) []const u8 {
-    var symbol: [64]u8 = undefined;
-    const n = @min(symbol.len, name.len);
-    for (name[0..n], 0..) |c, i| symbol[i] = if (c >= 32 and c <= 126) c else '?';
     const g = cfg.grid;
     const b = cfg.block;
     var w = std.Io.Writer.fixed(buf);
-    w.print("kernel {s}, grid {d}x{d}x{d}, block {d}x{d}x{d}, shared {d} B", .{ symbol[0..n], g.x, g.y, g.z, b.x, b.y, b.z, cfg.shared }) catch return w.buffered();
-    if (cfg.cluster) |c| {
-        w.print(", cluster {d}x{d}x{d}", .{ c.x, c.y, c.z }) catch return w.buffered();
-    } else w.writeAll(", cluster none") catch return w.buffered();
-    w.print(", pdl={}, cooperative={}, spread={}", .{ cfg.pdl, cfg.cooperative, cfg.cluster_spread }) catch return w.buffered();
+    w.print("kernel {s}, grid {d}x{d}x{d}, block {d}x{d}x{d}, shared {d} B", .{ name, g.x, g.y, g.z, b.x, b.y, b.z, cfg.shared }) catch return w.buffered();
+    if (cfg.cluster) |c| w.print(", cluster {d}x{d}x{d}", .{ c.x, c.y, c.z }) catch return w.buffered();
+    if (cfg.pdl) w.writeAll(", pdl") catch return w.buffered();
+    if (cfg.cooperative) w.writeAll(", cooperative") catch return w.buffered();
     return w.buffered();
+}
+
+test "a failed launch's description: the kernel, its grid, block and shared bytes, bounded" {
+    var buf: [160]u8 = undefined;
+    const cfg: Config = .{ .grid = .{ .x = 70000, .y = 2, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 }, .shared = 49152, .pdl = true };
+    try std.testing.expectEqualStrings("kernel _stream_pf, grid 70000x2x1, block 128x1x1, shared 49152 B, pdl", describe(&buf, "_stream_pf", cfg));
+    var small: [24]u8 = undefined;
+    try std.testing.expect(describe(&small, "a_very_long_kernel_symbol_name", cfg).len <= small.len);
 }
 
 fn attribute(id: abi.LaunchAttributeId) abi.LaunchAttribute {

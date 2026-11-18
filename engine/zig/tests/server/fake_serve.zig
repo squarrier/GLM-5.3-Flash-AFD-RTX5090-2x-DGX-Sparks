@@ -10,15 +10,6 @@ fn announce(port: u16) void {
     server.log.raw(line);
 }
 
-/// Whether `dir`'s config.json names GLM-5.3 (model_type glm5_next).
-fn isGlm(a: std.mem.Allocator, io: std.Io, dir: []const u8) bool {
-    const path = std.fs.path.join(a, &.{ dir, "config.json" }) catch return false;
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch return false;
-    const doc = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return false;
-    const t = (if (doc == .object) doc.object.get("model_type") else null) orelse return false;
-    return t == .string and std.mem.eql(u8, t.string, server.glm_text.model_type);
-}
-
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
@@ -41,23 +32,18 @@ pub fn main(init: std.process.Init) !u8 {
     for (vocab.object.get("pieces").?.array.items) |p| try pieces.append(a, p.string);
     var fake = FakeText.init(pieces.items);
     var problem: []const u8 = "";
-    const real = if (init.environ_map.get("TF_FAKE_TOKENIZER")) |path| server.hf_text.HfText.load(gpa, io, path, a, &problem) catch {
+    const real = if (init.environ_map.get("TF_FAKE_TOKENIZER")) |path| server.hf_text.HfText.load(gpa, io, path, args.chat_template, a, &problem) catch {
         std.debug.print("tensorfold: {s}\n", .{problem});
         return 1;
     } else null;
     defer if (real) |r| r.deinit();
-    // GLM-5.3's prompts as python-0.6's glm5_next family renders them, when the tokenizer folder is that checkpoint's
-    var glm: server.glm_text.GlmText = undefined;
-    const text = if (real) |r| blk: {
-        if (!isGlm(a, io, init.environ_map.get("TF_FAKE_TOKENIZER").?)) break :blk r.text();
-        glm = .{ .inner = r.text(), .clear = server.glm_text.clearThinking(init.environ_map.get("TF_GLM_CLEAR_THINKING")) catch return 2 };
-        break :blk glm.text();
-    } else fake.text();
+    const text = if (real) |r| r.text() else fake.text();
     const scripts_path = init.environ_map.get("TF_FAKE_SCRIPTS") orelse try std.fs.path.join(a, &.{ dir, "scripts.json" });
     const scripts_bytes = try std.Io.Dir.cwd().readFileAlloc(io, scripts_path, a, .limited(4 << 20));
     const scripts = try std.json.parseFromSliceLeaky(std.json.Value, a, scripts_bytes, .{});
     const context: u32 = if (init.environ_map.get("TF_FAKE_CONTEXT")) |c| try std.fmt.parseInt(u32, c, 10) else 0;
     var engine: ScriptEngine = .{ .gpa = gpa, .io = io, .text = text, .scripts = scripts, .info_ = .{ .lanes = server.cli.parallel(args.parallel) orelse 8, .context_window = context, .call_gates = true } };
+    defer engine.cancelled.deinit(gpa);
     return server.serve.run(gpa, io, args, .{
         .engine = engine.engine(),
         .text = text,

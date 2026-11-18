@@ -1,3 +1,6 @@
+// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
+// V4 fold change: explicit __fmaf_rn weighted accumulation replaces the V3 add/multiply expression.
 // glm53f-afd's large-M expert kernels in TensorFold's AFD expert node (TF_GLM_EXPERT_KERNEL=g53): one TP2 half's
 // routed experts of a prompt chunk, GLM-5.3-Flash, EXL3 4-bit "mcg" trellises.
 //
@@ -354,7 +357,7 @@ __device__ __forceinline__ bool reduce_item(const Args& a, int row, int blk, int
         const half2 s01 = *reinterpret_cast<const half2*>(&sv[s].x), s23 = *reinterpret_cast<const half2*>(&sv[s].y);
         const float svh[4] = {__low2float(s01), __high2float(s01), __low2float(s23), __high2float(s23)};
 #pragma unroll
-        for (int j = 0; j < 4; ++j) acc[j] = acc[j] + wt[s] * (v[j] * HAD_SCALE * svh[j]);
+        for (int j = 0; j < 4; ++j) acc[j] = __fmaf_rn(v[j] * HAD_SCALE * svh[j], wt[s], acc[j]);
     }
     bool bad = false;
 #pragma unroll

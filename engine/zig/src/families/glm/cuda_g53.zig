@@ -1,3 +1,5 @@
+// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
 //! glm53f-afd's large-M expert kernels for a TP2 half's prompt windows (TF_GLM_HALVES_KERNEL=g53kt3r, qualification_1b9bf461):
 //! python TF-AFD 2.15's g53_experts.py (default_cfg, tuned_cfg with KT3R's tier, max_groups) and the host side of its
 //! g53_rank.cu / g53_rank.cpp (g53_ffn_launch's launches, launch_persistent's grid, the binding's checks) over the image
@@ -9,7 +11,7 @@
 
 const std = @import("std");
 const cuda = @import("cuda");
-const ex3 = @import("cuda_exl3_experts.zig");
+const ex3 = @import("cuda_v3_g53_types.zig");
 
 pub const H: u32 = 4096; // model width: gate/up K, down N
 pub const WID: u32 = 1024; // the half's width (two ranks)
@@ -386,4 +388,11 @@ pub const Node = struct {
 
 test {
     _ = @import("cuda_g53_test.zig");
+}
+
+/// Helios current-native field adapter: the admitted4-bit MCG loader owns all data unchanged.
+pub fn nativeLayer(w:@import("cuda_exl3.zig").Experts) ex3.Layer {
+ return .{.gate_ptr=w.gt,.up_ptr=w.ut,.down_ptr=w.dt,.gate_k2=w.k2,.up_k2=w.k2,.down_k2=w.k2,
+ .suh_g=w.suh_g,.suh_u=w.suh_u,.svh_g=w.svh_g,.svh_u=w.svh_u,.suh_d=w.suh_d,.svh_d=w.svh_d,
+ .count=288,.dims=4096,.width=1024,.cb=.mcg,.k2_gu=.{8,8},.k2_d=.{8,8}};
 }

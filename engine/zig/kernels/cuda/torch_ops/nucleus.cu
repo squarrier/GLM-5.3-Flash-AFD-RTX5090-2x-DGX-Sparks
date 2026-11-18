@@ -37,39 +37,6 @@ extern "C" __global__ void tf_integer_row_sum_kernel(const uint64_t* input, uint
     if (threadIdx.x == 0) output[row] = partials[0];
 }
 
-// draft_policy (TF_GLM_ROWS_1024=1; after BadAd84's patches/0010, MiaAI-Lab qwen-next-single PR #35, a82cf8a): the mass and the
-// integer row sum of one row a block on 1024 threads. A mass is its own element's (the same operations whichever
-// thread computes it) and the sum is of integers (any order gives the same bits), so both are byte-identical to the
-// 256-thread kernels above, which stay as they were for the switch unset.
-extern "C" __global__ void __launch_bounds__(1024) tf_mass_wide_kernel(const double* scaled, const double* maxima, int64_t* mass,
-                                                                     uint64_t rows, uint64_t columns) {
-    const uint64_t row = blockIdx.x;
-    if (row >= rows) return;
-    for (uint64_t col = threadIdx.x; col < columns; col += blockDim.x) {
-        const double relative = __dsub_rn(scaled[row * columns + col], maxima[row]);
-        const double probability = exp(relative);
-        const double product = __dmul_rn(probability, 1099511627776.0);
-        mass[row * columns + col] = __double2ll_rz(floor(product));
-    }
-}
-
-// launched with exactly 1024 threads (the tree's first stride is 512)
-extern "C" __global__ void __launch_bounds__(1024) tf_integer_row_sum_wide_kernel(const uint64_t* input, uint64_t* output,
-                                                                                uint64_t rows, uint64_t columns) {
-    __shared__ uint64_t partials[1024];
-    const uint64_t row = blockIdx.x;
-    if (row >= rows) return;
-    uint64_t sum = 0;
-    for (uint64_t col = threadIdx.x; col < columns; col += blockDim.x) sum += input[row * columns + col];
-    partials[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = 512; stride; stride >>= 1) {
-        if (threadIdx.x < stride) partials[threadIdx.x] += partials[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) output[row] = partials[0];
-}
-
 
 
 extern "C" cudaError_t tf_scale_logits(const float* input, double* output, uint64_t count,

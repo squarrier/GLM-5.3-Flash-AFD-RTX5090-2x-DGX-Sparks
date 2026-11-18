@@ -1,6 +1,6 @@
 //! Request field checks shared by every route: numbers, stops, thinking switches, efforts, probabilities.
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const errors = @import("errors.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
@@ -61,7 +61,7 @@ pub fn parseNumbers(cx: *Cx, fields: Value) errors.Refused!Value {
     try requireObject(cx, fields);
     _ = try stopOptions(cx, fields);
     const parsed = try json.copyObject(cx.a, fields.object);
-    for (integer_fields ++ [_][]const u8{ "temperature", "top_p", "min_p" }) |name| {
+    for (integer_fields ++ [_][]const u8{ "temperature", "top_p", "min_p", "presence_penalty", "frequency_penalty" }) |name| {
         const value = fields.field(name) orelse continue;
         const integer = for (integer_fields) |f| {
             if (std.mem.eql(u8, f, name)) break true;
@@ -69,6 +69,7 @@ pub fn parseNumbers(cx: *Cx, fields: Value) errors.Refused!Value {
         const number: ?Value = if (integer) toInt(cx.a, value) catch null else toFloat(value);
         const n = number orelse return cx.fail(.request, "{s} must be {s} or null", .{ name, if (integer) "an integer" else "a finite number" });
         if (std.mem.eql(u8, name, "min_p") and !(n.float >= 0 and n.float <= 1)) return cx.refuse("min_p must be between 0 and 1, or null");
+        if (std.mem.endsWith(u8, name, "_penalty") and !(n.float >= -2 and n.float <= 2)) return cx.fail(.request, "{s} must be between -2 and 2, or null", .{name});
         const stored = if (std.mem.eql(u8, name, "top_k") and n.int[0] == '-') Value{ .int = "0" } else n;
         try parsed.put(cx.a, name, stored);
     }
@@ -193,7 +194,7 @@ fn thinkingSwitch(v: ?Value) ?bool {
     return null;
 }
 
-pub const Thinking = struct { effort: ?[]const u8 = null, enable: ?bool = null };
+pub const Thinking = struct { effort: ?[]const u8 = null, enable: ?bool = null, clear: ?bool = null };
 
 /// ``thinking_fields``: a request's effort and thinking switch where it sets them.
 pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.Refused!Thinking {
@@ -206,6 +207,8 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.R
     if (kw_object and !has_enable) if (thinkingSwitch(if (kwargs) |k| k.get("thinking") else null)) |sw| {
         enable = .{ .bool = sw };
     };
+    // DeepSeek's own API (and GLM's and Kimi's) switches thinking with a top-level ``thinking``; the kwargs win.
+    const top: ?bool = if (enable == null) thinkingSwitch(body.get("thinking")) else null;
     var effort = body.field("reasoning_effort");
     if (effort == null and kw_object) if (kwargs) |k| {
         effort = k.field("reasoning_effort");
@@ -218,6 +221,14 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.R
     if (kw_object) if (enable) |on| {
         out.enable = on.truthy();
         if (out.enable.? and out.effort != null and std.mem.eql(u8, out.effort.?, "none")) out.effort = null;
+    };
+    if (top) |on| {
+        out.enable = on;
+        if (on and out.effort != null and std.mem.eql(u8, out.effort.?, "none")) out.effort = null;
+    }
+    if (kw_object) if (kwargs) |k| if (k.get("clear_thinking")) |c| if (c != .null) {
+        if (c != .bool) return cx.refuse("chat_template_kwargs.clear_thinking must be true or false");
+        out.clear = c.bool;
     };
     return out;
 }
@@ -273,17 +284,41 @@ pub fn effortLevels(a: Allocator, template: []const u8) Allocator.Error![]const 
     return found.items;
 }
 
-/// ``probability_options``: n must be 1, and logprobs are refused (no engine reports them yet).
-pub fn probabilityOptions(cx: *Cx, body: Value) errors.Refused!void {
+/// ``probability_options``: n must be 1; the ``top_logprobs`` count when logprobs are asked and ``supported``.
+pub fn probabilityOptions(cx: *Cx, body: Value, supported: bool) errors.Refused!?u8 {
     if (body.field("n")) |n| if (n != .int or !std.mem.eql(u8, n.int, "1")) return cx.refuse("n must be 1; multiple choices are not supported");
     const enabled = body.field("logprobs");
     if (enabled) |e| if (e != .bool) return cx.refuse("logprobs must be a boolean or null");
+    var count: u8 = 0;
     if (body.field("top_logprobs")) |top| {
         const n = top.int64();
         if (n == null or n.? < 0 or n.? > 20) return cx.refuse("top_logprobs must be an integer between 0 and 20, or null");
         if (enabled == null or !enabled.?.bool) return cx.refuse("top_logprobs requires logprobs: true");
+        count = @intCast(n.?);
     }
-    if (enabled != null and enabled.?.bool) return cx.refuse("logprobs are not supported by this model or backend");
+    if (enabled == null or !enabled.?.bool) return null;
+    if (!supported) return cx.refuse("logprobs are not supported by this model or backend");
+    return count;
+}
+
+/// ``/v1/completions``' ``logprobs``: n must be 1; how many alternatives (0 through 20), or null when not asked.
+pub fn legacyLogprobs(cx: *Cx, body: Value, supported: bool) errors.Refused!?u8 {
+    if (body.field("n")) |n| if (n != .int or !std.mem.eql(u8, n.int, "1")) return cx.refuse("n must be 1; multiple choices are not supported");
+    const asked = body.field("logprobs") orelse return null;
+    const n = asked.int64();
+    if (asked != .int or n == null or n.? < 0 or n.? > 20) return cx.refuse("logprobs must be an integer between 0 and 20, or null");
+    if (!supported) return cx.refuse("logprobs are not supported by this model or backend");
+    return @intCast(n.?);
+}
+
+/// vLLM's ``prompt_logprobs``: 0 through 20 alternatives on a whole ``/v1/completions`` reply, or null when not asked.
+pub fn promptLogprobs(cx: *Cx, body: Value, completions: bool, streamed: bool, supported: bool) errors.Refused!?u8 {
+    const asked = body.field("prompt_logprobs") orelse return null;
+    const n = asked.int64();
+    if (asked != .int or n == null or n.? < 0 or n.? > 20) return cx.refuse("prompt_logprobs must be an integer between 0 and 20, or null");
+    if (!completions or streamed) return cx.refuse("prompt_logprobs are supported on /v1/completions without streaming only");
+    if (!supported) return cx.refuse("prompt_logprobs are not supported by this model or backend");
+    return @intCast(n.?);
 }
 
 const media = [_][]const u8{ "image", "images", "image_url", "input_image", "audio", "input_audio", "video", "video_url" };

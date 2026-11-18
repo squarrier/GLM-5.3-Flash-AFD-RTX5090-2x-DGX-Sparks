@@ -1,0 +1,692 @@
+{
+  "files": [
+    {
+      "bytes": 1077,
+      "path": "LICENSES/stable/AOTriton-MIT.txt",
+      "sha256": "47fb6a076a04a40545bee723a9b7f25e9e2084e22065044b10352e2c46d0c349"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/stable/Apache-2.0.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 3076,
+      "path": "LICENSES/stable/Kimi-K3.1-Pro.txt",
+      "sha256": "3e74581d3af80d62af968dfe3822378f26c5e144413ea6927d034925581c246c"
+    },
+    {
+      "bytes": 3064,
+      "path": "LICENSES/stable/Kimi-K3.txt",
+      "sha256": "282b09c71615dee175f49c620d1874162f508baea9d666a6ba686ace870952a7"
+    },
+    {
+      "bytes": 10573,
+      "path": "LICENSES/stable/LFM-Open-1.0.txt",
+      "sha256": "5a020ce8f34b9fd3a59c4e5f000ea19d8b81c4e3ba2639f1e4f1533fb90e4f66"
+    },
+    {
+      "bytes": 1080,
+      "path": "LICENSES/stable/MIT.txt",
+      "sha256": "be6a9ee4462784a762b21790954b8e76c4dcacc9fb6da2a40d03a8a9bddec93e"
+    },
+    {
+      "bytes": 2265,
+      "path": "LICENSES/stable/Mia-FlashNext-MIT.txt",
+      "sha256": "ed01c9ef861bcb1c20f028739d8c7102c6f04364ffe9903e5088c6d6449a4aff"
+    },
+    {
+      "bytes": 2265,
+      "path": "LICENSES/stable/MiaAI-Lab-MIT.txt",
+      "sha256": "ed01c9ef861bcb1c20f028739d8c7102c6f04364ffe9903e5088c6d6449a4aff"
+    },
+    {
+      "bytes": 3051,
+      "path": "LICENSES/stable/NVIDIA-OpenMDW-1.1.txt",
+      "sha256": "3375384ee1050a54d69c98c74d6499841166cd7db823ed90358f430df8c39856"
+    },
+    {
+      "bytes": 1457,
+      "path": "LICENSES/stable/Pillow-MIT-CMU.txt",
+      "sha256": "15181e7363dca9aed78b79bebebc7fde7f1814b8bd311ea3b87ae8ccadfc185b"
+    },
+    {
+      "bytes": 3464,
+      "path": "LICENSES/stable/PyTorch-BSD-3.txt",
+      "sha256": "bd018feef8825e88181c84eb7e3aa4eafb8f08a20d9fd6ef948569610c4a3e43"
+    },
+    {
+      "bytes": 1162,
+      "path": "LICENSES/stable/avx_mathfun-zlib.txt",
+      "sha256": "836cbf8808e61f15cc6712ffb449406c194ed8ef573961d0f3bcac9f41a963a4"
+    },
+    {
+      "bytes": 1098,
+      "path": "LICENSES/stable/mlx-omarchy-MIT.txt",
+      "sha256": "a74138dc7f24477a0bdb283cfa7651db16d31e82b17a0c79dd7fcc9bd275431f"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/Apache-2.0.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/Bizuayeu__TensorFold__146e113f.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/Bizuayeu__TensorFold__146e113f.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/Bizuayeu__TensorFold__2bc75a69.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/Bizuayeu__TensorFold__2bc75a69.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/Bizuayeu__TensorFold__322b4de6.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/Bizuayeu__TensorFold__322b4de6.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/Bizuayeu__TensorFold__55701180.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/Bizuayeu__TensorFold__55701180.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/Bizuayeu__TensorFold__75131b66.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/Bizuayeu__TensorFold__75131b66.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/Bizuayeu__TensorFold__b9528625.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/Bizuayeu__TensorFold__b9528625.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/Bizuayeu__TensorFold__be17a101.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/Bizuayeu__TensorFold__be17a101.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/Bizuayeu__TensorFold__d3cc052c.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/Bizuayeu__TensorFold__d3cc052c.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 1070,
+      "path": "LICENSES/previous/GLM-5.3-Flash-ZAI-MIT.txt",
+      "sha256": "30b85b6b9659f2e78aa259f8faf5d920a68dee7c9ced3fa6dba1f19f2bc4fca1"
+    },
+    {
+      "bytes": 1080,
+      "path": "LICENSES/previous/MIT.txt",
+      "sha256": "be6a9ee4462784a762b21790954b8e76c4dcacc9fb6da2a40d03a8a9bddec93e"
+    },
+    {
+      "bytes": 1070,
+      "path": "LICENSES/previous/Mia-EXL3-078455ff-MIT.txt",
+      "sha256": "30b85b6b9659f2e78aa259f8faf5d920a68dee7c9ced3fa6dba1f19f2bc4fca1"
+    },
+    {
+      "bytes": 2265,
+      "path": "LICENSES/previous/MiaAI-Lab-MIT.txt",
+      "sha256": "ed01c9ef861bcb1c20f028739d8c7102c6f04364ffe9903e5088c6d6449a4aff"
+    },
+    {
+      "bytes": 11854,
+      "path": "LICENSES/previous/MiaAI-Lab__GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold__a687724.NOTICE.txt",
+      "sha256": "a8c7302114d65006965dbb02387c22d8e6156a32b725ef5c0a083f9c77a5f526"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/MiaAI-Lab__GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold__a687724.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 11854,
+      "path": "LICENSES/previous/MiaAI-Lab__GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold__ba19a9c1.NOTICE.txt",
+      "sha256": "a8c7302114d65006965dbb02387c22d8e6156a32b725ef5c0a083f9c77a5f526"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/MiaAI-Lab__GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold__ba19a9c1.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 12628,
+      "path": "LICENSES/previous/MiaAI-Lab__GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold__029a852f.NOTICE.txt",
+      "sha256": "ee701e5d31c2bc766a1af791e6a394fc5fcfc8435f0361e7e9b596292e2dc7e1"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/MiaAI-Lab__GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold__029a852f.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 10514,
+      "path": "LICENSES/previous/MiaAI-Lab__GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold__11619a19.NOTICE.txt",
+      "sha256": "ca16ec33d97cfd0e48199f4a97f35c75b951d01fcee3a965672fd49f41a3af7d"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/MiaAI-Lab__GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold__11619a19.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 10045,
+      "path": "LICENSES/previous/MiaAI-Lab__GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold__1576746a.NOTICE.txt",
+      "sha256": "83a4ca999001b873c9de4fee5859cf7ad62f63aa0e67d6947b572ce0e8e6749c"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/MiaAI-Lab__GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold__1576746a.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 10514,
+      "path": "LICENSES/previous/MiaAI-Lab__GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold__3fd60dfc.NOTICE.txt",
+      "sha256": "ca16ec33d97cfd0e48199f4a97f35c75b951d01fcee3a965672fd49f41a3af7d"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/MiaAI-Lab__GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold__3fd60dfc.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 10514,
+      "path": "LICENSES/previous/MiaAI-Lab__GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold__549fdc56.NOTICE.txt",
+      "sha256": "ca16ec33d97cfd0e48199f4a97f35c75b951d01fcee3a965672fd49f41a3af7d"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/MiaAI-Lab__GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold__549fdc56.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 10514,
+      "path": "LICENSES/previous/MiaAI-Lab__GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold__616b8406.NOTICE.txt",
+      "sha256": "ca16ec33d97cfd0e48199f4a97f35c75b951d01fcee3a965672fd49f41a3af7d"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/MiaAI-Lab__GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold__616b8406.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 10514,
+      "path": "LICENSES/previous/MiaAI-Lab__GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold__90ccb492.NOTICE.txt",
+      "sha256": "ca16ec33d97cfd0e48199f4a97f35c75b951d01fcee3a965672fd49f41a3af7d"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/MiaAI-Lab__GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold__90ccb492.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 10514,
+      "path": "LICENSES/previous/MiaAI-Lab__GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold__c66a6cfd.NOTICE.txt",
+      "sha256": "ca16ec33d97cfd0e48199f4a97f35c75b951d01fcee3a965672fd49f41a3af7d"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/MiaAI-Lab__GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold__c66a6cfd.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 5568,
+      "path": "LICENSES/previous/MiaAI-Lab__Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold__cbfc429.NOTICE.txt",
+      "sha256": "af31508392aec270f2bf1f322fc9eb3b00005584afc782051172907a43332f1a"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/MiaAI-Lab__Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold__cbfc429.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 4942,
+      "path": "LICENSES/previous/MiaAI-Lab__Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold__0c7b8868.NOTICE.txt",
+      "sha256": "fdadf83b2d05dba3885333e38e33ce5531c843f50e1839f7ff67c5cc6f24acd4"
+    },
+    {
+      "bytes": 2265,
+      "path": "LICENSES/previous/MiaAI-Lab__Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold__0c7b8868.txt",
+      "sha256": "ed01c9ef861bcb1c20f028739d8c7102c6f04364ffe9903e5088c6d6449a4aff"
+    },
+    {
+      "bytes": 2265,
+      "path": "LICENSES/previous/MiaAI-Lab__Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold__a3aa8983.txt",
+      "sha256": "ed01c9ef861bcb1c20f028739d8c7102c6f04364ffe9903e5088c6d6449a4aff"
+    },
+    {
+      "bytes": 4942,
+      "path": "LICENSES/previous/MiaAI-Lab__Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold__a82cf8ae.NOTICE.txt",
+      "sha256": "fdadf83b2d05dba3885333e38e33ce5531c843f50e1839f7ff67c5cc6f24acd4"
+    },
+    {
+      "bytes": 2265,
+      "path": "LICENSES/previous/MiaAI-Lab__Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold__a82cf8ae.txt",
+      "sha256": "ed01c9ef861bcb1c20f028739d8c7102c6f04364ffe9903e5088c6d6449a4aff"
+    },
+    {
+      "bytes": 4942,
+      "path": "LICENSES/previous/MiaAI-Lab__Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold__e6a35d22.NOTICE.txt",
+      "sha256": "fdadf83b2d05dba3885333e38e33ce5531c843f50e1839f7ff67c5cc6f24acd4"
+    },
+    {
+      "bytes": 2265,
+      "path": "LICENSES/previous/MiaAI-Lab__Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold__e6a35d22.txt",
+      "sha256": "ed01c9ef861bcb1c20f028739d8c7102c6f04364ffe9903e5088c6d6449a4aff"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/ashhart__TensorFold__1184cdbb.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/ashhart__TensorFold__1184cdbb.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/ashhart__TensorFold__17a75f55.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/ashhart__TensorFold__17a75f55.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/ashhart__TensorFold__1b026895.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/ashhart__TensorFold__1b026895.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/ashhart__TensorFold__2193d145.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/ashhart__TensorFold__2193d145.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 1080,
+      "path": "LICENSES/previous/ashhart__TensorFold__3283e59b.txt",
+      "sha256": "be6a9ee4462784a762b21790954b8e76c4dcacc9fb6da2a40d03a8a9bddec93e"
+    },
+    {
+      "bytes": 1080,
+      "path": "LICENSES/previous/ashhart__TensorFold__34bae79a.txt",
+      "sha256": "be6a9ee4462784a762b21790954b8e76c4dcacc9fb6da2a40d03a8a9bddec93e"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/ashhart__TensorFold__4284048d.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/ashhart__TensorFold__4284048d.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/ashhart__TensorFold__5fa8ad0f.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/ashhart__TensorFold__5fa8ad0f.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/ashhart__TensorFold__711bacf2.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/ashhart__TensorFold__711bacf2.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/ashhart__TensorFold__720c4091.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/ashhart__TensorFold__720c4091.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/ashhart__TensorFold__86134886.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/ashhart__TensorFold__8ced2018.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/ashhart__TensorFold__8ced2018.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/ashhart__TensorFold__986c9960.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/ashhart__TensorFold__986c9960.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/ashhart__TensorFold__afa35dc0.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/ashhart__TensorFold__afa35dc0.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 1080,
+      "path": "LICENSES/previous/ashhart__TensorFold__b23c10ad.txt",
+      "sha256": "be6a9ee4462784a762b21790954b8e76c4dcacc9fb6da2a40d03a8a9bddec93e"
+    },
+    {
+      "bytes": 1080,
+      "path": "LICENSES/previous/ashhart__TensorFold__b3b8a391.txt",
+      "sha256": "be6a9ee4462784a762b21790954b8e76c4dcacc9fb6da2a40d03a8a9bddec93e"
+    },
+    {
+      "bytes": 1080,
+      "path": "LICENSES/previous/ashhart__TensorFold__b41a6b67.txt",
+      "sha256": "be6a9ee4462784a762b21790954b8e76c4dcacc9fb6da2a40d03a8a9bddec93e"
+    },
+    {
+      "bytes": 1080,
+      "path": "LICENSES/previous/ashhart__TensorFold__bb4b4a35.txt",
+      "sha256": "be6a9ee4462784a762b21790954b8e76c4dcacc9fb6da2a40d03a8a9bddec93e"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/ashhart__TensorFold__c080a18e.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/ashhart__TensorFold__c080a18e.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 1080,
+      "path": "LICENSES/previous/ashhart__TensorFold__d6ce24fe.txt",
+      "sha256": "be6a9ee4462784a762b21790954b8e76c4dcacc9fb6da2a40d03a8a9bddec93e"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/ashhart__TensorFold__d7b134cd.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/ashhart__TensorFold__d7b134cd.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/ashhart__TensorFold__d7d5f6f1.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/ashhart__TensorFold__d7d5f6f1.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/ashhart__TensorFold__db281878.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/ashhart__TensorFold__db281878.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/ashhart__TensorFold__e7c523eb.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/ashhart__TensorFold__e7c523eb.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/ashhart__TensorFold__ed78d6fc.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/ashhart__TensorFold__ed78d6fc.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 1080,
+      "path": "LICENSES/previous/ashhart__TensorFold__f119334d.txt",
+      "sha256": "be6a9ee4462784a762b21790954b8e76c4dcacc9fb6da2a40d03a8a9bddec93e"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/ashhart__TensorFold__f8fe17d2.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/ashhart__TensorFold__f8fe17d2.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 1080,
+      "path": "LICENSES/previous/ashhart__TensorFold__fb985b86.txt",
+      "sha256": "be6a9ee4462784a762b21790954b8e76c4dcacc9fb6da2a40d03a8a9bddec93e"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/bertholomus__TensorFold__2786594.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/bertholomus__TensorFold__2786594.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 3977,
+      "path": "LICENSES/previous/bertholomus__TensorFold__90b68e06.NOTICE.txt",
+      "sha256": "7249716cecec55a3b0a3deaed87ca0c94be36bf31495a9b914914978d266fb10"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/bertholomus__TensorFold__90b68e06.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 3638,
+      "path": "LICENSES/previous/bertholomus__TensorFold__ce20a545.NOTICE.txt",
+      "sha256": "e8e70c99e9e80d92f807603aad9bbb94bf4dcfcdc62f8bc39f0c385ae27ad267"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/bertholomus__TensorFold__ce20a545.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 356,
+      "path": "LICENSES/previous/bertholomus__TensorFold__dbe0773.NOTICE.txt",
+      "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7"
+    },
+    {
+      "bytes": 11358,
+      "path": "LICENSES/previous/bertholomus__TensorFold__dbe0773.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 11345,
+      "path": "LICENSES/previous/dmlc__dlpack__bbd2f4d3.txt",
+      "sha256": "3e8f6bc39276a586d60c8c5aaece2ff989262181cf2b3d2a128db58f97a9300c"
+    },
+    {
+      "bytes": 1065,
+      "path": "LICENSES/previous/fly9i__spark-engine__b09a53e.txt",
+      "sha256": "e1882e32cbac33c613d6382b849ebb41dc256fd256d4c07e759d01b8adffb555"
+    },
+    {
+      "bytes": 1080,
+      "path": "LICENSES/previous/glm53f-afd-LICENSE.tensorfold.txt",
+      "sha256": "be6a9ee4462784a762b21790954b8e76c4dcacc9fb6da2a40d03a8a9bddec93e"
+    },
+    {
+      "bytes": 1081,
+      "path": "LICENSES/previous/glm53f-afd-MIT.txt",
+      "sha256": "bcf2864b2403249319c65320d79c708236f6fd46c61eee568a52ac1e8816e8fa"
+    },
+    {
+      "bytes": 1080,
+      "path": "LICENSES/previous/hughmadden__glm53f-afd__91db3cc6.crates_glm53f-rank_LICENSE.tensorfold.txt",
+      "sha256": "be6a9ee4462784a762b21790954b8e76c4dcacc9fb6da2a40d03a8a9bddec93e"
+    },
+    {
+      "bytes": 1081,
+      "path": "LICENSES/previous/hughmadden__glm53f-afd__91db3cc6.txt",
+      "sha256": "bcf2864b2403249319c65320d79c708236f6fd46c61eee568a52ac1e8816e8fa"
+    },
+    {
+      "bytes": 11357,
+      "path": "LICENSES/previous/local-inference-lab__b12x__2cc7f66a.txt",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "bytes": 1066,
+      "path": "LICENSES/previous/ml-explore__mlx-lm__v0.31.3.txt",
+      "sha256": "ccfab7ccb2ea306f71531c8ca77bb55507606cd90768b1e32b8b52ab5b48cf01"
+    },
+    {
+      "bytes": 1066,
+      "path": "LICENSES/previous/ml-explore__mlx__v0.32.3.txt",
+      "sha256": "ccfab7ccb2ea306f71531c8ca77bb55507606cd90768b1e32b8b52ab5b48cf01"
+    },
+    {
+      "bytes": 35219,
+      "path": "LICENSES/previous/mlc-ai__xgrammar__97787376.3rdparty_picojson_picojson.h.txt",
+      "sha256": "de1a8a6d768ef2f581797ba1b265eba9c7fc37f1e9e5ed0cfb2805bbf06f77f7"
+    },
+    {
+      "bytes": 11357,
+      "path": "LICENSES/previous/mlc-ai__xgrammar__97787376.txt",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "bytes": 1336,
+      "path": "LICENSES/previous/picojson-BSD-2-Clause.txt",
+      "sha256": "5585fe141cc7bb08c953f3859db608852968d0bbc625b9b6d95c0bd6349bacb6"
+    },
+    {
+      "bytes": 23632,
+      "path": "LICENSES/previous/pytorch__pytorch__9186a08b.NOTICE.txt",
+      "sha256": "c2cc7bf0caec7652c2b460a8a470bea1677f241e4ab8e431df34cf17f5a9fec0"
+    },
+    {
+      "bytes": 3464,
+      "path": "LICENSES/previous/pytorch__pytorch__9186a08b.txt",
+      "sha256": "bd018feef8825e88181c84eb7e3aa4eafb8f08a20d9fd6ef948569610c4a3e43"
+    },
+    {
+      "bytes": 1069,
+      "path": "LICENSES/previous/tpurtell__cuteafd__c05d9939.txt",
+      "sha256": "0a3535964622b6d987f46a6ad5bcf197abe4dc9eba2f84f0e0b5e0982c8b2f36"
+    },
+    {
+      "bytes": 1132,
+      "path": "LICENSES/previous/triton-lang__triton__v3.7.1.txt",
+      "sha256": "92640fb97222fd0a698ff28ce0c3782c172623f8d6c609b557636a80f28fb946"
+    },
+    {
+      "bytes": 1065,
+      "path": "LICENSES/previous/turboderp-org__exllamav3__f45b8451.txt",
+      "sha256": "27a32b6263fcd96c79d3beeecf221c4366780bdf15ad51986f48650bd7369bff"
+    },
+    {
+      "bytes": 54,
+      "path": "LICENSES/previous/xgrammar-NOTICE.txt",
+      "sha256": "769c6907073c65801bfcfe3ce1c0e80bf0ae4e124e2769d4f026c038ad583c0f"
+    },
+    {
+      "path": "engine/LICENSES/glm53f-afd-MIT.txt",
+      "bytes": 1081,
+      "sha256": "bcf2864b2403249319c65320d79c708236f6fd46c61eee568a52ac1e8816e8fa"
+    },
+    {
+      "path": "engine/LICENSES/glm53f-afd-LICENSE.tensorfold.txt",
+      "bytes": 1080,
+      "sha256": "be6a9ee4462784a762b21790954b8e76c4dcacc9fb6da2a40d03a8a9bddec93e"
+    }
+  ],
+  "full_source_or_binary_legal_closure": false,
+  "new_code_licence": "Apache-2.0 matching selected native engine; earlier MIT material retains its original terms",
+  "schema": "V4.preserved-license-index.v1"
+}

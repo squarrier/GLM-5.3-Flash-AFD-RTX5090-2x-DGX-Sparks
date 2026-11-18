@@ -17,14 +17,23 @@ pub const Pipeline = @import("library.zig").Pipeline;
 pub const Queue = @import("command.zig").Queue;
 pub const CommandBuffer = @import("command.zig").CommandBuffer;
 pub const ComputeEncoder = @import("command.zig").ComputeEncoder;
+pub const BlitEncoder = @import("command.zig").BlitEncoder;
 pub const SharedEvent = @import("sync.zig").SharedEvent;
 pub const Event = @import("sync.zig").Event;
 pub const IndirectCommandBuffer = @import("icb.zig").IndirectCommandBuffer;
 pub const IndirectCommand = @import("icb.zig").Command;
 pub const ResidencySet = @import("residency.zig").ResidencySet;
+pub const resident = @import("resident.zig");
+pub const residency_policy = @import("residency_policy.zig");
 pub const keepalive = @import("keepalive.zig");
 pub const clock = @import("clock.zig");
+pub const pass_metrics = @import("pass_metrics.zig");
+pub const counters = @import("counters.zig");
+pub const ane = @import("ane.zig");
 
 test {
     std.testing.refAllDecls(@This());
 }
+
+pub const CommandSessionFor = @import("command_session.zig").Session;
+pub const CommandSession = CommandSessionFor(@This());

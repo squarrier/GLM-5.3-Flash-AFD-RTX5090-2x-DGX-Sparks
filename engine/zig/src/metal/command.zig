@@ -15,6 +15,10 @@ const Size = types.Size;
 pub const Queue = struct {
     id: Id,
 
+    pub fn deviceId(self: Queue) Id {
+        return objc.msg(Id, self.id, "device", .{});
+    }
+
     /// A command buffer that retains what it references (autoreleased: keep a pool around it).
     pub fn commandBuffer(self: Queue) CommandBuffer {
         return .{ .id = objc.msg(Id, self.id, "commandBuffer", .{}) };
@@ -46,6 +50,11 @@ pub const CommandBuffer = struct {
         return .{ .id = objc.msg(Id, self.id, "computeCommandEncoderWithDispatchType:", .{@backingInt(dispatch)}) };
     }
 
+    /// A blit encoder on this buffer, for copies between buffers on the GPU.
+    pub fn blit(self: CommandBuffer) BlitEncoder {
+        return .{ .id = objc.msg(Id, self.id, "blitCommandEncoder", .{}) };
+    }
+
     /// The GPU waits here until `event` reaches `value`.
     pub fn waitFor(self: CommandBuffer, event: SharedEvent, value: u64) void {
         objc.msg(void, self.id, "encodeWaitForEvent:value:", .{ event.id, value });
@@ -70,11 +79,15 @@ pub const CommandBuffer = struct {
     }
 
     pub fn commit(self: CommandBuffer) void {
+        @import("pass_metrics.zig").commit();
         objc.msg(void, self.id, "commit", .{});
     }
 
     pub fn wait(self: CommandBuffer) void {
+        const metrics = @import("pass_metrics.zig");
+        const start = metrics.time();
         objc.msg(void, self.id, "waitUntilCompleted", .{});
+        if (start != 0) metrics.wait(start, self.gpuSeconds());
     }
 
     pub fn status(self: CommandBuffer) types.CommandBufferStatus {
@@ -109,8 +122,29 @@ pub const CommandBuffer = struct {
     }
 };
 
+/// Copies between buffers on the GPU.
+pub const BlitEncoder = struct {
+    id: Id,
+
+    pub fn copy(self: BlitEncoder, from: Buffer, from_offset: usize, to: Buffer, to_offset: usize, size: usize) void {
+        objc.msg(void, self.id, "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:", .{ from.id, from_offset, to.id, to_offset, size });
+    }
+
+    pub fn fill(self: BlitEncoder, buffer: Buffer, offset: usize, size: usize, value: u8) void {
+        objc.msg(void, self.id, "fillBuffer:range:value:", .{ buffer.id, types.Range{ .location = offset, .length = size }, value });
+    }
+
+    pub fn end(self: BlitEncoder) void {
+        objc.msg(void, self.id, "endEncoding", .{});
+    }
+};
+
 pub const ComputeEncoder = struct {
     id: Id,
+
+    pub fn deviceId(self: ComputeEncoder) Id {
+        return objc.msg(Id, self.id, "device", .{});
+    }
 
     pub fn setPipeline(self: ComputeEncoder, pipeline: Pipeline) void {
         objc.msg(void, self.id, "setComputePipelineState:", .{pipeline.id});
@@ -164,5 +198,15 @@ pub const ComputeEncoder = struct {
 
     pub fn end(self: ComputeEncoder) void {
         objc.msg(void, self.id, "endEncoding", .{});
+    }
+
+    /// The command buffer this encoder was opened from, for the event ops a seam encodes BETWEEN encoders.
+    pub fn commandBuffer(self: ComputeEncoder) CommandBuffer {
+        return .{ .id = objc.msg(Id, self.id, "commandBuffer", .{}) };
+    }
+
+    /// Whether this encoder dispatches serially or concurrently: a seam reopens it in the same mode.
+    pub fn dispatchType(self: ComputeEncoder) types.DispatchType {
+        return @fromBackingInt(@intCast(objc.msg(usize, self.id, "dispatchType", .{})));
     }
 };

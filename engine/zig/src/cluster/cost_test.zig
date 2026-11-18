@@ -1,5 +1,6 @@
 //! K3 and GLM-5.3 rounds on four 512 GiB Studios at 1 to 128 rows: dedup, caches, collectives, and the MLA split.
 const std = @import("std");
+const platform = @import("sys");
 const node = @import("node.zig");
 const model = @import("model.zig");
 const estimate = @import("estimate.zig");
@@ -66,7 +67,7 @@ test "GLM-5.3 in FP8 reads far less a token than K3, and 128 streams at 32k cont
 }
 
 test "the cost tables for CLUSTER.md (TF_CLUSTER_REPORT=1)" {
-    if (std.testing.environ.getPosix("TF_CLUSTER_REPORT") == null) return error.SkipZigTest;
+    if (platform.getenv("TF_CLUSTER_REPORT") == null) return error.SkipZigTest;
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -93,4 +94,36 @@ test "the cost tables for CLUSTER.md (TF_CLUSTER_REPORT=1)" {
         }
     }
     std.debug.print("\n{s}\n", .{out.written()});
+}
+
+test "a dense round reads weights and caches without expert cost" {
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s: model.Shape = .{ .hidden = 128, .layers = 1, .heads = 8, .kv_heads = 8, .head_dim = 16, .inter = 256 };
+    const nodes = [_]node.Inventory{pt.studio(0, 128 * gib, 0)};
+    var tensors = [_]@import("checkpoint.zig").Tensor{.{
+        .name = "model.layers.0.mlp.down_proj.weight",
+        .file = 0,
+        .start = 0,
+        .bytes = 128 * 256 * 2,
+        .dtype = .bf16,
+        .rank = 2,
+        .shape = .{ 128, 256, 0, 0 },
+        .class = .{ .role = .dense_row, .layer = 0 },
+    }};
+    var files = [_]@import("checkpoint.zig").File{.{ .name = "model.safetensors", .size = 128 * 256 * 2 }};
+    const ck: @import("checkpoint.zig").Checkpoint = .{ .files = &files, .tensors = &tensors };
+    const p = try plan.plan(a, ck, &s, &nodes, .{ .context = 2048 });
+    const ns = try budget.needs(a, &p, ck, &s);
+    for ([_]cost.Round{ .{ .rows = 1 }, .{ .rows = 32, .streams = 32, .prompt = 512 } }) |r| {
+        const c = cost.round(&p, ns, &s, r, traffic.tb5_polled, .{});
+        try std.testing.expectEqual(@as(u64, 128 * 256 * 2), c.dense_bytes);
+        try std.testing.expectEqual(@as(u64, 0), c.expert_bytes);
+        try std.testing.expectEqual(@as(f64, 0), c.distinct);
+        try std.testing.expectEqual(@as(f64, 0), c.expert_ms);
+        try std.testing.expect(c.cache_bytes > 0 and c.flops > 0);
+        try std.testing.expect(std.math.isFinite(c.total_ms) and c.total_ms > 0);
+        try std.testing.expect(std.math.isFinite(c.tokensPerSecond(1)) and c.tokensPerSecond(1) > 0);
+    }
 }

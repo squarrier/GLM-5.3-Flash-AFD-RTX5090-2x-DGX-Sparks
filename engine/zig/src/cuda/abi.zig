@@ -22,6 +22,8 @@ pub const stream_non_blocking: c_uint = 1;
 pub const event_disable_timing: c_uint = 2;
 pub const host_alloc_portable: c_uint = 1;
 pub const host_alloc_devicemap: c_uint = 2;
+pub const host_register_devicemap: c_uint = 2;
+pub const host_register_iomemory: c_uint = 4; // the range is device or I/O memory, not RAM
 
 pub const CaptureMode = enum(c_int) { global = 0, thread_local = 1, relaxed = 2 };
 pub const CaptureStatus = enum(c_int) { none = 0, active = 1, invalidated = 2, _ };
@@ -37,6 +39,8 @@ pub const DeviceAttribute = enum(c_int) {
     compute_capability_minor = 76,
     max_shared_memory_per_multiprocessor = 81,
     max_shared_memory_per_block_optin = 97,
+    virtual_memory_management_supported = 102,
+    gpu_direct_rdma_with_cuda_vmm_supported = 110,
 };
 
 pub const FunctionAttribute = enum(c_int) {
@@ -64,6 +68,26 @@ pub const LaunchAttributeId = enum(c_uint) {
 pub const cluster_scheduling_spread: c_int = 1;
 
 pub const Dim3 = extern struct { x: c_uint = 1, y: c_uint = 1, z: c_uint = 1 };
+
+/// CUDA_MEMCPY2D for device addresses (type 2): `height` rows of `width` bytes, each side's rows its pitch apart.
+pub const Memcpy2D = extern struct {
+    src_x: usize = 0,
+    src_y: usize = 0,
+    src_type: c_int = 2,
+    src_host: ?*const anyopaque = null,
+    src: DevicePtr,
+    src_array: ?*anyopaque = null,
+    src_pitch: usize,
+    dst_x: usize = 0,
+    dst_y: usize = 0,
+    dst_type: c_int = 2,
+    dst_host: ?*anyopaque = null,
+    dst: DevicePtr,
+    dst_array: ?*anyopaque = null,
+    dst_pitch: usize,
+    width: usize,
+    height: usize,
+};
 
 /// CUlaunchAttributeValue: a 64-byte union aligned for its pointer members.
 pub const LaunchAttributeValue = extern union {
@@ -127,40 +151,12 @@ pub const ExecUpdateResultInfo = extern struct {
     error_from_node: GraphNode,
 };
 
-/// CUmemorytype: where a copy's side lives.
-pub const MemoryType = enum(c_uint) { host = 1, device = 2, array = 3, unified = 4 };
+/// CU_EVENT_RECORD_EXTERNAL: in a capture, an event record node outside work can wait on; else a plain record.
+pub const event_record_external: c_uint = 0x1;
 
-/// CUDA_MEMCPY2D (cuda.h, CUDA 12 ABI, 128 bytes): `Height` rows of `WidthInBytes` bytes, each side `Pitch` apart.
-pub const Memcpy2D = extern struct {
-    srcXInBytes: usize = 0,
-    srcY: usize = 0,
-    srcMemoryType: MemoryType = .device,
-    srcHost: ?*const anyopaque = null,
-    srcDevice: DevicePtr = 0,
-    srcArray: ?*anyopaque = null,
-    srcPitch: usize = 0,
-    dstXInBytes: usize = 0,
-    dstY: usize = 0,
-    dstMemoryType: MemoryType = .device,
-    dstHost: ?*anyopaque = null,
-    dstDevice: DevicePtr = 0,
-    dstArray: ?*anyopaque = null,
-    dstPitch: usize = 0,
-    WidthInBytes: usize = 0,
-    Height: usize = 0,
-};
-
-test "CUDA_MEMCPY2D's layout is cuda.h's" {
-    const std = @import("std");
-    try std.testing.expectEqual(@as(usize, 128), @sizeOf(Memcpy2D));
-    try std.testing.expectEqual(@as(usize, 16), @offsetOf(Memcpy2D, "srcMemoryType"));
-    try std.testing.expectEqual(@as(usize, 24), @offsetOf(Memcpy2D, "srcHost"));
-    try std.testing.expectEqual(@as(usize, 48), @offsetOf(Memcpy2D, "srcPitch"));
-    try std.testing.expectEqual(@as(usize, 72), @offsetOf(Memcpy2D, "dstMemoryType"));
-    try std.testing.expectEqual(@as(usize, 88), @offsetOf(Memcpy2D, "dstDevice"));
-    try std.testing.expectEqual(@as(usize, 104), @offsetOf(Memcpy2D, "dstPitch"));
-    try std.testing.expectEqual(@as(usize, 120), @offsetOf(Memcpy2D, "Height"));
-}
+/// CU_MEMORYTYPE_DEVICE
+pub const memory_type_host: c_uint = 1;
+pub const memory_type_device: c_uint = 2;
 
 pub const jit_info_log_buffer: c_int = 3;
 pub const jit_info_log_buffer_size: c_int = 4;
@@ -178,13 +174,16 @@ pub const Api = struct {
     cuDriverGetVersion: *const fn (*c_int) callconv(.c) R,
     cuDeviceGet: *const fn (*Device, c_int) callconv(.c) R,
     cuDeviceGetCount: *const fn (*c_int) callconv(.c) R,
+    cuDeviceGetUuid_v2: *const fn (*[16]u8, Device) callconv(.c) R,
     cuDeviceGetName: *const fn ([*]u8, c_int, Device) callconv(.c) R,
     cuDeviceGetAttribute: *const fn (*c_int, DeviceAttribute, Device) callconv(.c) R,
     cuDeviceTotalMem_v2: *const fn (*usize, Device) callconv(.c) R,
     cuDevicePrimaryCtxRetain: *const fn (*Context, Device) callconv(.c) R,
+    cuDevicePrimaryCtxSetFlags_v2: *const fn (Device, c_uint) callconv(.c) R,
     cuDevicePrimaryCtxRelease_v2: *const fn (Device) callconv(.c) R,
     cuCtxSetCurrent: *const fn (Context) callconv(.c) R,
     cuCtxGetCurrent: *const fn (*Context) callconv(.c) R,
+    cuCtxGetDevice: *const fn (*Device) callconv(.c) R,
     cuCtxSynchronize: *const fn () callconv(.c) R,
     cuMemGetInfo_v2: *const fn (*usize, *usize) callconv(.c) R,
     cuMemAlloc_v2: *const fn (*DevicePtr, usize) callconv(.c) R,
@@ -192,6 +191,8 @@ pub const Api = struct {
     cuMemHostAlloc: *const fn (*Ptr, usize, c_uint) callconv(.c) R,
     cuMemHostGetDevicePointer_v2: *const fn (*DevicePtr, Ptr, c_uint) callconv(.c) R,
     cuMemFreeHost: *const fn (Ptr) callconv(.c) R,
+    cuMemHostRegister_v2: *const fn (Ptr, usize, c_uint) callconv(.c) R,
+    cuMemHostUnregister: *const fn (Ptr) callconv(.c) R,
     cuMemcpyHtoD_v2: *const fn (DevicePtr, CPtr, usize) callconv(.c) R,
     cuMemcpyDtoH_v2: *const fn (Ptr, DevicePtr, usize) callconv(.c) R,
     cuMemcpyDtoD_v2: *const fn (DevicePtr, DevicePtr, usize) callconv(.c) R,
@@ -204,6 +205,8 @@ pub const Api = struct {
     cuMemsetD8Async: *const fn (DevicePtr, u8, usize, Stream) callconv(.c) R,
     cuMemsetD32Async: *const fn (DevicePtr, c_uint, usize, Stream) callconv(.c) R,
     cuStreamCreate: *const fn (*Stream, c_uint) callconv(.c) R,
+    cuStreamCreateWithPriority: *const fn (*Stream, c_uint, c_int) callconv(.c) R,
+    cuCtxGetStreamPriorityRange: *const fn (*c_int, *c_int) callconv(.c) R,
     cuStreamDestroy_v2: *const fn (Stream) callconv(.c) R,
     cuStreamSynchronize: *const fn (Stream) callconv(.c) R,
     cuStreamWaitEvent: *const fn (Stream, Event, c_uint) callconv(.c) R,
@@ -211,6 +214,7 @@ pub const Api = struct {
     cuEventCreate: *const fn (*Event, c_uint) callconv(.c) R,
     cuEventDestroy_v2: *const fn (Event) callconv(.c) R,
     cuEventRecord: *const fn (Event, Stream) callconv(.c) R,
+    cuEventRecordWithFlags: *const fn (Event, Stream, c_uint) callconv(.c) R,
     cuEventSynchronize: *const fn (Event) callconv(.c) R,
     cuEventQuery: *const fn (Event) callconv(.c) R,
     cuEventElapsedTime: *const fn (*f32, Event, Event) callconv(.c) R,
@@ -251,4 +255,31 @@ comptime {
     std.debug.assert(@sizeOf(LaunchConfig) == 56 and @offsetOf(LaunchConfig, "stream") == 32);
     std.debug.assert(@sizeOf(KernelNodeParams) == 72 and @offsetOf(KernelNodeParams, "params") == 40);
     std.debug.assert(@sizeOf(ExecUpdateResultInfo) == 24);
+}
+
+test "CUDA device attribute matches the RDMA VMM capability ABI" {
+    // CUDA's CUdevice_attribute assigns 110 to RDMA VMM support; 126 is the memory sync domain count.
+    try @import("std").testing.expectEqual(@as(c_int, 110), @backingInt(
+        DeviceAttribute.gpu_direct_rdma_with_cuda_vmm_supported,
+    ));
+}
+
+test "Memcpy2D has CUDA_MEMCPY2D's layout: each side's seven fields, then the copy's width and rows" {
+    const t = @import("std").testing;
+    const want = [_]struct { []const u8, usize }{
+        .{ "src_x", 0 },      .{ "src_y", 8 },       .{ "src_type", 16 }, .{ "src_host", 24 }, .{ "src", 32 },      .{ "src_array", 40 },
+        .{ "src_pitch", 48 }, .{ "dst_x", 56 },      .{ "dst_y", 64 },    .{ "dst_type", 72 }, .{ "dst_host", 80 }, .{ "dst", 88 },
+        .{ "dst_array", 96 }, .{ "dst_pitch", 104 }, .{ "width", 112 },   .{ "height", 120 },
+    };
+    const names = @typeInfo(Memcpy2D).@"struct".field_names;
+    try t.expectEqual(want.len, names.len);
+    inline for (names, 0..) |name, i| {
+        try t.expectEqualStrings(want[i][0], name);
+        try t.expectEqual(want[i][1], @offsetOf(Memcpy2D, name));
+    }
+    try t.expectEqual(@as(usize, 128), @sizeOf(Memcpy2D));
+    // a default copy is device to device, so a caller sets only addresses, pitches and the extent
+    const c: Memcpy2D = .{ .src = 0, .src_pitch = 0, .dst = 0, .dst_pitch = 0, .width = 0, .height = 0 };
+    try t.expectEqual(@as(c_int, memory_type_device), c.src_type);
+    try t.expectEqual(@as(c_int, memory_type_device), c.dst_type);
 }

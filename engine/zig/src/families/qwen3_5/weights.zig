@@ -1,7 +1,8 @@
-//! Views into one shared checkpoint buffer: the output projection aliases the packed input embedding.
+//! Views into one checkpoint buffer: a tied head aliases the packed embedding; an untied one is its own projection.
 const std = @import("std");
 const ck = @import("../../core/checkpoint_metal.zig");
 const c = @import("config.zig");
+const mlx_affine = @import("../../core/quant/mlx_affine.zig");
 
 pub const Tensor = ck.Tensor;
 pub const Linear = struct { weight: Tensor, scales: Tensor, biases: Tensor, inputs: usize, outputs: usize };
@@ -18,11 +19,14 @@ pub const Layer = struct {
 
 pub const Weights = struct {
     embedding: Linear,
+    /// The checkpoint's own output projection when it ships one, else null (the head is the packed embedding).
+    separate_head: ?Linear,
     norm: Tensor,
     blocks: [c.layers]Layer,
 
+    /// The output projection the forward's logits read.
     pub fn head(self: *const Weights) Linear {
-        return self.embedding;
+        return self.separate_head orelse self.embedding;
     }
 };
 
@@ -43,26 +47,25 @@ fn tensor(ckpt: *const ck.Checkpoint, prefix: []const u8, suffix: []const u8, dt
 fn projection(ckpt: *const ck.Checkpoint, prefix: []const u8, suffix: []const u8, outputs: usize, inputs: usize) !Linear {
     var buf: [256]u8 = undefined;
     const name = try std.fmt.bufPrint(&buf, "{s}{s}", .{ prefix, suffix });
-    return .{
-        .weight = try tensor(ckpt, name, ".weight", .u32, &.{ outputs, inputs / 8 }),
-        .scales = try tensor(ckpt, name, ".scales", .bf16, &.{ outputs, inputs / c.group }),
-        .biases = try tensor(ckpt, name, ".biases", .bf16, &.{ outputs, inputs / c.group }),
-        .inputs = inputs,
-        .outputs = outputs,
-    };
+    const t = try mlx_affine.read(ckpt, name, .{ .n = outputs, .k = inputs, .bits = 4, .group = c.group });
+    return .{ .weight = t.weight, .scales = t.scales, .biases = t.biases, .inputs = inputs, .outputs = outputs };
 }
 
-pub fn load(ckpt: *const ck.Checkpoint) !Weights {
-    const prefix = "language_model.model.";
+pub fn load(ckpt: *const ck.Checkpoint, tied: bool) !Weights {
+    const ships_head = ckpt.has("language_model.lm_head.weight");
+    if (ships_head != !tied) {
+        std.log.err("config.json says tie_word_embeddings={} but the checkpoint {s} a language_model.lm_head projection", .{ tied, if (ships_head) "ships" else "lacks" });
+        return error.QwenHeadTiednessMismatch;
+    }
     var w = Weights{
-        .embedding = try projection(ckpt, prefix, "embed_tokens", c.vocab, c.hidden),
-        .norm = try tensor(ckpt, prefix, "norm.weight", .bf16, &.{c.hidden}),
+        .embedding = try projection(ckpt, "language_model.model.", "embed_tokens", c.vocab, c.hidden),
+        .separate_head = if (ships_head) try projection(ckpt, "language_model.", "lm_head", c.vocab, c.hidden) else null,
+        .norm = try tensor(ckpt, "language_model.model.", "norm.weight", .bf16, &.{c.hidden}),
         .blocks = undefined,
     };
-    if (ckpt.has("language_model.lm_head.weight")) return error.UnexpectedUntiedQwenHead;
     for (&w.blocks, 0..) |*block, i| {
         var buf: [128]u8 = undefined;
-        const p = try std.fmt.bufPrint(&buf, "{s}layers.{d}.", .{ prefix, i });
+        const p = try std.fmt.bufPrint(&buf, "language_model.model.layers.{d}.", .{i});
         block.* = .{
             .input_norm = try tensor(ckpt, p, "input_layernorm.weight", .bf16, &.{c.hidden}),
             .post_norm = try tensor(ckpt, p, "post_attention_layernorm.weight", .bf16, &.{c.hidden}),

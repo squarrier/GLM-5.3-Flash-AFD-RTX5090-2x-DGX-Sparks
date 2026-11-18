@@ -1,6 +1,7 @@
 //! FlashNext text dimensions and quantization declarations are checked before weight or cache allocation.
 const std = @import("std");
-const affine = @import("affine.zig");
+const affine = @import("spec.zig");
+const rope_config = @import("rope_config");
 
 pub const Kind = enum { linear_attention, sparse_attention };
 pub const Gate = enum { sigmoid, silu };
@@ -54,6 +55,8 @@ pub const Config = struct {
     eos: [16]u32 = @splat(0),
     eos_count: usize = 0,
     global_affine: affine.Spec,
+    /// A widths.Widths set by a tensor reader; widths.quantization reads it, so this file imports no core.
+    widths: ?*const anyopaque = null,
 
     pub fn deinit(c: *Config) void {
         c.parsed.deinit();
@@ -93,7 +96,8 @@ pub const Config = struct {
         return c.kinds[i];
     }
 
-    pub fn quantization(c: *const Config, path: []const u8) !?affine.Spec {
+    /// The config's own width for `path`, keys spelled by `canonical` (core/quant/keys.zig): this file imports no core.
+    pub fn declared(c: *const Config, path: []const u8, canonical: *const fn ([]const u8) []const u8) !?affine.Spec {
         const wanted = canonical(path);
         var found = false;
         var answer: ?affine.Spec = c.global_affine;
@@ -112,14 +116,6 @@ pub const Config = struct {
         return answer;
     }
 };
-
-fn canonical(value: []const u8) []const u8 {
-    var path = if (std.mem.endsWith(u8, value, ".weight")) value[0 .. value.len - 7] else value;
-    for ([_][]const u8{ "model.language_model.", "language_model.", "text_model.", "model." }) |prefix| {
-        if (std.mem.startsWith(u8, path, prefix)) path = path[prefix.len..];
-    }
-    return path;
-}
 
 fn same(a: ?affine.Spec, b: ?affine.Spec) bool {
     if (a == null or b == null) return a == null and b == null;
@@ -205,12 +201,16 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
     if (tag != .string or !std.mem.eql(u8, tag.string, "qwen4_exp")) return error.NotFlashNext;
     const quant = try quantBlock(root, text);
     if (quant.get("quant_method")) |v| if (v != .null and (v != .string or (!std.mem.eql(u8, v.string, "mlx") and !std.mem.eql(u8, v.string, "affine")))) return error.UnsupportedAffineMode;
-    const rope = if (text.get("rope_parameters")) |v| if (v == .null) std.json.ObjectMap.empty else try object(v) else std.json.ObjectMap.empty;
-    for ([_][]const u8{ "rope_type", "type" }) |key| if (rope.get(key)) |v| if (v != .string or !std.mem.eql(u8, v.string, "default")) return error.UnsupportedFlashRope;
+    const rope = (rope_config.params(text) catch return error.InvalidFlashConfig) orelse std.json.ObjectMap.empty;
+    // `--context` sets Metal's YaRN factor, never the config
+    if (rope_config.scaled(text, rope)) |key| {
+        std.log.warn("Flash Next config.json: {s} asks for scaled RoPE (YaRN); this reader runs plain RoPE", .{key});
+        return error.UnsupportedFlashRope;
+    }
     const hidden = try required(text, "hidden_size");
     const heads = try required(text, "num_attention_heads");
     const head_dim = if (text.get("head_dim")) |v| if (v == .null or (v == .integer and v.integer == 0)) hidden / heads else try integer(v) else hidden / heads;
-    const partial = try number(rope.get("partial_rotary_factor") orelse text.get("partial_rotary_factor") orelse .{ .float = 0.25 });
+    const partial = try number(rope_config.pick(rope, text, "partial_rotary_factor", .both) orelse .{ .float = 0.25 });
     if (partial < 0 or partial > 1 or head_dim == 0) return error.UnsupportedFlashRope;
     const gate: std.json.Value = text.get("output_gate_type") orelse .{ .string = "sigmoid" };
     if (gate != .string) return error.UnsupportedFlashGate;
@@ -226,7 +226,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
         .kv_heads = try required(text, "num_key_value_heads"),
         .head_dim = head_dim,
         .rotary_dim = @intFromFloat(@as(f64, @floatFromInt(head_dim)) * partial),
-        .rope_theta = try number(rope.get("rope_theta") orelse .{ .float = 10_000_000 }),
+        .rope_theta = try number(rope_config.pick(rope, text, "rope_theta", .params) orelse .{ .float = 10_000_000 }),
         .key_heads = try required(text, "linear_num_key_heads"),
         .value_heads = try required(text, "linear_num_value_heads"),
         .key_dim = try required(text, "linear_key_head_dim"),
@@ -353,7 +353,7 @@ pub fn pleRef(c: *const Config) !PleRef {
     const half = @max(1, ((@as(u64, 1) << 63) - 1) / @max(c.vocab, 1) / 2);
     var multipliers: [3]i64 = undefined;
     for (0..3) |i| {
-        multipliers[i] = @intCast(2 * (splitmix64(c.seed +% golden * (i + 1)) % half) + 1);
+        multipliers[i] = @intCast(2 * (splitmix64(c.seed +% golden *% (i + 1)) % half) + 1);
     }
     // the PLE layer's eos is the text config's eos_token_id (model_layers.py), not the root generation one
     const eos: i64 = blk: {

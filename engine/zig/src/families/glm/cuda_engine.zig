@@ -1,400 +1,650 @@
-//! python-0.6's Engine (glm5_next/cuda/decode.py, ed78d6f) for a TP rank: the weights, one sequence's State, Buffers
-//! for decode windows (`buf`), prompt chunks (`pbuf`) and the MTP head (`mbuf`), and the sampler. `prefill` commits a
-//! prompt in chunks of prefill_rows (each chunk's next tokens absorbed into the MTP cache) and samples its first
-//! token; cuda_decode.zig's loops then step (serial, MTP drafts verified: mtp_decode, auto_decode's MTP arm), here as
-//! methods. Greedy, or with `sampling` at top_k 0 python's nucleus (qualification_45c10bcf: cuda_nucleus.zig, Mia's union cover).
-//! Every call goes through *Fwd: a CPU test records python's launches, a GPU runs them (CUDA graphs: qualification_qualification_44ba554e.8).
+// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
+//! One TP rank's GLM-5.3-Flash CUDA engine (the Python family's decode.Engine); all ranks draw the same tokens.
 const std = @import("std");
 const cuda = @import("cuda");
-const md = @import("cuda_model.zig");
-const views = @import("cuda_views.zig");
-const bufs = @import("cuda_buffers.zig");
-const trace = @import("cuda_trace.zig");
-const qmm = @import("cuda_qmm.zig");
-const cc = @import("cuda_compute.zig");
-const sample = @import("cuda_sample.zig");
-const nucleus = @import("cuda_nucleus.zig");
-const mtp = @import("cuda_mtp.zig");
-const prompt = @import("cuda_prompt.zig");
-const dump = @import("cuda_dump.zig");
-const decode = @import("cuda_decode.zig");
-const Tmp = @import("cuda_tmp.zig").Tmp;
-const Fwd = @import("cuda_fwd.zig").Fwd;
-const control = @import("lanes").structured_control;
+const lanes = @import("lanes");
+const config = @import("config.zig");
+const shard = @import("cuda_shard.zig");
+const weights = @import("cuda_weights.zig");
+const fw = @import("cuda_forward.zig");
+const ranks = @import("cuda_ranks.zig");
+const sampler = @import("cuda_sampler.zig");
+const prompt_lp = @import("cuda_prompt_logprobs.zig");
+const heat = @import("heat");
+const modelopt = @import("core").modelopt;
+const exl3 = @import("cuda_exl3.zig");
+const images_mod = @import("cuda_images.zig");
+const tile = @import("cuda_tile.zig");
+const mm_mod = @import("cuda_mm.zig");
+const dflash = @import("dflash.zig");
+const prof_mod = @import("cuda_prof.zig");
+const pages_mod = @import("cuda_pages.zig");
+const l2pf_mod = @import("cuda_l2pf.zig");
+const prompt_pair = @import("cuda_prompt_pair.zig");
+const tp = @import("tp");
+const mesh_mod = @import("mesh");
+pub const Options = @import("cuda_engine_types.zig").Options;
 
-const T = trace.T;
-const Buf = views.Buf;
-const Buffers = bufs.Buffers;
-const State = bufs.State;
+/// The most drafts a chain holds (decode.DepthPolicy's top depth).
+pub const max_drafts = 15;
+/// A greedy pick as it crosses ranks: (value, id) and padding, so the RoCE gather (16-byte packs) can carry it.
+const pair_bytes = 16;
+const pick_rows = @import("cuda_engine_pick.zig").pick_rows;
 
-/// decode.PREFILL_ROWS: rows of a prompt chunk
-pub const prefill_rows = 2048;
+/// A prompt pass's chunk rows (decode.prefill's).
+pub const prompt_rows = fw.prefill_rows;
+pub const solo_rows = fw.solo_rows;
+pub const max_together = @import("cuda_state.zig").prompt_heads;
+pub const Prompt = struct { slot: u32, ids: []const u32 };
 
-/// The Engine with the MTP layer's blocks from `B` (mtp.LaneA; a test's markers).
-pub fn EngineOf(comptime B: type) type {
-    return struct {
-        const Self = @This();
+/// A shared verify's max rows and streams: under hc_pre's 64-row block change; 16 streams take 2 rows each.
+pub const shared_rows = 32;
+pub const max_shared = 16;
 
-        m: *const md.Model,
-        w: *const views.Weights,
-        buf: Buffers,
-        pbuf: Buffers,
-        mbuf: ?Buffers,
-        st: State,
-        smp: sample.Sampler,
-        tmp: Tmp = .{},
-        prompt: prompt.Prompt,
-        /// prefill's `last` (the last chunk's logits row) and `e.last_hidden` (its final-normed row), python's clones
-        last: Buf,
-        last_hidden: Buf,
-        /// auto_decode's m_rows: committed rows the MTP head has not absorbed yet (decode.backlog_rows of them)
-        backlog: Buf,
-        prefill_rows: usize,
-        chip: qmm.Chip = .{},
-        /// qualification_6607f886's recorder on every prefill chunk and decode window (tf-glm-forward dump and teacher)
-        tap: ?dump.Tap = null,
-        /// The request's sampling (null, or temperature 0: greedy); top_k 0 draws the nucleus (useSampling first).
-        sampling: ?nucleus.Sampling = null,
-        nuc: ?nucleus.Nucleus = null,
-        /// sampling_tests: the AFD serve switch enables the top-k cut; other lanes keep their admission rule.
-        sampled_top_k: bool = false,
-        /// The request's nucleus calls by the gathers each took (prefill starts it afresh).
-        stats: nucleus.Stats = .{},
-        structured_control: ?control.Endpoint = null,
-        structured_logits_valid: bool = false,
+const types = @import("cuda_engine_types.zig");
+const snapshots = @import("cuda_snapshots.zig");
+const prompt_solo = @import("cuda_prompt_solo.zig");
+pub const prompt_cuts = @import("cuda_prompt_cuts.zig"); // cuda_lanes' resume check too
+pub const Part = types.Part;
+pub const Kept = types.Kept;
+const Seq = types.Seq;
+const Snap = types.Snap;
+pub const Resume = types.Resume;
+pub const Cancel = types.Cancel;
+pub const Marks = types.Marks;
 
-        /// Engine(w, capacity=, max_rows=, prefill_rows=, long_context=), no graphs; addresses by `walk` or Device.attach.
-        pub fn create(gpa: std.mem.Allocator, m: *const md.Model, w: *const views.Weights, capacity: usize, rows: usize, chunk: usize, long_context: bool) !*Self {
-            const e = try gpa.create(Self);
-            errdefer gpa.destroy(e);
-            e.* = .{
-                .m = m,
-                .w = w,
-                .buf = try Buffers.init(m, rows, capacity, false),
-                .pbuf = try Buffers.init(m, chunk, capacity, true),
-                .mbuf = if (w.mtp != null) try Buffers.init(m, rows, capacity, false) else null,
-                .st = try State.init(gpa, m, capacity, rows, long_context),
-                .smp = .{ .s = sample.Scratch.init(m, rows) },
-                .prompt = undefined,
-                .last = Buf.of(.bf16, &.{ 1, m.vl() }),
-                .last_hidden = Buf.of(.bf16, &.{ 1, m.hidden }),
-                .backlog = Buf.of(.bf16, &.{ decode.backlog_rows, m.hidden }),
-                .prefill_rows = chunk,
-            };
-            e.prompt = prompt.Prompt.init(m, &e.tmp, chunk);
-            e.prompt.dsa = prompt.dsaScratch(m, &e.pbuf, capacity, long_context); // long contexts: chunks past lat_s
-            e.smp.tmp = &e.tmp;
-            return e;
+pub const Engine = struct {
+    memory_plan: ?@import("cuda_hybrid_preload.zig").Plan=null,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    d: *const cuda.Driver,
+    c: config.Config,
+    share: shard.Share,
+    spans: []shard.Span, // every rank's vocabulary span
+    lib: *const cuda.nccl.Library,
+    comm: cuda.nccl.Comm,
+    group: ?*const cuda.tp_group.Group = null, // the main stream's all-gathers (RoCE on two ranks); null: lib and comm
+    mesh: mesh_mod.Mesh, // this rank's place: one tensor group of `world` ranks
+    backend: *tp.group.Backend, // the boundary's communicator over lib and comm, then the group once it is up
+    collective: tp.Collective, // backend's, made once so a const engine hands it out
+    images: ?*images_mod.Images = null, // --vision: a prompt pass's image rows (rank 0 encodes, the others receive)
+    packs: mm_mod.Packed = .{}, // the linears packed at load and their bits (TF_GLM_DENSE_BITS, _HEAD_BITS)
+    drafter: ?*dflash.Drafter = null, // --drafter: DFlash2 (every rank runs its passes; rank 0 selects the drafts)
+    profs: [fw.window_rows]?*prof_mod.Prof = @splat(null), // TF_GLM_PROF=1: verify sections' GPU time, by rows
+    profiling_prompt: ?*prof_mod.Prof = null,
+    prompt_profs: [4]?*prof_mod.Prof = @splat(null), // and prompt chunks': to 64, 256, 1024, 2048 rows
+    checkpoint_digest: [32]u8,
+    settings: ranks.Settings,
+    m: fw.Modules,
+    stream: cuda.Stream,
+    pieces: fw.Pieces,
+    w: weights.Weights,
+    bp: fw.Buffers, // prompt chunks
+    pair: ?prompt_pair.Pair = null, // TF_GLM_PROMPT_PAIR: a paired prompt step's second chunk
+    bd: fw.Buffers, // verify windows
+    bm: fw.Buffers, // the MTP head's rows
+    bs: ?fw.Buffers = null, // shared verify windows (with the MTP head, as the lane core shares only then)
+    bsp: ?fw.Buffers = null, // V3 two-flight shared verify: independent second crossing/workspace
+    pairs: cuda.DeviceBuffer, // every rank's (value, id) of a greedy draw
+    smp: sampler.Sampler,
+    seqs: std.ArrayList(?*Seq) = .empty, // every stream's sequence by slot (the lane backend's), slot 0 made at init
+    cur: *Seq = undefined, // the bound slot's: every step below runs on it
+    slot: u32 = 0,
+    capacity: usize,
+    mtp: bool,
+    heat_gate: heat.Gate, // upstream's bands (off unless set), read before each prompt chunk on the gathered maximum
+    shared_buf: cuda.DeviceBuffer, // one f64 every rank all-reduces to its maximum
+    snaps: std.AutoHashMapUnmanaged(u64, Snap) = .empty, // kept prompt states by id (the same ids on every rank)
+    snap_pages: ?snapshots.pages.Pool = null,
+    snap_setup: ?snapshots.Setup = null,
+    next_snap: u64 = 1, // rank 0: the next id
+    announce: u64 = 0, // rank 0: a state kept at this chunk's mark, for the other ranks to copy at its gate
+    dropped: std.ArrayList(u32) = .empty, // rank 0: ids dropped since the other ranks last heard (cuda_follow)
+    prompt_logprobs: ?prompt_lp.Want = null, // a prompt pass's rows asked for (every rank runs the head on them)
+    prompt_bufs: ?prompt_lp.Buffers = null, // their head passes' buffers, made at the first pass that asks
+    prompt_tried: bool = false, // that pass came: without buffers after it, the passes take the window's
+    prompt_out: prompt_lp.Output, // a head pass's logprob words, then its picks, host-mapped (rank 0 reads them)
+    structured: bool = false, // a structured output step: every rank's draws gather whole rows, rank 0 masks them
+    pages: ?*pages_mod.Pages = null, // the other streams' KV pages and sequences (cuda_pages), once the server attached them
+    index_split: bool = false, // the next prompt step's indexer rows split across the ranks: rank 0's choice, the chunk's flag 2
+    index_splits: u64 = 0, // prompt steps whose indexer rows split (glm-split-check counts them)
+    share_pages: bool = false, // TF_KV_SHARE: a kept state leaves its prefix's pages to the shared store that holds them
+    owns_host_gather: bool = false, // process singleton acquired by this engine, independent of later environment changes
+    routed: ?@import("cuda_routed.zig").Provider = null,
+    l2pf: ?l2pf_mod.L2pf = null, // TF_GLM_L2PF: the prefetch's side stream, kernels and table, made after the weights tile
+
+    /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
+        if (o.cancel_requested) |flag| if (flag.load(.acquire)) return error.Stopped;
+        const load_control=@import("cuda_hybrid_load.zig").Control{.stopping=o.cancel_requested,.until=o.setup_until};
+        try load_control.check();
+        const memory_scope=@import("cuda_hybrid_ledger.zig").scopeOwner(.workspace);defer memory_scope.end();
+        if(o.hybrid) |h| {
+            try h.attention(gpa,world,h.served_context,o.mtp,o.settings);
+            const expected=std.mem.alignForward(usize,@as(usize,h.served_context)+fw.window_rows,64);
+            if(o.capacity!=expected) return error.BadHybridContract;
         }
+        if (world > ranks.max_world) return error.TooManyRanks; // before anything is allocated
+        const e = try gpa.create(Engine);
+        errdefer gpa.destroy(e);
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const cfg_path = try std.fs.path.join(a, &.{ checkpoint, "config.json" });
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, cfg_path, a, .limited(1 << 24));
+        var why: modelopt.Why = .{};
+        const admitted = if (exl3.isExl3(gpa, text)) exl3.admit(gpa, text, &why) else @import("cuda_formats.zig").admit(gpa, text, &why);
+        admitted catch |err| { // anything but NVFP4, MIXED_PRECISION in recipes read here or EXL3 is refused by name before loading
+            std.log.err("{s}: {s}", .{ cfg_path, why.text() });
+            return err;
+        };
+        const c = try config.parse(gpa, text);
+        if(o.hybrid!=null and (!c.exl3 or c.hidden!=4096 or c.experts!=288 or c.topk!=8 or c.moe_inter!=2048 or (o.mtp and c.mtp==0))) return error.BadExpertGeometry;
+        const memory_plan=if(o.hybrid)|h|try @import("cuda_hybrid_preload.zig").read(gpa,io,checkpoint,h.*) else null;
+        // Verify/cancel the complete checkpoint before admitting even the first CUDA stream.
+        const checkpoint_digest = try ranks.artifactControlled(a, io, checkpoint, o.cancel_requested);
+        try load_control.check();
+        var stream = try cuda.Stream.init(d, false);
+        errdefer stream.deinit();
+        const config_hash = try ranks.hashFile(a, io, cfg_path);
+        const program_hash = try ranks.hashFile(a, io, "/proc/self/exe");
 
-        pub fn destroy(e: *Self, gpa: std.mem.Allocator) void {
-            if (e.nuc) |*n| n.deinit(gpa);
-            e.st.deinit(gpa);
-            gpa.destroy(e);
-        }
-
-        /// The nucleus sampler's rows (device, pinned and host), before Device.attach: sampled requests need them.
-        pub fn useSampling(e: *Self, gpa: std.mem.Allocator) !void {
-            if (e.nuc == null) e.nuc = try nucleus.Nucleus.init(gpa, e.m, e.buf.rows);
-        }
-
-        /// python's buffers by path (b, pbuf, mbuf, st), for a Space or an arena.
-        pub fn walk(e: *Self, ctx: anytype, comptime visit: fn (@TypeOf(ctx), []const u8, *Buf) anyerror!void) !void {
-            try views.walk(&e.buf, views.Path.init("b"), ctx, visit);
-            try views.walk(&e.pbuf, views.Path.init("pbuf"), ctx, visit);
-            if (e.mbuf) |*x| try views.walk(x, views.Path.init("mbuf"), ctx, visit);
-            try views.walk(&e.st, views.Path.init("st"), ctx, visit);
-        }
-
-        /// The engine's own rows for python's temporaries (the sampler's scratch, a cut layer's rows, prefill's clones,
-        /// auto_decode's backlog, the nucleus rows when sampling is used; last the prompt chunks' DSA Scratch when
-        /// reserved, so every other buffer keeps its place).
-        pub fn walkTmp(e: *Self, ctx: anytype, comptime visit: fn (@TypeOf(ctx), []const u8, *Buf) anyerror!void) !void {
-            try views.walk(&e.smp.s, views.Path.init("tmp"), ctx, visit);
-            try visit(ctx, "tmp.first", &e.prompt.first);
-            try visit(ctx, "tmp.cat", &e.prompt.cat);
-            try visit(ctx, "tmp.last", &e.last);
-            try visit(ctx, "tmp.last_hidden", &e.last_hidden);
-            try visit(ctx, "tmp.backlog", &e.backlog);
-            if (e.nuc) |*n| try views.walk(&n.s, views.Path.init("tmp.nucleus"), ctx, visit);
-            if (comptime prompt.DsaScratch != void) try views.walk(&e.prompt.dsa, views.Path.init("tmp.dsa"), ctx, visit);
-        }
-
-        /// decode.sample_rows on `logits` [R, V/world] at positions pos0 .. pos0 + R - 1: greedy without a sampling or at
-        /// temperature 0, nucleus_rows at top_k 0 (python's top_k path is not ported). With `probs`, each draw's
-        /// probability (a draft's confidence): greedy, decode._probability at temperature 1 under the request's top_p
-        /// and top_k; nucleus, the token's share of the mass (python's nucleus_rows probs).
-        pub fn sampleRows(e: *Self, f: *Fwd, logits: T, pos0: usize, out: []u32, probs: ?[]f64) !void {
-            const s = e.sampling orelse return sample.greedyTop(f, &e.smp, logits, out, probs);
-            if (s.temperature <= 0.0) return sample.greedyCut(f, &e.smp, logits, out, probs, .{ .top_p = s.top_p, .top_k = s.top_k });
-            if (s.top_k != 0 and !e.sampled_top_k) return error.TopKNotPorted;
-            const n = if (e.nuc) |*x| x else return error.NoNucleus;
-            var pos: [nucleus.max_rows]u64 = undefined;
-            const R = logits.shape[0];
-            if (R > pos.len) return error.SampleShape;
-            for (pos[0..R], 0..) |*q, i| q.* = pos0 + i;
-            try nucleus.nucleusRows(f, &e.smp, n, logits, pos[0..R], s, out, probs, &e.stats);
-        }
-
-        /// structured_users: sampleRows' nucleus draw of one row [1, V] at `pos0` among `mask`'s tokens (TF_GLM_SAMPLING=1 with
-        /// TF_AFD_GRAMMAR_MASK=1): the masked adapter's grammar_mask on the widened row before the temperature, the
-        /// maxima, the masses and the cuts, then the token checked eligible (cuda_mask_dev.Dev.sampled). No mask, or
-        /// every token allowed: nucleus_rows itself.
-        pub fn sampleMasked(e: *Self, f: *Fwd, logits: T, pos0: usize, out: []u32, mask: []const u32) !void {
-            const s = e.sampling orelse return error.NotNucleus;
-            if (!(s.temperature > 0.0)) return error.NotNucleus;
-            if (s.top_k != 0 and !e.sampled_top_k) return error.TopKNotPorted;
-            const n = if (e.nuc) |*x| x else return error.NoNucleus;
-            const d = e.smp.masked_dev orelse return error.IncompleteMaskedAdapter;
-            try d.sampled(f, &e.smp, n, logits, pos0, s, out, &e.stats, mask);
-        }
-
-        /// The bytes Device.attach reserves (each buffer at a 256-byte boundary), and the prompt Buffers' and the DSA
-        /// Scratch's among them (the log's line beside G-mem).
-        pub fn deviceBytes(e: *Self) !DeviceBytes {
-            var all: Sizer = .{};
-            try e.walk(&all, Sizer.visit);
-            try e.walkTmp(&all, Sizer.visit);
-            var pb: Sizer = .{};
-            try views.walk(&e.pbuf, views.Path.init("pbuf"), &pb, Sizer.visit);
-            var x: Sizer = .{};
-            if (comptime prompt.DsaScratch != void) try views.walk(&e.prompt.dsa, views.Path.init("tmp.dsa"), &x, Sizer.visit);
-            return .{ .total = all.used, .pbuf = pb.used, .dsa = x.used };
-        }
-
-        // -- prompts ----------------------------------------------------------------------------------------------
-
-        /// mtp.mtp_forward over B's blocks: stage, then compute at the MTP cache's length (the last row's logits); `p`, a
-        /// prompt chunk's context on prefill's absorb (its DSA Scratch).
-        fn mtpForward(f: *Fwd, w: *const views.Weights, st: *const State, b: *Buffers, next: []const u32, hidden: T, chip: qmm.Chip, p: ?*prompt.Prompt) !T {
-            const n = try mtp.stage(f, st, b, next, hidden);
-            const nch = (st.mtp_len + n + cc.chunk - 1) / cc.chunk;
-            return mtp.computeWith(B, f, w, st, b, n, .{ .nch = nch, .host_pos = st.mtp_len, .chip = chip, .prompt = p }, true);
-        }
-
-        /// decode.prefill (no snapshot or drafter): each chunk staged, computed, absorbed by the MTP head, committed.
-        pub fn prefill(e: *Self, f: *Fwd, ids: []const u32, use_mtp: bool) !u32 {
-            if (ids.len == 0) return error.EmptyPrompt;
-            const st = &e.st;
-            e.stats = .{};
-            try cc.reset(f, st);
-            const with_mtp = use_mtp and e.w.mtp != null;
-            var last: ?T = null;
-            var start: usize = 0;
-            while (start < ids.len) : (start += e.prefill_rows) {
-                const chunk = ids[start..@min(start + e.prefill_rows, ids.len)];
-                const R = try cc.stage(f, st, &e.pbuf, chunk);
-                const logits = (try e.compute(f, &e.pbuf, R, .{ .nch = cc.chunksFor(st, R), .host_pos = st.pos, .chip = e.chip, .prompt = &e.prompt })).?;
-                last = try cc.clone(f, &e.tmp, logits, &e.last);
-                _ = try cc.clone(f, &e.tmp, cc.rows(e.pbuf.fnormed, R - 1, 1), &e.last_hidden);
-                if (with_mtp and start + 1 < ids.len) {
-                    const next = ids[start + 1 .. @min(start + R + 1, ids.len)];
-                    _ = try mtpForward(f, e.w, st, &e.pbuf, next, cc.rows(e.pbuf.fnormed, 0, next.len), e.chip, &e.prompt);
-                    try cc.setMtpLen(f, st, st.mtp_len + next.len); // decode._absorb_rows
-                }
-                try cc.commit(f, st, &e.pbuf, R, R);
+        if(o.hybrid) |selected| {const id=try selected.identity(a);if(!std.mem.eql(u8,&id.model,&checkpoint_digest)) return error.BadHybridModel;}
+        var fp = ranks.Fingerprint.of(
+            world,
+            rank,
+            o.settings,
+            o.capacity,
+            o.mtp,
+            config_hash,
+            program_hash,
+            checkpoint_digest,
+        );
+        if (o.vision) |lim| ranks.mediaFingerprint(&fp, lim);
+        fp.mtp += @intFromBool(o.drafter);
+        try ranks.agree(d, lib, comm, stream, fp, try a.alloc(ranks.Fingerprint, world));
+        try ranks.probeStart(d, lib, comm, stream, o.settings, rank, world);
+        const place = mesh_mod.Mesh.init(.{ .tensor = std.math.cast(u32, world) orelse 0 }, std.math.cast(u32, rank) orelse std.math.maxInt(u32)) catch return error.BadRank;
+        const tg = place.group(.tensor);
+        const share = try shard.Share.of(&c, tg.rank, tg.world);
+        const backend = try gpa.create(tp.group.Backend);
+        errdefer gpa.destroy(backend);
+        backend.* = .{ .d = d, .lib = lib, .comm = comm, .rank = tg.rank, .world = tg.world, .owner = o.owner };
+        const kb = @import("cuda_kda_block.zig");
+        kb.pad_to = if (o.settings.kda_pad) kb.padWidth(c.kda_heads, world) else 0; // read once: rowWidth reads only this
+        const spans = try gpa.alloc(shard.Span, world);
+        errdefer gpa.free(spans);
+        for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;
+        const block32 = !exl3.isExl3(gpa, text) and try @import("cuda_experts.zig").wantsBlock32(gpa, text);
+        var m = try fw.Modules.load(d, ctx, block32);
+        errdefer m.deinit();
+        const pair = prompt_pair.wantedHybrid(o.settings.pair,o.settings.solo,world,o.hybrid!=null);
+        var pieces = try fw.Pieces.init(d, o.settings.pieces, pair);
+        errdefer pieces.deinit();
+        if (o.settings.layers > c.layers) return error.BadLayers;
+        const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
+        for (layers, 0..) |*l, i| l.* = @intCast(i);
+        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .mesh = place, .backend = backend, .collective = backend.collective(), .checkpoint_digest = checkpoint_digest, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .prompt_out = undefined, .mtp = o.mtp };
+        e.memory_plan=memory_plan;
+        const has_packs = o.settings.dense_bits != 16 or o.settings.head_bits != 16;
+        if (has_packs and !o.settings.tiled) return error.PackedNeedsGlmMm;
+        const Tile = struct {
+            gpa: std.mem.Allocator,
+            mk: *const mm_mod.Kernels,
+            s: cuda.Stream,
+            d: *const cuda.Driver,
+            enabled: bool,
+            dense: u8,
+            head: u8,
+            packs: *mm_mod.Packed,
+            fn apply(t: @This(), w: *weights.Weights) !void {
+                if (t.enabled) t.packs.* = try tile.tileLinears(t.gpa, w, t.mk, t.s, t.d, t.dense, t.head);
             }
-            var first: [1]u32 = undefined;
-            try e.sampleRows(f, last.?, ids.len, &first, null);
-            return first[0];
+        };
+        const tiler: Tile = .{ .gpa = gpa, .mk = &e.m.mm, .s = stream, .d = d, .enabled = o.settings.tiled, .dense = o.settings.dense_bits, .head = o.settings.head_bits, .packs = &e.packs };
+        e.w = try @import("cuda_load_owner.zig").finish((weights.loadRoleControlled(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, o.mtp, if(o.hybrid!=null) .attention else .local,load_control) catch |err| {if(err==error.Cancelled)return error.Stopped;return err;}), tiler, Tile.apply);
+        errdefer e.w.deinit();
+        errdefer {
+            gpa.free(e.packs.ptrs);
+            gpa.free(e.packs.bits);
         }
-
-        /// Structured-only deferred prompt; ordinary prefill above remains byte-identical.
-        pub fn prefillToLogits(e: *Self, f: *Fwd, ids: []const u32) !void {
-            try sample.maskedReady(f, &e.smp);
-            if (ids.len == 0) return error.EmptyPrompt;
-            const endpoint = e.structured_control;
-            e.structured_logits_valid = false;
-            errdefer e.structured_logits_valid = false;
-            if (endpoint) |p| {
-                if (!@import("builtin").is_test or f.gpu != null or f.rec == null) return error.IncompleteMaskedAdapter;
-                try p.open();
-                const reset = try p.before(.{ .kind = .reset, .epoch = 1, .peer_count = 2, .total_prompt_rows = ids.len });
-                cc.reset(f, &e.st) catch |err| return e.committedFault(endpoint, err);
-                try structuredDone(p, reset, false);
-            } else try cc.reset(f, &e.st);
-            const st = &e.st;
-            e.stats = .{};
-            var start: usize = 0;
-            while (start < ids.len) : (start += e.prefill_rows) {
-                const chunk = ids[start..@min(start + e.prefill_rows, ids.len)];
-                const permit: ?control.Permit = if (endpoint) |p| try p.before(.{ .kind = .prompt_chunk, .epoch = 1, .peer_count = 2,
-                    .chunk_index = @intCast(start / e.prefill_rows), .position = start, .rows = @intCast(chunk.len),
-                    .tokens = chunk, .total_prompt_rows = ids.len }) else null;
-                const R = cc.stage(f, st, &e.pbuf, chunk) catch |err| return e.committedFault(endpoint, err);
-                const logits = (e.compute(f, &e.pbuf, R, .{ .nch = cc.chunksFor(st, R), .host_pos = st.pos, .chip = e.chip, .prompt = &e.prompt }) catch |err| return e.committedFault(endpoint, err)).?;
-                _ = cc.clone(f, &e.tmp, logits, &e.last) catch |err| return e.committedFault(endpoint, err);
-                _ = cc.clone(f, &e.tmp, cc.rows(e.pbuf.fnormed, R - 1, 1), &e.last_hidden) catch |err| return e.committedFault(endpoint, err);
-                cc.commit(f, st, &e.pbuf, R, R) catch |err| return e.committedFault(endpoint, err);
-                if (permit) |q| try structuredDone(endpoint.?, q, true);
-            }
-            if (endpoint) |p| {
-                const finish = try p.before(.{ .kind = .group, .epoch = 1, .peer_count = 2, .position = ids.len, .total_prompt_rows = ids.len });
-                try structuredDone(p, finish, true);
-            }
-            e.structured_logits_valid = true;
+        e.m.mm.prompt_fixed_k = o.settings.prompt_fixed_k;
+        e.m.tiled = o.settings.tiled;
+        if (o.settings.tiled) e.m.packs = &e.packs;
+        if (o.settings.l2pf.want(try ctx.capability(), world)) e.l2pf = try l2pf_mod.L2pf.init(gpa, d, &e.w, o.settings.l2pf);
+        errdefer if (e.l2pf) |*p| p.deinit();
+        if (o.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it
+        errdefer {
+            e.free(0);
+            e.seqs.deinit(gpa);
         }
-
-        fn committedFault(e: *Self, endpoint: ?control.Endpoint, original: anyerror) anyerror {
-            e.structured_logits_valid = false;
-            if (endpoint) |p| { _ = p.quiesce(.poison) catch {}; return error.ControlPoison; }
-            return original;
-        }
-
-        fn structuredDone(endpoint: control.Endpoint, permit: control.Permit, valid: bool) !void {
-            const result = try endpoint.after(permit, .{ .logits_valid = valid });
-            switch (result.status) {
-                .ok => {}, .cancelled => return error.Cancelled, .empty_mask => return error.EmptyMask,
-                .request_error => return error.StructuredRequestError, .poison => return error.ControlPoison,
-            }
-        }
-
-        pub fn pickFirst(e: *Self, f: *Fwd, mask: []const u32) !u32 {
-            try sample.mask_cpu.shape(e.m.vocab, mask);
-            if (e.structured_control) |p| {
-                if (!e.structured_logits_valid) return error.NoDeferredFirst;
-                e.smp.masked_cpu.?.permit = try p.before(selectionDescriptor(e, .first, &.{}, mask, .select));
-            }
-            defer if (e.smp.masked_cpu) |cpu| { cpu.permit = null; };
-            var out: [1]u32 = undefined;
-            try sample.greedyMasked(f, &e.smp, T.whole(e.last), &out, mask);
-            return out[0];
-        }
-
-        fn selectionDescriptor(e: *Self, kind: control.Kind, tokens: []const u32, mask: []const u32, action: control.Action) control.Descriptor {
-            return .{ .kind = kind, .epoch = 1, .peer_count = 2, .position = e.st.pos + @intFromBool(kind == .step),
-                .rows = 1, .tokens = tokens, .mask = mask, .vocab_width = @intCast(e.m.vocab), .active = mask.len != 0, .action = action };
-        }
-
-        pub fn stepMasked(e: *Self, f: *Fwd, token: u32, mask: []const u32) !u32 {
-            try sample.mask_cpu.shape(e.m.vocab, mask);
-            try sample.maskedReady(f, &e.smp);
-            const endpoint = e.structured_control;
-            errdefer e.structured_logits_valid = false;
-            const forward_permit: ?control.Permit = if (endpoint) |p| try p.before(selectionDescriptor(e, .step, &.{token}, mask, .none)) else null;
-            const logits = e.forward(f, &.{token}) catch |err| return e.committedFault(endpoint, err);
-            if (forward_permit) |q| {
-                try structuredDone(endpoint.?, q, true);
-                e.smp.masked_cpu.?.permit = try endpoint.?.before(selectionDescriptor(e, .step, &.{token}, mask, .select));
-            }
-            defer if (e.smp.masked_cpu) |cpu| { cpu.permit = null; };
-            var out: [1]u32 = undefined;
-            try sample.greedyMasked(f, &e.smp, logits, &out, mask);
-            cc.commit(f, &e.st, &e.buf, 1, 1) catch |err| return e.committedFault(endpoint, err);
-            return out[0];
-        }
-
-        // -- steps --------------------------------------------------------------------------------------------------
-
-        /// Engine.forward (eager): a decode window's logits [R, V/world] in buf.logits.
-        pub fn forward(e: *Self, f: *Fwd, tokens: []const u32) !T {
-            const R = try cc.stage(f, &e.st, &e.buf, tokens);
-            return (try e.compute(f, &e.buf, R, .{ .nch = cc.chunksFor(&e.st, R), .host_pos = e.st.pos, .chip = e.chip })).?;
-        }
-
-        /// forward.compute with logits, through the recorder's taps when one is set.
-        fn compute(e: *Self, f: *Fwd, b: *const Buffers, R: usize, opt: @import("cuda_layer.zig").Opt) !?T {
-            if (e.tap) |t| return dump.compute(f, e.w, &e.st, b, R, opt, true, t);
-            return cc.compute(f, e.w, &e.st, b, R, opt, true);
-        }
-
-        /// Engine.mtp: the MTP head on (hidden, next token) rows: the last row's logits [1, V/world].
-        pub fn mtpStep(e: *Self, f: *Fwd, next: []const u32, hidden: T) !T {
-            const mb = if (e.mbuf) |*x| x else return error.NoMtp;
-            return mtpForward(f, e.w, &e.st, mb, next, hidden, e.chip, null);
-        }
-
-        /// Engine.main_hidden(0:n): the main rows the MTP head reads after a forward.
-        pub fn mainHidden(e: *const Self, n: usize) T {
-            return cc.rows(e.buf.fnormed, 0, n);
-        }
-
-        // -- the decode loops (cuda_decode.zig: python's decode.py functions over the Engine) ---------------------------
-
-        /// decode.draft with no confidence floor (tf-glm-forward's teacher draws): absorb, then `count` chained drafts.
-        pub fn draft(e: *Self, f: *Fwd, hidden: T, next: []const u32, count: usize, out: []u32) ![]u32 {
-            var steps: usize = 0;
-            return decode.draft(e, f, hidden, next, e.st.pos + 1, count, .{}, out, null, &steps);
-        }
-
-        /// decode.serial_decode's tokens: from `pending` one a step into `out`, to `count` or an eos (stop_eos); its
-        /// counters come with cuda_decode.serial.
-        pub fn serialDecode(e: *Self, f: *Fwd, pending: u32, count: usize, out: []u32, stop_eos: bool) ![]u32 {
-            return (try decode.serial(e, f, pending, count, out, stop_eos)).tokens;
-        }
-
-        /// decode.mtp_decode: verify [last, drafts] to the first mismatch, then draft again (the policy's depth).
-        pub fn mtpDecode(e: *Self, f: *Fwd, pending: u32, count: usize, out: []u32, policy: *DepthPolicy, stop_eos: bool) !Decoded {
-            return decode.mtp(e, f, pending, count, out, policy, stop_eos, null);
-        }
-
-        /// drafter_choice.auto_decode with no DFlash2 drafter (engine.py's default policy, `auto`): every round MTP.
-        pub fn autoDecode(e: *Self, f: *Fwd, pending: u32, count: usize, out: []u32, policy: *DepthPolicy, stop_eos: bool) !Decoded {
-            return decode.auto(e, f, pending, count, out, policy, stop_eos, null);
-        }
-    };
-}
-
-/// python's Engine: the MTP layer over lane A's blocks.
-pub const Engine = EngineOf(mtp.LaneA);
-
-pub const Decoded = decode.Decoded;
-pub const DepthPolicy = decode.DepthPolicy;
-
-/// An Engine's device bytes: the whole block Device.attach allocates, its prompt Buffers' and its DSA Scratch's.
-pub const DeviceBytes = struct { total: usize, pbuf: usize, dsa: usize };
-
-/// bufs.Arena's sizing pass without placing: every device buffer at a 256-byte boundary (pinned host rows out).
-const Sizer = struct {
-    used: usize = 0,
-
-    fn visit(s: *Sizer, path: []const u8, b: *Buf) anyerror!void {
-        _ = path;
-        if (!b.host) s.used = std.mem.alignForward(usize, s.used + b.bytes(), 256);
-    }
-};
-
-/// A rank's device memory for an Engine: one block for its buffers, pinned ids and `.cpu()` rows, `staged` events.
-pub const Device = struct {
-    block: cuda.DeviceBuffer,
-    host: [5]?cuda.HostBuffer = @splat(null),
-    events: [3]?cuda.Event = @splat(null),
-
-    pub fn attach(e: *Engine, d: *const cuda.Driver) !Device {
-        var a: bufs.Arena = .{};
-        try e.walk(&a, bufs.Arena.visit);
-        try e.walkTmp(&a, bufs.Arena.visit);
-        var dv: Device = .{ .block = try cuda.DeviceBuffer.alloc(d, a.used) };
-        errdefer dv.detach();
-        a = .{ .base = dv.block.ptr };
-        try e.walk(&a, bufs.Arena.visit);
-        try e.walkTmp(&a, bufs.Arena.visit);
-        var i: usize = 0;
-        for ([_]*Buffers{ &e.buf, &e.pbuf }) |b| {
-            try pin(d, &dv, &i, &b.ids_host);
-            dv.events[i - 1] = try cuda.Event.init(d, false);
-            b.staged = dv.events[i - 1];
-        }
-        if (e.mbuf) |*b| {
-            try pin(d, &dv, &i, &b.ids_host);
-            dv.events[i - 1] = try cuda.Event.init(d, false);
-            b.staged = dv.events[i - 1];
-        }
-        try pin(d, &dv, &i, &e.smp.s.cpu);
-        if (e.nuc) |*n| try pin(d, &dv, &i, &n.s.host);
-        return dv;
+        e.bp = try fw.Buffers.init(d, &e.w, prompt_solo.bufferRows(o.settings.solo), true, o.capacity);
+        errdefer e.bp.deinit();
+        if (o.settings.solo and rank == 0) std.log.info("glm: prompt passes of {d} rows, {d} while another stream decodes", .{ fw.solo_rows, fw.prefill_rows });
+        if (world > 1 and rank == 0) std.log.info("glm: a prompt chunk's exchanges in {d} row pieces", .{o.settings.pieces});
+        if (pair) e.pair = try prompt_pair.Pair.init(d, &e.w, &e.bp, &e.pieces, o.capacity);
+        errdefer if (e.pair) |*p| p.deinit();
+        e.bd = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
+        errdefer e.bd.deinit();
+        e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
+        errdefer e.bm.deinit();
+        if (o.mtp) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
+        errdefer if (e.bs) |*b| b.deinit();
+        if (o.mtp and o.hybrid != null) e.bsp = try fw.Buffers.initShared(d,&e.w,shared_rows,o.capacity);
+        errdefer if (e.bsp) |*b| b.deinit();
+        e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world * pick_rows);
+        errdefer e.pairs.free();
+        try d.check(d.api.cuMemsetD8_v2(e.pairs.ptr, 0, pair_bytes * world * pick_rows), "cuMemsetD8"); // each pair's padding stays zero
+        e.smp = try sampler.Sampler.init(d, c.vocab, fw.window_rows);
+        errdefer e.smp.deinit();
+        errdefer e.freeProfs();
+        const profiled = try prof_mod.Prof.wanted();
+        if (profiled) for (&e.profs) |*p| {
+            p.* = try prof_mod.Prof.init(d, io);
+        };
+        if (profiled) for (&e.prompt_profs) |*p| {
+            p.* = try prof_mod.Prof.init(d, io);
+            p.*.?.every = 4;
+        };
+        e.prompt_out = try prompt_lp.Output.init(d);
+        errdefer e.prompt_out.free();
+        e.shared_buf = try cuda.DeviceBuffer.alloc(d, 8);
+        errdefer e.shared_buf.free();
+        errdefer @import("cuda_load_owner.zig").drain(stream, d);
+        try e.stream.synchronize();
+        return e;
     }
 
-    fn pin(d: *const cuda.Driver, dv: *Device, i: *usize, b: *Buf) !void {
-        if (!b.host) return error.NotHostRows;
-        dv.host[i.*] = try cuda.HostBuffer.alloc(d, b.bytes());
-        b.ptr = @intFromPtr(dv.host[i.*].?.bytes.ptr);
-        i.* += 1;
+    /// At native startup before room measurement, repeated during page attach for this same owner.
+    pub fn prepareHostGather(e: *Engine) !void {
+        const host=@import("cuda_kv_host.zig");
+        if(!host.onHost()) return;
+        while(!host.lifecycle.tryLock()) std.Thread.yield() catch {};
+        defer host.lifecycle.unlock();
+        if(e.owns_host_gather) {
+            const g=host.active orelse return error.GlmKvHostUnavailable;
+            if(g.slot_of.d!=e.d or g.cap!=try @import("cuda_attention_tile.zig").gatherCapacity(e.capacity) or g.row_bytes!=e.w.config.kv_lora*2) return error.GlmKvHostUnavailable;
+            return;
+        }
+        if(host.active!=null) return error.GlmKvHostBusy;
+        try host.prepare(e.d,@import("cuda_state.zig").pageBytes(&e.w),e.capacity,e.w.config.kv_lora*2);
+        e.owns_host_gather=true;
     }
 
-    pub fn detach(dv: *Device) void {
-        for (&dv.events) |*x| if (x.*) |*v| v.deinit();
-        for (&dv.host) |*x| if (x.*) |*v| v.free();
-        dv.block.free();
+    /// Only Engine.deinit after the native family's hybrid quiet gate; nonquiet failed opens retain the Engine.
+    fn releaseHostGather(e: *Engine) void {
+        if(!e.owns_host_gather) return;
+        const host=@import("cuda_kv_host.zig");
+        while(!host.lifecycle.tryLock()) std.Thread.yield() catch {};
+        defer host.lifecycle.unlock();
+        cuda.completion.drain(e.d,e.stream,"GLM host gather main stream did not drain");
+        cuda.completion.drain(e.d,e.pieces.side,"GLM host gather piece stream did not drain");
+        if(e.pair) |*p| cuda.completion.drain(e.d,p.pieces.side,"GLM host gather paired stream did not drain");
+        if(e.l2pf) |*p| cuda.completion.drain(e.d,p.side,"GLM host gather prefetch stream did not drain");
+        if(host.active) |*g| g.deinit();
+        host.active=null;e.owns_host_gather=false;
+    }
+
+    pub fn deinit(e: *Engine) void {
+        e.releaseHostGather();
+        e.stream.synchronize() catch {};
+        e.gpa.free(e.packs.ptrs);
+        e.gpa.free(e.packs.bits);
+        if (e.drafter) |dr| dr.deinit();
+        var it = e.snaps.valueIterator();
+        while (it.next()) |s| e.freeSnap(s);
+        e.snaps.deinit(e.gpa);
+        if (e.snap_pages) |*p| p.deinit();
+        e.dropped.deinit(e.gpa);
+        e.shared_buf.free();
+        e.freeProfs();
+        if (e.prompt_bufs) |*b| b.free();
+        e.prompt_out.free();
+        e.smp.deinit();
+        e.pairs.free();
+        if (e.bs) |*b| b.deinit();
+        if (e.bsp) |*b| b.deinit();
+        e.bm.deinit();
+        e.bd.deinit();
+        if (e.pair) |*p| p.deinit();
+        e.bp.deinit();
+        if (e.pages) |p| p.deinit();
+        for (0..e.seqs.items.len) |i| e.free(i);
+        e.seqs.deinit(e.gpa);
+        if (e.l2pf) |*p| p.deinit();
+        e.w.deinit();
+        e.pieces.deinit();
+        e.m.deinit();
+        e.stream.deinit();
+        e.gpa.free(e.spans);
+        e.gpa.destroy(e.backend);
+        const gpa = e.gpa;
+        gpa.destroy(e);
+    }
+
+    const freeProfs = @import("cuda_engine_prof.zig").freeProfs;
+
+    pub fn installRouted(e: *Engine,p: ?@import("cuda_routed.zig").Provider) !void {
+        if(p!=null and e.w.role!=.attention) return error.BadHybridRole;
+        if(p) |provider| try provider.check(provider.ctx);
+        const buffers=[_]?*fw.Buffers{&e.bp,&e.bd,&e.bm,if(e.bs)|*b|b else null,if(e.bsp)|*b|b else null,if(e.pair)|*pair|&pair.bp else null,if(e.pair)|pair|if(pair.extra[0])|twin|&twin.bp else null else null,if(e.pair)|pair|if(pair.extra[1])|twin|&twin.bp else null else null};
+        for(buffers) |maybe| if(maybe) |b| {if(p!=null and b.moe.hybrid==null) return error.MissingRoutedStorage;};
+        if(p) |provider| if(provider.touch) |touch| {
+            try touch(provider.ctx,e.stream);try touch(provider.ctx,e.pieces.side);
+            if(e.pair)|*pair|{try touch(provider.ctx,pair.pieces.side);for(pair.extra)|slot|if(slot)|twin|try touch(provider.ctx,twin.pieces.side); }
+            if(e.l2pf) |*prefetch| try touch(provider.ctx,prefetch.side);
+        };
+        for(buffers) |maybe| if(maybe) |b| {if(b.moe.hybrid) |h| {h.provider=p;if(p==null) h.result=.local_slots;}};
+        e.routed=p;
+    }
+
+    /// The serving group, its RoCE wires open: the main stream's and the boundary's gathers take its route now.
+    pub fn installGroup(e: *Engine, g: *cuda.tp_group.Group) void {
+        e.group = g;
+        e.backend.group = g;
+        std.log.info("[tensorfold] glm: rank {d} of {d} sums through the {t} collective (RoCE gathers {s})", .{ g.rank, g.world, e.collective.kind(), if (g.fast != null or g.multi != null) "on" else "off" });
+    }
+
+    pub fn exchange(e: *const Engine) fw.Exchange {
+        return .{ .nccl = .{ .lib = e.lib, .comm = e.comm, .collective = e.collective } };
+    }
+
+    pub fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
+        out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
+        const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = prompt_pair.piecesOf(e, b), .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .l2pf = if (e.l2pf) |*p| p else null };
+    }
+
+    /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
+    pub fn bind(e: *Engine, slot: u32) !void {
+        if (slot >= e.seqs.items.len) try e.seqs.appendNTimes(e.gpa, null, slot + 1 - e.seqs.items.len);
+        const made = e.seqs.items[slot] == null;
+        const previous = if (e.images != null) e.cur else null;
+        const previous_slot = if (e.images != null) e.slot else 0;
+        errdefer {
+            if (made) e.free(slot);
+            if (previous) |q| {
+                e.cur = q;
+                e.slot = previous_slot;
+            }
+        }
+        if (made) {
+            const q = try e.gpa.create(Seq);
+            errdefer e.gpa.destroy(q);
+            q.* = .{ .st = try fw.State.initFormat(e.gpa, e.d, &e.w, e.capacity, e.settings.kv8) };
+            e.seqs.items[slot] = q;
+        }
+        e.cur = e.seqs.items[slot].?;
+        e.slot = slot;
+        if (e.images) |v| try v.activate(slot);
+    }
+
+    /// Frees slot `slot`'s sequence (slot 0 stays, and a paged one gives its pages back) and binds slot 0.
+    pub fn release(e: *Engine, slot: u32) void {
+        if (e.images) |v| v.release(slot);
+        const paged = if (e.pages) |p| p.paged(slot) else false;
+        if (paged) e.pages.?.close(slot) else if (slot != 0) e.free(slot);
+        e.cur = e.seqs.items[0].?;
+        e.slot = 0;
+    }
+
+    fn free(e: *Engine, slot: usize) void {
+        const q = e.seqs.items[slot] orelse return;
+        cuda.completion.drain(e.d, e.stream, "GLM sequence release did not drain");
+        q.st.deinit();
+        q.cuts.deinit(e.gpa);
+        e.gpa.destroy(q);
+        e.seqs.items[slot] = null;
+    }
+
+    /// Bytes one more stream's sequence takes on this rank (its state arena).
+    pub fn seqBytes(e: *const Engine) u64 {
+        return e.seqs.items[0].?.st.arena.buf.len;
+    }
+
+    /// The committed length: the pending token sits at this position, a window's row r draws position pos + 1 + r.
+    pub fn pos(e: *const Engine) usize {
+        return e.cur.st.pos;
+    }
+
+    /// A follower's begin: rank 0's next request; no image rows from an earlier one splice into it.
+    pub fn beginFollowing(e: *Engine, sampling: ?sampler.Sampling) !void {
+        if (e.images) |v| v.clear();
+        return e.begin(sampling);
+    }
+
+    /// A fresh sequence with `sampling` (null or temperature 0: greedy).
+    pub fn begin(e: *Engine, sampling: ?sampler.Sampling) !void {
+        if(e.routed) |provider| try provider.check(provider.ctx);
+        e.cur.sampling = sampler.check(sampling);
+        e.cur.in_head = 0;
+        e.cur.cuts.clearRetainingCapacity(); // a request without starts cuts on the grid alone
+        try e.cur.st.reset(e.stream);
+        if (e.drafter) |dr| try dr.restart(e.slot, 0);
+    }
+
+    /// decode.prefill: `ids` chunk by chunk to each cut, then the first token from the last row; `from` resumes.
+    pub fn prefill(e: *Engine, ids: []const u32, from: ?Resume, cancel: ?Cancel, marks: ?Marks) !u32 {
+        var start = try e.prefillStart(ids.len, from);
+        while (true) {
+            const end = prompt_cuts.nextCut(ids.len, e.cur.cuts.items, start);
+            if (try e.prefillChunk(ids[start..@min(ids.len, end + 1)], start, ids.len, null, cancel, marks)) |first| return first;
+            start = end;
+        }
+    }
+
+    /// Where a prompt pass of `len` ids starts: 0, or `from`'s position with its kept state restored.
+    fn prefillStart(e: *Engine, len: usize, from: ?Resume) !usize {
+        if (len == 0 or len + fw.window_rows >= e.cur.st.capacity) return error.PromptTooLong;
+        const r = from orelse return 0;
+        if (r.at == 0 or r.at >= len or !prompt_cuts.coldCut(len, e.cur.cuts.items, r.at)) return error.BadResume;
+        try e.restoreState(r.id);
+        if (e.drafter) |dr| try dr.restart(e.slot, r.at); // the rows before it were never tapped
+        return r.at;
+    }
+
+    /// One chunk of a `len`-id prompt pass: `part` from `start` plus the next id; first token at the end, else null.
+    pub fn prefillChunk(e: *Engine, part: []const u32, start: usize, len: usize, from: ?Resume, cancel: ?Cancel, marks: ?Marks) !?u32 {
+        const split = e.index_split; // this step's alone
+        e.index_split = false;
+        if ((from != null or start == 0) and try e.prefillStart(len, from) != start) return error.BadChunk;
+        const rows = try prompt_cuts.stepRows(len, e.cur.cuts.items, start, part.len);
+        if (rows > fw.prefill_rows and e.pair != null) return prompt_pair.prefill(e, part, start, len, cancel, marks, split);
+        if (part.len != @min(len - start, rows + 1)) return error.BadChunk;
+        if (rows > fw.prefill_rows and !prompt_solo.allowed(e, start, rows)) return error.BadChunk;
+        var one: [1]fw.Rank = undefined;
+        var f = e.view(&e.bp, &one);
+        f.index_split = split;
+        if (start + rows <= len -| @as(usize, @intCast(dflash.WIN))) f.taps = null; // none read (dflash.promptRun)
+        const as_i32: []const i32 = @ptrCast(part);
+        if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
+        f.prof = e.prompt_profs[if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3];
+        const labels = [_][]const u8{ "prompt chunk to 64 rows", "prompt chunk to 256 rows", "prompt chunk to 1024 rows", "prompt chunk to 2048 rows" };
+        if (f.prof) |p| try p.beginPrompt(e.stream, labels[if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3], .{ .rank = e.share.rank, .slot = e.slot, .start = start, .rows = rows }, e.c.run, e.pieces.count);
+        if (f.prof) |p| e.profiling_prompt = p;
+        defer if (f.prof != null) {
+            e.profiling_prompt = null;
+        };
+        defer if (f.prof) |p| p.end();
+        errdefer if (f.prof) |p| {
+            p.prompt.?.invalid = true;
+        };
+        var stamp = prof_mod.span(f.prof, e.stream, .gate);
+        e.gate(cancel) catch |err| {
+            if (err == error.Cancelled) try snapshots.interrupted(e, marks, @intCast(start));
+            return err;
+        };
+        stamp.end();
+        if (f.prof) |p| p.mark(e.stream, .gate);
+        try f.run(as_i32[0..rows]);
+        e.index_splits += @intFromBool(split);
+        stamp = prof_mod.span(f.prof, e.stream, .prompt_score);
+        if (e.prompt_logprobs) |p| if (part.len > 1) try prompt_lp.run(e, p, part[1..]);
+        stamp.end();
+        stamp = prof_mod.span(f.prof, e.stream, .drafter);
+        if (e.drafter) |dr| try dr.prompt(e, e.slot, start, rows, len);
+        stamp.end();
+        stamp = prof_mod.span(f.prof, e.stream, .draw);
+        const last = start + rows == len;
+        var first: ?u32 = null;
+        if (last) {
+            var t: [1]u32 = undefined;
+            try e.draw(e.bp.logits, 1, len, 0, &t);
+            first = t[0];
+        }
+        stamp.end();
+        if (f.prof) |p| p.mark(e.stream, .draw);
+        if (last) try e.holdPrompt(e.bp.fnormed + (rows - 1) * e.c.hidden * 2);
+        stamp = prof_mod.span(f.prof, e.stream, .mtp);
+        if (e.mtp) try prompt_solo.mtpRows(e, &f, as_i32);
+        stamp.end();
+        if (f.prof) |p| p.mark(e.stream, .mtp);
+        stamp = prof_mod.span(f.prof, e.stream, .commit);
+        try f.commit(rows);
+        stamp.end();
+        if (f.prof) |p| p.mark(e.stream, .commit);
+        return first;
+    }
+
+    pub const gate = @import("cuda_engine_gate.zig").gate;
+    pub const shared = @import("cuda_engine_gate.zig").shared;
+
+    pub const stateBytes = snapshots.bytes;
+    pub const prepareSnapshots = snapshots.prepare;
+    pub const keepState = snapshots.keep;
+    pub const keepAs = snapshots.keepAs;
+    pub const restoreState = snapshots.restore;
+    pub const holds = snapshots.holds;
+    pub const dropState = snapshots.drop;
+    const freeSnap = snapshots.free;
+
+    /// A verify window: `ids` (pending token, then drafts) at the committed position; `out[r]` drawn at pos + 1 + r.
+    pub fn verify(e: *Engine, ids: []const u32, out: []u32, bits: u64) !void {
+        if(e.routed) |provider| try provider.check(provider.ctx);
+        if (ids.len == 0 or ids.len > fw.window_rows) return error.WindowTooWide;
+        var one: [1]fw.Rank = undefined;
+        var f = e.view(&e.bd, &one);
+        const at = e.cur.st.pos;
+        f.prof = e.profs[ids.len - 1];
+        if (f.prof) |p| try p.begin(e.stream, verifyLabel(ids.len));
+        try f.run(@ptrCast(ids));
+        if (e.drafter) |dr| try dr.noteVerify(e.slot, 0, ids.len, at, true);
+        e.cur.rows_at = e.bd.fnormed;
+        try e.draw(e.bd.logits, ids.len, at + 1, bits, out);
+        if (f.prof) |p| p.end();
+    }
+
+    const verifyLabel = @import("cuda_engine_prof.zig").verifyLabel;
+
+    /// Several streams' windows in one forward: shared row ops, per-part attention and KDA.
+    pub const verifyPingPong = @import("cuda_hybrid_users.zig").verify;
+    pub fn verifyShared(e: *Engine, parts: []const Part) !void {
+        if(e.routed) |provider| try provider.check(provider.ctx);
+        if(e.w.role==.attention and e.bsp!=null and parts.len>1 and e.drafter==null) return e.verifyPingPong(parts);
+        const b = if (e.bs) |*x| x else return error.NoSharedWindows;
+        if (parts.len == 0 or parts.len > max_shared) return error.WindowTooWide;
+        var segs: [max_shared]fw.Seg = undefined;
+        var ids: [shared_rows]u32 = undefined;
+        var rows: usize = 0;
+        for (parts, 0..) |p, i| {
+            if (p.ids.len == 0 or p.ids.len > fw.window_rows or rows + p.ids.len > shared_rows) return error.WindowTooWide;
+            for (parts[0..i]) |q| if (q.slot == p.slot) return error.SlotTwice;
+            try e.bind(p.slot);
+            segs[i] = .{ .st = &e.cur.st, .row0 = rows, .rows = p.ids.len };
+            @memcpy(ids[rows..][0..p.ids.len], p.ids);
+            rows += p.ids.len;
+        }
+        var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
+        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(false) else null, .l2pf = if (e.l2pf) |*p| p else null };
+        try f.run(@ptrCast(ids[0..rows]));
+        if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
+        for (parts, segs[0..parts.len]) |p, g| {
+            try e.bind(p.slot);
+            e.cur.rows_at = b.fnormed + g.row0 * e.c.hidden * 2;
+            try e.draw(b.logits + g.row0 * e.share.vocab.len() * 2, g.rows, g.st.pos + 1, p.bits, p.out);
+        }
+    }
+
+    /// DFlash2's round (every rank, the same `reqs`): each stream's kept rows into its context, then the block pass.
+    pub fn draftBlock(e: *Engine, reqs: []dflash.Req) !void {
+        const dr = e.drafter orelse return error.NoDrafter;
+        for (reqs) |*q| q.pos = @intCast((e.seqs.items[q.slot] orelse return error.UnknownSlot).st.pos);
+        try dr.draft(e, reqs);
+    }
+
+    pub const holdPrompt = @import("cuda_prompt_hold.zig").save;
+    pub const prefillMany = @import("cuda_prompts.zig").prefillMany;
+
+    /// forward.commit of the last window's first `n` rows (the KDA replay when fewer than it ran).
+    pub fn keep(e: *Engine, n: usize) !void {
+        var one: [1]fw.Rank = undefined;
+        const f = e.view(&e.bd, &one);
+        try f.commit(n);
+    }
+
+    pub const draftShared = @import("cuda_hybrid_mtp.zig").run;
+    /// decode.draft: the MTP head absorbs the kept rows (committed first) with `follow`, then chains `depth` drafts.
+    pub fn draft(e: *Engine, from_prompt: bool, follow: []const u32, depth: usize, out: []u32, chances: ?[]f64) !void {
+        if(e.routed) |provider| try provider.check(provider.ctx);
+        if (!e.mtp) return error.NoDraftHead;
+        if (depth > max_drafts) return error.TooDeep;
+        var one: [1]fw.Rank = undefined;
+        const f = e.view(&e.bm, &one);
+        const D = e.c.hidden;
+        const hidden = if (from_prompt) @import("cuda_prompt_hold.zig").input(e) else e.cur.rows_at;
+        try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len - e.cur.in_head);
+        e.cur.in_head = 0;
+        const next: []const i32 = @ptrCast(follow);
+        var s0: usize = 0;
+        while (s0 < next.len) : (s0 += fw.window_rows) {
+            const part = next[s0..@min(next.len, s0 + fw.window_rows)];
+            try f.mtpMode(part, &.{hidden + s0 * D * 2}, depth > 0);
+            try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + part.len);
+        }
+        for (0..depth) |j| {
+            if (chances != null and !e.structured and e.cur.sampling == null) {
+                const p = try e.greedyChance(e.bm.logits);
+                out[j] = p.token;
+                chances.?[j] = p.chance;
+            } else {
+                try e.draw(e.bm.logits, 1, e.cur.st.pos + 1 + j, 0, out[j..][0..1]);
+                if (chances) |c| c[j] = 1; // a sampled or structured draft keeps chance 1: its window runs whole
+            }
+            if (j + 1 < depth) {
+                try f.mtp(@ptrCast(out[j..][0..1]), &.{e.bm.fnormed});
+                try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + 1);
+                e.cur.in_head += 1;
+            }
+        }
+    }
+
+    /// `rows` logits rows of this rank's vocabulary -> the tokens at positions first, first + 1, ...
+    pub fn draw(e: *Engine, logits: u64, rows: usize, first: u64, bits: u64, out: []u32) !void {
+        try e.checkGathers();
+        if (e.structured) return e.drawWhole(logits, rows, first, bits, out);
+        if (e.cur.sampling) |s| {
+            try e.smp.draw(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = logits }}, rows, first, sampler.rule(s), out);
+            return e.checkGathers(); // the draw read rows the forward's gathers made
+        }
+        try @import("cuda_engine_pick.zig").greedyRows(e, logits, rows, out);
+    }
+
+    pub const promptHead = @import("cuda_structured.zig").promptHead;
+    pub const drawWhole = @import("cuda_structured.zig").drawWhole;
+    pub const redrawFirst = @import("cuda_structured.zig").redrawFirst;
+    /// decode.sample_rows' greedy pick: per-rank top-1 (tf_glm_top1), all-gathered, largest value then lowest id.
+    const greedy = @import("cuda_engine_pick.zig").greedy;
+    pub const greedyChance = @import("cuda_engine_pick.zig").greedyChance;
+
+    /// A failed RoCE gather (its rows hold nothing) or TF_GLM_KV_HOST gather past its slots, after a synchronize.
+    pub fn checkGathers(e: *const Engine) !void {
+        if(e.routed) |provider| try provider.check(provider.ctx);
+        if (e.group) |g| try g.check();
+        try @import("cuda_kv_host.zig").checkActive(); // a TF_GLM_KV_HOST gather past its slots
+    }
+
+    pub fn copy(e: *const Engine, dst: u64, src: u64, bytes: usize) !void {
+        try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, e.stream.handle), "cuMemcpyDtoDAsync");
     }
 };

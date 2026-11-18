@@ -1,3 +1,5 @@
+// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
 //! The three-node exchange's wire (qualification_12f4270a): python TF-AFD 2.15's request and reply layout and header, the pair-rank map over roce_proxy.c's region, and the settings both ends agree on.
 //! The layout is mcdma.py's `Layout` at src@0849f3f (glm5_next/cuda), so each section's bytes can be checked against our python AFD lane; no code is copied.
 const std = @import("std");
@@ -155,6 +157,8 @@ pub fn takeSrc(expert: ?u32, k: u32) u32 {
 
 /// What both ends must run with; the control link's agreement compares their digests.
 pub const Settings = struct {
+    /// Current-native session/model/settings/timeout contract; absent preserves the released V3 text.
+    native_contract: ?[32]u8 = null,
     layout: Layout,
     max_rows: usize,
     ports: usize,
@@ -200,7 +204,9 @@ pub const Settings = struct {
         const stripes = if (s.stripes == 0) "" else if (s.stripe_min == STRIPE_MIN) try std.fmt.bufPrint(&st, " stripes={d}", .{s.stripes}) else try std.fmt.bufPrint(&st, " stripes={d}/{d}", .{ s.stripes, s.stripe_min });
         var ln: [16]u8 = undefined;
         const lanes = if (s.lanes > 0) try std.fmt.bufPrint(&ln, " lanes={d}", .{s.lanes}) else "";
-        return std.fmt.bufPrint(buf, "tf-xchg v{d} wire {d} d={d} s={d} fp8={d} bf16={d} rows={d} slot={d} ports={d}{s}{s}{s}{s}{s}{s}{s}{s}", .{ VERSION, WIRE, s.layout.d, s.layout.s, @intFromBool(s.layout.fp8), @intFromBool(s.layout.bf16), s.max_rows, s.slotBytes(), s.ports, if (s.pairs) " pairs=1" else "", flight, if (s.seq) " seq=1" else "", if (s.halves.len > 0) " halves=" else "", s.halves, stripes, lanes, if (s.fp) " fp=1" else "" });
+        const base=try std.fmt.bufPrint(buf, "tf-xchg v{d} wire {d} d={d} s={d} fp8={d} bf16={d} rows={d} slot={d} ports={d}{s}{s}{s}{s}{s}{s}{s}{s}", .{ VERSION, WIRE, s.layout.d, s.layout.s, @intFromBool(s.layout.fp8), @intFromBool(s.layout.bf16), s.max_rows, s.slotBytes(), s.ports, if (s.pairs) " pairs=1" else "", flight, if (s.seq) " seq=1" else "", if (s.halves.len > 0) " halves=" else "", s.halves, stripes, lanes, if (s.fp) " fp=1" else "" });
+        if(s.native_contract)|id|{const suffix=try std.fmt.bufPrint(buf[base.len..]," native5={s} post=1048576",.{std.fmt.bytesToHex(id,.lower)});return buf[0..base.len+suffix.len];}
+        return base;
     }
 };
 

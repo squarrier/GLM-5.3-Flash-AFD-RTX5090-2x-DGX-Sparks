@@ -1,11 +1,26 @@
-//! A prompt chunk's Mamba, attention and MoE mixers: prefill_forward.py's launches, states and KV rows written in place.
+//! Prompt-chunk Mamba, attention and MoE mixers: prefill_forward.py's launches, states and KV rows written in place.
 const std = @import("std");
 const mtl = @import("metal");
 const wts = @import("weights.zig");
 const pre = @import("prefill.zig");
 const pl = @import("prefill_launch.zig");
+const layers = @import("layers.zig");
+const prefill_w = @import("prefill_w.zig");
+const Experts = @import("../../core/row_projection.zig").Experts;
 
 const At = pl.At;
+const kvp = @import("kv_pages.zig");
+const st = @import("state.zig");
+
+/// A cache's keys (or values) for a prompt kernel: its own buffer, or its part of every page.
+fn cacheAt(kv: st.Kv, values: bool) At {
+    if (kv.paged) |p| return .{ .b = p.arena(), .off = if (values) p.v_off else p.k_off };
+    return At.of(if (values) kv.v else kv.k);
+}
+
+fn tableOf(p: st.Paged) pl.Table {
+    return .{ .b = p.table(), .off = p.tableOff(), .page_bytes = p.pageBytes() };
+}
 const Chunk = pre.Chunk;
 
 /// mlx_lm's Mamba2 mixer over the chunk's normed rows (s.x) into s.out; conv and SSM states into the fresh slot.
@@ -81,6 +96,8 @@ pub fn mamba(x: Chunk, m: pre.Mamba, lin: wts.Mamba, index: usize) void {
     x.rms(s.ya, At.of(x.p.ones), inner / G, L * G, s.yb);
     l.glue("scale_cols_bfloat16_t_bfloat16_t_int32_t_bfloat16_t", &.{ yb, pre.tensorAt(lin.norm) }, &.{ L * inner, inner }, &.{ya}, .{ L * inner, 1, 1 }, .{ 256, 1, 1 });
     x.linear("out", "xsum_4096", lin.out_proj, m.out_proj, s.ya, s.out);
+    if (lin.slide) |r| layers.rest(x.f, x.e, r, s.ya, s.out, L, inner);
+    if (lin.adapter) |ad| layers.adapt(x.f, x.e, ad, s.ya, s.out, L);
 }
 
 /// Causal attention of the chunk's rows on the stream's KV rows (the chunk's own written first) into s.out.
@@ -93,18 +110,19 @@ pub fn attention(x: Chunk, a: pre.Attention, lin: wts.Attention, index: usize) v
     const row = c.heads * D;
     const kv = x.cache.kv[index];
     const cap = kv.capacity;
+    kvp.holds(kv, x.cache.len + L);
     const qkv = At.of(s.qkv);
     var q_row = row;
-    if (L <= pre.lane_rows) {
+    if (L <= pre.lane_rows or lin.qkv.tiles == null) {
         // lane_qmm's q, k and v columns stacked in one call: a column's bits follow only K and its K slices
-        x.f.xsum(x.e, "xsum_2688", c.hidden, s.x, 0, s.xs, L);
-        x.f.coop(x.e, "qkv", lin.qkv, s.x, 0, s.xs, s.qkv, L);
+        if (lin.qkv.tiles != null) x.f.xsum(x.e, "xsum_2688", c.hidden, s.x, 0, s.xs, L);
+        if (L <= pre.lane_rows or !x.f.wide(x.e, lin.qkv, s.x, s.qkv, L)) x.f.coop(x.e, "qkv", lin.qkv, s.x, 0, s.xs, s.qkv, L);
         const e = x.e;
-        e.pipe(x.f.k.get("tf_kv_write"));
+        e.pipe(if (kv.paged != null) x.f.k.paged.?.glue[0] else x.f.k.get("tf_kv_write"));
         e.buf(s.qkv, 0, 0);
-        e.buf(kv.k, 0, 1);
-        e.buf(kv.v, 0, 2);
+        kvp.bindKv(e, kv, 1, 2);
         e.bytes([4]u32{ @intCast(c.qkvDim()), @intCast(row), @intCast(cap), @intCast(x.cache.len) }, 3);
+        if (kv.paged) |pg| kvp.bindTable(e, pg, 4);
         e.run(.{ D, c.kv_heads, L }, .{ D, 1, 1 });
         q_row = c.qkvDim();
     } else {
@@ -114,15 +132,21 @@ pub fn attention(x: Chunk, a: pre.Attention, lin: wts.Attention, index: usize) v
         l.qmm(At.of(s.x), a.q, qkv, At.of(s.parts), L, row, c.hidden);
         l.qmm(At.of(s.x), a.k, k_at, At.of(s.parts), L, kv_row, c.hidden);
         l.qmm(At.of(s.x), a.v, v_at, At.of(s.parts), L, kv_row, c.hidden);
-        for ([2]At{ k_at, v_at }, [2]At{ At.of(kv.k), At.of(kv.v) }) |src, dst| {
-            l.glue("kv_put_bfloat16_t_bfloat16_t_int32_t_bfloat16_t", &.{ src, src }, &.{ L, c.kv_heads, D, cap, x.cache.len, cap, 0 }, &.{dst}, .{ D, L, c.kv_heads }, .{ 128, 2, 1 });
+        for ([2]At{ k_at, v_at }, [2]At{ cacheAt(kv, false), cacheAt(kv, true) }) |src, dst| {
+            const p = [_]usize{ L, c.kv_heads, D, cap, x.cache.len, cap, 0 };
+            if (kv.paged) |pg| {
+                l.goWith(x.f.k.paged.?.glue[2], &.{ src, src }, &p, 16, null, &.{dst}, .{ D, L, c.kv_heads }, .{ 128, 2, 1 }, tableOf(pg));
+            } else l.glue("kv_put_bfloat16_t_bfloat16_t_int32_t_bfloat16_t", &.{ src, src }, &p, &.{dst}, .{ D, L, c.kv_heads }, .{ 128, 2, 1 });
         }
     }
     const kvh = c.kv_heads * cap * D;
     const strides = [12]usize{ L * q_row, D, q_row, kvh, cap * D, D, kvh, cap * D, D, L * row, D, row };
     const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(D), -0.5));
-    l.attention(qkv, At.of(kv.k), At.of(kv.v), At.of(s.ya), L, x.cache.len + L, c.heads, c.kv_heads, strides, scale);
+    const paged: ?pl.Paged = if (kv.paged) |pg| .{ .pipes = x.f.k.paged.?, .table = tableOf(pg) } else null;
+    l.attention(qkv, cacheAt(kv, false), cacheAt(kv, true), At.of(s.ya), L, x.cache.len + L, c.heads, c.kv_heads, strides, scale, paged, At.of(s.attention_pick));
     x.linear("out", "xsum_4096", lin.o_proj, a.o, s.ya, s.out);
+    if (lin.slide) |r| layers.rest(x.f, x.e, r, s.ya, s.out, L, row);
+    if (lin.adapter) |ad| layers.adapt(x.f, x.e, ad, s.ya, s.out, L);
 }
 
 /// The routed experts (a counting sort by expert, then MLX's gather matmuls) plus the shared expert, into s.out.
@@ -153,22 +177,40 @@ pub fn moe(x: Chunk, m: pre.Moe, w: wts.Moe) void {
     l.glue("sort_place_uint32_t_int32_t_int32_t_uint32_t_uint32_t", &.{ At.of(s.ids), At.of(s.starts) }, &.{ n, E }, &.{ order, At.of(s.sorted) }, .{ blocks * 256, 1, 1 }, .{ 256, 1, 1 });
     const fc1 = [3]At{ pre.tensorAt(w.fc1[0]), pre.tensorAt(w.fc1[1]), pre.tensorAt(w.fc1[2]) };
     const fc2 = [3]At{ pre.tensorAt(w.fc2[0]), pre.tensorAt(w.fc2[1]), pre.tensorAt(w.fc2[2]) };
-    if (n >= 16 and n / E >= 4) {
+    // the gathers read token rows and write down rows through the pair order, so y2 lands in pair order
+    var pair_rows = s.y2;
+    if (w.routed) |r| {
+        // another width: the routed rows in expert order through qmmw_nax's gathers (else the indexed rows), unsorted
         l.glue("rows_take_bfloat16_t_uint32_t_int32_t_bfloat16_t", &.{ At.of(s.x), order }, &.{ n, D, k }, &.{At.of(s.xr)}, .{ D, n, 1 }, .{ 256, 1, 1 });
-        l.gatherQmm(At.of(s.xr), fc1, At.of(s.offsets), At.of(s.y1), n, W, D, E);
+        const g1 = prefill_w.of(x.f.k.gathers, r[0]);
+        const g2 = prefill_w.of(x.f.k.gathers, r[1]);
+        if (g1 != null and g2 != null) {
+            gatherW(x, g1.?, r[0], s.xr, D, W, n, s.y1);
+            x.relu2(s.y1, n * W, s.y1r);
+            gatherW(x, g2.?, r[1], s.y1r, W, D, n, s.y2);
+        } else {
+            x.f.indexed(e, r[0], 1, n, true, s.xr, s.sorted, s.y1r);
+            x.f.indexed(e, r[1], 1, n, false, s.y1r, s.sorted, s.y2);
+        }
+        l.glue("sort_inverse_uint32_t_int32_t_uint32_t", &.{order}, &.{n}, &.{At.of(s.inv)}, .{ n, 1, 1 }, .{ 256, 1, 1 });
+        l.glue("rows_take_bfloat16_t_uint32_t_int32_t_bfloat16_t", &.{ At.of(s.y2), At.of(s.inv) }, &.{ n, D, 1 }, &.{At.of(s.xr)}, .{ D, n, 1 }, .{ 256, 1, 1 });
+        pair_rows = s.xr;
+    } else if (n >= 16 and n / E >= 4) {
+        l.gatherMap(At.of(s.x), fc1, At.of(s.offsets), order, k, At.of(s.y1), n, W, D, E);
         x.relu2(s.y1, n * W, s.y1r);
-        l.gatherQmm(At.of(s.y1r), fc2, At.of(s.offsets), At.of(s.y2), n, D, W, E);
+        l.gatherMap(At.of(s.y1r), fc2, At.of(s.offsets), order, 0, At.of(s.y2), n, D, W, E);
     } else {
         l.glue("rows_of_uint32_t_int32_t_uint32_t", &.{order}, &.{ n, k }, &.{At.of(s.xids)}, .{ n, 1, 1 }, .{ 256, 1, 1 });
         l.glue("rows_of_uint32_t_int32_t_uint32_t", &.{order}, &.{ n, 0 }, &.{At.of(s.rowids)}, .{ n, 1, 1 }, .{ 256, 1, 1 });
         gatherQmv(x, fc1, s.x, s.xids, D, W, n, s.y1);
         x.relu2(s.y1, n * W, s.y1r);
         gatherQmv(x, fc2, s.y1r, s.rowids, W, D, n, s.y2);
+        l.glue("sort_inverse_uint32_t_int32_t_uint32_t", &.{order}, &.{n}, &.{At.of(s.inv)}, .{ n, 1, 1 }, .{ 256, 1, 1 });
+        l.glue("rows_take_bfloat16_t_uint32_t_int32_t_bfloat16_t", &.{ At.of(s.y2), At.of(s.inv) }, &.{ n, D, 1 }, &.{At.of(s.xr)}, .{ D, n, 1 }, .{ 256, 1, 1 });
+        pair_rows = s.xr;
     }
-    l.glue("sort_inverse_uint32_t_int32_t_uint32_t", &.{order}, &.{n}, &.{At.of(s.inv)}, .{ n, 1, 1 }, .{ 256, 1, 1 });
-    l.glue("rows_take_bfloat16_t_uint32_t_int32_t_bfloat16_t", &.{ At.of(s.y2), At.of(s.inv) }, &.{ n, D, 1 }, &.{At.of(s.xr)}, .{ D, n, 1 }, .{ 256, 1, 1 });
     e.pipe(x.p.k.get("tf_moe_combine_rows"));
-    e.buf(s.xr, 0, 0);
+    e.buf(pair_rows, 0, 0);
     e.buf(s.wt, 0, 1);
     e.bytes([2]i32{ @intCast(k), @intCast(D) }, 2);
     e.buf(s.out, 0, 3);
@@ -176,7 +218,26 @@ pub fn moe(x: Chunk, m: pre.Moe, w: wts.Moe) void {
     x.linear("up", "xsum_2688", w.shared_up, m.up, s.x, s.up);
     x.relu2(s.up, L * c.shared_width, s.upr);
     x.linear("down", "xsum_3712", w.shared_down, m.down, s.upr, s.sh);
+    if (w.slide) |r| layers.rest(x.f, e, r, s.upr, s.sh, L, c.shared_width);
+    if (w.adapter) |ad| layers.adapt(x.f, e, ad, s.upr, s.sh, L);
+    if (w.pocket) |p| if (p.used > 0) layers.taught(x.f, e, p, s.x, s.sh, L);
     x.add(s.out, s.sh, L * D, s.out);
+}
+
+/// y [n, N] = the sorted pairs' rows `xs` times each one's expert W^T at its width, experts' first rows in s.offsets.
+fn gatherW(x: Chunk, g: prefill_w.Gathers, ex: Experts, xs: mtl.Buffer, K: usize, N: usize, n: usize, y: mtl.Buffer) void {
+    const E = x.p.c.experts;
+    const bm: usize = if (n / E < 64) 32 else 64;
+    const e = x.e;
+    e.pipe(g.tiles[if (bm == 64) 1 else 0]);
+    e.buf(xs, 0, 0);
+    e.buf(ex.one.w, ex.one.w_off, 1);
+    e.buf(ex.one.scales, ex.one.s_off, 2);
+    e.buf(ex.one.biases, ex.one.b_off, 3);
+    e.buf(x.p.s.offsets, 0, 4);
+    e.bytes([4]i32{ @intCast(n), @intCast(N), @intCast(K), @intCast(E) }, 5);
+    e.buf(y, 0, 6);
+    e.run(.{ (N + 63) / 64 * 128, n / bm + E, 1 }, .{ 128, 1, 1 });
 }
 
 /// Each sorted pair's row of `rows` (by `xids`) times its expert's 4-bit W^T: tf_gather_qmv_b4_g64 into y [n, N].

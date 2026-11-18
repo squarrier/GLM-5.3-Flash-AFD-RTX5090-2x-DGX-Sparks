@@ -1,6 +1,6 @@
-//! Server-sent events as the Python server frames them: the head, ``data:`` frames, typed ``event:`` frames, ``[DONE]``.
+//! Python-compatible SSE: the head, data frames, typed event frames and [DONE].
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const Conn = @import("http_conn.zig").Conn;
 const Allocator = std.mem.Allocator;
 
@@ -14,24 +14,28 @@ pub fn open(conn: *Conn) error{Closed}!void {
 }
 
 /// ``data: {json}`` and a blank line, sent at once.
-pub fn data(conn: *Conn, a: Allocator, payload: json.Value) error{Closed}!void {
+pub fn data(conn: *Conn, _: Allocator, payload: json.Value) error{Closed}!void {
+    var frame = std.heap.ArenaAllocator.init(conn.gpa);
+    defer frame.deinit();
+    const a = frame.allocator();
     const text = json.stringify(a, payload, .{}) catch return error.Closed;
-    try conn.writeAll(std.mem.concat(a, u8, &.{ "data: ", text, "\n\n" }) catch return error.Closed);
-    conn.noteStreamWrite();
+    return conn.writeAll(std.mem.concat(a, u8, &.{ "data: ", text, "\n\n" }) catch return error.Closed);
+}
+
+/// An SSE comment line, which clients skip: it keeps a stream alive while nothing else is sent.
+pub fn comment(conn: *Conn) error{Closed}!void {
+    return conn.writeAll(": keepalive\n\n");
 }
 
 pub fn done(conn: *Conn) error{Closed}!void {
-    try conn.writeAll("data: [DONE]\n\n");
-    conn.noteStreamWrite();
+    return conn.writeAll("data: [DONE]\n\n");
 }
 
 /// ``event: KIND`` then its data line (Responses and Messages events).
-pub fn event(conn: *Conn, a: Allocator, kind: []const u8, payload: json.Value) error{Closed}!void {
+pub fn event(conn: *Conn, _: Allocator, kind: []const u8, payload: json.Value) error{Closed}!void {
+    var frame = std.heap.ArenaAllocator.init(conn.gpa);
+    defer frame.deinit();
+    const a = frame.allocator();
     const text = json.stringify(a, payload, .{}) catch return error.Closed;
-    try conn.writeAll(std.fmt.allocPrint(a, "event: {s}\ndata: {s}\n\n", .{ kind, text }) catch return error.Closed);
-    conn.noteStreamWrite();
-}
-
-pub fn comment(conn: *Conn, io: std.Io) error{Closed}!void {
-    return conn.writeComment(io);
+    return conn.writeAll(std.fmt.allocPrint(a, "event: {s}\ndata: {s}\n\n", .{ kind, text }) catch return error.Closed);
 }

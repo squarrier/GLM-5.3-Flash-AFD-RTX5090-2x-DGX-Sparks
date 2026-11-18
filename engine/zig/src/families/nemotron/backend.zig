@@ -1,35 +1,43 @@
 //! The lane core's Metal backend for Nemotron: streams' rows in one forward a round, drawn tokens in GPU slots.
 const std = @import("std");
+const platform = @import("sys");
 const mtl = @import("metal");
 const lanes = @import("lanes");
 const Fence = @import("../../core/fence.zig").Fence;
 const fwd = @import("forward.zig");
 const st = @import("state.zig");
+const kv_pages = @import("kv_pages.zig");
+const kvp = @import("../../core/metal_kv_pages.zig");
+const lesson_route = @import("living").lesson_route;
+const layers = @import("layers.zig");
 const mtp = @import("mtp.zig");
 const timing = @import("timing.zig");
 const tree = @import("tree.zig");
 const head_tree = @import("head_tree.zig");
 const prefill = @import("prefill.zig");
 const head_block = @import("head_block.zig");
+const snapshot = @import("snapshot.zig");
 const Model = @import("model.zig").Model;
 const nemotron_config = @import("config.zig");
+const grammar = @import("grammar.zig");
+const Masks = @import("../../core/grammar_mask.zig").Masks;
 
 const be = lanes.backend;
 const opts = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
 const ring = 1 << 16;
-
+pub const limits = @import("limits.zig");
 /// A lone stream's window rows at most, and a shared round's.
-pub const max_window = 16;
+pub const max_window = limits.max_window;
 
 /// A stream's tree window's rows at most (its lanes).
-pub const max_lanes = 64;
+pub const max_lanes = limits.max_lanes;
 
 /// Prompt chunks this short take the decode kernels, longer ones the prefill kernels (Python's fused_rows).
 pub const fused_rows = 16;
 
 pub const Kind = timing.Kind;
 
-const Flight = struct { end: u64, cb: mtl.CommandBuffer, kind: Kind };
+const Flight = struct { end: u64, cb: mtl.CommandBuffer, kind: Kind, prompt: ?@import("prompt_flight.zig").Prompt = null };
 
 /// A window's host rows in the token ring: the pending token at `stage`, then `n` tokens after its `held` drafts.
 const Fill = struct { stage: u64, held: usize, n: usize };
@@ -61,25 +69,37 @@ pub const Metal = struct {
     timing: timing.Timing = .{},
     costs: timing.Costs = .{},
     geometry: usize = 0, // routed experts' kernel geometry (bit-identical)
-    members: usize = 2, // routed experts' member rows a pass (bit-identical; one at a time for one-row forwards)
+    members: usize = 3, // routed experts' member rows a pass (bit-identical; 3: tf_experts_w; one at a time for one row)
     ranks_always: bool = false, // the head keeps every chained level's best tokens, asked or not (shared rounds' grafts)
     concurrent: bool = true, // concurrent encoders with barriers on data flow (false: serial encoders)
     gpu_ms: f64 = 0, // GPU ms of every command buffer landed so far
     last_ms: f64 = 0, // and of the last one
+    masks: ?Masks = null, // structured output's bits (grammar.zig), made at the first structured request
+    living: ?@import("adapters.zig").Sites = null, // the saved lessons' gated blocks, until a learner takes them
+    trace: bool = false, // TF_SLIDE_TRACE: each reply's lesson scores logged (dev)
+    coop_split: bool = true, // TF_COOP_SPLIT as forward.zig resolves it at load: in, out and eh K slices a threadgroup
+    residency: ?mtl.ResidencySet.Follow = null,
+    kv_arena: ?mtl.Buffer = null, // TF_NEMOTRON_METAL_KV_PAGES: every page, in the residency set
+    kv_tables: ?mtl.Buffer = null, // and every lane's page table
+    kv_pages: ?*kvp.Pages = null, // the core pool over them: a stream leases a lane's pages when it opens
+    kv_pipes: ?*kv_pages.Pipelines = null, // the paged twins (the model's kernels point at them)
 
     pub fn init(gpa: std.mem.Allocator, m: *Model, o: Options) !*Metal {
         const b = try gpa.create(Metal);
         errdefer gpa.destroy(b);
+        if (o.batch_rows > st.max_rows) return error.BatchTooWide; // verify and draft hold st.max_rows streams
         const rows = @max(o.batch_rows, max_lanes);
         b.* = .{
             .gpa = gpa,
             .m = m,
             .o = o,
-            .pool = try st.Pool.init(gpa, m.device, m.config, rows + o.streams + 1, o.streams + 4),
+            .pool = try st.Pool.init(gpa, m.device, m.config, st.poolSlots(o.streams), o.streams + 2),
             .scratch = try st.Scratch.init(m.device, m.config, rows, o.capacity),
             .tokens = try m.device.buffer(ring * 4, opts),
             .prompt = try m.device.buffer(@max(o.capacity, 16) * 4, opts),
             .fence = try Fence.init(m.device),
+            .trace = platform.c.getenv("TF_SLIDE_TRACE") != null,
+            .coop_split = fwd.splitOn(),
         };
         if (o.chunk > fused_rows) b.wide = try prefill.Prefill.init(m, @min(o.chunk, o.capacity));
         if (o.drafts and m.weights.mtp != null) b.head = try mtp.Head.init(m.device, m.config, &m.kernels, &m.weights, &b.pool, max_lanes, o.capacity);
@@ -91,6 +111,7 @@ pub const Metal = struct {
 
     pub fn deinit(self: *Metal) void {
         self.drain() catch {};
+        @import("residency.zig").set(self, null);
         self.flights.deinit(self.gpa);
         var it = self.caches.valueIterator();
         while (it.next()) |c| {
@@ -98,8 +119,11 @@ pub const Metal = struct {
             self.gpa.destroy(c.*);
         }
         self.caches.deinit(self.gpa);
+        kv_pages.detach(self);
         if (self.head) |*h| h.deinit();
+        if (self.masks) |*m| m.deinit();
         if (self.wide) |*w| w.deinit();
+        if (self.living) |*s| s.deinit();
         self.fence.deinit();
         self.prompt.deinit();
         self.tokens.deinit();
@@ -109,26 +133,18 @@ pub const Metal = struct {
     }
 
     pub fn backend(self: *Metal) be.Backend {
-        return .{ .ptr = self, .vtable = &.{
-            .prefill = prefillFn,
-            .first = firstFn,
-            .queue = queueFn,
-            .read = readFn,
-            .verify = verifyFn,
-            .keep = keepFn,
-            .draft = draftFn,
-            .release = releaseFn,
-            .alternatives = alternativesFn,
-        } };
+        return .{ .ptr = self, .vtable = &.{ .prefill = prefillFn, .first = firstFn, .first_masked = grammar.firstMasked, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn, .alternatives = alternativesFn, .held = grammar.held, .reports_fill = true } };
     }
 
-    /// The facts the round loop reads at setup (Python's NemotronH attributes), with this engine's own timings.
+    /// The round loop's setup facts, including this engine's measured head-step depth cap.
     pub fn facts(self: *const Metal) lanes.Model {
         const drafting = self.head != null;
         return .{
             .exact_width = if (drafting) max_window else 1,
             .gpu_tokens = true,
             .mtp = drafting,
+            .allocate_shared_drafts = drafting,
+            .limit_shared_drafts = drafting,
             .speculate = drafting,
             .speculate_early = false,
             .draft_prior = &nemotron_config.draft_prior,
@@ -143,9 +159,8 @@ pub const Metal = struct {
             .lane_costs = self.costs.window[0..self.costs.windows],
         };
     }
-
     pub fn forward(self: *Metal) fwd.Forward {
-        return .{ .c = self.m.config, .k = &self.m.kernels, .w = &self.m.weights, .s = &self.scratch, .pool = &self.pool, .geometry = self.geometry, .members = self.members };
+        return .{ .c = self.m.config, .k = &self.m.kernels, .w = &self.m.weights, .s = &self.scratch, .pool = &self.pool, .geometry = self.geometry, .members = self.members, .masks = if (self.masks) |*m| m else null };
     }
 
     pub fn cacheOf(self: *Metal, s: *lanes.Stream) !*st.Cache {
@@ -172,18 +187,7 @@ pub const Metal = struct {
 
     /// Wait for the oldest command buffer in flight and record its GPU time.
     pub fn land(self: *Metal) !void {
-        const f = self.flights.orderedRemove(0);
-        defer f.cb.release();
-        f.cb.wait();
-        if (f.cb.failure()) |text| {
-            std.log.err("command buffer failed: {s}", .{text});
-            return error.GpuFailed;
-        }
-        self.landed = @max(self.landed, f.end);
-        self.last_ms = f.cb.gpuSeconds() * 1e3;
-        self.gpu_ms += self.last_ms;
-        self.timing.ms[@backingInt(f.kind)] += self.last_ms;
-        self.timing.count[@backingInt(f.kind)] += 1;
+        return @import("prompt_flight.zig").land(self);
     }
 
     pub fn drain(self: *Metal) !void {
@@ -214,11 +218,6 @@ pub const Metal = struct {
         if (c.pending) |p| c.commit(&self.pool, p.rows);
     }
 
-    /// A stream's draw at `position`: argmax, or its keyed sampler (rows after it at the next positions).
-    fn drawOf(s: *const lanes.Stream, position: u64) fwd.Draw {
-        return if (s.sampling) |t| .{ .sampled = .{ .sampling = t, .position = position } } else .greedy;
-    }
-
     /// The fresh state slot a segment stores to: always after all its rows, after its replayed rows if it has any.
     pub fn slotFor(self: *Metal, c: *const st.Cache, store: fwd.Store) !i32 {
         return if (store == .full or c.replay > 0) @intCast(try self.pool.take()) else -1;
@@ -234,7 +233,7 @@ pub const Metal = struct {
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
         const self: *Metal = @ptrCast(@alignCast(ptr));
         const ids = s.prompt();
-        if (ids.len == 0 or ids.len + s.max_new + max_window > self.o.capacity) return error.PromptTooLong;
+        try limits.check(ids.len, s.max_new, self.o.capacity);
         if (s.isCancelled()) return error.Cancelled;
         const rows_needed = @min(self.o.capacity, ids.len + s.max_new + max_lanes + 1); // the reply and a widest window past it
         try self.drain();
@@ -243,10 +242,7 @@ pub const Metal = struct {
             self.gpa.destroy(old);
             _ = self.caches.remove(s);
         }
-        const c = try self.gpa.create(st.Cache);
-        c.* = try st.Cache.init(self.m.device, self.m.config, rows_needed, self.head != null);
-        c.rid = try self.pool.takeRid();
-        try self.caches.put(self.gpa, s, c);
+        const c = try @import("residency.zig").openCache(self, s, rows_needed);
         @memcpy(self.prompt.slice(u32, ids.len), ids);
         const Chunks = struct {
             n: usize,
@@ -285,34 +281,68 @@ pub const Metal = struct {
                 }
             }
         };
-        // a command buffer a chunk, each committed before the one ahead of it is waited on, so the GPU keeps a chunk queued
+        s.cached = 0;
         var at: usize = 0;
+        if (s.reuse.saved) |saved| { // a kept state of this prompt's prefix: the pass starts there
+            const snap: *snapshot.Snap = @ptrCast(@alignCast(saved));
+            if (snap.at < ids.len) if (snapshot.restore(self, c, snap)) |_| {
+                at = snap.at;
+            } else |_| {};
+            s.cached = @intCast(at);
+            s.reuse_failed = at == 0;
+        }
+        s.fill_at.store(@intCast(at), .monotonic); // a restored prefix is done the moment it is restored
+        // a command buffer a chunk, each committed before the one ahead is waited on, so the GPU keeps a chunk queued
         var k: usize = 0;
         while (at < ids.len) {
-            while (k < s.chunks.len and s.chunks[k] <= at) k += 1;
-            const end = if (k < s.chunks.len) @min(s.chunks[k], ids.len) else ids.len;
-            const rows = @min(self.o.chunk, end - at);
+            const decision: ?usize = if (c.decide == lesson_route.none) null else @intCast(c.decide);
+            const rows = @import("prompt_flight.zig").rows(s, at, self.o.chunk, decision, &k);
             if (s.isCancelled()) return error.Cancelled; // release() waits for the chunk still in flight
-            try self.submit(.prefill, self.next, Chunks{ .n = ids.len, .c = c, .at = at, .rows = rows });
-            while (self.flights.items.len > 1) try self.land();
+            try kv_pages.grow(c, at + rows);
+            try @import("prompt_flight.zig").submit(self, s, Chunks{ .n = ids.len, .c = c, .at = at, .rows = rows });
             at += rows;
+            // landed tokens only: the newest chunk is still queued on the GPU
+            s.fill_at.store(@intCast(at - rows), .monotonic);
+            if (s.reuse.hook) |hk| if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) hk.at(hk.ptr, s, @intCast(at));
         }
+        if (self.trace and c.decide != lesson_route.none) try self.traceLessons(c);
+    }
+
+    /// Dev trace (TF_SLIDE_TRACE): the stream's router scores at its decision row and the lessons acting on its reply.
+    fn traceLessons(self: *Metal, c: *const st.Cache) !void {
+        const ad = layers.firstAdapter(&self.m.weights) orelse return;
+        try self.drain();
+        const n = lesson_route.max_blocks;
+        const at: usize = @intCast(@max(c.rid, 0));
+        const score = ad.score.slice(f32, lesson_route.max_slots * n)[at * n ..][0..n];
+        const flags = ad.latch.slice(u32, lesson_route.max_slots * n)[at * n ..][0..n];
+        const need = ad.need.slice(f32, n);
+        var line: [2048]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&line);
+        for (0..ad.rank / 16) |b| w.print(" {d:.2}/{d:.2}{s}", .{ score[b], need[b], if (flags[b] != 0) "*" else "" }) catch break;
+        std.log.info("slide trace: decision row {d}: scores{s} (* acting)", .{ c.decide, w.buffered() });
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
         const self: *Metal = @ptrCast(@alignCast(ptr));
+        return self.firstAt(s, position, null);
+    }
+
+    /// The first token's draw from the prompt's last row, among a grammar's allowed tokens from bits row `mask_row`.
+    pub fn firstAt(self: *Metal, s: *lanes.Stream, position: u64, mask_row: ?usize) !u64 {
         const c = try self.cacheOf(s);
         const h = self.take(1);
         const Head = struct {
             h: u64,
             c: *st.Cache,
             how: fwd.Draw,
+            mask_row: ?usize,
             fn encode(j: @This(), b: *Metal, e: *fwd.Enc) !void {
-                const segs = [_]fwd.Seg{.{ .rows = j.c.rows, .cache = j.c, .draw = j.how }};
+                const segs = [_]fwd.Seg{.{ .rows = j.c.rows, .cache = j.c, .draw = j.how, .mask_row = j.mask_row }};
                 b.forward().draw(e, &segs, .last, b.tokens, slot(j.h));
             }
         };
-        try self.submit(.prefill, h + 1, Head{ .h = h, .c = c, .how = drawOf(s, position) });
+        try self.submit(.prefill, h + 1, Head{ .h = h, .c = c, .how = fwd.drawOf(s, position), .mask_row = mask_row });
         return h;
     }
 
@@ -335,7 +365,9 @@ pub const Metal = struct {
         const in = self.feedSlot(feed);
         const out = self.take(1);
         if (c.len + 1 > c.kv[0].capacity) return error.ContextFull;
+        try kv_pages.grow(c, c.len + 1);
         const state = try self.slotFor(c, .full);
+        errdefer self.pool.give(@intCast(state));
         const Step = struct {
             in: u64,
             out: u64,
@@ -350,7 +382,7 @@ pub const Metal = struct {
                 f.draw(e, &segs, .all, b.tokens, slot(j.out));
             }
         };
-        try self.submit(.step, out + 1, Step{ .in = in, .out = out, .c = c, .state = state, .how = drawOf(s, position) });
+        try self.submit(.step, out + 1, Step{ .in = in, .out = out, .c = c, .state = state, .how = fwd.drawOf(s, position) });
         hold(c, 1, .full, state);
         c.commit(&self.pool, 1);
         c.start = 0;
@@ -369,22 +401,28 @@ pub const Metal = struct {
         const self: *Metal = @ptrCast(@alignCast(ptr));
         var segs: [st.max_rows]fwd.Seg = undefined;
         var fills: [st.max_rows]Fill = undefined;
+        if (windows.len > segs.len) return error.WindowTooWide;
         var total: usize = 0;
+        var taken: usize = 0; // windows whose fresh slot segs holds until hold() hands it to their cache
+        errdefer for (segs[0..taken]) |g| if (g.slot >= 0) self.pool.give(@intCast(g.slot));
         for (windows, 0..) |w, i| {
             const c = try self.cacheOf(w.stream);
             self.settle(c);
             const rows = w.rows();
             if (rows > max_lanes or c.len + rows > c.kv[0].capacity) return error.WindowTooWide;
+            try kv_pages.grow(c, c.len + rows);
             if (w.parents == null) {
                 for (w.positions, 0..) |p, r| if (p != w.positions[0] + r) return error.PositionsNotAChain;
             } else if (windows.len > 1) return error.SharedTreesNotBuilt else if (w.stream.sampling != null) return error.SampledTreesNotBuilt;
-            // the host's rows go to fresh ring slots and the verify copies them in: a draft still in flight writes this window
+            // the host's rows go to fresh ring slots, the verify copies them in: a draft in flight writes this window
             const stage = self.take(1 + w.tokens.len);
             const staged = self.tokens.slice(u32, ring);
             staged[stage % ring] = w.pending;
             for (w.tokens, 0..) |t, r| staged[(stage + 1 + r) % ring] = t;
             fills[i] = .{ .stage = stage, .held = w.held, .n = w.tokens.len };
-            segs[i] = .{ .rows = rows, .cache = c, .store = .lag, .slot = try self.slotFor(c, .lag), .parents = w.parents, .draw = drawOf(w.stream, w.positions[0]) };
+            const mask_row = try grammar.stage(self, w, total);
+            segs[i] = .{ .rows = rows, .cache = c, .store = .lag, .slot = try self.slotFor(c, .lag), .parents = w.parents, .draw = fwd.drawOf(w.stream, w.positions[0]), .mask_row = mask_row };
+            taken = i + 1;
             c.start = total;
             c.rows = rows;
             total += rows;
@@ -442,6 +480,7 @@ pub const Metal = struct {
                 @memcpy(c.compact.?.path[0..path.len], path);
             }
             c.commit(&self.pool, path.len);
+            if (self.flights.items.len == 0) kv_pages.keep(c); // the dropped rows' pages: the verify has landed
             for (path, 0..) |r, i| c.replay_map[i] = @intCast(r);
         }
     }
@@ -471,11 +510,13 @@ pub const Metal = struct {
             ranks: bool = false, // keep each chained level's best tokens
         };
         var jobs: [st.max_rows]Draft = undefined;
+        if (requests.len > jobs.len) return error.WindowTooWide;
         for (requests, 0..) |r, i| {
             const c = try self.cacheOf(r.stream);
             if (r.lanes == null and r.depth + 1 > max_window) return error.WindowTooWide;
+            try kv_pages.grow(c, @max(c.len, c.mtp_len) + max_lanes + max_window); // the head's kept rows and drafts
             if (r.lanes) |l| if (l.parents.len + 1 > max_lanes or r.stream.sampling != null) return error.WindowTooWide;
-            jobs[i] = .{ .c = c, .kept = 0, .depth = r.depth, .how = drawOf(r.stream, r.position), .token = 0, .lanes = r.lanes, .ranks = r.ranks or self.ranks_always };
+            jobs[i] = .{ .c = c, .kept = 0, .depth = r.depth, .how = fwd.drawOf(r.stream, r.position), .token = 0, .lanes = r.lanes, .ranks = r.ranks or self.ranks_always };
             if (r.rows) |rows| {
                 jobs[i].kept = rows.len;
                 jobs[i].path = rows;
@@ -536,10 +577,13 @@ pub const Metal = struct {
 
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self: *Metal = @ptrCast(@alignCast(ptr));
-        self.drain() catch {};
+        self.drain() catch {
+            @import("prompt_flight.zig").forget(self, s);
+        };
         if (self.caches.fetchRemove(s)) |kv| {
             kv.value.deinit(&self.pool);
             self.gpa.destroy(kv.value);
         }
+        if (self.caches.count() == 0) kv_pages.census(self);
     }
 };

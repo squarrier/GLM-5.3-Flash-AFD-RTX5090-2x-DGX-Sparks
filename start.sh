@@ -1,3 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
-exec bash "$(dirname "$0")/scripts/afd-role.sh" "$@"
+ROOT=$(cd -- "$(dirname -- "$0")" && pwd)
+exec python3 "$ROOT/scripts/local.py" run "$@"

@@ -61,6 +61,8 @@ pub const Library = struct {
 
     /// Metal source compiled now with `options`.
     pub fn fromSource(device: Device, source: []const u8, options: CompileOptions) Error!Library {
+        const timing = @import("profile").startup_receipt.span(.metal_source_build);
+        defer timing.end();
         const str = objc.string(source);
         defer objc.release(str);
         const opts = objc.msg(Id, objc.msg(Id, objc.class("MTLCompileOptions"), "alloc", .{}), "init", .{});
@@ -97,6 +99,17 @@ pub const Pipeline = struct {
 
     /// The kernel `name` of `library`; `indirect` lets indirect command buffers use it.
     pub fn init(device: Device, library: Library, name: []const u8, indirect: bool) Error!Pipeline {
+        return make(device, library, name, indirect, false);
+    }
+
+    /// `init` for a pipeline the caller can do without: a failed build is logged as info, not as an error.
+    pub fn initOptional(device: Device, library: Library, name: []const u8, indirect: bool) Error!Pipeline {
+        return make(device, library, name, indirect, true);
+    }
+
+    fn make(device: Device, library: Library, name: []const u8, indirect: bool, optional: bool) Error!Pipeline {
+        const timing = @import("profile").startup_receipt.span(.metal_pipeline_build);
+        defer timing.end();
         const func = try library.function(name);
         defer objc.release(func);
         var err: ?Id = null;
@@ -106,7 +119,7 @@ pub const Pipeline = struct {
         objc.msg(void, desc, "setSupportIndirectCommandBuffers:", .{indirect});
         const id = objc.msg(?Id, device.id, "newComputePipelineStateWithDescriptor:options:reflection:error:", .{ desc, @as(usize, 0), @as(?*anyopaque, null), &err });
         return .{ .id = id orelse {
-            std.log.err("pipeline {s}: {s}", .{ name, objc.errorText(err) });
+            if (optional) std.log.info("pipeline {s}: {s}", .{ name, objc.errorText(err) }) else std.log.err("pipeline {s}: {s}", .{ name, objc.errorText(err) });
             return error.PipelineBuild;
         } };
     }

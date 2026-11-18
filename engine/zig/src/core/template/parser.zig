@@ -6,11 +6,21 @@ const Allocator = std.mem.Allocator;
 
 pub const Error = error{ SyntaxError, OutOfMemory };
 
+/// How deep the parser recurses and how tall an expression stands: the scope pass and the renderer recurse as deep.
+pub const max_depth = 256;
+
 pub const Parser = struct {
     a: Allocator,
     toks: []const lex.Token,
     i: usize = 0,
     msg: []const u8 = "",
+    depth: u32 = 0,
+
+    /// One more production open; the caller closes it with `defer p.depth -= 1`.
+    fn deeper(p: *Parser) Error!void {
+        if (p.depth >= max_depth) return p.fail("nested more than {d} levels deep", .{max_depth});
+        p.depth += 1;
+    }
 
     fn fail(p: *Parser, comptime fmt: []const u8, args: anytype) Error {
         p.msg = std.fmt.allocPrint(p.a, "line {d}: " ++ fmt, .{p.cur().line} ++ args) catch return error.OutOfMemory;
@@ -88,6 +98,8 @@ pub const Parser = struct {
     }
 
     fn subparse(p: *Parser, end: []const []const u8) Error![]ast.Stmt {
+        try p.deeper();
+        defer p.depth -= 1;
         var body: std.ArrayList(ast.Stmt) = .empty;
         var pieces: std.ArrayList(ast.Piece) = .empty;
         while (true) {
@@ -250,6 +262,8 @@ pub const Parser = struct {
 
     fn targetItem(p: *Parser, namespace: bool) Error!ast.Target {
         if (p.skipOp(.lparen)) {
+            try p.deeper();
+            defer p.depth -= 1;
             const inner = try p.assignTarget(&.{}, false);
             try p.expectOp(.rparen);
             return inner;
@@ -283,6 +297,8 @@ pub const Parser = struct {
     }
 
     fn condExpr(p: *Parser) Error!*ast.Expr {
+        try p.deeper();
+        defer p.depth -= 1;
         var yes = try p.orExpr();
         while (p.skipName("if")) {
             const t = try p.orExpr();
@@ -305,8 +321,10 @@ pub const Parser = struct {
     }
 
     fn notExpr(p: *Parser) Error!*ast.Expr {
-        if (p.skipName("not")) return p.expr(.{ .not_ = try p.notExpr() });
-        return p.compare();
+        if (!p.skipName("not")) return p.compare();
+        try p.deeper();
+        defer p.depth -= 1;
+        return p.expr(.{ .not_ = try p.notExpr() });
     }
 
     fn compare(p: *Parser) Error!*ast.Expr {
@@ -372,6 +390,8 @@ pub const Parser = struct {
     }
 
     fn unary(p: *Parser, with_filter: bool) Error!*ast.Expr {
+        try p.deeper();
+        defer p.depth -= 1;
         var node = if (p.skipOp(.sub)) try p.expr(.{ .neg = try p.unary(false) }) else if (p.skipOp(.add)) try p.expr(.{ .pos = try p.unary(false) }) else try p.primary();
         node = try p.postfix(node);
         if (with_filter) node = try p.filterExpr(node);
@@ -496,16 +516,24 @@ pub const Parser = struct {
         try p.expectOp(.lparen);
         var pos: std.ArrayList(*ast.Expr) = .empty;
         var kw: std.ArrayList(ast.Kwarg) = .empty;
+        var dyn_kw: ?*ast.Expr = null;
         var need_comma = false;
         while (!p.isOp(.rparen)) {
             if (need_comma) {
                 try p.expectOp(.comma);
                 if (p.isOp(.rparen)) break;
             }
-            if (p.isOp(.mul) or p.isOp(.pow)) return p.fail("*args and **kwargs calls are not supported", .{});
-            if (p.cur().tag == .name and p.look().tag == .op and p.look().op == .assign) {
+            if (dyn_kw != null) return p.fail("invalid syntax for function call expression", .{});
+            if (p.skipOp(.pow)) {
+                dyn_kw = try p.expression(true);
+            } else if (p.isOp(.mul)) {
+                return p.fail("*args calls are not supported", .{});
+            } else if (p.cur().tag == .name and p.look().tag == .op and p.look().op == .assign) {
                 const key = p.advance().text;
                 _ = p.advance();
+                for (kw.items) |existing| {
+                    if (std.mem.eql(u8, key, existing.name)) return p.fail("keyword argument repeated: {s}", .{key});
+                }
                 try kw.append(p.a, .{ .name = key, .value = try p.expression(true) });
             } else {
                 if (kw.items.len > 0) return p.fail("invalid syntax for function call expression", .{});
@@ -514,7 +542,7 @@ pub const Parser = struct {
             need_comma = true;
         }
         try p.expectOp(.rparen);
-        return .{ .pos = pos.items, .kw = kw.items };
+        return .{ .pos = pos.items, .kw = kw.items, .dyn_kw = dyn_kw };
     }
 
     fn dottedName(p: *Parser) ![]const u8 {

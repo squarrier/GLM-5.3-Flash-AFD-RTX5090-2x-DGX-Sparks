@@ -1,23 +1,31 @@
 //! The CUDA driver opened at run time: libcuda.so.1's versioned entry points in one table, and checked calls.
-//! qualification_b95086f6 adds lazy optional bounded cuFuncGetName only; Jay Leaton's #635 design adapted by GPT-6.1 Sol via Hermes.
-//! Source: ashhart/TensorFold 986c996041e25e8b4a0341a8b54524a9d2248c12 / 5fa8ad0fd9c53131c599c39f8885117d5a582fda, Apache-2.0 and retained notices.
 
 const std = @import("std");
+const platform = @import("sys");
 const abi = @import("abi.zig");
 
-pub const Error = error{ DriverUnavailable, MissingSymbol, CudaFailed, OutOfDeviceMemory, NotReady, NotFound, Invalid };
+pub const Error = error{ CopySourceLimit, StageBusy, StageUnprepared, UnownedCaptureSource, OutOfMemory, DriverUnavailable, DriverTooOld, WrongGpu, MissingSymbol, CudaFailed, CudaContextLost, GraphNotPermitted, OutOfDeviceMemory, NotReady, NotFound, Invalid };
+
+/// The oldest CUDA version (cuDriverGetVersion) the kernels load on: nvcc 13 builds them, which needs a 13.x driver.
+pub const min_version: c_int = 13000;
+/// The NVIDIA driver branch that first runs CUDA 13.0.
+pub const min_branch = "R580";
 
 pub const Driver = struct {
-    lib: std.DynLib,
+    lib: platform.DynLib,
     api: abi.Api,
+    /// cuFuncGetName (CUDA 12.3+; optional: an older driver opens without it): a failed launch names its kernel
+    func_name: ?FuncGetName = null,
+
+    pub const FuncGetName = *const fn (*?[*:0]const u8, abi.Function) callconv(.c) abi.Result;
 
     pub fn open() Error!Driver {
-        return openPath("libcuda.so.1");
+        return openPath(platform.cuda_driver);
     }
 
     /// Resolves every field of `abi.Api` by its exact name; a missing symbol refuses the whole driver.
     pub fn openPath(path: []const u8) Error!Driver {
-        var lib = std.DynLib.open(path) catch return error.DriverUnavailable;
+        var lib = platform.DynLib.open(path) catch return error.DriverUnavailable;
         errdefer lib.close();
         var api: abi.Api = undefined;
         const info = @typeInfo(abi.Api).@"struct";
@@ -27,44 +35,72 @@ pub const Driver = struct {
                 return error.MissingSymbol;
             };
         }
-        const d: Driver = .{ .lib = lib, .api = api };
+        const d: Driver = .{ .lib = lib, .api = api, .func_name = lib.lookup(FuncGetName, "cuFuncGetName") };
         try d.check(api.cuInit(0), "cuInit");
+        var buf: [256]u8 = undefined;
+        if (d.tooOld(&buf)) |why| {
+            std.log.err("{s}", .{why});
+            return error.DriverTooOld;
+        }
         return d;
     }
 
+    /// Why this driver cannot load the kernels, read before any image: an older one crashes inside cuModuleLoadData.
+    pub fn tooOld(self: *const Driver, buf: []u8) ?[]const u8 {
+        var v: c_int = 0;
+        if (self.api.cuDriverGetVersion(&v) != abi.success) v = 0;
+        return refusal(v, buf);
+    }
+
     pub fn close(self: *Driver) void {
+        if (@import("copy_source.zig").keepDriver(self)) return;
+        @import("download_stage.zig").closeDriver(self);
         self.lib.close();
     }
 
+    pub fn synchronize(self: *const Driver) Error!void {
+        try @import("copy_source.zig").synchronizeContext(self);
+    }
     /// Logs a failed call with the driver's own name and text for the code; NOT_READY is a state, not a failure.
     pub fn check(self: *const Driver, res: abi.Result, what: []const u8) Error!void {
         if (res == abi.success) return;
         if (res == abi.error_not_ready) return error.NotReady;
-        std.log.err("{s}: {s} ({d}) {s}", .{ what, self.errorName(res), res, self.errorText(res) });
+        _ = self.result(res) catch {}; // publish a sticky fault before logging or caller cleanup
+        std.log.err("{s}: {s} ({d}) {s}{s}", .{ what, self.errorName(res), res, self.errorText(res), shutdownNote(res) });
+        return errorOf(res);
+    }
+
+    /// Classifies a driver result and publishes sticky execution faults for the calling thread's context.
+    pub fn result(self: *const Driver, res: abi.Result) Error!void {
+        if (res == abi.success) return;
+        @import("context_health.zig").observe(self, @import("copy_source.zig").current(), res);
+        return errorOf(res);
+    }
+
+    /// The error a failed call returns (`check` without its log line, for callers that log more).
+    pub fn errorOf(res: abi.Result) Error {
+        if (@import("context_health.zig").sticky(res)) return error.CudaContextLost;
         return switch (res) {
             2 => error.OutOfDeviceMemory,
             abi.error_not_found => error.NotFound,
+            abi.error_not_ready => error.NotReady,
             else => error.CudaFailed,
         };
     }
 
+    /// The driver's name for the code, else knownName's: during the exit's teardown cuGetErrorName fails too.
     pub fn errorName(self: *const Driver, res: abi.Result) []const u8 {
         var s: ?[*:0]const u8 = null;
-        if (self.api.cuGetErrorName(res, &s) != abi.success) return "CUDA_ERROR_UNKNOWN_CODE";
-        return if (s) |p| std.mem.span(p) else "CUDA_ERROR_UNKNOWN_CODE";
+        if (self.api.cuGetErrorName(res, &s) == abi.success) if (s) |p| return std.mem.span(p);
+        return knownName(res) orelse "CUDA_ERROR_UNKNOWN_CODE";
     }
 
-    /// Optional diagnostic-only lookup, never part of startup's mandatory API table; scans at most 64 bytes.
+    /// A kernel's symbol name (cuFuncGetName), or "?" when the driver cannot say.
     pub fn functionName(self: *const Driver, f: abi.Function) []const u8 {
-        const GetName = *const fn (*?[*:0]const u8, abi.Function) callconv(.c) abi.Result;
-        var lib = self.lib;
-        const get = lib.lookup(GetName, "cuFuncGetName") orelse return "?";
+        const get = self.func_name orelse return "?";
         var s: ?[*:0]const u8 = null;
         if (get(&s, f) != abi.success) return "?";
-        const p = s orelse return "?";
-        var n: usize = 0;
-        while (n < 64 and p[n] != 0) : (n += 1) {}
-        return p[0..n];
+        return if (s) |p| std.mem.span(p) else "?";
     }
 
     pub fn errorText(self: *const Driver, res: abi.Result) []const u8 {
@@ -96,4 +132,123 @@ pub const Driver = struct {
         try self.check(self.api.cuDeviceGetAttribute(&minor, .compute_capability_minor, dev), "cuDeviceGetAttribute");
         return @intCast(10 * major + minor);
     }
+
+    /// The current context's device's compute capability as 10 * major + minor.
+    pub fn currentCapability(self: *const Driver) Error!u32 {
+        var dev: abi.Device = 0;
+        try self.check(self.api.cuCtxGetDevice(&dev), "cuCtxGetDevice");
+        var major: c_int = 0;
+        var minor: c_int = 0;
+        try self.check(self.api.cuDeviceGetAttribute(&major, .compute_capability_major, dev), "cuDeviceGetAttribute");
+        try self.check(self.api.cuDeviceGetAttribute(&minor, .compute_capability_minor, dev), "cuDeviceGetAttribute");
+        return @intCast(10 * major + minor);
+    }
+
+    /// Device `ordinal`'s name ("NVIDIA GB10"), read without making a context.
+    pub fn deviceName(self: *const Driver, ordinal: c_int, buf: []u8) Error![]const u8 {
+        if (buf.len < 2) return error.Invalid;
+        var dev: abi.Device = 0;
+        try self.check(self.api.cuDeviceGet(&dev, ordinal), "cuDeviceGet");
+        try self.check(self.api.cuDeviceGetName(buf.ptr, @intCast(buf.len), dev), "cuDeviceGetName");
+        return std.mem.sliceTo(buf, 0);
+    }
 };
+
+/// CUresult names (cuda.h) for when cuGetErrorName cannot answer.
+pub fn knownName(res: abi.Result) ?[]const u8 {
+    return switch (res) {
+        1 => "CUDA_ERROR_INVALID_VALUE",
+        2 => "CUDA_ERROR_OUT_OF_MEMORY",
+        3 => "CUDA_ERROR_NOT_INITIALIZED",
+        4 => "CUDA_ERROR_DEINITIALIZED",
+        101 => "CUDA_ERROR_INVALID_DEVICE",
+        200 => "CUDA_ERROR_INVALID_IMAGE",
+        201 => "CUDA_ERROR_INVALID_CONTEXT",
+        209 => "CUDA_ERROR_NO_BINARY_FOR_GPU",
+        400 => "CUDA_ERROR_INVALID_HANDLE",
+        500 => "CUDA_ERROR_NOT_FOUND",
+        600 => "CUDA_ERROR_NOT_READY",
+        700 => "CUDA_ERROR_ILLEGAL_ADDRESS",
+        701 => "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES",
+        702 => "CUDA_ERROR_LAUNCH_TIMEOUT",
+        709 => "CUDA_ERROR_CONTEXT_IS_DESTROYED",
+        710 => "CUDA_ERROR_ASSERT",
+        714 => "CUDA_ERROR_HARDWARE_STACK_ERROR",
+        715 => "CUDA_ERROR_ILLEGAL_INSTRUCTION",
+        716 => "CUDA_ERROR_MISALIGNED_ADDRESS",
+        719 => "CUDA_ERROR_LAUNCH_FAILED",
+        800 => "CUDA_ERROR_NOT_PERMITTED",
+        999 => "CUDA_ERROR_UNKNOWN",
+        else => null,
+    };
+}
+
+/// CUDA_ERROR_DEINITIALIZED: the process is exiting (a stop signal, then exit) while a thread still calls the driver.
+pub fn shutdownNote(res: abi.Result) []const u8 {
+    return if (res == 4) " (the CUDA driver is shutting down: the process is exiting)" else "";
+}
+
+/// The refusal for a driver running CUDA `v` (0 when it reports none), naming the driver needed; null when it suffices.
+pub fn refusal(v: c_int, buf: []u8) ?[]const u8 {
+    if (v >= min_version) return null;
+    const need = std.fmt.comptimePrint("TensorFold's GPU kernels need CUDA {d}.{d}: install NVIDIA driver {s} or newer", .{ min_version / 1000, min_version % 1000 / 10, min_branch });
+    if (v <= 0) return "this NVIDIA driver reports no CUDA version, and " ++ need;
+    return std.fmt.bufPrint(buf, "this NVIDIA driver runs CUDA {d}.{d}, and " ++ need, .{ @divTrunc(v, 1000), @divTrunc(@mod(v, 1000), 10) }) catch need;
+}
+
+/// The refusal for CUDA device `ordinal` of `capability` when every image is for SM `built` (-Dgpu); null if it fits.
+pub fn gpuRefusal(built: ?u32, capability: u32, ordinal: c_int, buf: []u8) ?[]const u8 {
+    const sm = built orelse return null;
+    if (sm == capability) return null;
+    const head = "this server was built for sm_{d} (-Dgpu=sm_{d}), and CUDA device {d} is sm_{d}";
+    const text = if (std.mem.indexOfScalar(u32, &@import("gpu_builds.zig").sms, capability) != null)
+        std.fmt.bufPrint(buf, head ++ ": build it with -Dgpu=sm_{d}, or use the release server", .{ sm, sm, ordinal, capability, capability })
+    else
+        std.fmt.bufPrint(buf, head ++ ", which -Dgpu does not build a server for", .{ sm, sm, ordinal, capability });
+    return text catch "this server was built for another GPU (-Dgpu)";
+}
+
+test "a -Dgpu server: a GPU of another SM is refused naming both SMs, and a -Dgpu only when it builds one" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("this server was built for sm_120 (-Dgpu=sm_120), and CUDA device 0 is sm_121: build it with -Dgpu=sm_121, or use the release server", gpuRefusal(120, 121, 0, &buf).?);
+    try std.testing.expectEqualStrings("this server was built for sm_121 (-Dgpu=sm_121), and CUDA device 2 is sm_86: build it with -Dgpu=sm_86, or use the release server", gpuRefusal(121, 86, 2, &buf).?);
+    try std.testing.expectEqualStrings("this server was built for sm_120 (-Dgpu=sm_120), and CUDA device 0 is sm_90, which -Dgpu does not build a server for", gpuRefusal(120, 90, 0, &buf).?);
+    try std.testing.expect(gpuRefusal(120, 120, 0, &buf) == null);
+    try std.testing.expect(gpuRefusal(null, 121, 0, &buf) == null);
+    var short: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("this server was built for another GPU (-Dgpu)", gpuRefusal(80, 86, 0, &short).?);
+}
+
+test "CUresult names without the driver: DEINITIALIZED is 4, unknown codes stay unknown" {
+    try std.testing.expectEqualStrings("CUDA_ERROR_DEINITIALIZED", knownName(4).?);
+    try std.testing.expectEqualStrings("CUDA_ERROR_ILLEGAL_ADDRESS", knownName(700).?);
+    try std.testing.expect(knownName(12345) == null);
+    try std.testing.expect(shutdownNote(4).len > 0 and shutdownNote(1).len == 0);
+}
+
+test "the driver floor: an older driver, or one reporting no version, is refused with the driver needed" {
+    const Fake = struct {
+        var cuda: c_int = 0;
+        var reply: abi.Result = abi.success;
+        fn version(v: *c_int) callconv(.c) abi.Result {
+            v.* = cuda;
+            return reply;
+        }
+    };
+    var d: Driver = undefined;
+    d.api.cuDriverGetVersion = Fake.version;
+    var buf: [256]u8 = undefined;
+    const need = ", and TensorFold's GPU kernels need CUDA 13.0: install NVIDIA driver R580 or newer";
+    for ([_]struct { c_int, abi.Result, ?[]const u8 }{
+        .{ 12040, abi.success, "this NVIDIA driver runs CUDA 12.4" ++ need },
+        .{ 12090, abi.success, "this NVIDIA driver runs CUDA 12.9" ++ need },
+        .{ 13000, abi.success, null },
+        .{ 13020, abi.success, null },
+        .{ 0, abi.success, "this NVIDIA driver reports no CUDA version" ++ need },
+        .{ 13000, 3, "this NVIDIA driver reports no CUDA version" ++ need },
+    }) |case| {
+        Fake.cuda = case[0];
+        Fake.reply = case[1];
+        if (case[2]) |want| try std.testing.expectEqualStrings(want, d.tooOld(&buf) orelse "admitted") else try std.testing.expect(d.tooOld(&buf) == null);
+    }
+}

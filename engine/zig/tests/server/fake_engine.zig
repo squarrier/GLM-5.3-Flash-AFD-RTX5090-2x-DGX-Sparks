@@ -1,4 +1,4 @@
-//! The parity tests' engine: a request replays the script its prompt names, as script_scheduler.py does.
+//! The native server tests' engine: a request replays the script its prompt names.
 const std = @import("std");
 const api = @import("engine_api");
 const model_text = @import("server").model_text;
@@ -31,7 +31,7 @@ pub const ScriptEngine = struct {
     }
 
     /// The parity engine has no weights, so every label logit is zero.
-    fn score(_: *anyopaque, _: []const u32, _: []const u32, logits: []f64) error{Failed}!f64 {
+    fn score(_: *anyopaque, _: []const u32, _: []const u32, logits: []f64, _: bool) error{Failed}!f64 {
         for (logits) |*logit| logit.* = 0;
         return 0;
     }

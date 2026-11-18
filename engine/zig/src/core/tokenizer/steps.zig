@@ -11,6 +11,7 @@ pub const Error = error{ UnsupportedNormalizer, UnsupportedPreTokenizer, Unsuppo
 pub const Context = struct {
     a: Allocator,
     matcher: regex.Matcher,
+    raw_bytes: bool = false,
     spans: std.ArrayList(Span) = .empty,
     hits: std.ArrayList([2]usize) = .empty,
 };
@@ -105,15 +106,31 @@ pub const Normalizer = union(enum) {
     sequence: []const Normalizer,
     nfc,
     nfd,
+    nfkc,
+    nfkd,
     replace: struct { pattern: Pattern, content: []const u8 },
     prepend: []const u8,
     strip: struct { left: bool, right: bool },
+
+    /// Only operations known to preserve every byte position can reuse an incoming request mask.
+    pub fn preservesBytes(n: *const Normalizer) bool {
+        return switch (n.*) {
+            .sequence => |items| for (items) |*item| {
+                if (!item.preservesBytes()) break false;
+            } else true,
+            .prepend => |prefix| prefix.len == 0,
+            .strip => |s| !s.left and !s.right,
+            else => false,
+        };
+    }
 
     pub fn parse(a: Allocator, v: Value) Error!Normalizer {
         const kind = string(v, "type") orelse return error.UnsupportedNormalizer;
         if (std.mem.eql(u8, kind, "Sequence")) return .{ .sequence = try sequence(Normalizer, a, v, "normalizers") };
         if (std.mem.eql(u8, kind, "NFC")) return .nfc;
         if (std.mem.eql(u8, kind, "NFD")) return .nfd;
+        if (std.mem.eql(u8, kind, "NFKC")) return .nfkc;
+        if (std.mem.eql(u8, kind, "NFKD")) return .nfkd;
         if (std.mem.eql(u8, kind, "Replace")) return .{ .replace = .{ .pattern = try Pattern.parse(a, field(v, "pattern")), .content = string(v, "content") orelse return error.InvalidTokenizer } };
         if (std.mem.eql(u8, kind, "Prepend")) return .{ .prepend = string(v, "prepend") orelse return error.InvalidTokenizer };
         if (std.mem.eql(u8, kind, "Strip")) return .{ .strip = .{ .left = flag(v, "strip_left", true), .right = flag(v, "strip_right", true) } };
@@ -125,7 +142,7 @@ pub const Normalizer = union(enum) {
             .sequence => |steps| for (steps) |*step| {
                 if (step.hasForms()) break true;
             } else false,
-            .nfc, .nfd => true,
+            .nfc, .nfd, .nfkc, .nfkd => true,
             else => false,
         };
     }
@@ -140,6 +157,8 @@ pub const Normalizer = union(enum) {
             },
             .nfc => return unicode.normalize(ctx.a, s, .nfc),
             .nfd => return unicode.normalize(ctx.a, s, .nfd),
+            .nfkc => return unicode.normalize(ctx.a, s, .nfkc),
+            .nfkd => return unicode.normalize(ctx.a, s, .nfkd),
             .replace => |r| {
                 // Replacement text takes the alignment of the text it replaces.
                 var out: std.ArrayList(u8) = .empty;
@@ -236,6 +255,8 @@ pub const PreTokenizer = union(enum) {
             return .{ .metaspace = .{ .replacement = replacement, .scheme = try scheme(v), .split = flag(v, "split", true) } };
         }
         if (std.mem.eql(u8, kind, "WhitespaceSplit")) return .whitespace_split;
+        // tokenizers' Digits splits on char::is_numeric (\p{N}): each digit isolated, or runs kept contiguous
+        if (std.mem.eql(u8, kind, "Digits")) return .{ .split = .{ .pattern = .{ .regex = try regex.Regex.compile(a, "\\p{N}") }, .behavior = if (flag(v, "individual_digits", false)) .isolated else .contiguous, .invert = false } };
         return error.UnsupportedPreTokenizer;
     }
 
@@ -365,6 +386,32 @@ pub const Decoder = union(enum) {
         return error.UnsupportedDecoder;
     }
 
+    /// Only token-local chains can supply exact bytes independently of adjacent tokens.
+    pub fn tokenLocal(d: *const Decoder) bool {
+        var joined = false;
+        return d.localChain(&joined);
+    }
+
+    fn localChain(d: *const Decoder, joined: *bool) bool {
+        return switch (d.*) {
+            .byte_level, .byte_fallback => blk: {
+                if (joined.*) break :blk false;
+                joined.* = true;
+                break :blk true;
+            },
+            .fuse => blk: {
+                joined.* = true;
+                break :blk true;
+            },
+            .replace => |r| !joined.* and r.pattern == .literal,
+            .sequence => |items| blk: {
+                for (items) |*item| if (!item.localChain(joined)) break :blk false;
+                break :blk true;
+            },
+            else => false,
+        };
+    }
+
     /// Runs the decoder chain and joins its output, like tokenizers' Decoder::decode.
     pub fn decode(d: *const Decoder, a: Allocator, ctx: *Context, tokens: []const []const u8) Error![]u8 {
         return std.mem.concat(a, u8, try d.chain(ctx, tokens));
@@ -394,6 +441,7 @@ pub const Decoder = union(enum) {
                         try bytes.appendSlice(a, token);
                     }
                 }
+                if (ctx.raw_bytes) return a.dupe([]const u8, &.{bytes.items});
                 var text: std.ArrayList(u8) = .empty;
                 try unicode.appendLossy(&text, a, bytes.items);
                 return a.dupe([]const u8, &.{text.items});
@@ -405,7 +453,7 @@ pub const Decoder = union(enum) {
                     const byte: ?u8 = if (token.len == 6 and std.mem.startsWith(u8, token, "<0x") and token[5] == '>') std.fmt.parseInt(u8, token[3..5], 16) catch null else null;
                     if (byte) |b| try pending.append(a, b);
                     if (byte == null or i + 1 == tokens.len) if (pending.items.len > 0) {
-                        if (std.unicode.utf8ValidateSlice(pending.items)) try out.append(a, try a.dupe(u8, pending.items)) else for (pending.items) |_| try out.append(a, "\u{FFFD}");
+                        if (ctx.raw_bytes or std.unicode.utf8ValidateSlice(pending.items)) try out.append(a, try a.dupe(u8, pending.items)) else for (pending.items) |_| try out.append(a, "\u{FFFD}");
                         pending.clearRetainingCapacity();
                     };
                     if (byte == null) try out.append(a, token);
@@ -496,6 +544,25 @@ test "split behaviors match tokenizers" {
     for (cases) |case| {
         var out: std.ArrayList(Piece) = .empty;
         try splitPiece(&ctx, &out, .{ .text = "the-final--countdown", .first = true }, &.{ .literal = "-" }, case[0], false);
+        try std.testing.expectEqual(case[1].len, out.items.len);
+        for (case[1], out.items) |want, got| try std.testing.expectEqualStrings(want, got.text);
+    }
+}
+
+test "Digits splits as tokenizers' does: each digit, or each run of them" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ctx = Context{ .a = a, .matcher = .{ .a = a } };
+    const cases = [_]struct { []const u8, []const []const u8 }{
+        .{ "{\"type\": \"Digits\", \"individual_digits\": true}", &.{ "a", "1", "2", "3", "b", "4" } },
+        .{ "{\"type\": \"Digits\", \"individual_digits\": false}", &.{ "a", "123", "b", "4" } },
+    };
+    for (cases) |case| {
+        const v = try std.json.parseFromSliceLeaky(Value, a, case[0], .{});
+        const p = try PreTokenizer.parse(a, v);
+        var out: std.ArrayList(Piece) = .empty;
+        try splitPiece(&ctx, &out, .{ .text = "a123b4", .first = true }, &p.split.pattern, p.split.behavior, false);
         try std.testing.expectEqual(case[1].len, out.items.len);
         for (case[1], out.items) |want, got| try std.testing.expectEqualStrings(want, got.text);
     }

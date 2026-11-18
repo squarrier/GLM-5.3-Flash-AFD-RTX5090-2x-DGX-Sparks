@@ -1,9 +1,11 @@
+// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
 //! cuda_g53.zig's CPU tests: the arguments' layout and every launch against the cubins' tables (g53_kernels.json), the
 //! configuration per window size (default_cfg, KT3R's tier), the plan's buffers and the binding's refusals.
 
 const std = @import("std");
 const g = @import("cuda_g53.zig");
-const ex3 = @import("cuda_exl3_experts.zig");
+const ex3 = @import("cuda_v3_g53_types.zig");
 const testing = std.testing;
 
 test "Args is g53_rank.cu's struct: 272 bytes, every field where the C++ compiler puts it" {

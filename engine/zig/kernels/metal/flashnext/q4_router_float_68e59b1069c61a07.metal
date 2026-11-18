@@ -171,7 +171,7 @@ inline float qgroup_doth(const device uint32_t* w, float scale, float bias, cons
   }
   return fma(scale, dq, bias * dx);
 }
-[[kernel]] void custom_kernel_q4_router_floalocal integration69c61a07_bfloat16_t_bfloat16_t_int32_tc_float(
+[[kernel]] void custom_kernel_q4_router_float_68e59b1069c61a07_bfloat16_t_bfloat16_t_int32_tc_float(
   const device bfloat16_t* X [[buffer(0)]],
   const device bfloat16_t* GW [[buffer(1)]],
   const constant int32_t* rows [[buffer(2)]],

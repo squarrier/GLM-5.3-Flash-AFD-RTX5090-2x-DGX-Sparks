@@ -1,4 +1,4 @@
-//! Shard pulls over the cluster's links: a pull names a file range; the holder answers with the bytes and their SHA-256.
+//! Shard pulls over the cluster's links: a pull names a file range; the holder answers with bytes and their SHA-256.
 const std = @import("std");
 const node = @import("node.zig");
 const wire = @import("wire.zig");
@@ -91,7 +91,7 @@ pub const Agent = struct {
             const n = h.readPositionalAll(ag.io, ag.out[data_at..][0..len], offset) catch break :blk .failed;
             break :blk if (n == len) .ok else .failed;
         };
-        try o.int(u8, @intFromEnum(status));
+        try o.int(u8, @backingInt(status));
         var sha: [32]u8 = @splat(0);
         if (status == .ok) Sha256.hash(ag.out[data_at..][0..len], &sha, .{});
         try o.bytes(&sha);

@@ -72,31 +72,5 @@
     "<EOS>"
    ]
   ]
- },
- "glm_tool": {
-  "chunks": [
-   [
-    "<tool_call>lookup<arg_key>query</arg_key><arg_value>speed</arg_value></tool_call>"
-   ],
-   [
-    "<EOS>"
-   ]
-  ]
- },
- "glm_think_tool": {
-  "chunks": [
-   [
-    "Need a lookup"
-   ],
-   [
-    "</think>"
-   ],
-   [
-    "<tool_call>lookup<arg_key>query</arg_key><arg_value>{\"x\": [1, 2]}</arg_value></tool_call>"
-   ],
-   [
-    "<EOS>"
-   ]
-  ]
  }
 }

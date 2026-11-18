@@ -1,4 +1,4 @@
-//! The lanes backend for a cluster: the leader plans each round and broadcasts it; every rank runs its shard of every row.
+//! The cluster's lanes backend: the leader plans each round and broadcasts it; every rank runs its shard of every row.
 const std = @import("std");
 const lanes = @import("lanes");
 const exchange = @import("exchange.zig");
@@ -8,7 +8,7 @@ const be = lanes.backend;
 const Stream = lanes.Stream;
 const Allocator = std.mem.Allocator;
 
-/// One rank's part of the model (Metal, CUDA or the toy): it runs every row of a round through its shard and the collectives.
+/// One rank's part of the model (Metal, CUDA or the toy): runs every row of a round through its shard and collectives.
 pub const Shard = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -98,7 +98,7 @@ pub const Leader = struct {
         _ = try l.send(.{ .kind = .stop }, null);
     }
 
-    /// One round on every rank: the command (with pending rollbacks), then this rank's shard; sampled rows' logits back.
+    /// One round on every rank: the command (with pending rollbacks), then the rank's shard; sampled rows' logits back.
     pub fn run(l: *Leader, rows: []const round.Row) ![]f32 {
         var sampled: usize = 0;
         for (rows) |r| sampled += @intFromBool(r.sample);
@@ -134,6 +134,7 @@ pub const Leader = struct {
 
     /// Greedy rows take the lowest id among the largest logits; sampled rows use the engine's keyed host rule.
     pub fn draw(l: *Leader, row: []const f32, s: ?lanes.Sampling, position: u64) !u32 {
+        for (row) |x| if (!std.math.isFinite(x)) return error.NonfiniteLogits;
         if (s) |st| {
             const values = try l.gpa.alloc(f64, row.len);
             defer l.gpa.free(values);

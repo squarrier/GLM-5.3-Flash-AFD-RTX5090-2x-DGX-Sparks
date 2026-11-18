@@ -12,13 +12,20 @@ pub const Node = abi.GraphNode;
 
 /// Starts capturing `stream`; every launch on it is recorded until `endCapture`, nothing runs.
 pub fn beginCapture(stream: Stream, mode: abi.CaptureMode) Error!void {
+    const source = @import("copy_source.zig");
+    try source.captureBegin(stream, mode);
+    errdefer source.captureEnd(stream);
     try stream.d.check(stream.d.api.cuStreamBeginCapture_v2(stream.handle, mode), "cuStreamBeginCapture");
 }
 
 /// Ends the capture; an invalidated capture returns an error and no graph.
 pub fn endCapture(stream: Stream) Error!Graph {
+    const source = @import("copy_source.zig");
     var g: abi.Graph = null;
+    // An invalidated end still ends the sequence, a wrong-thread end does not: keep the guard only while it captures.
+    errdefer if ((captureStatus(stream) catch .active) == .none) source.captureEnd(stream);
     try stream.d.check(stream.d.api.cuStreamEndCapture(stream.handle, &g), "cuStreamEndCapture");
+    source.captureEnd(stream);
     return .{ .d = stream.d, .handle = g };
 }
 
@@ -95,7 +102,10 @@ pub const Graph = struct {
 
     pub fn instantiate(self: Graph) Error!Exec {
         var e: abi.GraphExec = null;
-        try self.d.check(self.d.api.cuGraphInstantiateWithFlags(&e, self.handle, 0), "cuGraphInstantiateWithFlags");
+        const res = self.d.api.cuGraphInstantiateWithFlags(&e, self.handle, 0);
+        // A capture-policy refusal is recoverable: callers can execute the same body eagerly.
+        if (res == 800) return error.GraphNotPermitted;
+        try self.d.check(res, "cuGraphInstantiateWithFlags");
         return .{ .d = self.d, .handle = e };
     }
 };

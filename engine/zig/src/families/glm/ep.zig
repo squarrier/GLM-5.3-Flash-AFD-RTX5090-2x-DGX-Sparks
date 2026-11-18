@@ -1,5 +1,6 @@
-//! Expert parallel over two Macs (MCDMA): half the routed experts each, a MoE call's (row, slot) outputs swapped, all combined on both.
+//! Two-Mac expert parallel (MCDMA): half the routed experts each; MoE (row, slot) outputs swapped, combined on both.
 const std = @import("std");
+const platform = @import("sys");
 const mtl = @import("metal");
 const fabric = @import("fabric");
 const settings = @import("../flashnext/tp_settings.zig");
@@ -21,7 +22,7 @@ const PAGE = 16384;
 pub const PROMPT_ROWS = 4096;
 const SLOT = @max(MAXP * ENTRY, PROMPT_ROWS * D * 4); // one exchange's entries at most
 
-// The window (the same on both Macs): the peer's entries and ours by parity (a page before each send), flags, GPU words.
+// The window (same on both Macs): the peer's entries and ours by parity (a page before each send), flags, GPU words.
 const RECV = 0;
 const SEND = RECV + 2 * SLOT;
 const FLAGS = SEND + 2 * (PAGE + SLOT);
@@ -46,7 +47,7 @@ fn reached(posted: u32, x: u64) bool {
     return @as(i32, @bitCast(posted -% @as(u32, @truncate(x)))) >= 0;
 }
 
-// The lists one exchange keeps (i32): this Mac's unique experts with local ids and their members, the picks each Mac computes.
+// Lists one exchange keeps (i32): this Mac's unique experts with local ids and members, the picks each Mac computes.
 const L_IDS = 0;
 const L_MEM = L_IDS + MAXP * 4;
 const L_COUNT = L_MEM + MAXP * MAXR * 4;
@@ -58,6 +59,7 @@ const LISTS = COUNTS + 256;
 const source = @import("kernel_sources").glm_ep;
 
 pub const Ep = struct {
+    benchmark_group: ?[]const u8 = null,
     rank: u32,
     peer: u32,
     own: [2]u32,
@@ -90,7 +92,7 @@ pub const Ep = struct {
     st: Stats = .{}, // when the peer's entries land against our post, and how the picks split
 
     /// Connect to the peer in `s`, refuse it unless it runs the same model with the other half of the experts (`me`).
-    pub fn init(gpa: std.mem.Allocator, device: mtl.Device, s: Settings, me: Identity) !*Ep {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, device: mtl.Device, s: Settings, me: Identity) !*Ep {
         if (s.rank > 1 or s.links.len != 1) return error.EpTwoRanksOneLink;
         const link = blk: {
             const lib = try gpa.dupeSentinel(u8, s.library, 0);
@@ -119,9 +121,12 @@ pub const Ep = struct {
         t.* = .{ .rank = s.rank, .peer = 1 - s.rank, .own = .{ me.own_lo, me.own_hi }, .link = link, .rd = rd, .win = win, .wbuf = wbuf, .lists = lists, .localize_pipe = pipes[0], .pack_pipe = pipes[1], .post_pipe = pipes[2], .unpack_pipe = pipes[3], .rcombine_pipe = pipes[4], .rfinal_pipe = pipes[5], .rsend_pipe = pipes[6], .rsum_pipe = pipes[7], .amax_send_pipe = pipes[8], .amax_merge_pipe = pipes[9], .ctl = undefined };
         t.ctl = try control.Control.init(gpa, rd, CONTROL, &t.failed);
         errdefer t.ctl.deinit(gpa);
+        t.ctl.inventory = true;
         _ = try t.ctl.hello(me); // both Macs up, running the same thing, before the first exchange
-        t.trace = std.c.getenv("GLM_EP_TRACE") != null;
-        if (std.c.getenv("GLM_EP_DELAY_US")) |v| t.delay_ns = 1000 * (std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0);
+        t.benchmark_group = try @import("core").benchmark_group.metal(gpa, io, device, rd, FLAGS + 4096, CONTROL, 3);
+        errdefer if (t.benchmark_group) |b| gpa.free(b);
+        t.trace = platform.c.getenv("GLM_EP_TRACE") != null;
+        if (platform.c.getenv("GLM_EP_DELAY_US")) |v| t.delay_ns = 1000 * (std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0);
         t.thread = try std.Thread.spawn(.{}, service, .{t});
         std.log.info("expert parallel: rank {d} of 2 holds experts {d}-{d}, connected", .{ t.rank, me.own_lo, me.own_hi - 1 });
         return t;
@@ -144,6 +149,7 @@ pub const Ep = struct {
         t.lists.deinit();
         t.wbuf.deinit();
         t.link.deinit();
+        if (t.benchmark_group) |b| gpa.free(b);
         gpa.destroy(t);
     }
 
@@ -200,7 +206,7 @@ pub const Ep = struct {
         enc.dispatchThreads(mtl.Size.of(1, 1, 1), mtl.Size.of(1, 1, 1));
     }
 
-    /// By rows: this Mac's routed sums (`yp` partials weighted by `wts`) into the send slot, then the post (a window or a prompt chunk).
+    /// By rows: our routed sums (`yp` partials weighted by `wts`) to the send slot, then the post (window or chunk).
     pub fn sendRows(t: *Ep, enc: mtl.ComputeEncoder, yp: Ref, wts: Ref, rows: u32) void {
         std.debug.assert(rows <= PROMPT_ROWS);
         enc.setPipeline(t.rcombine_pipe);
@@ -214,7 +220,7 @@ pub const Ep = struct {
         t.send(enc, yp, rows, false, true);
     }
 
-    /// The send slot guard's operands (ep_slot_free) from buffer index `first`: the flag, this exchange, the give-up count.
+    /// The send slot guard's operands (ep_slot_free) from buffer `first`: the flag, this exchange, the give-up count.
     fn slotGuard(t: *const Ep, enc: mtl.ComputeEncoder, first: usize) void {
         enc.setBuffer(t.wbuf, FLAG, first);
         enc.setValue(@as(u32, @truncate(t.x)), first + 1);
@@ -305,8 +311,9 @@ pub const Ep = struct {
         return @ptrCast(@alignCast(t.win.ptr + off));
     }
 
-    /// Each posted exchange's entries to the peer, then its flag; 10 s without an answer fails the link and lands every flag.
+    /// Each posted exchange's entries to the peer, then its flag; 10 s with no answer fails the link, lands every flag.
     fn service(t: *Ep) void {
+        _ = platform.c.pthread_set_qos_class_self_np(.USER_INTERACTIVE, 0); // busy CPUs must not hold back a send
         const posted = t.word32(POSTED);
         const flag = t.word64(FLAG);
         var x: u64 = 1;
@@ -319,26 +326,26 @@ pub const Ep = struct {
                 t.st.watch(@atomicLoad(u64, flag, .acquire), x - 1);
                 if (t.stop.load(.acquire)) return;
                 if (waiting and @atomicLoad(u64, flag, .acquire) >= want) waiting = false;
-                if (waiting and !t.failed.load(.acquire) and std.c.mach_absolute_time() - want_at > 240_000_000) {
+                if (waiting and !t.failed.load(.acquire) and platform.c.mach_absolute_time() - want_at > 240_000_000) {
                     t.fail(want, error.PeerSilent);
                     t.land(want);
                     waiting = false;
                 }
                 spins += 1;
                 if (spins > 1_000_000) { // idle: back off
-                    const ts: std.c.timespec = .{ .sec = 0, .nsec = 20_000 };
-                    _ = std.c.nanosleep(&ts, null);
+                    const ts: platform.c.timespec = .{ .sec = 0, .nsec = 20_000 };
+                    _ = platform.c.nanosleep(&ts, null);
                 } else std.atomic.spinLoopHint();
             }
-            const seen = std.c.mach_absolute_time();
+            const seen = platform.c.mach_absolute_time();
             const n: usize = @atomicLoad(u32, t.word32(COUNT + 4 * @as(usize, @intCast(x % 2))), .acquire);
             const theirs: u32 = @bitCast(@as([*]const i32, @ptrCast(@alignCast(t.lists.contents() + COUNTS)))[1]);
             t.st.posted(x, seen, @intCast(n), theirs);
             t.st.watch(@atomicLoad(u64, flag, .acquire), x);
             if (t.trace) std.debug.print("EP rank{d} exchange {d}: {d} entries\n", .{ t.rank, x, n });
             if (t.delay_ns > 0 and n * ENTRY > 1 << 20) {
-                const ts: std.c.timespec = .{ .sec = @intCast(t.delay_ns / std.time.ns_per_s), .nsec = @intCast(t.delay_ns % std.time.ns_per_s) };
-                _ = std.c.nanosleep(&ts, null);
+                const ts: platform.c.timespec = .{ .sec = @intCast(t.delay_ns / std.time.ns_per_s), .nsec = @intCast(t.delay_ns % std.time.ns_per_s) };
+                _ = platform.c.nanosleep(&ts, null);
             }
             if (t.failed.load(.acquire) or n * ENTRY > SLOT) {
                 if (n * ENTRY > SLOT) t.fail(x, error.BadCount);
@@ -348,7 +355,7 @@ pub const Ep = struct {
                 t.land(x);
             };
             want = x;
-            want_at = std.c.mach_absolute_time();
+            want_at = platform.c.mach_absolute_time();
             waiting = true;
             t.sent += 1;
             t.held_ticks += want_at - seen;
@@ -393,7 +400,7 @@ pub const Ep = struct {
         /// The flag's new value seen now; every exchange up to `upto` whose post and landing are both known is counted.
         fn watch(s: *Stats, flag: u64, upto: u64) void {
             if (flag > s.flag_seen) {
-                const now = std.c.mach_absolute_time();
+                const now = platform.c.mach_absolute_time();
                 var v = s.flag_seen + 1;
                 while (v <= flag) : (v += 1) s.flag_t[v % 64] = now;
                 s.flag_seen = flag;

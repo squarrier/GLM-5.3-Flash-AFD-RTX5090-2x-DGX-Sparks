@@ -1,5 +1,6 @@
 //! The GPU device: queues, buffers (zero-copy over mmap too), events and residency sets.
 const std = @import("std");
+const platform = @import("sys");
 const objc = @import("objc.zig");
 const types = @import("types.zig");
 const command = @import("command.zig");
@@ -26,6 +27,10 @@ pub const Buffer = struct {
     /// The buffer viewed as `len` values of T from its start.
     pub fn slice(self: Buffer, comptime T: type, len: usize) []T {
         return @as([*]T, @ptrCast(@alignCast(self.contents())))[0..len];
+    }
+
+    pub fn deviceId(self: Buffer) Id {
+        return objc.msg(Id, self.id, "device", .{});
     }
 
     pub fn gpuAddress(self: Buffer) u64 {
@@ -68,6 +73,11 @@ pub const Device = struct {
         return objc.msg(u64, self.id, "recommendedMaxWorkingSetSize", .{});
     }
 
+    /// The longest buffer this device makes, in bytes.
+    pub fn maxBufferLength(self: Device) u64 {
+        return objc.msg(u64, self.id, "maxBufferLength", .{});
+    }
+
     /// Bytes of every buffer and texture this device holds now.
     pub fn allocated(self: Device) u64 {
         return objc.msg(u64, self.id, "currentAllocatedSize", .{});
@@ -83,6 +93,7 @@ pub const Device = struct {
 
     /// A new buffer of `len` bytes; `options` from types.ResourceOptions (shared storage by default).
     pub fn buffer(self: Device, len: usize, options: usize) Error!Buffer {
+        @import("pass_metrics.zig").buffer();
         const id = objc.msg(?Id, self.id, "newBufferWithLength:options:", .{ len, options });
         return .{ .id = id orelse return error.NoBuffer };
     }
@@ -139,10 +150,10 @@ pub const MappedFile = struct {
     size: usize,
 
     pub fn open(path: [*:0]const u8) !MappedFile {
-        const fd = std.c.open(path, .{ .ACCMODE = .RDONLY });
+        const fd = platform.c.open(path, .{ .ACCMODE = .RDONLY });
         if (fd < 0) return error.OpenFailed;
-        defer _ = std.c.close(fd);
-        const end = std.c.lseek(fd, 0, std.c.SEEK.END);
+        defer _ = platform.c.close(fd);
+        const end = platform.c.lseek(fd, 0, platform.c.SEEK.END);
         if (end <= 0) return error.EmptyFile;
         const size: usize = @intCast(end);
         const page = std.heap.pageSize();

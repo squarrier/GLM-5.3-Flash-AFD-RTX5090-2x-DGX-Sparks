@@ -84,14 +84,17 @@ pub const Tri = struct {
         try t.run("_conv_commit", .{ cdiv(m.cd, 128), 1, 1 }, &.{ p("P", "*bf16", proj), p("BASE", "*bf16", base), int("R", rows) }, &.{ ci("PROJ", m.proj), ci("XOFF", m.xd), ci("CD", m.cd), ci("BC", 128) });
     }
 
-    pub const Attn = struct { nqkv: usize, heads: usize, kv_heads: usize, dim: usize, nch: usize };
+    /// `pt`: a stream's page table (0: contiguous rows), `ps` elements between pages; the captured set reads rows.
+    pub const Attn = struct { nqkv: usize, heads: usize, kv_heads: usize, dim: usize, nch: usize, pt: u64 = 0, ps: u64 = 0 };
 
     pub fn kvWrite(t: Tri, qkv: u64, kc: u64, vc: u64, meta: u64, rows: usize, a: Attn) !void {
+        if (a.pt != 0) return error.PagedNeedsOwnGlue;
         try t.run("_kv_write", .{ u(rows), 1, 1 }, &.{ p("QKV", "*bf16", qkv), p("KC", "*bf16", kc), p("VC", "*bf16", vc), p("META", "*i32", meta), int("R", rows) }, &.{ ci("NQKV", a.nqkv), ci("QD", a.heads * a.dim), ci("KVD", a.kv_heads * a.dim) });
     }
 
     /// attention.attention: 512-key chunks at absolute positions, merged in order (a row's bits ignore its window).
     pub fn attention(t: Tri, qkv: u64, kc: u64, vc: u64, meta: u64, po: u64, pm: u64, pl: u64, out: u64, xs: u64, rows: usize, a: Attn) !void {
+        if (a.pt != 0) return error.PagedNeedsOwnGlue;
         const g = a.heads / a.kv_heads;
         const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(a.dim), -0.5));
         try t.run("_chunk", .{ u(rows), u(a.kv_heads), u(a.nch) }, &.{ p("QKV", "*bf16", qkv), p("KC", "*bf16", kc), p("VC", "*bf16", vc), p("META", "*i32", meta), p("PO", "*fp32", po), p("PM", "*fp32", pm), p("PL", "*fp32", pl) }, &.{ ci("NQKV", a.nqkv), ci("H", a.heads), ci("HK", a.kv_heads), ci("D", a.dim), ci("G", g), ci("CH", 512), ci("NCH", a.nch), aot.cf("SCALE", scale) });
@@ -103,14 +106,14 @@ pub const Tri = struct {
         try t.run("_concat_norms", .{ u(rows), 2, 1 }, &.{ p("E", "*bf16", e), p("Hd", "*bf16", h), p("WE", "*bf16", we), p("WH", "*bf16", wh), p("OUT", "*bf16", out), p("XS", "*fp32", xs), aot.float("eps", eps) }, &.{ ci("D", d), ci("BLOCK", pow2(d)) });
     }
 
-    /// sampler._keyed, one program a row: row r draws position META[0] + r + 1 + offset; without `prob` PROB is OUT, as Python passes it.
+    /// sampler._keyed, a program a row: row r draws position META[0]+r+1+offset; no `prob`: PROB is OUT, as in Python.
     pub fn keyed(t: Tri, vals: u64, ids: u64, meta: u64, out: u64, seed: u64, fp: u64, prob: ?u64, offset: usize, rows: usize, count: usize, k: Keyed) !void {
         const share = if (prob) |x| p("PROB", "*fp32", x) else p("PROB", "*i32", out);
         try t.run("_keyed", .{ u(rows), 1, 1 }, &.{ p("VALS", "*fp32", vals), p("IDS", "*i64", ids), p("META", "*i32", meta), p("OUT", "*i32", out), p("SEED", "*i64", seed), p("FP", "*fp64", fp), share, aot.word("c1", 0x9E3779B97F4A7C15), aot.word("c2", 0xD1B54A32D192ED03), aot.word("m1", 0xBF58476D1CE4E5B9), aot.word("m2", 0x94D049BB133111EB), int("offset", offset) }, &.{ ci("C", count), ci("CP", pow2(count)), ci("K", k.k), ci("CUT", @intFromBool(k.cut)), ci("GREEDY", @intFromBool(k.greedy)), ci("WRITE_PROB", @intFromBool(prob != null)), ci("MINP", @intFromBool(k.minp)), ci("CONF_T", @intFromBool(k.conf_t)) });
     }
 };
 
-/// The rule a _keyed launch compiles in: top_k, the top-p cut, greedy rank 0, the min-p cut, a draft's share at the request's temperature.
+/// Compiled into a _keyed launch: top_k, top-p cut, greedy rank 0, min-p cut, draft share at the request's temperature.
 pub const Keyed = struct { k: usize, cut: bool = false, greedy: bool = false, minp: bool = false, conf_t: bool = false };
 
 test "router K slices" {

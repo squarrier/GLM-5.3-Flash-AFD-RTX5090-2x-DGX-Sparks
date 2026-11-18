@@ -26,7 +26,7 @@ inline void cut_bin(threadgroup atomic_uint* hist, uint lane, uint prefix, int s
 }
 
 [[max_total_threads_per_threadgroup(1024)]]
-[[kernel]] void custom_kernel_q4_idx_seleclocal integration389cc7ed_float_int32_t_int32_t_int32_t(
+[[kernel]] void custom_kernel_q4_idx_select_4092b8bd389cc7ed_float_int32_t_int32_t_int32_t(
   const device float* SC [[buffer(0)]],
   const constant int* SC_shape [[buffer(1)]],
   const device int32_t* COMPLETE [[buffer(2)]],

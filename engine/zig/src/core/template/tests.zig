@@ -2,6 +2,10 @@
 const std = @import("std");
 const template = @import("template.zig");
 
+test {
+    _ = @import("concat_test.zig");
+}
+
 const Outcome = struct { text: ?[]const u8, raised: ?[]const u8 };
 
 fn render(source: []const u8, vars: []const u8, diag: *template.Diag) ![]u8 {
@@ -118,4 +122,112 @@ test "syntax and unknown filters fail at compile time" {
     try expect("{{ x | nofilter }}", shared, .{ .text = null, .raised = null });
     try expect("{% if %}", shared, .{ .text = null, .raised = null });
     try expect("{% for x in y %}", shared, .{ .text = null, .raised = null });
+}
+
+fn expectRenderRejected(source: []const u8) !void {
+    const a = std.testing.allocator;
+    var diag: template.Diag = .{};
+    defer if (diag.msg.len > 0) a.free(diag.msg);
+    var compiled = try template.compile(a, source, &diag);
+    defer compiled.deinit();
+    try std.testing.expectError(error.TemplateFailed, template.render(a, &compiled, .null, .null, .{ .object = .empty }, false, &diag));
+}
+
+test "fromjson reads a string's JSON into values a template walks" {
+    try expect("{% for k, x in '{\"city\": \"Paris\", \"days\": 3}' | fromjson | items %}{{ k }}={{ x }};{% endfor %}", "{}", .{ .text = "city=Paris;days=3;", .raised = null });
+}
+
+test "dynamic keyword mappings feed dict constructors and scoped macros" {
+    try expect("{{ dict({'a': 1}, b=2, **{'c': 3}) | tojson }}", "{}", .{ .text = "{\"a\": 1, \"b\": 2, \"c\": 3}", .raised = null });
+    try expect("{{ dict({'a': 1}, **{'a': 2}) | tojson }}", "{}", .{ .text = "{\"a\": 2}", .raised = null });
+    try expect("{{ dict(**{}) | tojson }}|{{ dict(a=1, **{},) | tojson }}", "{}", .{ .text = "{}|{\"a\": 1}", .raised = null });
+    try expect("{{ dict(**options) | tojson }}", "{\"options\":{\"a\":1}}", .{ .text = "{\"a\": 1}", .raised = null });
+    try expect("{% macro m(a, b=2, c=3) %}{{ a }}:{{ b }}:{{ c }}{% endmacro %}{% for options in [{'c': 9}, {}] %}{{ m(1, b=4, **options) }};{% endfor %}{{ m(**{'a': 5}) }}", "{}", .{ .text = "1:4:9;1:4:3;5:2:3", .raised = null });
+    try expect("{{ [1, 3, 2] | sort(**{'reverse': true}) | join(',') }}", "{}", .{ .text = "3,2,1", .raised = null });
+}
+
+test "dynamic keyword expansion rejects non-mappings and non-string keys" {
+    for ([_][]const u8{
+        "{{ dict(**[1, 2]) }}",
+        "{{ dict(**none) }}",
+        "{{ dict(**'x') }}",
+        "{{ dict(**1) }}",
+        "{{ dict(**missing) }}",
+        "{{ dict(**namespace(a=1)) }}",
+    }) |source| try expectRenderRejected(source);
+    try expectRenderRejected("{{ dict(**{1: 'x'}) }}");
+    try expectRenderRejected("{{ dict(**dict([(1, 'x')])) }}");
+}
+
+test "dynamic keyword expansion rejects duplicate and unknown keyword names" {
+    try expectRenderRejected("{{ dict(x=1, **{'x': 2}) }}");
+    try expectRenderRejected("{% macro m(a) %}{{ a }}{% endmacro %}{{ m(a=1, **{'a': 2}) }}");
+    try expect("{{ dict(x=1, x=2) }}", "{}", .{ .text = null, .raised = null });
+    try expectRenderRejected("{% macro m(a) %}{{ a }}{% endmacro %}{{ m(1, **{'a': 2}) }}");
+    try expectRenderRejected("{% macro m(a) %}{{ a }}{% endmacro %}{{ m(**{'unknown': 2}) }}");
+}
+
+test "dynamic keyword mapping must be the final call argument" {
+    for ([_][]const u8{
+        "{{ dict(**{}, a=1) }}",
+        "{{ dict(**{}, {}) }}",
+        "{{ dict(**{}, **{}) }}",
+        "{{ dict(a=1, {}) }}",
+    }) |source| try expect(source, "{}", .{ .text = null, .raised = null });
+    try expect("{{ dict(*[]) }}", "{}", .{ .text = null, .raised = null });
+}
+
+test "appending to a long string in a namespace stays linear in memory" {
+    const a = std.testing.allocator;
+    const filler: [1000]u8 = @splat('x');
+    var json: std.ArrayList(u8) = .empty;
+    defer json.deinit(a);
+    try json.appendSlice(a, "{\"messages\":[");
+    for (0..600) |i| {
+        if (i > 0) try json.append(a, ',');
+        try json.print(a, "{{\"role\":\"user\",\"content\":\"{s}\"}}", .{&filler});
+    }
+    try json.appendSlice(a, "]}");
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json.items, .{});
+    defer parsed.deinit();
+    const budget = try a.alloc(u8, 24 << 20);
+    defer a.free(budget);
+    var fba = std.heap.FixedBufferAllocator.init(budget);
+    const source = "{% set ns = namespace(out='') %}{% for m in messages %}{% set ns.out = ns.out + m.content %}{% set ns.out = ns.out ~ '|' %}{% endfor %}{{ ns.out }}";
+    const tilde = "{% set ns = namespace(out='') %}{% for m in messages %}{% set ns.out = ns.out ~ m.content ~ '|' %}{% endfor %}{{ ns.out }}";
+    const out = try template.renderChat(fba.allocator(), source, parsed.value.object.get("messages").?, .null, parsed.value, false, null);
+    try std.testing.expectEqual(@as(usize, 600 * 1001), out.len);
+    try std.testing.expectEqualStrings(filler ++ "|" ++ filler ++ "|", out[0 .. 2 * 1001]);
+    const first = try a.dupe(u8, out);
+    defer a.free(first);
+    fba.reset();
+    const out2 = try template.renderChat(fba.allocator(), tilde, parsed.value.object.get("messages").?, .null, parsed.value, false, null);
+    try std.testing.expectEqualStrings(first, out2);
+}
+
+test "a render leaves only its text and spans in the caller's allocator" {
+    const a = std.testing.allocator;
+    var data = std.heap.ArenaAllocator.init(a);
+    defer data.deinit();
+    const d = data.allocator();
+    var messages = std.json.Array.init(d);
+    var want: std.ArrayList(u8) = .empty;
+    for (0..64) |i| {
+        const role = if (i % 2 == 0) "user" else "assistant";
+        const body = try d.alloc(u8, 64 << 10);
+        @memset(body, 'a' + @as(u8, @intCast(i % 26)));
+        var m: std.json.ObjectMap = .empty;
+        try m.put(d, "role", .{ .string = role });
+        try m.put(d, "content", .{ .string = body });
+        try messages.append(.{ .object = m });
+        try want.print(d, "<{s}>{s}", .{ role, body });
+    }
+    var t = try template.compile(a, "{% for m in messages %}<{{ m.role }}>{{ m.content | trim }}{% endfor %}", null);
+    defer t.deinit();
+    const budget = try a.alloc(u8, want.items.len * 5 / 2);
+    defer a.free(budget);
+    var fba = std.heap.FixedBufferAllocator.init(budget);
+    const out = try template.renderProvenance(fba.allocator(), &t, .{ .array = messages }, .null, .null, false, null);
+    try std.testing.expectEqualStrings(want.items, out.s);
+    try std.testing.expect(fba.end_index <= out.s.len + (out.spans.len + 1) * @sizeOf(template.Span));
 }

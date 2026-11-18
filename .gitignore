@@ -1,13 +1,7 @@
 .env
+runtime/
 .build/
 __pycache__/
-*.py[cod]
-.zig-cache/
-zig-out/
-*.cubin
-*.fatbin
-*.so
-*.so.*
-*.a
-*.safetensors
-*.gguf
+*.pyc
+engine/.zig-cache/
+engine/zig-out/

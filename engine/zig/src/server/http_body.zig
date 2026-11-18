@@ -1,11 +1,13 @@
 //! Bounded request bodies, fixed-length or chunked, refused as the Python server refuses them.
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const errors = @import("errors.zig");
 const Conn = @import("http_conn.zig").Conn;
 const Allocator = std.mem.Allocator;
 
 pub const limit = 32 * 1024 * 1024;
+/// A body no route reads is taken only to keep the connection in step, so it gets a small cap of its own.
+pub const unread_limit = 64 * 1024;
 const metadata_limit = 65536;
 
 /// A body, or the refusal a RequestError carries (the connection then closes).
@@ -33,7 +35,10 @@ fn strip(s: []const u8) []const u8 {
 
 /// Reads one body without consuming the next request on the connection.
 pub fn read(c: *Conn, a: Allocator, max: usize) Allocator.Error!Body {
-    const too_big = try std.fmt.allocPrint(a, "request body exceeds the {d} MiB limit", .{max / (1024 * 1024)});
+    const too_big = if (max >= 1024 * 1024)
+        try std.fmt.allocPrint(a, "request body exceeds the {d} MiB limit", .{max / (1024 * 1024)})
+    else
+        try std.fmt.allocPrint(a, "request body exceeds the {d} KiB limit", .{max / 1024});
     var transfers = false;
     var lengths = false;
     for (c.headers) |h| {
@@ -54,6 +59,8 @@ pub fn read(c: *Conn, a: Allocator, max: usize) Allocator.Error!Body {
         }
         if (!chunked or codings != 1 or !std.mem.eql(u8, c.version, "HTTP/1.1"))
             return refuse(c, "unsupported request Transfer-Encoding; expected chunked over HTTP/1.1");
+        c.budget.body(c.nowMs(), c.timeouts.request);
+        defer c.budget = .{};
         return chunks(c, a, max, too_big);
     }
     if (!lengths) return .{ .ok = "" };
@@ -71,6 +78,9 @@ pub fn read(c: *Conn, a: Allocator, max: usize) Allocator.Error!Body {
         }
     }
     if (size.? > max) return refuse(c, too_big);
+    c.budget.body(c.nowMs(), c.timeouts.request);
+    c.budget.declared(size.?, c.timeouts.request);
+    defer c.budget = .{};
     var body: std.ArrayList(u8) = .empty;
     if ((c.readExact(a, &body, size.?) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -90,31 +100,34 @@ fn metaLine(c: *Conn, a: Allocator) Allocator.Error!?[]const u8 {
 
 fn chunks(c: *Conn, a: Allocator, max: usize, too_big: []const u8) Allocator.Error!Body {
     var body: std.ArrayList(u8) = .empty;
-    var extensions: usize = 0;
+    var framing: usize = 0;
     while (true) {
         const head = try metaLine(c, a) orelse return refuse(c, "invalid or oversized chunked request framing");
+        framing += head.len + 2;
+        if (framing > metadata_limit) return refuse(c, "chunk metadata exceeds the request framing limit");
         const semi = std.mem.indexOfScalar(u8, head, ';');
         const size_text = if (semi) |i| std.mem.trimEnd(u8, head[0..i], " \t") else head;
         if (size_text.len == 0) return refuse(c, "invalid chunk size");
         for (size_text) |ch| if (!std.ascii.isHex(ch)) return refuse(c, "invalid chunk size");
-        if (semi) |i| extensions += head.len - i - 1;
-        if (extensions > metadata_limit) return refuse(c, "chunk extensions exceed the request framing limit");
         const size = std.fmt.parseInt(u64, size_text, 16) catch std.math.maxInt(u64);
         if (size > max or body.items.len + size > max) return refuse(c, too_big);
         if (size == 0) {
-            var trailers: usize = 0;
             while (true) {
                 const trailer = try metaLine(c, a) orelse return refuse(c, "invalid or oversized chunked request framing");
+                framing += trailer.len + 2;
+                if (framing > metadata_limit or (trailer.len > 0 and !trailerName(trailer)))
+                    return refuse(c, "invalid or oversized request trailers");
                 if (trailer.len == 0) return .{ .ok = body.items };
-                trailers += trailer.len + 2;
-                if (trailers > metadata_limit or !trailerName(trailer)) return refuse(c, "invalid or oversized request trailers");
             }
         }
+        c.budget.declared(size, c.timeouts.request);
         const got = c.readExact(a, &body, size) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => 0,
         };
         if (got != size) return refuse(c, "incomplete request body");
+        framing += 2;
+        if (framing > metadata_limit) return refuse(c, "chunk metadata exceeds the request framing limit");
         var crlf: std.ArrayList(u8) = .empty;
         const n = c.readExact(a, &crlf, 2) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -146,4 +159,27 @@ pub fn readJson(conn: *Conn, cx: *errors.Cx) errors.Refused!json.Value {
         .ok => |v| v,
         .err => |message| cx.other(message),
     };
+}
+
+test "security: chunk size lines share a bounded framing budget" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var wire: std.ArrayList(u8) = .empty;
+    for (0..3) |_| {
+        try wire.appendNTimes(a, '0', 32000);
+        try wire.appendSlice(a, "1\r\na\r\n");
+    }
+    try wire.appendSlice(a, "0\r\n\r\n");
+    var conn = try Conn.init(std.testing.allocator, 0, "fixture");
+    defer conn.deinit();
+    conn.version = "HTTP/1.1";
+    conn.close = false;
+    var headers = [_]@import("http_conn.zig").Header{.{ .name = "Transfer-Encoding", .value = "chunked" }};
+    conn.headers = &headers;
+    @memcpy(conn.buf[0..wire.items.len], wire.items);
+    conn.end = wire.items.len;
+    const body = try read(&conn, a, limit);
+    try std.testing.expect(body == .refused);
+    try std.testing.expect(conn.close);
 }
