@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Independent sparse header fixture from native cuda_weights/mpt_load + upstream weights_test schemas.
-//! Test data only, no model payload. Credits: TensorFold contributors; Helios/OpenAI Codex for Scott.
+//! Test data only, no model payload. Credits: TensorFold contributors; OpenAI Codex assistance for Scott.
 const std=@import("std");const glm=@import("glm");const t=std.testing;
 pub const Header=struct {
     a:std.mem.Allocator, text:std.ArrayList(u8)=.empty, end:u64=0, resident:u64=0,scalar_mcg:bool=false,

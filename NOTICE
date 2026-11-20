@@ -5,7 +5,7 @@ Copyright 2026 Scott Quarrier
 
 [Mia / Mia's AI Lab / @MiaAI-Lab](https://github.com/MiaAI-Lab) authored the [recipe and native RoCE adaptations](https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104/tree/80be4d6882837d8e0840827ae2aab6124fd48da3), [EXL3 quantization at078455ff](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold/tree/078455ffe6472f9a52fbc1139f58b9db2881b25c), drafter integration, README layout and the byte-identical [attribution AGENTS.md](AGENTS.md). [Hugh Madden / @hughmadden](https://github.com/hughmadden) authored [glm53f-afd's split/prompt kernels at91db3cc6](https://github.com/hughmadden/glm53f-afd/tree/91db3cc6fe672e2724efa3464f63bd31493f63f6); [T.J. Purtell / @tpurtell](https://github.com/tpurtell) authored the [expert-channel split](https://github.com/tpurtell/glmrt-5.3-1rtx-4spark/tree/dc6d9b8) and [CuteAFD](https://github.com/tpurtell/cuteafd/tree/b4818a73371788aa3b9dd54023c017646d109f01); Hugh Madden authored its graph-key design. These works are not reassigned to Scott or the porting agents.
 
-[taussoe / @taussoe](https://github.com/taussoe) authored [KDA work atfb985b86](https://github.com/ashhart/TensorFold/tree/fb985b8649c8b42c2ac2aba1fd7c6f905bc8413c). [Turboderp / @turboderp](https://github.com/turboderp) authored [ExLlamaV3/EXL3 atf45b8451](https://github.com/turboderp-org/exllamav3/tree/f45b84512ba65bca77f7d394399d4b68821fc71b). [Z.ai](https://huggingface.co/zai-org) authored [GLM-5.3-Flash and built-in MTP](https://huggingface.co/zai-org/GLM-5.3-Flash/tree/91b69215804f2d2036a8867f6ce44848e278dcda). [NVIDIA](https://github.com/NVIDIA) authored CUDA/libdevice; no compiled CUDA object is supplied here. [Scott Quarrier / @squarrier](https://github.com/squarrier) directed the recipe packaging; Helios (GPT-6.1 Sol via Hermes/openai-codex), Workerbee (recorded local execution route) and Claude Opus5.5 retain their distinct roles below. Exact per-file and previous-version authors remain in [CREDITS.md](CREDITS.md), [CREDIT-REGISTER.json](CREDIT-REGISTER.json) and every preserved notice.
+[taussoe / @taussoe](https://github.com/taussoe) authored [KDA work atfb985b86](https://github.com/ashhart/TensorFold/tree/fb985b8649c8b42c2ac2aba1fd7c6f905bc8413c). [Turboderp / @turboderp](https://github.com/turboderp) authored [ExLlamaV3/EXL3 atf45b8451](https://github.com/turboderp-org/exllamav3/tree/f45b84512ba65bca77f7d394399d4b68821fc71b). [Z.ai](https://huggingface.co/zai-org) authored [GLM-5.3-Flash and built-in MTP](https://huggingface.co/zai-org/GLM-5.3-Flash/tree/91b69215804f2d2036a8867f6ce44848e278dcda). [NVIDIA](https://github.com/NVIDIA) authored CUDA/libdevice; no compiled CUDA object is supplied here. [Scott Quarrier / @squarrier](https://github.com/squarrier) directed the recipe packaging; GPT-6.1 Sol via Hermes/openai-codex, an earlier local AI agent and Opus5.5 retain their distinct roles below. Exact per-file and previous-version authors remain in [CREDITS.md](CREDITS.md), [CREDIT-REGISTER.json](CREDIT-REGISTER.json) and every preserved notice.
 
 [Raymond Lucke / @rwl4](https://github.com/rwl4) authored the [literal tool-closer cases at029a852f](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/029a852f14bcf604ffe9a55bfbd6ce7f50ec57be). [Albert Lee / @bertholomus](https://github.com/bertholomus) authored [group-count/place and MMA work-list kernels](https://github.com/bertholomus/TensorFold/commit/90b68e063a0b8bba59aaf13340ef16619e751195). [SvangenStudios / @SvangenStudios](https://github.com/SvangenStudios) authored the [structured response-channel work in PR31](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/31), with the recorded Mia adapter at80be4d6 distinguished from original authorship. [Alfonso Fortunato / @devopsfortunato](https://github.com/devopsfortunato) authored [the malformed GLM argument-boundary fix](https://github.com/ashhart/TensorFold/pull/2831); its exact original merge SHA is not invented. Their earlier-candidate roles are retained, not assertions that each old patch was recopied onto the native base.
 
@@ -19,7 +19,7 @@ Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
 MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
 THIRD_PARTY_NOTICES.md.
 
-The historical documentary NOTICE below is retained verbatim, not a description of the new source membership. Current membership is manifests/engine-source.json.
+The historical documentary NOTICE below is retained with local profile names omitted, not a description of the new source membership. Current membership is manifests/engine-source.json.
 
 # NOTICE — unpublished documentary V4 preview
 
@@ -33,7 +33,7 @@ https://github.com/ashhart/TensorFold
 
 [Mia / Mia's AI Lab / @MiaAI-Lab](https://github.com/MiaAI-Lab) authored the [recipe and native RoCE adaptations](https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104/tree/80be4d6882837d8e0840827ae2aab6124fd48da3), [EXL3 quantization at078455ff](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold/tree/078455ffe6472f9a52fbc1139f58b9db2881b25c), drafter integration, README layout and the byte-identical [attribution AGENTS.md](AGENTS.md). [Hugh Madden / @hughmadden](https://github.com/hughmadden) authored [glm53f-afd's split/prompt kernels at91db3cc6](https://github.com/hughmadden/glm53f-afd/tree/91db3cc6fe672e2724efa3464f63bd31493f63f6); [T.J. Purtell / @tpurtell](https://github.com/tpurtell) authored the [expert-channel split](https://github.com/tpurtell/glmrt-5.3-1rtx-4spark/tree/dc6d9b8) and [CuteAFD](https://github.com/tpurtell/cuteafd/tree/b4818a73371788aa3b9dd54023c017646d109f01); Hugh Madden authored its graph-key design. These works are not reassigned to Scott or the porting agents.[3][7]
 
-[taussoe / @taussoe](https://github.com/taussoe) authored [KDA work atfb985b86](https://github.com/ashhart/TensorFold/tree/fb985b8649c8b42c2ac2aba1fd7c6f905bc8413c). [Turboderp / @turboderp](https://github.com/turboderp) authored [ExLlamaV3/EXL3 atf45b8451](https://github.com/turboderp-org/exllamav3/tree/f45b84512ba65bca77f7d394399d4b68821fc71b). [Z.ai](https://huggingface.co/zai-org) authored [GLM-5.3-Flash and built-in MTP](https://huggingface.co/zai-org/GLM-5.3-Flash/tree/91b69215804f2d2036a8867f6ce44848e278dcda). [NVIDIA](https://github.com/NVIDIA) authored CUDA/libdevice; no compiled CUDA object is supplied here. [Scott Quarrier / @squarrier](https://github.com/squarrier) directed the recipe packaging; Helios (GPT-6.1 Sol via Hermes/openai-codex), Workerbee (recorded local execution route) and Claude Opus5.5 retain their distinct roles below. Exact per-file and previous-version authors remain in [CREDITS.md](CREDITS.md), [CREDIT-REGISTER.json](CREDIT-REGISTER.json) and every preserved notice.[3][7]
+[taussoe / @taussoe](https://github.com/taussoe) authored [KDA work atfb985b86](https://github.com/ashhart/TensorFold/tree/fb985b8649c8b42c2ac2aba1fd7c6f905bc8413c). [Turboderp / @turboderp](https://github.com/turboderp) authored [ExLlamaV3/EXL3 atf45b8451](https://github.com/turboderp-org/exllamav3/tree/f45b84512ba65bca77f7d394399d4b68821fc71b). [Z.ai](https://huggingface.co/zai-org) authored [GLM-5.3-Flash and built-in MTP](https://huggingface.co/zai-org/GLM-5.3-Flash/tree/91b69215804f2d2036a8867f6ce44848e278dcda). [NVIDIA](https://github.com/NVIDIA) authored CUDA/libdevice; no compiled CUDA object is supplied here. [Scott Quarrier / @squarrier](https://github.com/squarrier) directed the recipe packaging; GPT-6.1 Sol via Hermes/openai-codex, an earlier local AI agent and Opus5.5 retain their distinct roles below. Exact per-file and previous-version authors remain in [CREDITS.md](CREDITS.md), [CREDIT-REGISTER.json](CREDIT-REGISTER.json) and every preserved notice.[3][7]
 
 [Raymond Lucke / @rwl4](https://github.com/rwl4) authored the [literal tool-closer cases at029a852f](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/029a852f14bcf604ffe9a55bfbd6ce7f50ec57be). [Albert Lee / @bertholomus](https://github.com/bertholomus) authored [group-count/place and MMA work-list kernels](https://github.com/bertholomus/TensorFold/commit/90b68e063a0b8bba59aaf13340ef16619e751195). [SvangenStudios / @SvangenStudios](https://github.com/SvangenStudios) authored the [structured response-channel work in PR31](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/31), with the recorded Mia adapter at80be4d6 distinguished from original authorship. [Alfonso Fortunato / @devopsfortunato](https://github.com/devopsfortunato) authored [the malformed GLM argument-boundary fix](https://github.com/ashhart/TensorFold/pull/2831); its exact original merge SHA is not invented. Their earlier-candidate roles are retained, not assertions that each old patch was recopied onto the native base.[3][7]
 
@@ -41,9 +41,9 @@ https://github.com/ashhart/TensorFold
 
 | Agent / model | Authored work and scope |
 |---|---|
-| Helios / GPT-6.1 Sol / openai-codex / Hermes Agent | Current upstream-first port/adapters, integration, CPU regressions, original sole-owner qualification and documentary release work; not authorship of upstream mechanisms |
-| Workerbee / recorded local execution route | Earlier packaging, matched-evaluation harness and release research; underlying checkpoint identity is not established by a route alias |
-| Claude / Opus5.5 / Anthropic via Hermes | Retained earlier hybrid, recorder and CPU-fixture work; not a claim that Claude executed the current native runs |
+| GPT-6.1 Sol / openai-codex / Hermes Agent | Current upstream-first port/adapters, integration, CPU regressions, original sole-owner qualification and documentary release work; not authorship of upstream mechanisms |
+| Earlier local AI agent (model unknown) | Earlier packaging, matched-evaluation harness and release research; underlying checkpoint identity is not established by a route alias |
+| Anthropic Opus 5.5 via Hermes | Retained earlier hybrid, recorder and CPU-fixture work; not a claim that this model executed the current native runs |
 | Earlier self-hosted GLM-5.3-Flash execution agent | Previous published version only |
 | Model under test / GLM-5.3-Flash built-in MTP | Evaluated model/drafter, not a new code-author claim |
 
@@ -104,7 +104,7 @@ Mia's selected EXL3 checkpoint revision078455ffe6472f9a52fbc1139f58b9db2881b25c 
 Unchanged upstream native files retain their original notices. The supplemental manifests/release-contexts.jsonl distinguishes inherited source, design, external dependencies and historical references; it is not a declaration that all named repositories were copied or that the substantive provenance gate passed. Original authors, template and all previous credits remain.
 
 
-## Previous public V3 NOTICE retained verbatim
+## Previous public V3 NOTICE retained with local profile names omitted
 
 The following is the historical V3 notice, not a statement that its old deployment or dependency scope describes V4. Current corrections above remain separate.
 
@@ -112,7 +112,7 @@ The following is the historical V3 notice, not a statement that its old deployme
 
 Copyright 2026 Scott Quarrier. Own packaging is Apache-2.0, unchanged from v2.0. Ash Hart authored TensorFold and MCDMA; Mia authored the GLM recipe, EXL3 quantization, drafter integration and attribution AGENTS.md. All named source authors below keep their original roles, profiles, source revisions and licence texts. The upstream TensorFold copyright line is retained verbatim below.
 
-Native source revision: 1fab9035bb24bb3d647103c7d4285bb230a9a52e. Public packaging removes only private labels/addresses and adds generic configuration, scripts and documentation. Every source author's notice remains; numerical kernels are not rewritten. Claude Opus 5.5 and GPT-6.1 Sol via Hermes authored the local integration and staging; the published previous version also credits the earlier self-hosted GLM-5.3-Flash executor.
+Native source revision: 1fab9035bb24bb3d647103c7d4285bb230a9a52e. Public packaging removes only private labels/addresses and adds generic configuration, scripts and documentation. Every source author's notice remains; numerical kernels are not rewritten. Opus 5.5 and GPT-6.1 Sol via Hermes authored the local integration and staging; the published previous version also credits the earlier self-hosted GLM-5.3-Flash executor.
 
 No weights, compiled objects, cubins, fatbins, ELF executables, grammar libraries, caches or images are distributed. Install-time compilation uses NVIDIA's compiler and may link libdevice. NVIDIA authored CUDA/libdevice; no permission to redistribute its object-code output is inferred from this source-only release. The exact original build-toolkit redistribution terms remain unresolved for any future binary shipment.
 
@@ -147,7 +147,7 @@ his was copied. Ash Hart (@ashhart / @ashxhart) authored TensorFold and its
 lane core; Mia (@MiaAI_lab) authored the GLM-5.3 EXL3 lane, its MTP drafter and
 recipe; Hugh Madden (@dangerm00se) and tpurtell (@wrldsuksgo2mars) authored the
 AFD attention/expert split; Turboderp authored EXL3. This change and its CPU
-qualification: Claude Opus 5.5 (Anthropic), via Hermes. Hardware NOT RUN; no
+qualification: Opus 5.5 (Anthropic), via Hermes. Hardware NOT RUN; no
 adoption. Every earlier entry is retained.
 
 shared_forward local CPU change (2026-10-12) on joined_profile's join head b5804353: with
@@ -164,7 +164,7 @@ branch pr/glm53-flash-cuda (a TensorFold fork, Apache-2.0), commits 75131b66,
 @ashxhart) authored TensorFold and its lane core; Mia (@MiaAI_lab) authored the
 GLM-5.3 EXL3 lane and recipe; Hugh Madden (@dangerm00se) and tpurtell
 (@wrldsuksgo2mars) authored the AFD attention/expert split; Turboderp authored
-EXL3. This change and its CPU qualification: Claude Opus 5.5 (Anthropic), via
+EXL3. This change and its CPU qualification: Opus 5.5 (Anthropic), via
 Hermes. Hardware NOT RUN; no adoption. Every earlier entry is retained.
 
 structured_users local CPU change (2026-10-12) on server_join's joined head 8086a7de:
@@ -181,8 +181,8 @@ contributors (MLC, Apache-2.0) are behind grammar_abi's library; Mia (@MiaAI_lab
 authored the GLM-5.3 EXL3 lane, its nucleus recipe and union cover; Hugh Madden
 (@dangerm00se) and tpurtell (@wrldsuksgo2mars) authored the AFD
 attention/expert split; Turboderp authored EXL3. concurrent_users_r2: GPT-6.1 Sol (OpenAI
-Codex), via Hermes. The qualification_8a2734a3 line, concurrent_users_r4, concurrent_join and server_join: Claude Opus
-5.5 (Anthropic), via Hermes. This change and its CPU qualification: Claude Opus
+Codex), via Hermes. The qualification_8a2734a3 line, concurrent_users_r4, concurrent_join and server_join: Opus
+5.5 (Anthropic), via Hermes. This change and its CPU qualification: Opus
 5.5 (Anthropic), via Hermes. Hardware NOT RUN; no adoption. Every earlier entry
 below is retained.
 
@@ -199,7 +199,7 @@ GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold PR #158, commit 029a852f
 lane and recipe; Ash Hart (@ashhart / @ashxhart) authored TensorFold and its
 server. @data-angel / Enntity's sparkglm PR #46 (RC4.1) was read only, and
 nothing was taken from Atlas (AGPL-3.0). literal_boundary (the study and its fixtures) and
-this change and its CPU qualification: Claude Opus 5.5 (Anthropic), via Hermes.
+this change and its CPU qualification: Opus 5.5 (Anthropic), via Hermes.
 Hardware NOT RUN; no adoption. Every earlier entry is retained.
 
 tool_response_fixes local CPU change (2026-10-12) on joined_profile's join head b5804353: three
@@ -228,7 +228,7 @@ changes only for those replies and requests. Mia (@MiaAI_lab) authored the
 GLM-5.3 EXL3 lane and recipe; Raymond Lucke (@rwl4) authored the literal-closer
 design literal_tool_boundary reimplemented (MiaAI-Lab GLM PR #158, 029a852f); Ash Hart
 (@ashhart / @ashxhart) authored TensorFold and its server. tool_api_fixes (the study and
-its fixtures) and this change and its CPU qualification: Claude Opus 5.5
+its fixtures) and this change and its CPU qualification: Opus 5.5
 (Anthropic), via Hermes. Hardware NOT RUN; no adoption. Every earlier entry is
 retained.
 
@@ -243,8 +243,8 @@ behind grammar_abi's library; Mia (@MiaAI_lab) authored the GLM-5.3 EXL3 lane,
 recipe and attribution template; Hugh Madden (@dangerm00se) and tpurtell
 (@wrldsuksgo2mars) authored the AFD attention/expert split; Turboderp authored
 EXL3. concurrent_users_r2: GPT-6.1 Sol (OpenAI Codex), via Hermes. concurrent_users_r4, qualification_af0d6a64 and
-grammar_join_3: Claude Opus 5.5 (Anthropic), via Hermes. This join and its CPU
-qualification: Claude Opus 5.5 (Anthropic), via Hermes. Hardware NOT RUN; no
+grammar_join_3: Opus 5.5 (Anthropic), via Hermes. This join and its CPU
+qualification: Opus 5.5 (Anthropic), via Hermes. Hardware NOT RUN; no
 adoption. Every earlier entry below is retained.
 
 grammar_join_3 local CPU join (2026-10-11): grammar_join_2's integrated GRAM head 6c81d20a
@@ -260,10 +260,10 @@ mask-before-draw and the v1.0.6 tf_grammar.cc shim; @BobClawblaw authored
 Hugh Madden (@dangerm00se) and tpurtell (@wrldsuksgo2mars) designed the AFD
 attention/expert split; Turboderp authored EXL3. Every author and licence in
 the entries below is retained verbatim. The pick applied without conflicts.
-The GRAM line was done by GPT-6.1 Sol (OpenAI Codex) and Claude Opus 5.5
+The GRAM line was done by GPT-6.1 Sol (OpenAI Codex) and Opus 5.5
 (Anthropic), via Hermes; grammar_mask, qualification_64bda797, grammar_join, grammar_join_2 and grammar_server
-by Claude Opus 5.5 (Anthropic), via Hermes.
-Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes.
+by Opus 5.5 (Anthropic), via Hermes.
+Assisted-by: Opus 5.5 (planning and execution), via Hermes.
 Default OFF; Info.structures stays false unless TF_AFD_GRAMMAR_SERVE=1 (with
 the mask); no adoption, deployment or hardware result.
 
@@ -281,9 +281,9 @@ Hugh Madden (@dangerm00se) and tpurtell (@wrldsuksgo2mars) designed the AFD
 attention/expert split; Turboderp authored EXL3. Every author and licence in
 the entries below is retained verbatim. Only adjacent-line conflicts were
 resolved, as unions. The GRAM line was done by GPT-6.1 Sol (OpenAI Codex)
-and Claude Opus 5.5 (Anthropic), via Hermes; grammar_mask, qualification_64bda797 and grammar_join
-by Claude Opus 5.5 (Anthropic), via Hermes.
-Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes.
+and Opus 5.5 (Anthropic), via Hermes; grammar_mask, qualification_64bda797 and grammar_join
+by Opus 5.5 (Anthropic), via Hermes.
+Assisted-by: Opus 5.5 (planning and execution), via Hermes.
 Default OFF; Info.structures stays false; no adoption, deployment or hardware
 result.
 
@@ -294,7 +294,7 @@ patch 0034). Ash Hart (@ashhart / @ashxhart) authored TensorFold/MCDMA; Mia
 (@MiaAI_lab) authored the recipe and attribution template; @akol1 authored
 TensorFold #650's condition; every author and licence in the entries below is
 retained verbatim. Only adjacent-line conflicts were resolved, as unions.
-Assisted-by: Claude Opus 5.5 (planning and execution), via Hermes.
+Assisted-by: Opus 5.5 (planning and execution), via Hermes.
 Default OFF; no adoption, deployment or hardware result.
 
 prose_filter_852a local-only whole-response correction (2026-10-11):
@@ -420,7 +420,7 @@ the 512-row prompt chunks of latent.py, sparse.py and forward.py
 
 This backfill (the text above, THIRD_PARTY_NOTICES.md's Zig engine, grammar
 library and weights sections, LICENSES/xgrammar-NOTICE.txt and
-LICENSES/picojson-BSD-2-Clause.txt): Claude Opus 5.5 (Anthropic), via Hermes
+LICENSES/picojson-BSD-2-Clause.txt): Opus 5.5 (Anthropic), via Hermes
 (credit_audit). No code, script, model id or default changed.
 
 Jay Leaton (@jayleaton, https://github.com/jayleaton) authored the shared JSON
@@ -538,7 +538,7 @@ written by bertholomus (Albert Lee, BertholomusAI, https://github.com/bertholomu
 in https://github.com/bertholomus/TensorFold, branch glm-dsa-tp4, commit dbe0773
 ("perf(exl3 experts): prompt chunks decode each weight tile once for up to 64
 member rows"), Apache License, Version 2.0; the two kernels are included unchanged.
-His commits name Claude Opus 5.5 as co-author.
+His commits name Opus 5.5 as co-author.
 
 The EXL3 routed experts' prompt-window kernels in zig/kernels/cuda/exl3/mma/
 (grouped_mma_kernel and work_list_kernel, launched behind TF_GLM_EXL3_MMA from
@@ -550,7 +550,7 @@ appears); both kernels as copied here, in the work-list form of the tree of bran
 deepseek-v41-tp2 at commit 90b68e0 (experts_grouped.cuh and experts.cu), with one
 change marked in the file (rows rotated once, X1's rowrot); and the launch order
 of his zig/src/families/dsv41/exl3_experts.zig in branch deepseek-v41-zig, commit
-ce20a545. Apache License, Version 2.0. His commits name Claude Opus 5.5 as
+ce20a545. Apache License, Version 2.0. His commits name Opus 5.5 as
 co-author.
 
 qualification_b95086f6 local modifications to zig/src/cuda/launch.zig and driver.zig:
@@ -577,7 +577,7 @@ pr/glm53-flash-cuda, commit 322b4de6 (zig/src/families/glm/cuda_ranks.zig lines
 1-31: a fingerprint of three env settings, world and rank, capacity, the sha256 of
 config.json, aot.json and the executable, and the snapshot name, all-gathered
 before the weights load), Apache License, Version 2.0. Reimplemented here from
-that field list; no code was copied. Claude Opus 5.5 (Anthropic), via Hermes,
+that field list; no code was copied. Opus 5.5 (Anthropic), via Hermes,
 wrote the implementation and its tests.
 
 
@@ -891,7 +891,7 @@ Profile: https://github.com/ashhart
 - **code-ported**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/e7c523ebfa16b8094cf9e35e3773a7d25befcc5b) at `e7c523ebfa16b8094cf9e35e3773a7d25befcc5b` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Ash Hart authored TensorFold v1.0.7 (e7c523eb): the lane host's Admit hook and its test, which local integration ported (15f6451d, picked as cf2c45c8), and #639's shared MLA cache pool, whose region rule cuda_afd_pool.zig reimplements with no code copied.
 - **code-copied**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/c080a18eeae970a742135ee86325115b0387a1c8) at `c080a18eeae970a742135ee86325115b0387a1c8` (Apache-2.0). Related study/test-package or later candidate; not newly adopted in v3.0. Ash Hart authored TensorFold v1.0.6's tf_grammar.cc shim (c080a18e), which wraps XGrammar in local integration's libtfgrammar.so.
 - **reference**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/60626dc1b2505375854dc94c06718f7ae67ebda9) at `60626dc1b2505375854dc94c06718f7ae67ebda9` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. Mia (@MiaAI_lab/MiaAI-Lab) authored the native GLM EXL3 recipe/port in this pinned repository; Ash Hart and TensorFold contributors authored the engine/arithmetic, Jürgen Schmied authored native CUDA serving/registry, and local-inference-lab authored b12x/RoCEnante.
-- **reference**, [https://github.com/ahinore/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/ahinore/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/2636c1cb3019ede4ab27191299d5ad6843344942) at `2636c1cb3019ede4ab27191299d5ad6843344942` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. iegamo (@ahinore) authored PR164 input literal-added-token marking in this fork/commit; its commit preserves Claude Opus 5.5 as co-author, and all Mia/TensorFold/inherited notices remain intact.
+- **reference**, [https://github.com/ahinore/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/ahinore/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/2636c1cb3019ede4ab27191299d5ad6843344942) at `2636c1cb3019ede4ab27191299d5ad6843344942` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. iegamo (@ahinore) authored PR164 input literal-added-token marking in this fork/commit; its commit preserves Opus 5.5 as co-author, and all Mia/TensorFold/inherited notices remain intact.
 - **reference**, [https://github.com/ashhart/TensorFold](https://github.com/ashhart/TensorFold/tree/e7c523ebfa16b8094cf9e35e3773a7d25befcc5b) at `e7c523ebfa16b8094cf9e35e3773a7d25befcc5b` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. Ash Hart (@ashhart/@ashxhart) and TensorFold contributors authored the configured v1.0.7 base read here to reconstruct selected shared-source patch hunks; no implementation was taken into our engine.
 
 ## Mia (@MiaAI_lab)
@@ -915,7 +915,7 @@ Profile: https://github.com/MiaAI-Lab
 - **design**, [https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold/tree/ba19a9c16a51175a90e1b135748219c4fb51fb0b) at `ba19a9c16a51175a90e1b135748219c4fb51fb0b` (Apache-2.0). Native source, reimplemented design or build/runtime dependency. Mia (@MiaAI_lab) authored tools/exact.py in GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold (ba19a9c), whose exactness checks (each reply equal to its alone reference) local integration's client implements with new code (local integration-kit 813781c2) and the users path's together = solo tests follow.
 - **reference**, [https://mia-ai.net/lab/downloads/agents-md-credit-and-attribution](https://mia-ai.net/lab/downloads/agents-md-credit-and-attribution) at `81a6dd958181aa1d581cb24d54d30a327842e955bd42b40256e54bfc1abfa8cb` (none). Research/benchmark reference only; no code taken for v3.0. Mia (@MiaAI_lab) authored the AGENTS.md credit and attribution guide; local integration read its published page and download and preserves her credit without copying additional guide text into the shipping change or assigning it an invented licence.
 - **reference**, [https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/60626dc1b2505375854dc94c06718f7ae67ebda9) at `60626dc1b2505375854dc94c06718f7ae67ebda9` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. Mia (@MiaAI_lab/MiaAI-Lab) authored the native GLM EXL3 recipe/port in this pinned repository; Ash Hart and TensorFold contributors authored the engine/arithmetic, Jürgen Schmied authored native CUDA serving/registry, and local-inference-lab authored b12x/RoCEnante.
-- **reference**, [https://github.com/ahinore/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/ahinore/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/2636c1cb3019ede4ab27191299d5ad6843344942) at `2636c1cb3019ede4ab27191299d5ad6843344942` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. iegamo (@ahinore) authored PR164 input literal-added-token marking in this fork/commit; its commit preserves Claude Opus 5.5 as co-author, and all Mia/TensorFold/inherited notices remain intact.
+- **reference**, [https://github.com/ahinore/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/ahinore/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/2636c1cb3019ede4ab27191299d5ad6843344942) at `2636c1cb3019ede4ab27191299d5ad6843344942` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. iegamo (@ahinore) authored PR164 input literal-added-token marking in this fork/commit; its commit preserves Opus 5.5 as co-author, and all Mia/TensorFold/inherited notices remain intact.
 
 ## Mia (@MiaAI_lab)
 
@@ -1071,7 +1071,7 @@ Profile: https://github.com/hughmadden
 
 Profile: https://github.com/ahinore
 
-- **reference**, [https://github.com/ahinore/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/ahinore/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/2636c1cb3019ede4ab27191299d5ad6843344942) at `2636c1cb3019ede4ab27191299d5ad6843344942` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. iegamo (@ahinore) authored PR164 input literal-added-token marking in this fork/commit; its commit preserves Claude Opus 5.5 as co-author, and all Mia/TensorFold/inherited notices remain intact.
+- **reference**, [https://github.com/ahinore/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/ahinore/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/tree/2636c1cb3019ede4ab27191299d5ad6843344942) at `2636c1cb3019ede4ab27191299d5ad6843344942` (Apache-2.0). Research/benchmark reference only; no code taken for v3.0. iegamo (@ahinore) authored PR164 input literal-added-token marking in this fork/commit; its commit preserves Opus 5.5 as co-author, and all Mia/TensorFold/inherited notices remain intact.
 
 ## Jay Leaton (@jayleaton)
 
@@ -1520,7 +1520,7 @@ in the patched tree.
 - `extras/gb10-hostguard/` is v1.0's host guard, carried over unchanged in its code: Python's standard library and
   systemd only.
 - `extras/watch/` is v1.0's watcher (keep-alive, telemetry and its report), ported to this version: Python's standard
-  library, run from cron or a systemd timer. v1.0's credits name its author: v1.0's orchestrating agent (Claude Opus
+  library, run from cron or a systemd timer. v1.0's credits name its author: v1.0's orchestrating agent (Opus
   5.5 in the Hermes agent harness) wrote it, with v1.0's other operations code.
 
 ## AGENTS.md (rules for agents that edit this repo)
@@ -1707,7 +1707,7 @@ ping_pong_qualified private attribution reconciliation (text only; no new runtim
 Z.AI (@Zai_org, https://huggingface.co/zai-org) authored GLM-5.3-Flash at 91b69215804f2d2036a8867f6ce44848e278dcda (MIT). Mia (@MiaAI_lab) authored its EXL3 quantization in https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold at 078455ffe6472f9a52fbc1139f58b9db2881b25c (MIT); later 41ba3c2b Apache-2.0 terms do not change the served pin.
 XGrammar Contributors (MLC, https://github.com/mlc-ai/xgrammar) authored the retained matcher/rollback API and fixed-w1 grammar at 97787376faee5ed8466cfad57c99855e4ce2f6aa (Apache-2.0). Hugging Face tokenizers contributors (https://github.com/huggingface/tokenizers) authored the unchanged tokenizer at 7f1623b90b5adfb9bc327d4c3468d2f70bbce262 (Apache-2.0). Hugging Face authored the referenced transformers GLM semantics at 7cd73d9df0c14b151c684b708a9f27d8d0349dfe (Apache-2.0).
 linux-rdma/rdma-core contributors, Topspin Communications, Intel Corporation, Cisco Systems, Inc., and PathScale, Inc. authored the retained verbs/header components of https://github.com/linux-rdma/rdma-core v50.0 (selected BSD-2-Clause/OpenIB.org terms; individual-file alternatives retained). Scott Quarrier (@squarrier, https://github.com/squarrier) authored packaging/documentation of GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks at 1bff49e94deb717bd7711480188539d315af89e6 (Apache-2.0).
-Zig contributors (https://github.com/ziglang/zig) authored the pinned 0.17.0 compiler and standard library (MIT). Claude Opus 5.5 via Hermes authored the retained shared_verify recorder and CPU runner; GPT-6.1 Sol (OpenAI Codex), via Hermes, authored this qualification and private kit adaptation.
+Zig contributors (https://github.com/ziglang/zig) authored the pinned 0.17.0 compiler and standard library (MIT). Opus 5.5 via Hermes authored the retained shared_verify recorder and CPU runner; GPT-6.1 Sol (OpenAI Codex), via Hermes, authored this qualification and private kit adaptation.
 Shared-ledger cross-card design disclosures, NOT code imported here: Yaniv Leviathan, Matan Kalman and Yossi Matias authored speculative acceptance/residual correction (https://arxiv.org/abs/2211.17192v2, CC-BY-4.0). Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste Lespiau, Laurent Sifre and John Jumper authored speculative sampling correction (https://arxiv.org/abs/2302.01318v1, CC-BY-4.0). No sampled helper or instrumentation branch is included in ping_pong_qualified.
 Every inherited NOTICE paragraph and licence below is preserved verbatim.
 
@@ -1754,8 +1754,8 @@ https://github.com/Bizuayeu/TensorFold at 75131b66c39fdcf55dbd130ccaec166b65394f
 none of his code. Ash Hart (@ashhart / @ashxhart) authored TensorFold and MTP;
 Mia (@MiaAI_lab) authored the EXL3 weights and MTP drafter; tpurtell
 (@wrldsuksgo2mars, cuteafd, MIT) and Hugh Madden (@dangerm00se) authored the
-AFD split; Turboderp authored EXL3. Earlier user_drafts/shared_verify work: Claude Opus 5.5
-(Anthropic), via Hermes. batched_drafts initial receipt analysis/worktree: Claude Opus
+AFD split; Turboderp authored EXL3. Earlier user_drafts/shared_verify work: Opus 5.5
+(Anthropic), via Hermes. batched_drafts initial receipt analysis/worktree: Opus
 5.5 (Anthropic), via Hermes; this implementation and qualification: GPT-6.1
 Sol (OpenAI Codex), via Hermes. CPU only; hardware NOT RUN; no adoption or
 public/production authority. Every earlier notice and licence is retained.

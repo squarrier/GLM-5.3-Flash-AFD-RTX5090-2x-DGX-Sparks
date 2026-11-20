@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Test-only I2 Lifetime CPU boundary adaptation, TensorFold/Helios/OpenAI Codex/Scott credits retained.
+// Test-only I2 Lifetime CPU boundary adaptation, TensorFold/OpenAI Codex assistance/Scott credits retained.
 const std=@import("std");const t=std.testing;const cuda=@import("cuda");const engine_mod=@import("cuda_engine.zig");
 pub const F=struct{
     pub var live:usize=0;pub var fail_free:u64=0;var calls:usize=0;var fail_at:usize=std.math.maxInt(usize);

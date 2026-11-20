@@ -1,4 +1,4 @@
-// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Modified for V4 by Scott Quarrier with AI assistance: native hybrid integration/adaptation.
 // Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
 //! A TP rank's settings fingerprint, all-gathered before weights load: a mismatch stops every rank.
 
@@ -501,7 +501,7 @@ pub fn artifact(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ![32]u8 {
     return @import("core").checkpoint_identity.fullIdentity(gpa, io, dir);
 }
 
-// Helios: test-only access to the actual checkpoint worker seams.
+// AI-assisted integration: test-only access to the actual checkpoint worker seams.
 pub const IdentityTest=if(@import("builtin").is_test)@import("core").checkpoint_identity.Content.Test else struct{};
 
 /// The same full checkpoint fingerprint with the process-owned startup stop token.

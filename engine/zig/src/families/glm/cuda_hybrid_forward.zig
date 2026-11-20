@@ -172,7 +172,7 @@ pub const Peer = struct {
     }
 };
 
-// Helios: sole current-native Session now owns the released V3 mapped/device exchange.
+// AI-assisted integration: sole current-native Session now owns the released V3 mapped/device exchange.
 const v3 = @import("cuda_hybrid_v3.zig");
 const exchange_api = cuda.xchg;
 pub const V3Testing = if (@import("builtin").is_test) struct {
@@ -1053,7 +1053,7 @@ pub fn runExpert(a: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir
     a.destroy(o);
 }
 
-// Helios: real Peer/Session entry cancellation before an event or bootstrap admission.
+// AI-assisted integration: real Peer/Session entry cancellation before an event or bootstrap admission.
 pub const StopTest = if (@import("builtin").is_test) struct {
     pub fn peerEntry(session_case: bool) !void {
         const t = std.testing;

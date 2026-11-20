@@ -1,4 +1,4 @@
-// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Modified for V4 by Scott Quarrier with AI assistance: native hybrid integration/adaptation.
 // Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
 //! TCP for the bootstrap and the fate channel: listen, accept and connect with deadlines, whole sends and receives.
 const std = @import("std");
@@ -241,7 +241,7 @@ test "a listener and a client trade bytes and see the hang-up" {
     try std.testing.expectError(error.Closed, recvExact(b, &got, deadline));
 }
 
-// Helios: CPU pipe readiness is the actual poll consumer; no socket/device is admitted.
+// AI-assisted integration: CPU pipe readiness is the actual poll consumer; no socket/device is admitted.
 const SockModule=@This();
 pub const StopTest=if(@import("builtin").is_test)struct {
     pub fn cancelledConnectOwnership()!void {

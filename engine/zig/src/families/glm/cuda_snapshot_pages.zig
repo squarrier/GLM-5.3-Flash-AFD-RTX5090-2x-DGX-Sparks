@@ -1,4 +1,4 @@
-// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Modified for V4 by Scott Quarrier with AI assistance: native hybrid integration/adaptation.
 // Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
 //! Preallocated snapshot pages inside the prompt-cache budget; a keep or restore makes no device allocation.
 const std = @import("std");

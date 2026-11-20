@@ -1,4 +1,4 @@
-// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Modified for V4 by Scott Quarrier with AI assistance: native hybrid integration/adaptation.
 // Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
 //! The model's text loads on another thread while the engine opens on this one: both come up, or neither is left open.
 const std = @import("std");
@@ -127,7 +127,7 @@ test "both failing reports the text's error, as when it loaded first; both up ha
     try std.testing.expectEqual(@as(u32, 0), Fake.closed + Fake.freed);
 }
 
-// Helios: actual startup join under real Io task cancellation and process TERM; no model/devices.
+// AI-assisted integration: actual startup join under real Io task cancellation and process TERM; no model/devices.
 const t=std.testing;const startup=@This();
 const P=struct {
     var stopping=std.atomic.Value(bool).init(false);var fallback=std.atomic.Value(bool).init(false);

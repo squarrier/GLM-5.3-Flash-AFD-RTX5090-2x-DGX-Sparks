@@ -1,4 +1,4 @@
-//! Helios: source-bound occupied-page checkpoints for one finite private524288x8 qualification, default-inert.
+//! AI-assisted integration: source-bound occupied-page checkpoints for one finite private524288x8 qualification, default-inert.
 const std=@import("std");
 const sha=std.crypto.hash.sha2.Sha256;
 var frontier:usize=0;

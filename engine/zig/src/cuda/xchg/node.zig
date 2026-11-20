@@ -1,4 +1,4 @@
-// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Modified for V4 by Scott Quarrier with AI assistance: native hybrid integration/adaptation.
 // Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
 //! One node of the three-node exchange (qualification_12f4270a): the attention rank (both experts' pairs over one region) or an expert rank (one pair), the control-link handshake, the attention's watcher, the experts' heartbeat, and the status a request checks.
 //! Each pair is roce_proxy.c (Mia's patch 0006, unchanged) behind `Proxy`, or a test's stand-in; the GPU half is fn_xchg.cu (`Gpu`), or its CPU build in tests and tf-xchg's no-GPU mode.
@@ -36,7 +36,7 @@ pub const Proxy = struct {
         failure: *const fn (ctx: *anyopaque) ?[]const u8,
         ops: *const fn (ctx: *anyopaque) u64,
         close: *const fn (ctx: *anyopaque) void,
-        /// Helios: typed CQ/thread/accepted-doorbell proof; null cannot release a live runtime owner.
+        /// AI-assisted integration: typed CQ/thread/accepted-doorbell proof; null cannot release a live runtime owner.
         quiesce: ?*const fn (ctx: *anyopaque, until: u64) anyerror!void = null,
         /// qualification_17c70e37: the settings' stripes, before the start (null: a proxy without stripes)
         stripes: ?*const fn (ctx: *anyopaque, k: u32, min: u64) anyerror!void = null,
@@ -509,7 +509,7 @@ pub const Node = struct {
         for (n.links) |l| if (l) |x| x.send(tag_stop, &.{}) catch {};
     }
 
-    /// Helios: GPU consumers must already be proved complete. Failed/unknown/partial
+    /// AI-assisted integration: GPU consumers must already be proved complete. Failed/unknown/partial
     /// proxies retain every handle and the registered frame; no deinit on refusal.
     pub fn closeChecked(n: *Node, until: u64) !void {
         try n.check();

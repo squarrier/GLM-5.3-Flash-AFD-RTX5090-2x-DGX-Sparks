@@ -1,4 +1,4 @@
-// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Modified for V4 by Scott Quarrier with AI assistance: native hybrid integration/adaptation.
 // Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
 // V4 fold change: explicit __fmaf_rn weighted accumulation replaces the V3 add/multiply expression.
 // glm53f-afd's large-M expert kernels in TensorFold's AFD expert node (TF_GLM_EXPERT_KERNEL=g53): one TP2 half's

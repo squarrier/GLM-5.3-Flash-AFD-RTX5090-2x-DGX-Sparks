@@ -2,19 +2,19 @@
   "AI_credit_completeness": "Historical missing Assisted-by trailers and unrecorded model identities remain unknown; author display name is not sole-authorship proof.",
   "agent_models": [
     {
-      "agent": "Helios",
+      "agent": "AI-assisted native integration",
       "model": "GPT-6.1 Sol",
       "platform": "Hermes Agent",
       "provider": "openai-codex",
       "role": "Current upstream-first implementation, integration, qualification and release evidence"
     },
     {
-      "agent": "Workerbee",
+      "agent": "Earlier local AI agent",
       "model": "Recorded local execution route; underlying checkpoint not established",
       "role": "Earlier packaging, evaluation harness and release research; not new device operator"
     },
     {
-      "agent": "Claude",
+      "agent": "AI-assisted hybrid and fixtures",
       "model": "Opus 5.5, Anthropic via Hermes",
       "role": "Retained earlier hybrid/recorder/CPU-fixture work"
     },
@@ -25,7 +25,7 @@
     }
   ],
   "all_final_import_authorship_resolved": false,
-  "all_recorded_names_retained": true,
+  "human_and_upstream_credits_retained": true,
   "historical_exclusions_superseded": "Russell Marr and Bizuayeu host-KV are incorporated native-upstream on v1.2.8; old exclusion applies only to earlier v1.2.7 candidate.",
   "historical_human_records": [
     {

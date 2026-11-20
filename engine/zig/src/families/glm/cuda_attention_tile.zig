@@ -1,4 +1,4 @@
-//! Helios: optional temporary-attention tiling, without changing prompt/KDA/verify geometry or numeric kernels.
+//! AI-assisted integration: optional temporary-attention tiling, without changing prompt/KDA/verify geometry or numeric kernels.
 const std=@import("std");
 pub fn parse(text:?[]const u8) !?usize {
  const t=text orelse return null;

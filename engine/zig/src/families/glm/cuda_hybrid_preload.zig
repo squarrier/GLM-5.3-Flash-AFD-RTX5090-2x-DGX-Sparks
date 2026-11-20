@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Header-only EXL3 attention preflight. Source schemas: native cuda_weights/cuda_mtp_load,
-//! ashhart/TensorFold; EXL3 recipe Mia-AiLab. Adapter: Helios/OpenAI Codex for Scott Quarrier.
+//! ashhart/TensorFold; EXL3 recipe Mia-AiLab. Adapter: OpenAI Codex assistance for Scott Quarrier.
 const std=@import("std");const core=@import("core");const model=@import("config.zig");const cfg=@import("cuda_hybrid_config.zig");const m=@import("cuda_hybrid_memory.zig");
 const st=core.safetensors;const P="model.language_model.";
 pub const Plan=struct {role:cfg.Role,initial:m.WeightTotals=. {},resident:m.WeightTotals=. {},resident_upper_bound:m.WeightTotals=. {},load_peak:u64=0,draft_scratch:u64=0,tiling_scratch:u64=0,required_tensors:usize=0,header_binding:[32]u8,scope:[]const u8="selected_weight_peak_bound_not_whole_process_admission",driver_private:?u64=null,verbs_private:?u64=null,heap_and_checkpoint_residency:?u64=null};

@@ -1,4 +1,4 @@
-// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Modified for V4 by Scott Quarrier with AI assistance: native hybrid integration/adaptation.
 // Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
 //! ``tensorfold-native``: ``capabilities --json`` for the Python switch, and ``serve MODEL [flags]`` with no Python.
 const std = @import("std");
@@ -269,7 +269,7 @@ fn samplingFlags(args: cli.Args) @import("family_sampling.zig").Flags {
 
 const Closer = @import("idle_unload_closer.zig").Closer;
 
-// Helios: actual CLI entry and actual serving handoff, real OS TERM, no device/network.
+// AI-assisted integration: actual CLI entry and actual serving handoff, real OS TERM, no device/network.
 test "V4 startup: real main latches TERM before argument discovery" {
     const t=std.testing;const a=t.allocator;
     serve.StopTest.reset();defer serve.StopTest.reset();

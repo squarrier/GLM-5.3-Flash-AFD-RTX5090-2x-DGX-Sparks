@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Bounded native-buffer event ledger. Original: Helios/OpenAI Codex for Scott Quarrier.
+//! Bounded native-buffer event ledger. Original: OpenAI Codex assistance for Scott Quarrier.
 //! Counts actual owning allocations and successful releases; quiet is not a release.
 const std=@import("std");const cuda=@import("cuda");const m=@import("cuda_hybrid_memory.zig");const witness=cuda.memory_owner;
 const State=enum{empty,reserved,live,releasing,retained,released};

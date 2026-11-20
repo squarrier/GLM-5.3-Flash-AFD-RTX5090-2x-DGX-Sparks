@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Private I3 original accounting delta for TensorFold v1.2.8.
-//! Helios (gpt-6.1-sol/OpenAI Codex), for Scott Quarrier.
+//! GPT-6.1 Sol via OpenAI Codex, for Scott Quarrier.
 //! Native loader/page/transport formula attribution is retained in PROVENANCE.md.
 //! Pure metadata only. This module never probes, loads, allocates, pins or maps model memory.
 const std = @import("std");

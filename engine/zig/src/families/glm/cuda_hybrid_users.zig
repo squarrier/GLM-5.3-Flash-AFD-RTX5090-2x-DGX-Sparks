@@ -1,6 +1,6 @@
 //! V3 two-flight shared-user port onto current TensorFold state, masking and draw interfaces.
 //! TensorFold/MTP: Ash Hart. Shared-window design: @Bizuayeu. AFD: Hugh Madden and T.J. Purtell.
-//! Helios (GPT-6.1 Sol/OpenAI Codex via Hermes) authored these minimal native adapters.
+//! GPT-6.1 Sol via OpenAI Codex authored these minimal native adapters.
 const std = @import("std");
 const cuda = @import("cuda");
 const engine = @import("cuda_engine.zig");

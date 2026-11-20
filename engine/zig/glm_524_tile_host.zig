@@ -1,4 +1,4 @@
-//! Helios: actual selected native sparse/dense consumers with a recording-only driver; no numerical qualification.
+//! AI-assisted integration: actual selected native sparse/dense consumers with a recording-only driver; no numerical qualification.
 const std=@import("std");
 const fixture=@import("glm_kv_host_hybrid_host.zig");
 extern "c" fn setenv([*:0]const u8,[*:0]const u8,c_int)c_int;

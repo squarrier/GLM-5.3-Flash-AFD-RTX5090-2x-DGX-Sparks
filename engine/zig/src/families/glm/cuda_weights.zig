@@ -1,4 +1,4 @@
-// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Modified for V4 by Scott Quarrier with AI assistance: native hybrid integration/adaptation.
 // Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
 //! A TP rank's GLM-5.3-Flash weights on CUDA (the Python family's weights.load, NVFP4), named by its paths for digests.
 
@@ -646,7 +646,7 @@ test "an empty mixed recipe table cannot make an undeclared NVFP4 projection loo
     try std.testing.expectEqual(formats.Format.nvfp4, try formats.of(l.declaredAs("m"), stored));
 }
 
-// Helios: test-only entry to this module's actual private Loader; dependency tests are called by root.
+// AI-assisted integration: test-only entry to this module's actual private Loader; dependency tests are called by root.
 const WeightModule=@This();
 pub const StopTest=if(@import("builtin").is_test)struct {
     pub fn afterUpload()!void {try @import("cuda_hybrid_load_test.zig").attentionControlled(Loader);}

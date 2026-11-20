@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Helios/Scott I3: actual native memory consumers; CUDA API calls are recording-only CPU fixtures.
+//! Scott and AI assistance I3: actual native memory consumers; CUDA API calls are recording-only CPU fixtures.
 const std=@import("std");const t=std.testing;const glm=@import("glm");const cuda=@import("cuda");const m=glm.hybrid_memory;
 test { _=glm.native; }
 test { _=@import("glm_hybrid_preload_host.zig"); _=@import("glm_hybrid_expert_memory_host.zig"); _=@import("glm_hybrid_packed_memory_host.zig"); _=@import("glm_hybrid_ledger_host.zig"); _=@import("glm_hybrid_owned_gather_host.zig"); }
@@ -83,7 +83,7 @@ test "I3 native: selected preload precedes generic checkpoint fallback and propa
     try t.expectError(error.SelectedOwnerUnknown,fm.weights(Selected,t.allocator,t.io,.{.dir="/fixture/NEVER_OPENED",.model_type="glm5_next"},&why));
 }
 
-// Helios: actual attention native and Engine entry stop gates before any metadata/device access.
+// AI-assisted integration: actual attention native and Engine entry stop gates before any metadata/device access.
 test "V4 startup: actual GLM Engine refuses latched stop before checkpoint or CUDA" {
     var requested=std.atomic.Value(bool).init(true);
     var o=glm.engine.Options{.capacity=64,.mtp=false,.settings=.{}};
@@ -107,7 +107,7 @@ test "V4 startup: native family options forward exact sticky token without mutat
     try t.expect(options.set(Family,input,&out,&why));try t.expect(out.cancel_requested==&requested);try t.expect(requested.load(.acquire));
 }
 
-// Helios: actual attention Engine.init, actual hash worker, real OS TERM; CUDA calls record only.
+// AI-assisted integration: actual attention Engine.init, actual hash worker, real OS TERM; CUDA calls record only.
 test "V4 startup: attention hash cooperatively aborts before digest success or first CUDA stream" {
     const a=t.allocator;var tmp=t.tmpDir(.{});defer tmp.cleanup();
     const text=try glm.config.textConfig(a,1,0,&.{},288,128,4096);defer a.free(text);

@@ -1,4 +1,4 @@
-//! Helios: an unquiescent hybrid owner is process-lifetime quarantine, not a normal nullable refusal.
+//! AI-assisted integration: an unquiescent hybrid owner is process-lifetime quarantine, not a normal nullable refusal.
 //! Returning through std.process.Init's SafeAllocator would reclaim retained watcher/frame owners.
 const std = @import("std");
 /// Do not free user allocators, drivers, registered buffers or accepted-partial

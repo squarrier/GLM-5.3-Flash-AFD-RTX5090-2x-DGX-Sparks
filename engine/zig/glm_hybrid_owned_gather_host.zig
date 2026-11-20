@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Actual Engine.prepareHostGather/deinit. CPU CUDA boundary adapted byte-for-byte in behavior
-//! from I2 Lifetime fixture; native TensorFold contributor and Helios/OpenAI Codex credits retained.
+//! from I2 Lifetime fixture; native TensorFold contributor and OpenAI Codex assistance credits retained.
 const std=@import("std");const t=std.testing;const glm=@import("glm");const cuda=@import("cuda");
 extern "c" fn setenv([*:0]const u8,[*:0]const u8,c_int)c_int;extern "c" fn unsetenv([*:0]const u8)c_int;
 const F=struct{

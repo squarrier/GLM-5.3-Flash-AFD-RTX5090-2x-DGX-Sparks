@@ -1,4 +1,4 @@
-//! Helios adapts V3's four-lane layer-major pipeline to current TensorFold state/commit APIs.
+//! The local AI adapter adapts V3's four-lane layer-major pipeline to current TensorFold state/commit APIs.
 //! Hugh Madden authored the original lanes; Ash Hart authored TensorFold/MCDMA.
 //! Native index rings hold4096 rows: use four1024-row lanes per full native4096-row
 //! step, not four2048-row lanes which would overrun that ring. Pair tails stay native.

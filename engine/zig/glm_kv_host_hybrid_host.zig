@@ -1,6 +1,6 @@
 //! I2 actual native DSA/MTP host-KV consumers. Recording driver only; no CUDA math/device qualification.
 //! Native host-KV: russellmm/PR1795; native MTP stride: Bizuayeu/PR2173.
-//! Private I2 regression/adapter: Scott Quarrier with Helios (OpenAI gpt-6.1-sol).
+//! Private I2 regression/adapter: Scott Quarrier with AI assistance (OpenAI gpt-6.1-sol).
 const std = @import("std");
 const cuda = @import("cuda");
 const glm = @import("glm");

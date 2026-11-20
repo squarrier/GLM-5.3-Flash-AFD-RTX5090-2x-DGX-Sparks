@@ -1,4 +1,4 @@
-// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Modified for V4 by Scott Quarrier with AI assistance: native hybrid integration/adaptation.
 // Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
 //! The three-node exchange per MoE layer (qualification_12f4270a): the attention rank posts each layer's rows and routing to two expert ranks and takes their partials back, one pair over 0006's RoCE proxy to each expert.
 //! Family-agnostic: messages are bytes; proto.Layout describes python TF-AFD 2.15's wire for any hidden size and slot count.

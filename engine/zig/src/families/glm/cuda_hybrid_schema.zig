@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Required metadata for the selected native EXL3 role, not a prefix-size census.
 //! Schemas from TensorFold cuda_weights/cuda_mtp_load/cuda_exl3, retained attribution;
-//! adapter by Helios/OpenAI Codex for Scott Quarrier. No payload validation is claimed.
+//! adapter by OpenAI Codex assistance for Scott Quarrier. No payload validation is claimed.
 const std=@import("std");const core=@import("core");const model=@import("config.zig");const cfg=@import("cuda_hybrid_config.zig");
 const P="model.language_model.";const Header=core.safetensors.Header;
 pub fn experts(names:*const Header,c:model.Config,h:cfg.Config) !usize {

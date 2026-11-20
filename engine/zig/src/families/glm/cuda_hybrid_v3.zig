@@ -1,4 +1,4 @@
-//! Helios authored this current-native adapter to the released V3 AFD exchange.
+//! The local AI assistant authored this current-native adapter to the released V3 AFD exchange.
 //! V3 source: squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks cd50fe4d, engine1fab9035.
 //! Ash Hart authored TensorFold/MCDMA; Hugh Madden and T.J. Purtell authored the split;
 //! Mia's AI Lab authored the imported native RoCE work. No original credit is removed.

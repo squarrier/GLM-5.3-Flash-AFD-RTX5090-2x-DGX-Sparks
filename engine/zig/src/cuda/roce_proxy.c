@@ -1,9 +1,9 @@
-// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Modified for V4 by Scott Quarrier with AI assistance: native hybrid integration/adaptation.
 // Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
 // The host half of the one-shot RoCE all-gather between two ranks (two DGX Sparks): a proxy thread that RDMA-writes each staged shard to the peer.
 // Source: Mia's patch 0006, MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold @ cbfc429, patches/0006-two-ranks.patch, zig/src/cuda/roce_proxy.c (Apache-2.0, Copyright 2026 MiaAI-Lab).
 // Changed here: the header comments condensed to one line each; tf_roce_proxy_built added. The proxy's code is unchanged but for qualification_17c70e37's stripes (tf_roce_set_stripes, post_striped; off unless set, and then post's one write a port as before) and qualification_9e49592e's: the slots a source a count given at open (tf_roce_open_slots, 2 to ROCE_SLOTS_MAX; tf_roce_open keeps ROCE_SLOTS).
-// Direct-port change by Helios: bounded1MiB payload WRs; full actual-row message/flag ordering retained.
+// Direct-port change by the local AI assistant: bounded1MiB payload WRs; full actual-row message/flag ordering retained.
 // Protocol: b12x's "RoCEnante" (https://github.com/local-inference-lab/b12x, b12x/comm/roce, by local-inference-lab, Apache-2.0), in new code.
 // A rank stages its shard into a pinned send slot and rings a doorbell; this thread writes it into the peer's receive slot over every port, each stripe then its flag.
 // The peer's kernel (zig/kernels/cuda/fn_roce.cu) waits for every port's flag, then reads the shard; zig/src/cuda/roce.zig drives both halves.
@@ -378,7 +378,7 @@ static int reap(tf_roce *r, int i) {
   return 0;
 }
 
-// Helios direct-V3 adapter: keep actual-R slots, but every native RDMA payload write is <=1MiB.
+// AI-assisted integration direct-V3 adapter: keep actual-R slots, but every native RDMA payload write is <=1MiB.
 // Each signalled chunk is counted until reaped; a partial submit never publishes the final message flag.
 #define TF_AFD_MAX_POST (1u << 20)
 static int post_payload(tf_roce *r, int i, uint64_t send, uint64_t recv, uint32_t bytes) {
@@ -583,7 +583,7 @@ int tf_roce_failed(tf_roce *r) { return atomic_load(&r->failed); }
 const char *tf_roce_error(tf_roce *r) { return r->err; }
 uint64_t tf_roce_ops(tf_roce *r) { return atomic_load_explicit(&r->ops, memory_order_relaxed); }
 
-/* Helios: only a typed, deadline-bound quiet proof permits registered-memory release.
+/* AI-assisted integration: only a typed, deadline-bound quiet proof permits registered-memory release.
  * The CUDA consumer must be complete BEFORE this call. Failure/unknown partial writes
  * keep the proxy, QP and MR owned; stopping a thread is not a quiet proof. */
 #define TF_AFD_TYPED_QUIESCENCE 1

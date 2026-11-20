@@ -90,7 +90,7 @@ test "I3 expert CLI: selected observer is installed before driver and clean star
     try t.expectEqualSlices(cuda.memory_receipt.Phase,&.{.load_begin,.cleanup_begin,.cleanup_end},Probe.phases[0..Probe.count]);
 }
 
-// Helios: real TERM at the actual CLI hash boundary; CUDA remains fenced.
+// AI-assisted integration: real TERM at the actual CLI hash boundary; CUDA remains fenced.
 test "I3 expert CLI: TERM before checkpoint identity is latched before any driver admission" {
     const a=t.allocator;var tmp=t.tmpDir(.{});defer tmp.cleanup();const text=try glm.config.textConfig(a,1,0,&.{},288,128,4096);defer a.free(text);
     const config=try std.mem.replaceOwned(u8,a,text,"{\"model_type\"","{\"quantization_config\":{\"quant_method\":\"exl3\",\"bits\":4,\"codebook\":\"mcg\"},\"model_type\"");defer a.free(config);try tmp.dir.writeFile(t.io,.{.sub_path="config.json",.data=config});const shape=try glm.config.parse(a,config);
@@ -115,7 +115,7 @@ test "I3 expert CLI: TERM before checkpoint identity is latched before any drive
     try t.expect(cuda.memory_owner.snapshot()==null);
 }
 
-// Helios: real TERM inside the real full-identity worker must not publish a digest.
+// AI-assisted integration: real TERM inside the real full-identity worker must not publish a digest.
 test "I3 expert CLI: TERM inside actual hash worker aborts before digest publication and driver" {
     const a=t.allocator;var tmp=t.tmpDir(.{});defer tmp.cleanup();const text=try glm.config.textConfig(a,1,0,&.{},288,128,4096);defer a.free(text);
     const config=try std.mem.replaceOwned(u8,a,text,"{\"model_type\"","{\"quantization_config\":{\"quant_method\":\"exl3\",\"bits\":4,\"codebook\":\"mcg\"},\"model_type\"");defer a.free(config);try tmp.dir.writeFile(t.io,.{.sub_path="config.json",.data=config});const shape=try glm.config.parse(a,config);

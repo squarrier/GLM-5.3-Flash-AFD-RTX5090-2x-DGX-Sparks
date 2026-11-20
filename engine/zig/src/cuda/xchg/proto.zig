@@ -1,4 +1,4 @@
-// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Modified for V4 by Scott Quarrier with AI assistance: native hybrid integration/adaptation.
 // Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
 //! The three-node exchange's wire (qualification_12f4270a): python TF-AFD 2.15's request and reply layout and header, the pair-rank map over roce_proxy.c's region, and the settings both ends agree on.
 //! The layout is mcdma.py's `Layout` at src@0849f3f (glm5_next/cuda), so each section's bytes can be checked against our python AFD lane; no code is copied.

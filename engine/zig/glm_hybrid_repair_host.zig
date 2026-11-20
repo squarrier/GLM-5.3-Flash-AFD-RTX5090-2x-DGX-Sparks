@@ -1,4 +1,4 @@
-//! Helios-authored Q1 repair regressions; metadata/clock/work seams only, no devices or sockets.
+//! AI-authored Q1 repair regressions; metadata/clock/work seams only, no devices or sockets.
 const std=@import("std");const glm=@import("glm");const tr=glm.moe.hybridTransport;const t=std.testing;
 const identity=tr.Identity{.session=1,.model=@splat(0xAA),.settings=@splat(0xBB),.transaction_timeout_ns=1000};
 fn header(lo:u32,rows:u32,sequence:u64)tr.wire.Header{var h=tr.wire.Header{.session=1,.sequence=sequence,.native_round=3,.buffer_epoch=7,.layer=3,.live_rows=@min(128,rows-lo),.tile_row_lo=lo,.call_rows=rows,.model_contract_sha256=identity.model,.row_map_sha256=@splat(0xCC),.settings_sha256=identity.settings};h.bind();return h;}

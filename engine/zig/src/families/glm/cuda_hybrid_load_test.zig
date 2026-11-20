@@ -87,7 +87,7 @@ pub fn attention(comptime Loader: type) !void {
     for(w.named.items) |n| try t.expect(std.mem.indexOf(u8,n.name,".exl3.")==null);
 }
 
-// Helios: actual scaled loader boundary for the real hardware's late TERM and stale setup budget.
+// AI-assisted integration: actual scaled loader boundary for the real hardware's late TERM and stale setup budget.
 pub fn controlled(cancel_after_copy:bool) !void {
     const H=@import("cuda_hybrid_load.zig");var arena=std.heap.ArenaAllocator.init(t.allocator);defer arena.deinit();const a=arena.allocator();
     var fx=Fixture{.g=a};try fx.moe(0);try fx.moe(1);const memory=try a.alignedAlloc(u8,.fromByteUnits(4096),fx.bytes.items.len);@memcpy(memory,fx.bytes.items);
@@ -189,7 +189,7 @@ pub fn reclamation()!void {
     for(originals,0..)|bytes,i| {const name=try std.fmt.allocPrint(a,"model-{d}.safetensors",.{i});const actual=try tmp.dir.readFileAlloc(t.io,name,a,.limited(2<<20));try t.expectEqualSlices(u8,bytes,actual);}
 }
 
-// Helios: real attention Loader cancellation after its first synchronous recording upload.
+// AI-assisted integration: real attention Loader cancellation after its first synchronous recording upload.
 pub fn attentionControlled(comptime Loader:type)!void {
     var arena=std.heap.ArenaAllocator.init(t.allocator);defer arena.deinit();const a=arena.allocator();var fx=Fixture{.g=a};try fx.moe(0);try fx.moe(1);
     const memory=try a.alignedAlloc(u8,.fromByteUnits(4096),fx.bytes.items.len);@memcpy(memory,fx.bytes.items);

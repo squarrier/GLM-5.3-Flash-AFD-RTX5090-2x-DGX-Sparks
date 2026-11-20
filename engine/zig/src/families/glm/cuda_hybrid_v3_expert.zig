@@ -1,4 +1,4 @@
-//! Helios authored the current-native expert owner of released V3 actual-row replies.
+//! The local AI assistant authored the current-native expert owner of released V3 actual-row replies.
 //! TensorFold/MCDMA: Ash Hart. Released hybrid split: Hugh Madden and T.J. Purtell.
 //! Native RoCE: Mia's AI Lab. Direct V3 g53 arithmetic/launch planner remains unchanged.
 const std = @import("std");

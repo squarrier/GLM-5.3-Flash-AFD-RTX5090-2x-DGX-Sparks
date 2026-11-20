@@ -1,4 +1,4 @@
-// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Modified for V4 by Scott Quarrier with AI assistance: native hybrid integration/adaptation.
 // Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
 //! glm53f-afd's large-M expert kernels for a TP2 half's prompt windows (TF_GLM_HALVES_KERNEL=g53kt3r, qualification_1b9bf461):
 //! python TF-AFD 2.15's g53_experts.py (default_cfg, tuned_cfg with KT3R's tier, max_groups) and the host side of its
@@ -390,7 +390,7 @@ test {
     _ = @import("cuda_g53_test.zig");
 }
 
-/// Helios current-native field adapter: the admitted4-bit MCG loader owns all data unchanged.
+/// AI-assisted integration current-native field adapter: the admitted4-bit MCG loader owns all data unchanged.
 pub fn nativeLayer(w:@import("cuda_exl3.zig").Experts) ex3.Layer {
  return .{.gate_ptr=w.gt,.up_ptr=w.ut,.down_ptr=w.dt,.gate_k2=w.k2,.up_k2=w.k2,.down_k2=w.k2,
  .suh_g=w.suh_g,.suh_u=w.suh_u,.svh_g=w.svh_g,.svh_u=w.svh_u,.suh_d=w.suh_d,.svh_d=w.svh_d,

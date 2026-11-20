@@ -1,4 +1,4 @@
-// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Modified for V4 by Scott Quarrier with AI assistance: native hybrid integration/adaptation.
 // Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
 //! Real file mutations, corrupt entries and competing processes exercise the shared digest cache.
 const std = @import("std");
@@ -328,7 +328,7 @@ test "digest cache schema is bounded versioned and has no implicit home in tests
     try t.expectError(error.CorruptDigestCache, cache.decode(t.allocator, duplicate));
 }
 
-// Helios: actual persistent cache, pthread mutex/file lock waits, deterministic stop arrival.
+// AI-assisted integration: actual persistent cache, pthread mutex/file lock waits, deterministic stop arrival.
 const StopRead=struct {
     checks:*std.atomic.Value(usize),reads:*std.atomic.Value(usize),requested:*std.atomic.Value(bool),arm_at:usize=0,
     pub fn check(r:@This())!void {const n=r.checks.fetchAdd(1,.acq_rel)+1;if(r.arm_at!=0 and n==r.arm_at)r.requested.store(true,.release);if(r.requested.load(.acquire))return error.Stopped;}

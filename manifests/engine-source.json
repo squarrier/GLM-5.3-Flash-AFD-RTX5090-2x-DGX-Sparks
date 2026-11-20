@@ -406,11 +406,13 @@
       "path": "engine/zig/build/cuda.zig",
       "source_relative": "zig/build/cuda.zig",
       "source_blob": "fbf22c77bb142e30731dcfe287dcfc781547fbba",
-      "sha256": "bc707e767414016a5da1949b59f16c8597ee839d520457068b990b4f37b2bc55",
-      "bytes": 49411,
+      "sha256": "e5fe69c9a2fc79cbedad0c31dda7afacf9b57263efbd2466f08f40d926990d7b",
+      "bytes": 49418,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "e7747d08a7c4e57a4d167e4074b7069bf4f049f7",
-      "hardware_tested_sha256": "4d7f1159b8dae4244721403192ed983a0e75ef57e87324ba73229d586c0e9dd8"
+      "hardware_tested_sha256": "4d7f1159b8dae4244721403192ed983a0e75ef57e87324ba73229d586c0e9dd8",
+      "pre_profile_scrub_sha256": "bc707e767414016a5da1949b59f16c8597ee839d520457068b990b4f37b2bc55",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/build/cuda_census.zig",
@@ -496,11 +498,13 @@
       "path": "engine/zig/build/cuda_kernels.zig",
       "source_relative": "zig/build/cuda_kernels.zig",
       "source_blob": "f3e152d18c30fd8ffb5b7f04abfe44acd5d9a861",
-      "sha256": "ca5a2d60a32ad19d7e56e56df935f234af20590a15ddff0f4a7601a09acb4078",
-      "bytes": 17079,
+      "sha256": "526f0829ea5383362d45b6e54be3b1531863b3ac7215ad47df07e1910e401f6c",
+      "bytes": 17086,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "4bae75a0753e533c7f755b16fecc08db78412154",
-      "hardware_tested_sha256": "246d0b991ba6672caca1fd20368ec8034bf525620b4effd0c1665d14cfb7202a"
+      "hardware_tested_sha256": "246d0b991ba6672caca1fd20368ec8034bf525620b4effd0c1665d14cfb7202a",
+      "pre_profile_scrub_sha256": "ca5a2d60a32ad19d7e56e56df935f234af20590a15ddff0f4a7601a09acb4078",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/build/cuda_readback_host.zig",
@@ -546,11 +550,13 @@
       "path": "engine/zig/build/cuda_runtime.zig",
       "source_relative": "zig/build/cuda_runtime.zig",
       "source_blob": "0f63e891036a32397cdc72a50fbf2ecc241eccbe",
-      "sha256": "7cf890fb6b381414896ef7d079c9aa054add254c51d2b5e986b536cfc69ddcf3",
-      "bytes": 3157,
+      "sha256": "a30494ad8e7c4e58c8dd50bea5f758b2cddc3461ea084f4a459ac4ac60f58cbf",
+      "bytes": 3164,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "1dec9adcc775c881c936f8d47d3c55b0ce63f08d",
-      "hardware_tested_sha256": "05212c91e806e3bd09ea2965bd5c3682ee7389e82ee03bc2dfe30ff17546e7cb"
+      "hardware_tested_sha256": "05212c91e806e3bd09ea2965bd5c3682ee7389e82ee03bc2dfe30ff17546e7cb",
+      "pre_profile_scrub_sha256": "7cf890fb6b381414896ef7d079c9aa054add254c51d2b5e986b536cfc69ddcf3",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/build/cuda_server_host.zig",
@@ -588,11 +594,13 @@
       "path": "engine/zig/build/digest.zig",
       "source_relative": "zig/build/digest.zig",
       "source_blob": "a404dea5bf98615dab4e0d0d3d7564e3536fa474",
-      "sha256": "ed4b8dd760cba8f6c6f7615ac55cbb478b427697e9c16c0d3fe3bca7ba0ddf1f",
-      "bytes": 5153,
+      "sha256": "34d4a7515a7d0a388d614f66cd2c892b49760d69e6f96fe9b72a57450fd100ae",
+      "bytes": 5160,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "f0b478977f802d46264981275efabcbfe2409c08",
-      "hardware_tested_sha256": "21e26b0af7f4460ac855d8a0b2626015c0647601eebbb788267c3dd303293b43"
+      "hardware_tested_sha256": "21e26b0af7f4460ac855d8a0b2626015c0647601eebbb788267c3dd303293b43",
+      "pre_profile_scrub_sha256": "ed4b8dd760cba8f6c6f7615ac55cbb478b427697e9c16c0d3fe3bca7ba0ddf1f",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/build/disk_identity_host.zig",
@@ -902,11 +910,13 @@
       "path": "engine/zig/build/glm_family_host.zig",
       "source_relative": "zig/build/glm_family_host.zig",
       "source_blob": "1613cda788461734364a327ca4d906edef5f7cee",
-      "sha256": "79546e1523e5d678688d333e7776769bcb5a975162c7796abb56a1e725679b44",
-      "bytes": 16193,
+      "sha256": "4454cf8b957ebd2ac45aee688e72862784b4eadfc232284b018a1d88e3980bba",
+      "bytes": 16200,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "04bc5d9f832901df99c51bb93ac2d6bf86bb5353",
-      "hardware_tested_sha256": "d22630b6135af01fc1a7a93c5a898f4a5d11e07f2ad6aa246c9545ae49af7a1e"
+      "hardware_tested_sha256": "d22630b6135af01fc1a7a93c5a898f4a5d11e07f2ad6aa246c9545ae49af7a1e",
+      "pre_profile_scrub_sha256": "79546e1523e5d678688d333e7776769bcb5a975162c7796abb56a1e725679b44",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/build/glm_hybrid.zig",
@@ -1600,11 +1610,13 @@
       "path": "engine/zig/build/server.zig",
       "source_relative": "zig/build/server.zig",
       "source_blob": "63567d1635454e389a469fe45c4748328ecaabe4",
-      "sha256": "b2e7592555b017ac023bb8cfe1f182419a103bcb39d49fa1d8384ab9eb3cac24",
-      "bytes": 15025,
+      "sha256": "6746158d2c8ac2f90dc9631375fc39382c66c128daafa118b3ffc2d86fd58ea4",
+      "bytes": 15032,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "e1f00e8cd0103511bb3a6f2365f85e8be43c5f5f",
-      "hardware_tested_sha256": "fec4df0fa5aa7cc936b5a3ca6109eeaca0fda7af58ee3ecb94c7daa48e2f2712"
+      "hardware_tested_sha256": "fec4df0fa5aa7cc936b5a3ca6109eeaca0fda7af58ee3ecb94c7daa48e2f2712",
+      "pre_profile_scrub_sha256": "b2e7592555b017ac023bb8cfe1f182419a103bcb39d49fa1d8384ab9eb3cac24",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/build/server_seed_host.zig",
@@ -2274,9 +2286,11 @@
       "path": "engine/zig/glm_524_tile_host.zig",
       "source_relative": "zig/glm_524_tile_host.zig",
       "source_blob": "b4b19e6429b8f3811854cdbbb230c95b9131a1da",
-      "sha256": "fabd7531be19cc55809c7e85e451b41308abc121c6d10006d379e07c18ea1fb8",
-      "bytes": 1677,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "9aa281ec14334579d44b1b9f872e1003e3364363808241fcaeee836f714514cc",
+      "bytes": 1694,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "fabd7531be19cc55809c7e85e451b41308abc121c6d10006d379e07c18ea1fb8",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/glm_admission_host.zig",
@@ -2314,9 +2328,11 @@
       "path": "engine/zig/glm_expert.zig",
       "source_relative": "zig/glm_expert.zig",
       "source_blob": "562d6a772881cb52924a50234f001a088bacad46",
-      "sha256": "cd81cba65592cc237f37ae4062875533c56c65c1f5e04643d185c28b6d64848d",
-      "bytes": 19301,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "6dc20caea6d0223317751bd4fc9f9e6e590540e35720e5b0f95b53e431524cd0",
+      "bytes": 19335,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "cd81cba65592cc237f37ae4062875533c56c65c1f5e04643d185c28b6d64848d",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/glm_fp8_gate_compile.zig",
@@ -2354,25 +2370,31 @@
       "path": "engine/zig/glm_hybrid_memory_fixture.zig",
       "source_relative": "zig/glm_hybrid_memory_fixture.zig",
       "source_blob": "375ee27e1197ad40dc8a1b57e6c60fd36ed0ea6e",
-      "sha256": "358ad0eaf9de89e40b35cf4adcf12a560be3b3c6b3b5bb4217753b1f417d0d42",
-      "bytes": 5995,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "136df95b429e38a494fc1b47d4d72010af90cf17542f7ded3847c80059ecf106",
+      "bytes": 5999,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "358ad0eaf9de89e40b35cf4adcf12a560be3b3c6b3b5bb4217753b1f417d0d42",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/glm_hybrid_memory_host.zig",
       "source_relative": "zig/glm_hybrid_memory_host.zig",
       "source_blob": "64c904e11e2859b3aeb27ee11923bceb866a397b",
-      "sha256": "f375b587fbfd2a82ec3ae737dbfb3085b3e84fbef7fe9b8f3e87a5f04a2434ee",
-      "bytes": 15479,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "1351dcd1841508705095829b761290fb8f8a2fe280def7a1998eb6b391264eb2",
+      "bytes": 15524,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "f375b587fbfd2a82ec3ae737dbfb3085b3e84fbef7fe9b8f3e87a5f04a2434ee",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/glm_hybrid_owned_gather_host.zig",
       "source_relative": "zig/glm_hybrid_owned_gather_host.zig",
       "source_blob": "5fed2eb6f77adc09869e8f7b2855e59fbf6f46c8",
-      "sha256": "e08c3722038297198125c5bdd30a255de891fa6e0eede5d8024894c61f4777a3",
-      "bytes": 3593,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "55c7bbe0da5b0af348ad0e8ca60c50dcc716a960b304cd6b0ed06397237f2afb",
+      "bytes": 3597,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "e08c3722038297198125c5bdd30a255de891fa6e0eede5d8024894c61f4777a3",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/glm_hybrid_packed_memory_host.zig",
@@ -2394,9 +2416,11 @@
       "path": "engine/zig/glm_hybrid_repair_host.zig",
       "source_relative": "zig/glm_hybrid_repair_host.zig",
       "source_blob": "e0aa0c79a0aaf7a70c4696cd9773de133a2769a7",
-      "sha256": "ea247bb7733e5ba78ea7929d65b7344a1d8f470ecc9bcd75f0bcf857e8e0b6aa",
-      "bytes": 7408,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "acfca0d7a8ec6d45c0250a7ead2fc4c770c5a851b8fa72cbf8b5953e15db1918",
+      "bytes": 7404,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "ea247bb7733e5ba78ea7929d65b7344a1d8f470ecc9bcd75f0bcf857e8e0b6aa",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/glm_image_cache_host.zig",
@@ -2410,9 +2434,11 @@
       "path": "engine/zig/glm_kv_host_hybrid_host.zig",
       "source_relative": "zig/glm_kv_host_hybrid_host.zig",
       "source_blob": "d6223918f0bee6450c6315ddf91608627be9466b",
-      "sha256": "6765e1659ccd0d5737aed30b36f6fb2e102bd4dbe02a3a58abd4360023051d7d",
-      "bytes": 27506,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "174b1eae48e611136ef87e5e4fc0ef8a9503c8efaa7b3222f45c5db094982f9b",
+      "bytes": 27513,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "6765e1659ccd0d5737aed30b36f6fb2e102bd4dbe02a3a58abd4360023051d7d",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/glm_kv_uncached_host.zig",
@@ -2426,11 +2452,13 @@
       "path": "engine/zig/glm_lane_costs_host.zig",
       "source_relative": "zig/glm_lane_costs_host.zig",
       "source_blob": "8d7765d2c0fcdfa90ca557de1c9d44f21042733d",
-      "sha256": "e755e41436374b65110b5cea2dfc8efcd0f3b51b849d7d402d5ba21c0dc11c46",
-      "bytes": 4894,
+      "sha256": "56d30a5c8fe1f8aee8ff0eea39f2cd41c45203f7059c03cd7fb7ffa4b7852fb8",
+      "bytes": 4901,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "ed72824b1cd90c336a253cc9e91df7198094aee5",
-      "hardware_tested_sha256": "f19fe97d136b4f975c0c7725a6a7f248ede044984ce619bcf311c0077a3c12fb"
+      "hardware_tested_sha256": "f19fe97d136b4f975c0c7725a6a7f248ede044984ce619bcf311c0077a3c12fb",
+      "pre_profile_scrub_sha256": "e755e41436374b65110b5cea2dfc8efcd0f3b51b849d7d402d5ba21c0dc11c46",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/glm_link_transport_host.zig",
@@ -3620,11 +3648,13 @@
       "path": "engine/zig/kernels/cuda/g53/rank_math.cuh",
       "source_relative": "zig/kernels/cuda/g53/rank_math.cuh",
       "source_blob": "7da59bfc68c2339c98387e70e578dd995fc1b30d",
-      "sha256": "384ef8f0832f1125a51573bd7592ae591b0e2b3df26bec3fc543858913dcfcee",
-      "bytes": 24789,
+      "sha256": "5966d72f7694360a0f536374d0c375473b8206aee63a365ec632e35473c2f79d",
+      "bytes": 24796,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "cf4e7cd35ead8766ca838cfb9ce0b03c9bd78f12",
-      "hardware_tested_sha256": "2ba76c73719385383460b2a97bd21b5700d3fa396ee2fa659cc31441ec3fe5a4"
+      "hardware_tested_sha256": "2ba76c73719385383460b2a97bd21b5700d3fa396ee2fa659cc31441ec3fe5a4",
+      "pre_profile_scrub_sha256": "384ef8f0832f1125a51573bd7592ae591b0e2b3df26bec3fc543858913dcfcee",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/kernels/cuda/gdn.cu",
@@ -10246,11 +10276,13 @@
       "path": "engine/zig/src/core/checkpoint_identity.zig",
       "source_relative": "zig/src/core/checkpoint_identity.zig",
       "source_blob": "1ff61846301d4abe9fa48ddb695302f1a4916a92",
-      "sha256": "dcab878ab2ffb119b973d167b810fc82e93b132d29088789dd8fbb625fe5d8f5",
-      "bytes": 19901,
+      "sha256": "2956a80736ab9b45b97945a8dc5ef4e7928a7b2348808cf2fedd9b185e182dbc",
+      "bytes": 19908,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "ffa753476f4b2b4718ca57f8743714e05fef3782",
-      "hardware_tested_sha256": "7f652c6d022fbd9b27c0a4de4e0f40f97608efd4c689961e571fe3c93b368a3f"
+      "hardware_tested_sha256": "7f652c6d022fbd9b27c0a4de4e0f40f97608efd4c689961e571fe3c93b368a3f",
+      "pre_profile_scrub_sha256": "dcab878ab2ffb119b973d167b810fc82e93b132d29088789dd8fbb625fe5d8f5",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/core/checkpoint_identity_test.zig",
@@ -11792,11 +11824,13 @@
       "path": "engine/zig/src/core/digest_cache.zig",
       "source_relative": "zig/src/core/digest_cache.zig",
       "source_blob": "519a9888ac2978bf6359ed04e92b11ecf81cc937",
-      "sha256": "1a8d35dc24cebf78da5ab8798c8b37f6e53e81899b466bf1e85e706ad2a2153c",
-      "bytes": 8393,
+      "sha256": "9f57097bd94367e75b4583910aa66b701bcdd5b1ff0c10e977aa69e4accc78a6",
+      "bytes": 8400,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "e23a8c4fb8db058939547a0a97322d80a6e598ad",
-      "hardware_tested_sha256": "1a0254c74839184610fe1ccf1a7e398d0c08674c5a87649ac89c60ee617c09e5"
+      "hardware_tested_sha256": "1a0254c74839184610fe1ccf1a7e398d0c08674c5a87649ac89c60ee617c09e5",
+      "pre_profile_scrub_sha256": "1a8d35dc24cebf78da5ab8798c8b37f6e53e81899b466bf1e85e706ad2a2153c",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/core/digest_cache_probe.zig",
@@ -11810,11 +11844,13 @@
       "path": "engine/zig/src/core/digest_cache_test.zig",
       "source_relative": "zig/src/core/digest_cache_test.zig",
       "source_blob": "41c8261fecbf7b56da6c5af9ebee8b7d16adb2ef",
-      "sha256": "0f3c24c29c44bae0cc2b9958a91225ccabea7cf94eb6de17d654bdc64535eca5",
-      "bytes": 19731,
+      "sha256": "465d3dd1c527f0bd00348eda45cced9ff77f50647fb78496a7ec2bf61eb24d8c",
+      "bytes": 19755,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "77ac0d30b66e89b5b0897e9dc0d0e001c87080f4",
-      "hardware_tested_sha256": "34a0135a456ea68086a89e63ddb35b05f6b041b15ac1e7f40b08c70c414bbf4a"
+      "hardware_tested_sha256": "34a0135a456ea68086a89e63ddb35b05f6b041b15ac1e7f40b08c70c414bbf4a",
+      "pre_profile_scrub_sha256": "0f3c24c29c44bae0cc2b9958a91225ccabea7cf94eb6de17d654bdc64535eca5",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/core/digest_fixture.zig",
@@ -11836,11 +11872,13 @@
       "path": "engine/zig/src/core/digest_lock.zig",
       "source_relative": "zig/src/core/digest_lock.zig",
       "source_blob": "3535bcfcba8d87af17c0d988f868bea7d4d834f5",
-      "sha256": "b43944cfe7478e18a827c11c36c7dc1ff96ba51b60f431034d5cf73df82669ff",
-      "bytes": 3669,
+      "sha256": "47e94f8c26a6e8c9b1455e04013ba3def61dea7cf3bbfc2ab0fffb80b3951a51",
+      "bytes": 3676,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "18bb43b9bd8be3a76364f622501311950d337e32",
-      "hardware_tested_sha256": "dc487335bc997afa1b6bc10d4f5edded623e856f02f303116b411a5c40869fe3"
+      "hardware_tested_sha256": "dc487335bc997afa1b6bc10d4f5edded623e856f02f303116b411a5c40869fe3",
+      "pre_profile_scrub_sha256": "b43944cfe7478e18a827c11c36c7dc1ff96ba51b60f431034d5cf73df82669ff",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/core/digest_parallel_test.zig",
@@ -11998,11 +12036,13 @@
       "path": "engine/zig/src/core/engine_api.zig",
       "source_relative": "zig/src/core/engine_api.zig",
       "source_blob": "ac83a9615a3151da4dfb3c4d8585b757ea2e1d9b",
-      "sha256": "07de627edf13d01c0db2f44de5165a4d218c57da7b526f2146cb18fcd29c565a",
-      "bytes": 33613,
+      "sha256": "306422d11377e4a736d9ee38745856d9cb4ea0810e0c424a56d4338325588ebf",
+      "bytes": 33620,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "cb31962b1d380fb1501f60f3ca173ceb6d38bf77",
-      "hardware_tested_sha256": "29aa7df027a3fda8d83564697c56114cc19309f79d83a76dee128f30d98bc4df"
+      "hardware_tested_sha256": "29aa7df027a3fda8d83564697c56114cc19309f79d83a76dee128f30d98bc4df",
+      "pre_profile_scrub_sha256": "07de627edf13d01c0db2f44de5165a4d218c57da7b526f2146cb18fcd29c565a",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/core/engine_api_test.zig",
@@ -12992,11 +13032,13 @@
       "path": "engine/zig/src/core/lane_host.zig",
       "source_relative": "zig/src/core/lane_host.zig",
       "source_blob": "e4fdf7fc0df8b30a31725563b7b54eb7a672143c",
-      "sha256": "1553f286ea7207616caa075a7e4bc66d1a7e73bcfcbcc2cc6a76295003e58376",
-      "bytes": 28562,
+      "sha256": "14428ef3860e03ae610e168be99978e474ce744756a35573c8876478b6918c5a",
+      "bytes": 28569,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "b273605178bd34b94fbc33faee93e5bccc971c92",
-      "hardware_tested_sha256": "8a94340f30954773ec98d67b57bb9837729240c910308d3b8baec5b1e3d2d3d9"
+      "hardware_tested_sha256": "8a94340f30954773ec98d67b57bb9837729240c910308d3b8baec5b1e3d2d3d9",
+      "pre_profile_scrub_sha256": "1553f286ea7207616caa075a7e4bc66d1a7e73bcfcbcc2cc6a76295003e58376",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/core/lane_host_admit.zig",
@@ -13482,10 +13524,12 @@
       "path": "engine/zig/src/core/lane_qualify524.zig",
       "source_relative": "zig/src/core/lane_qualify524.zig",
       "source_blob": "710bb750d349a03cbef6b6781a029ca3feb71f23",
-      "sha256": "2572e68375c18a1c10cadada90c4c1d78e7e7181699a0cd8c1dbe628cf0d30c5",
-      "bytes": 1990,
+      "sha256": "543595a6581184bbf8a7b55acb36e01dfcb831488a513433dcf30c1545050ecc",
+      "bytes": 2007,
       "disposition": "measured_observer557_overlay",
-      "base_sha256": "f03e5e636d765ac72ef32f338b77f0da4b7dbdf7b44b7e813de0579af932d64f"
+      "base_sha256": "f03e5e636d765ac72ef32f338b77f0da4b7dbdf7b44b7e813de0579af932d64f",
+      "pre_profile_scrub_sha256": "2572e68375c18a1c10cadada90c4c1d78e7e7181699a0cd8c1dbe628cf0d30c5",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/core/lane_qualify524_test.zig",
@@ -17003,11 +17047,13 @@
       "path": "engine/zig/src/cuda/copy_source.zig",
       "source_relative": "zig/src/cuda/copy_source.zig",
       "source_blob": "cdc8cf58a9bf374112b28876e1317d0f63e0d5cf",
-      "sha256": "70bdad29bdbb5ac8b57dcfd91056991d717f35e65d21154eb4e581da555dfe89",
-      "bytes": 23158,
+      "sha256": "3931410e4532bc07d948f5ad9e4ad20e3e3bf3b14b774962f43c119df1e5aa77",
+      "bytes": 23165,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "6183374a934543746d150371d89f8621fc27db6b",
-      "hardware_tested_sha256": "916650eb243052838d246eefd77d844ef07898e700044ad1aae83234056246c2"
+      "hardware_tested_sha256": "916650eb243052838d246eefd77d844ef07898e700044ad1aae83234056246c2",
+      "pre_profile_scrub_sha256": "70bdad29bdbb5ac8b57dcfd91056991d717f35e65d21154eb4e581da555dfe89",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/cuda/copy_source_budget.zig",
@@ -17581,11 +17627,13 @@
       "path": "engine/zig/src/cuda/kernels.zig",
       "source_relative": "zig/src/cuda/kernels.zig",
       "source_blob": "47412c895aaf0c8e4ecdeaed870066e734a5d2a5",
-      "sha256": "508c09a31023303ceb644b4b6c459260b229ceaa8760e77ca757aff12d7bc756",
-      "bytes": 13866,
+      "sha256": "c0ec96d5c3ab3b4757a4e3642506c0e505de98fcbc091c4c5b1a34d8bff6dca5",
+      "bytes": 13873,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "3c1145eb72da3396cba712072de00dc4b0ef36b4",
-      "hardware_tested_sha256": "544b64d6525d2b29b50cd93ccb2f94dc71cc55386b2584457968391d92e9a4a4"
+      "hardware_tested_sha256": "544b64d6525d2b29b50cd93ccb2f94dc71cc55386b2584457968391d92e9a4a4",
+      "pre_profile_scrub_sha256": "508c09a31023303ceb644b4b6c459260b229ceaa8760e77ca757aff12d7bc756",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/cuda/launch.zig",
@@ -17607,11 +17655,13 @@
       "path": "engine/zig/src/cuda/memory.zig",
       "source_relative": "zig/src/cuda/memory.zig",
       "source_blob": "86b3f9d8207076ef1db7a7fcd284a2d488d4b7c8",
-      "sha256": "ae50cfdf19c5714727a4f58d24eff94f1d324b785aaf82b997b878e9dbd707e9",
-      "bytes": 25626,
+      "sha256": "c1b101b8d6dc894e8f3f50e9ed5f9157276719f259dcd6bd09cf30dd47daa0fb",
+      "bytes": 25633,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "f1ac6afdda08cf787d1371be482d8e43f9d1e2ba",
-      "hardware_tested_sha256": "df44d646da0b084de0e506e9d56f3ce54ae3fda96ca4b4fdc885df2ba93f3fe1"
+      "hardware_tested_sha256": "df44d646da0b084de0e506e9d56f3ce54ae3fda96ca4b4fdc885df2ba93f3fe1",
+      "pre_profile_scrub_sha256": "ae50cfdf19c5714727a4f58d24eff94f1d324b785aaf82b997b878e9dbd707e9",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/cuda/memory_owner.zig",
@@ -17625,11 +17675,13 @@
       "path": "engine/zig/src/cuda/memory_receipt.zig",
       "source_relative": "zig/src/cuda/memory_receipt.zig",
       "source_blob": "8765b7b48592537acc67af4fee94ae09032d5a34",
-      "sha256": "94c888c41deea1fa6c0be6b4094725163eb5c13d35f13e8b432e0e83841f5e12",
-      "bytes": 3846,
+      "sha256": "8f2af0f700349ba97bad8c7f04bba617ba1ce9e042826b64af890f87dbf96989",
+      "bytes": 3853,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "ced1b67ab824569c9b15827544116d4e51870dec",
-      "hardware_tested_sha256": "bd9cb777a75c42a83eda1fb239d74dc0dc5bdb827767e41b4e17b81fd0b72a39"
+      "hardware_tested_sha256": "bd9cb777a75c42a83eda1fb239d74dc0dc5bdb827767e41b4e17b81fd0b72a39",
+      "pre_profile_scrub_sha256": "94c888c41deea1fa6c0be6b4094725163eb5c13d35f13e8b432e0e83841f5e12",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/cuda/mla.zig",
@@ -17915,11 +17967,13 @@
       "path": "engine/zig/src/cuda/roce_proxy.c",
       "source_relative": "zig/src/cuda/roce_proxy.c",
       "source_blob": "66b2acb3c079bfb38b266f1c2657050308037a53",
-      "sha256": "478542555e34b85d4cb117a4f271ad109fd52673c795c7e8aeb47dce1984a960",
-      "bytes": 26706,
+      "sha256": "658f72ee7502f62ead73ddbe233bea970577305efa933ac088d23973d8ca93a5",
+      "bytes": 26763,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "4ec2ca5cdefabfdde952ae4cf9203860215faf8e",
-      "hardware_tested_sha256": "10141c314960b28e9e3ebcbf7132c88c78a769364d92f2d156b5b64affbacdad"
+      "hardware_tested_sha256": "10141c314960b28e9e3ebcbf7132c88c78a769364d92f2d156b5b64affbacdad",
+      "pre_profile_scrub_sha256": "478542555e34b85d4cb117a4f271ad109fd52673c795c7e8aeb47dce1984a960",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/cuda/roce_verbs.zig",
@@ -17933,11 +17987,13 @@
       "path": "engine/zig/src/cuda/root.zig",
       "source_relative": "zig/src/cuda/root.zig",
       "source_blob": "96712454cec31926619a22f5f8a2fcae8973b75f",
-      "sha256": "4365d157bf85055c904e229b281933039e917083266688dcedf32dc61341398a",
-      "bytes": 7007,
+      "sha256": "57b294991d6b4b500ddcdea44cbe5df7864938b52add68f037325588fbdf3329",
+      "bytes": 7014,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "367963aaf83be048436c438a37722a7efdcdcec5",
-      "hardware_tested_sha256": "c8bd5eda6a4a47566704d958a9e7061e2aac2c3113cf755a7fcd9f126716a220"
+      "hardware_tested_sha256": "c8bd5eda6a4a47566704d958a9e7061e2aac2c3113cf755a7fcd9f126716a220",
+      "pre_profile_scrub_sha256": "4365d157bf85055c904e229b281933039e917083266688dcedf32dc61341398a",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/cuda/route_rows.zig",
@@ -18151,21 +18207,25 @@
       "path": "engine/zig/src/cuda/xchg/node.zig",
       "source_relative": "zig/src/cuda/xchg/node.zig",
       "source_blob": "790a4d972c48bde1f1f50395284c61d2cd180cb3",
-      "sha256": "3ff0cc224e04ff9935dfd216d9c337de4ebf4b83f807ef32585a5285cacdfb2e",
-      "bytes": 26136,
+      "sha256": "9e5c418f9ea88e6385054d22550f42ab7e246611e31bb62f07578c0efaf5435c",
+      "bytes": 26177,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "6c200bb3e326e37890c60421a7937ecc5a468283",
-      "hardware_tested_sha256": "b81524496ef57d9639bc2cb794645d49053a9ad65a101dcdcaa0136bd7da93ab"
+      "hardware_tested_sha256": "b81524496ef57d9639bc2cb794645d49053a9ad65a101dcdcaa0136bd7da93ab",
+      "pre_profile_scrub_sha256": "3ff0cc224e04ff9935dfd216d9c337de4ebf4b83f807ef32585a5285cacdfb2e",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/cuda/xchg/proto.zig",
       "source_relative": "zig/src/cuda/xchg/proto.zig",
       "source_blob": "ce68fb576acb2c09ed7fc138a82585d2e23e48eb",
-      "sha256": "d6eec094f1e780ed0e11ae872026e197361fbea7f4af1fd91f10358dc2f83cc0",
-      "bytes": 31648,
+      "sha256": "225696f3381ad540791d160e42f4b980a5badc1ccc36f58139e04c9cd81c6d13",
+      "bytes": 31655,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "573cc56ad1c5aab363e4574d33d7da5ebdcd5660",
-      "hardware_tested_sha256": "fed9c91881c3245a4b9924f6051742e6ad8f1de79fd7cd9ecd06ee3c7935b928"
+      "hardware_tested_sha256": "fed9c91881c3245a4b9924f6051742e6ad8f1de79fd7cd9ecd06ee3c7935b928",
+      "pre_profile_scrub_sha256": "d6eec094f1e780ed0e11ae872026e197361fbea7f4af1fd91f10358dc2f83cc0",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/cuda/xchg/setup.zig",
@@ -18187,11 +18247,13 @@
       "path": "engine/zig/src/cuda/xchg/xchg.zig",
       "source_relative": "zig/src/cuda/xchg/xchg.zig",
       "source_blob": "aef743a31ccec1ebc66f70af2ea3bc51df97424e",
-      "sha256": "413e4dd7dca4a6501fe489365b3affcdfa7b76f440f2425875af35f85b4901ee",
-      "bytes": 1355,
+      "sha256": "565187a3253537745f1e28aa73efefcaa19dda9a3dd8d6dc07bb4a492c233a64",
+      "bytes": 1362,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "31f45daf5ccedb43b7ae96e01bf36765848fec85",
-      "hardware_tested_sha256": "199ba3a7be98fd77b94918bf6c33d13713448a47cd5e54ce6292fbac915bc995"
+      "hardware_tested_sha256": "199ba3a7be98fd77b94918bf6c33d13713448a47cd5e54ce6292fbac915bc995",
+      "pre_profile_scrub_sha256": "413e4dd7dca4a6501fe489365b3affcdfa7b76f440f2425875af35f85b4901ee",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/cuda_dense/backend.zig",
@@ -19013,11 +19075,13 @@
       "path": "engine/zig/src/fabric/tp/bootstrap.zig",
       "source_relative": "zig/src/fabric/tp/bootstrap.zig",
       "source_blob": "f967eed934815465136325485bbf1ae601372e12",
-      "sha256": "961397aa82da7400637bea48f4f40a61fe96de274b12800dd9548639fede0985",
-      "bytes": 16617,
+      "sha256": "8339b73adef3bddc6d4bf04479266045eefdb3b2acbe5e5e2d20b23108098b00",
+      "bytes": 16624,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "e1c1a6d7578d0bb7752fe4552da34447728eb207",
-      "hardware_tested_sha256": "82dba0627e615c72d206de363ee08cf92459a561bb10e5bc394b42acf0aa2de6"
+      "hardware_tested_sha256": "82dba0627e615c72d206de363ee08cf92459a561bb10e5bc394b42acf0aa2de6",
+      "pre_profile_scrub_sha256": "961397aa82da7400637bea48f4f40a61fe96de274b12800dd9548639fede0985",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/fabric/tp/collective.zig",
@@ -19223,11 +19287,13 @@
       "path": "engine/zig/src/fabric/tp/roce.zig",
       "source_relative": "zig/src/fabric/tp/roce.zig",
       "source_blob": "f7a9dbb6ecca5d5a60bb719349458065cbf66ba1",
-      "sha256": "8eda8aad3c1a41b1e146c181bf8f31e31a63e65b0a0dcab91f56ef90c844de5a",
-      "bytes": 34006,
+      "sha256": "6c25880f1de1e593ed18c33cbeba2557f32c83a02bd48306902fda1d88afaf08",
+      "bytes": 34013,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "cab1357862819e3ec977861c25ffe8765e70ff4c",
-      "hardware_tested_sha256": "393f224866aa78eb7396de8089b263ea296baf41816d4bbf4fb21fe3dbe6c35e"
+      "hardware_tested_sha256": "393f224866aa78eb7396de8089b263ea296baf41816d4bbf4fb21fe3dbe6c35e",
+      "pre_profile_scrub_sha256": "8eda8aad3c1a41b1e146c181bf8f31e31a63e65b0a0dcab91f56ef90c844de5a",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/fabric/tp/roce_close.zig",
@@ -19537,11 +19603,13 @@
       "path": "engine/zig/src/fabric/tp/sock.zig",
       "source_relative": "zig/src/fabric/tp/sock.zig",
       "source_blob": "89ce74868595d9ceeb49db14a40467277ad6f588",
-      "sha256": "67b1b534f192076ab0681d28a567d290cfe3b9b33bb16be9debe923b70529795",
-      "bytes": 13221,
+      "sha256": "c28e8cac7e8e62372a8c8851014eaae9ae35178717f39eb20c4502011852a6eb",
+      "bytes": 13245,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "3ea49d2e403cd4985bd479ba6865f459116351fd",
-      "hardware_tested_sha256": "accc9740f1b57697e2c03ee4f4f19a9c00f7e00642aa3852247b5da2792c3609"
+      "hardware_tested_sha256": "accc9740f1b57697e2c03ee4f4f19a9c00f7e00642aa3852247b5da2792c3609",
+      "pre_profile_scrub_sha256": "67b1b534f192076ab0681d28a567d290cfe3b9b33bb16be9debe923b70529795",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/fabric/tp/suite_host.zig",
@@ -26635,19 +26703,23 @@
       "path": "engine/zig/src/families/glm/cuda.zig",
       "source_relative": "zig/src/families/glm/cuda.zig",
       "source_blob": "859258c26b5b944f7322d51c87cb33678d474d4b",
-      "sha256": "3135f59236ad8b8f7664c38d717a557068503e4df2d88476cc38c46565b4d623",
-      "bytes": 4909,
+      "sha256": "0b70f6513a85a737f204be41b37e85ecc376d6385892a84de694c2509736618c",
+      "bytes": 4916,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "3f7c0da7db4e9fc0848ec776bc49c2cef9abe1e7",
-      "hardware_tested_sha256": "5bd0a30e1b3139427e529d3dd11dc13c7224e6961f899702d5c947f4bbc6d037"
+      "hardware_tested_sha256": "5bd0a30e1b3139427e529d3dd11dc13c7224e6961f899702d5c947f4bbc6d037",
+      "pre_profile_scrub_sha256": "3135f59236ad8b8f7664c38d717a557068503e4df2d88476cc38c46565b4d623",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_attention_tile.zig",
       "source_relative": "zig/src/families/glm/cuda_attention_tile.zig",
       "source_blob": "cf245129dc5d1c680980edcc77e1f57fcc47794a",
-      "sha256": "5e6c04080f9dcf1955018816063cb8e933f3e31fee497306f1e1fa08c5e3ed99",
-      "bytes": 1388,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "7ce6e022ad283f133aafb0de3c0bccf0274d202fc4e5b4738547ff1917f994ce",
+      "bytes": 1405,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "5e6c04080f9dcf1955018816063cb8e933f3e31fee497306f1e1fa08c5e3ed99",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_b16.zig",
@@ -26677,31 +26749,37 @@
       "path": "engine/zig/src/families/glm/cuda_dsa_block.zig",
       "source_relative": "zig/src/families/glm/cuda_dsa_block.zig",
       "source_blob": "d0f159ee8490e9d518f1f04d6228894fc392649f",
-      "sha256": "1d0fe43226f1fe174306445a58740b2b758a800fe154212f155ec4bc3bfd3772",
-      "bytes": 16020,
+      "sha256": "7570d60e6b6062d1daff5747359a64acbfb777bd8d5b3021f93e41cf5e716b34",
+      "bytes": 16027,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "41f99a6416d44a2d543cb6a77dbb63baf199096f",
-      "hardware_tested_sha256": "c5d460946726f538c9335e9b34567d283f6fe967061d2b9b9f736fcd5cceceae"
+      "hardware_tested_sha256": "c5d460946726f538c9335e9b34567d283f6fe967061d2b9b9f736fcd5cceceae",
+      "pre_profile_scrub_sha256": "1d0fe43226f1fe174306445a58740b2b758a800fe154212f155ec4bc3bfd3772",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_engine.zig",
       "source_relative": "zig/src/families/glm/cuda_engine.zig",
       "source_blob": "b25f6d6d7531d95d0f7659618a6a6b83b576013f",
-      "sha256": "426364a7ac477f53bf6d2b9d65fd9a17e23a71134641b3372d285a5091f2368b",
-      "bytes": 36232,
+      "sha256": "aada9d04cbb96e485da4cb0e5b100748c66766acf688b63fee96c666c8ed6537",
+      "bytes": 36239,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "571c5c973fa7d617f26adf609b8dad7e47f6b0ca",
-      "hardware_tested_sha256": "6d634d2c78595ace3323464d83786d2e7fc94aaa876c5b96f42ac17b391d331a"
+      "hardware_tested_sha256": "6d634d2c78595ace3323464d83786d2e7fc94aaa876c5b96f42ac17b391d331a",
+      "pre_profile_scrub_sha256": "426364a7ac477f53bf6d2b9d65fd9a17e23a71134641b3372d285a5091f2368b",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_engine_gate.zig",
       "source_relative": "zig/src/families/glm/cuda_engine_gate.zig",
       "source_blob": "37cda67a86ada50412d5c616e94b4a5b4aa24a24",
-      "sha256": "192abf128185af4bcfd96b913273d2272b5e898510fbff29427a30d97e38e3cb",
-      "bytes": 2960,
+      "sha256": "f4ed073b5f909215625845e35ba2f83847fa945f5c60fa485f16d72e57b83e92",
+      "bytes": 2967,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "e5c55f801b25af7658d093fd207d3b328f9ab788",
-      "hardware_tested_sha256": "ab6dfc385829e9d74445c0cacb5cede7754e53f18e48d546bfa678bd953f5164"
+      "hardware_tested_sha256": "ab6dfc385829e9d74445c0cacb5cede7754e53f18e48d546bfa678bd953f5164",
+      "pre_profile_scrub_sha256": "192abf128185af4bcfd96b913273d2272b5e898510fbff29427a30d97e38e3cb",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_engine_pick.zig",
@@ -26723,11 +26801,13 @@
       "path": "engine/zig/src/families/glm/cuda_engine_types.zig",
       "source_relative": "zig/src/families/glm/cuda_engine_types.zig",
       "source_blob": "cd7591b9aaa94fc5ad195aabbfc57492197c1fca",
-      "sha256": "961d45c97d4503158e04f44ebe8bdcd697018fa6c4157f1d74d6f0866ba56be0",
-      "bytes": 3101,
+      "sha256": "e66d006626d6777b22ea8cb3b47763b2078611f8be557b5c00f1561f79cc6cce",
+      "bytes": 3108,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "e20be601b9c9c58a4d6a84a1ed034911a36fce58",
-      "hardware_tested_sha256": "197209ed33ee298f9ac9602655015ece0b2151737c1f242588a69a1ad9eec0a0"
+      "hardware_tested_sha256": "197209ed33ee298f9ac9602655015ece0b2151737c1f242588a69a1ad9eec0a0",
+      "pre_profile_scrub_sha256": "961d45c97d4503158e04f44ebe8bdcd697018fa6c4157f1d74d6f0866ba56be0",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_env.zig",
@@ -26749,11 +26829,13 @@
       "path": "engine/zig/src/families/glm/cuda_exl3.zig",
       "source_relative": "zig/src/families/glm/cuda_exl3.zig",
       "source_blob": "7d22585bfad10b2c2b5387773f27dea6d514f275",
-      "sha256": "c0df94a528350d01ce5045f5e9b858370b388bea02c4559ec9e77a6a6d805b4d",
-      "bytes": 13344,
+      "sha256": "a60bbd59e4ec6808e1cb047506cd02663d5de98456c1eca5b66b1d9a36e22967",
+      "bytes": 13351,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "a1c669f892367e448820cde8781ba979e8e999a8",
-      "hardware_tested_sha256": "ee8d13d670831a958e7606c0c2043191059174d9a9eaac72682aef45217fc4d9"
+      "hardware_tested_sha256": "ee8d13d670831a958e7606c0c2043191059174d9a9eaac72682aef45217fc4d9",
+      "pre_profile_scrub_sha256": "c0df94a528350d01ce5045f5e9b858370b388bea02c4559ec9e77a6a6d805b4d",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_experts.zig",
@@ -26791,21 +26873,25 @@
       "path": "engine/zig/src/families/glm/cuda_forward.zig",
       "source_relative": "zig/src/families/glm/cuda_forward.zig",
       "source_blob": "6a25f94bb7efe8b8f2db958741ddc98360f1861f",
-      "sha256": "789d995a917f69726ad3068660ce080bf56566acc429abe4c86a1d9e1a462b4d",
-      "bytes": 32810,
+      "sha256": "dc752781a79d0bde731059647784b06edb7e10c5d60b6dab278c728c893495e1",
+      "bytes": 32817,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "c3672065e46efcf0e5428f0214351753da9abbbc",
-      "hardware_tested_sha256": "4b66de10906a8063b75eb3f5d9952fa6d2252df02b41047ca2004ab30098d6d9"
+      "hardware_tested_sha256": "4b66de10906a8063b75eb3f5d9952fa6d2252df02b41047ca2004ab30098d6d9",
+      "pre_profile_scrub_sha256": "789d995a917f69726ad3068660ce080bf56566acc429abe4c86a1d9e1a462b4d",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_forward_pair.zig",
       "source_relative": "zig/src/families/glm/cuda_forward_pair.zig",
       "source_blob": "926d26fe4c172cbbfcf3bc7a1fc7448711f2ffab",
-      "sha256": "b9e76edfdfecf58e271f28c02696e2ff2767e4d3a29905bc23ccb6e2a9793103",
-      "bytes": 10847,
+      "sha256": "741fe4082f7b8b41c0263df249215bd52d8772d9cd82ba530b9457b1b9168d50",
+      "bytes": 10871,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "54173df1b9e304688fc162473a64c2568318b42f",
-      "hardware_tested_sha256": "892a493ec4b58dd7cb06d4491ee6f87ae604c7abc267224731d39facbfd7d9dd"
+      "hardware_tested_sha256": "892a493ec4b58dd7cb06d4491ee6f87ae604c7abc267224731d39facbfd7d9dd",
+      "pre_profile_scrub_sha256": "b9e76edfdfecf58e271f28c02696e2ff2767e4d3a29905bc23ccb6e2a9793103",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_forward_pieces.zig",
@@ -26827,31 +26913,37 @@
       "path": "engine/zig/src/families/glm/cuda_g53.zig",
       "source_relative": "zig/src/families/glm/cuda_g53.zig",
       "source_blob": "78f0967571c9bb17be99ac35a7ea897765a27867",
-      "sha256": "9139e70b839adc3e09b99a8435575803fc2d22ae96d647fc22563aa76faae641",
-      "bytes": 18819,
+      "sha256": "8c59e0f43d7d1b1500fda094af75900e903050658468e55369d27396690b7968",
+      "bytes": 18843,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "04b7a8feb5ddc21f0d5892ae85ef6477f2173656",
-      "hardware_tested_sha256": "c729ce24478f8894d950839751c819a9437f0bac1da3c90114f92b6b08662b19"
+      "hardware_tested_sha256": "c729ce24478f8894d950839751c819a9437f0bac1da3c90114f92b6b08662b19",
+      "pre_profile_scrub_sha256": "9139e70b839adc3e09b99a8435575803fc2d22ae96d647fc22563aa76faae641",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_g53_test.zig",
       "source_relative": "zig/src/families/glm/cuda_g53_test.zig",
       "source_blob": "8bae3829957914ab82aef37dd667d2fb008396e1",
-      "sha256": "eb38a6f2cc364034871f4ac9fc17adbba345dc112fcfa5bc66146ffd92ba143e",
-      "bytes": 12535,
+      "sha256": "6c05076a5dc261fbe09201ad44b7fbdf52ea4b2af2102ccf8fe55f6666818a6b",
+      "bytes": 12542,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "3edb85d42e2ccf16cdd86385f9e5edfa64d7f3ad",
-      "hardware_tested_sha256": "238f474591452df50a0ce963bf480c791d6684c2410fadc80e5a8070fa4f8d58"
+      "hardware_tested_sha256": "238f474591452df50a0ce963bf480c791d6684c2410fadc80e5a8070fa4f8d58",
+      "pre_profile_scrub_sha256": "eb38a6f2cc364034871f4ac9fc17adbba345dc112fcfa5bc66146ffd92ba143e",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_glue.zig",
       "source_relative": "zig/src/families/glm/cuda_glue.zig",
       "source_blob": "56a330656dbd4b4a7288aee9ad65f1a34ec4385d",
-      "sha256": "fe24a7be0e1110ccf7423eedd2a79f1f5bdfba434006519a843df26ef7536c11",
-      "bytes": 15703,
+      "sha256": "1b4fa22b7a876e870c8498e444cd288c986cccfd893c140ee01130241bfdb8fe",
+      "bytes": 15710,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "c4afd5c0c28cb265c756838c5e1280c2135b0cc6",
-      "hardware_tested_sha256": "b798297f974d3ec19d4c6181b61e9b70281b5b6e8b7a5708e92f587746a04639"
+      "hardware_tested_sha256": "b798297f974d3ec19d4c6181b61e9b70281b5b6e8b7a5708e92f587746a04639",
+      "pre_profile_scrub_sha256": "fe24a7be0e1110ccf7423eedd2a79f1f5bdfba434006519a843df26ef7536c11",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_hybrid_config.zig",
@@ -26881,17 +26973,21 @@
       "path": "engine/zig/src/families/glm/cuda_hybrid_forward.zig",
       "source_relative": "zig/src/families/glm/cuda_hybrid_forward.zig",
       "source_blob": "5615a20cbcf36c4413e438c501a1e0deb0a3d6bc",
-      "sha256": "907c96c0748d1ee1aee9c97cc4d674d00a70c5998ca35350931f6eec96027abd",
-      "bytes": 50940,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "5bc1c72d800985a93509f4f5378a3553886200a63066de1f953f25ace7020374",
+      "bytes": 50974,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "907c96c0748d1ee1aee9c97cc4d674d00a70c5998ca35350931f6eec96027abd",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_hybrid_ledger.zig",
       "source_relative": "zig/src/families/glm/cuda_hybrid_ledger.zig",
       "source_blob": "45901e2af4823fa5228311ec7604b1e9799c3fc8",
-      "sha256": "6f8e8c80e44db2fa88c4eb2e3614737465c90203c47260ff81bc58556acef1ff",
-      "bytes": 6271,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "36646fc0e948c18da3cdbcea7f9fc1702186cfa3dec6e986c27f80e8841eac63",
+      "bytes": 6275,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "6f8e8c80e44db2fa88c4eb2e3614737465c90203c47260ff81bc58556acef1ff",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_hybrid_load.zig",
@@ -26905,25 +27001,31 @@
       "path": "engine/zig/src/families/glm/cuda_hybrid_load_test.zig",
       "source_relative": "zig/src/families/glm/cuda_hybrid_load_test.zig",
       "source_blob": "84be9a9010bb8fdb97675d5d3dd084f82d7d370a",
-      "sha256": "ed0a56d96d195d0a7cfb6c1bb489641a717bb29991605835f0516c706eaf5fd7",
-      "bytes": 16939,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "81be34b3f29d129b006b179bd306bc4e54f274f47ba596c6379760d7e799f3f4",
+      "bytes": 16973,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "ed0a56d96d195d0a7cfb6c1bb489641a717bb29991605835f0516c706eaf5fd7",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_hybrid_memory.zig",
       "source_relative": "zig/src/families/glm/cuda_hybrid_memory.zig",
       "source_blob": "fa91a8b3ff2c69962e699922f5f44ff6519a0ab5",
-      "sha256": "7a999a64f1898aeafe57c362453ed2cbedcdc35a410c79f0297b6477a24840b7",
-      "bytes": 20887,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "656e96b1a2a4f3bc9d52f39c30ef01786c0b5a655e9c5e98538fefaca19cbd60",
+      "bytes": 20882,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "7a999a64f1898aeafe57c362453ed2cbedcdc35a410c79f0297b6477a24840b7",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_hybrid_memory_fixture_cpu.zig",
       "source_relative": "zig/src/families/glm/cuda_hybrid_memory_fixture_cpu.zig",
       "source_blob": "095d6b527b848f0959447d7b6870f02295980820",
-      "sha256": "20e7ac9dd73eafb2640e3577ceedf861bd6d5257ca50c9a685db12c64c9024c8",
-      "bytes": 2365,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "36556a88e1bc2f2e509b6acc51b471b22ab5bc995c56de838fdff2256522832b",
+      "bytes": 2369,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "20e7ac9dd73eafb2640e3577ceedf861bd6d5257ca50c9a685db12c64c9024c8",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_hybrid_memory_test.zig",
@@ -26937,9 +27039,11 @@
       "path": "engine/zig/src/families/glm/cuda_hybrid_mtp.zig",
       "source_relative": "zig/src/families/glm/cuda_hybrid_mtp.zig",
       "source_blob": "1638142c1c7eaaea27554b6dbbc66d407f29e43c",
-      "sha256": "b18ec76b3b2f6b91ed85123e3fad310eee5623ae09e92a75c256f13d18e1e1de",
-      "bytes": 9038,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "eff40843359a5ebf07cbf3ed0d39a7023d305b85ae4cfc5edb911bce4fe22a87",
+      "bytes": 9022,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "b18ec76b3b2f6b91ed85123e3fad310eee5623ae09e92a75c256f13d18e1e1de",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_hybrid_owner_fixture.zig",
@@ -26953,9 +27057,11 @@
       "path": "engine/zig/src/families/glm/cuda_hybrid_preload.zig",
       "source_relative": "zig/src/families/glm/cuda_hybrid_preload.zig",
       "source_blob": "4f0eddc176835bcbd5933f28b2bc55c8d8a7fd6e",
-      "sha256": "b0e8e30e5365d5c15afb0e67a9f675db07ad618ce6d054fdee71e09532b01988",
-      "bytes": 8532,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "52dae8f842ef86b96c6f4b94f58226e5a73fbb0c2f3898d17937e3f5e04d8ef2",
+      "bytes": 8536,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "b0e8e30e5365d5c15afb0e67a9f675db07ad618ce6d054fdee71e09532b01988",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_hybrid_provider_test.zig",
@@ -26969,9 +27075,11 @@
       "path": "engine/zig/src/families/glm/cuda_hybrid_schema.zig",
       "source_relative": "zig/src/families/glm/cuda_hybrid_schema.zig",
       "source_blob": "954316c3a377b05963ebea08197a8dae0858353d",
-      "sha256": "bd59d55d4822956e2e25bad44eeb06e5c15b1cf406cabd3585a542109ba9ab2a",
-      "bytes": 6711,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "6bfdfcf708525e41909774b6d1f608dffddffa563367c1e9377e8a55fc147be8",
+      "bytes": 6715,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "bd59d55d4822956e2e25bad44eeb06e5c15b1cf406cabd3585a542109ba9ab2a",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_hybrid_transport.zig",
@@ -26993,25 +27101,31 @@
       "path": "engine/zig/src/families/glm/cuda_hybrid_users.zig",
       "source_relative": "zig/src/families/glm/cuda_hybrid_users.zig",
       "source_blob": "9cadd69586f7b1286cdfa38b2434eb47d4385cfe",
-      "sha256": "1e6d1c2e7f23d0f18135519aa0a15737c8d4362948f47af01b445494e2680dfc",
-      "bytes": 3850,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "3cfc6343e7d6284cd9d53253e0d9495b3d1e8bcb52cae5bf4cd23dfc018ccf94",
+      "bytes": 3834,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "1e6d1c2e7f23d0f18135519aa0a15737c8d4362948f47af01b445494e2680dfc",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_hybrid_v3.zig",
       "source_relative": "zig/src/families/glm/cuda_hybrid_v3.zig",
       "source_blob": "84beec7494b3d3b2cc53cef6b7e8a04c24074a05",
-      "sha256": "1b1d828693a174db69c5434af2f88e673f5bbf431e710e993e8cdd110c15de9a",
-      "bytes": 10610,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "5f71fb1b523fec72a9b27fd3d327875478ec35514c6b4cea42cfb3ea05196e55",
+      "bytes": 10626,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "1b1d828693a174db69c5434af2f88e673f5bbf431e710e993e8cdd110c15de9a",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_hybrid_v3_expert.zig",
       "source_relative": "zig/src/families/glm/cuda_hybrid_v3_expert.zig",
       "source_blob": "ef5a13144849e48f4c0b0fe0268ef712853add55",
-      "sha256": "06247e573fad2b04e34a617b59001c2cf77500d2bbebd1e5332da6b292e25437",
-      "bytes": 7941,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "04cca0c26bc9d0a8213a57857a6ddd17f0772b2a4523a6bd5f1490bfb1efebc7",
+      "bytes": 7957,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "06247e573fad2b04e34a617b59001c2cf77500d2bbebd1e5332da6b292e25437",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_hybrid_wire.zig",
@@ -27081,11 +27195,13 @@
       "path": "engine/zig/src/families/glm/cuda_kv_host.zig",
       "source_relative": "zig/src/families/glm/cuda_kv_host.zig",
       "source_blob": "0ccd6cbd33b0045ffff1d530a4dda16c070d580a",
-      "sha256": "19134238a4d95c50da611d8f56c4c2a5cd369064dc565bad54b14a7170746570",
-      "bytes": 17559,
+      "sha256": "331f43a8acc52da94e67c407d18fdda4635c699ee938d52335525e6006396ea6",
+      "bytes": 17566,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "3f004fd8f437e840b5b32956081006b532b9b446",
-      "hardware_tested_sha256": "7c05fe653777f25edc956a17467409f37c0414715c904fd00567fd9076cf4242"
+      "hardware_tested_sha256": "7c05fe653777f25edc956a17467409f37c0414715c904fd00567fd9076cf4242",
+      "pre_profile_scrub_sha256": "19134238a4d95c50da611d8f56c4c2a5cd369064dc565bad54b14a7170746570",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_l2pf.zig",
@@ -27107,21 +27223,25 @@
       "path": "engine/zig/src/families/glm/cuda_lane_costs.zig",
       "source_relative": "zig/src/families/glm/cuda_lane_costs.zig",
       "source_blob": "f5b8d9a508e14dbd49f6e7cee63a9236af7e7d3e",
-      "sha256": "052860396819c3dc187edf1bc3b7d4e92920d6add7114f1ddd74217a07b7dfb1",
-      "bytes": 11527,
+      "sha256": "d946a8392074779bb3b64e78a900e493a4a9025e59ebd7b2cac4ecec49cf759f",
+      "bytes": 11534,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "82efc72cd86b7e78a0dc77ed1ad382d22d8d0cb6",
-      "hardware_tested_sha256": "1ff007110f0c0d32107592b64d668bee448582e0974f79e886a167e12a093699"
+      "hardware_tested_sha256": "1ff007110f0c0d32107592b64d668bee448582e0974f79e886a167e12a093699",
+      "pre_profile_scrub_sha256": "052860396819c3dc187edf1bc3b7d4e92920d6add7114f1ddd74217a07b7dfb1",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_lanes.zig",
       "source_relative": "zig/src/families/glm/cuda_lanes.zig",
       "source_blob": "9d0c7cea67ce4e9b301257ab0fb76f8c4a240b1d",
-      "sha256": "5bfd0629ba438fb79098a860e97eba29839db28c02ecd6de6ac90f20cd941961",
-      "bytes": 32694,
+      "sha256": "83f51986f385519c70eb48a4e8c16c761bb7ab3b233ac1c3f89614ac58eb974b",
+      "bytes": 32701,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "3ab909778192a468e765484461a53e1cd5e7095a",
-      "hardware_tested_sha256": "d2ec694cd3da3853619517d62c0debde18f8d9c9e674105a3176ef5d4bb18349"
+      "hardware_tested_sha256": "d2ec694cd3da3853619517d62c0debde18f8d9c9e674105a3176ef5d4bb18349",
+      "pre_profile_scrub_sha256": "5bfd0629ba438fb79098a860e97eba29839db28c02ecd6de6ac90f20cd941961",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_lanes_test.zig",
@@ -27135,11 +27255,13 @@
       "path": "engine/zig/src/families/glm/cuda_latent.zig",
       "source_relative": "zig/src/families/glm/cuda_latent.zig",
       "source_blob": "e29bf12d502cb803b87ea29303185408b866b9c2",
-      "sha256": "9e9c7b255317e8358b655b7eeda2ce41fe158b573e3ccade0c39feb83561f7d7",
-      "bytes": 8899,
+      "sha256": "edbedaecdeb84edab3a2d0d35f902928df3291f50a059c256493134ea125e54c",
+      "bytes": 8906,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "b26d401bf28619eb1729449472091c8283bccd61",
-      "hardware_tested_sha256": "070822ef86339cddb376a77963f900085b7babcb62f5eefcb91643666e136296"
+      "hardware_tested_sha256": "070822ef86339cddb376a77963f900085b7babcb62f5eefcb91643666e136296",
+      "pre_profile_scrub_sha256": "9e9c7b255317e8358b655b7eeda2ce41fe158b573e3ccade0c39feb83561f7d7",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_load_ahead.zig",
@@ -27193,11 +27315,13 @@
       "path": "engine/zig/src/families/glm/cuda_moe.zig",
       "source_relative": "zig/src/families/glm/cuda_moe.zig",
       "source_blob": "a2efb1fef6e6aa7cfa296e3b31b3b79d4fcd6d90",
-      "sha256": "828ae3b2c6652bf315a36aea4e3b22e535ca3beca80caf27213d5c9d62e1dede",
-      "bytes": 6054,
+      "sha256": "535b9ea139dd9b627d5f8f67554602c93b1538769a8df41e01177da05490e7f4",
+      "bytes": 6061,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "44562ad3c1054247030ea0cef39f9a70a2978141",
-      "hardware_tested_sha256": "eea4d5fdc9fab2264b637d1c6ffcc96341a30197d3aa54e042bdb74bdbd3a219"
+      "hardware_tested_sha256": "eea4d5fdc9fab2264b637d1c6ffcc96341a30197d3aa54e042bdb74bdbd3a219",
+      "pre_profile_scrub_sha256": "828ae3b2c6652bf315a36aea4e3b22e535ca3beca80caf27213d5c9d62e1dede",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_mtp_chance.zig",
@@ -27235,11 +27359,13 @@
       "path": "engine/zig/src/families/glm/cuda_native.zig",
       "source_relative": "zig/src/families/glm/cuda_native.zig",
       "source_blob": "1768fb8e56012361009374dc29d5a68c43952d69",
-      "sha256": "296b815a66339070c653741535feb19a07b02a63e0eb38b2820a957ed2cd8534",
-      "bytes": 53771,
+      "sha256": "5bf23e7ab725c84415858183d7274c71af3d2520227c81881eb8e91ce6e241c0",
+      "bytes": 53795,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "94bb3ca412afd52d3694e46817f76d4415e78063",
-      "hardware_tested_sha256": "bd0131bd88c3a155711665814d10d3be18201dbe40101b1b60777750cba6e02f"
+      "hardware_tested_sha256": "bd0131bd88c3a155711665814d10d3be18201dbe40101b1b60777750cba6e02f",
+      "pre_profile_scrub_sha256": "296b815a66339070c653741535feb19a07b02a63e0eb38b2820a957ed2cd8534",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_open_owner.zig",
@@ -27253,11 +27379,13 @@
       "path": "engine/zig/src/families/glm/cuda_pages.zig",
       "source_relative": "zig/src/families/glm/cuda_pages.zig",
       "source_blob": "12d0128366074fa660329a39d6eb5bb35efdcd4f",
-      "sha256": "a47039e756de23f6f13addb2bc84245cbc04aab04eee592b3b6a481c8ddb0c6d",
-      "bytes": 13730,
+      "sha256": "527969e440faced0666525768d9ca54c15bd2886c7e59912a802f69559b736af",
+      "bytes": 13737,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "92e21da92feaddc76c8bf1ccc83878efa8a3a61a",
-      "hardware_tested_sha256": "1291f87ca73c37c147bcba496d52d0a62599398f8bbd9372efc59ec81f25d6fa"
+      "hardware_tested_sha256": "1291f87ca73c37c147bcba496d52d0a62599398f8bbd9372efc59ec81f25d6fa",
+      "pre_profile_scrub_sha256": "a47039e756de23f6f13addb2bc84245cbc04aab04eee592b3b6a481c8ddb0c6d",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_pages_test.zig",
@@ -27303,9 +27431,11 @@
       "path": "engine/zig/src/families/glm/cuda_prompt_lanes.zig",
       "source_relative": "zig/src/families/glm/cuda_prompt_lanes.zig",
       "source_blob": "30a1e46b64d2cc90d51f70b6da110d1817498a46",
-      "sha256": "61498031e6c6f046f376d2955bafacd0ba3573855eb97135893dc5db05e4b826",
-      "bytes": 3859,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "9e9b8ef002cfab85a2dd63426b5386ebd7f802ba61f8c550cbf75e6efee2c802",
+      "bytes": 3873,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "61498031e6c6f046f376d2955bafacd0ba3573855eb97135893dc5db05e4b826",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_prompt_logprobs.zig",
@@ -27319,11 +27449,13 @@
       "path": "engine/zig/src/families/glm/cuda_prompt_pair.zig",
       "source_relative": "zig/src/families/glm/cuda_prompt_pair.zig",
       "source_blob": "1a26f4939c28d3ff0c28a9b27b4535599a0df1cc",
-      "sha256": "0e2ff6957ccab76fbd53ff8a4dd3780bec1b213888b0c2b122e36d526eb05e8e",
-      "bytes": 10507,
+      "sha256": "1cb53689e3340fb1a192c3bf223611c5bf94e7d04909ddc35a95401f12c7f9a1",
+      "bytes": 10514,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "423d0460ec5ae95be77a982bfcd0840dd1d8be49",
-      "hardware_tested_sha256": "7a79c330a9c682257836707fdc7faea2447c7670f603be46ed6526e7f8221239"
+      "hardware_tested_sha256": "7a79c330a9c682257836707fdc7faea2447c7670f603be46ed6526e7f8221239",
+      "pre_profile_scrub_sha256": "0e2ff6957ccab76fbd53ff8a4dd3780bec1b213888b0c2b122e36d526eb05e8e",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_prompt_sink.zig",
@@ -27393,10 +27525,12 @@
       "path": "engine/zig/src/families/glm/cuda_qualify524.zig",
       "source_relative": "zig/src/families/glm/cuda_qualify524.zig",
       "source_blob": "760959c7869dcc7f3b60a8a6ed82c2a01ef81eff",
-      "sha256": "a3f10781fed55e51f595c53a88209104e6065ad45f576ae37d157b3ea6d6acaa",
-      "bytes": 3960,
+      "sha256": "7bc2f8dfda3e6b29486adba2bb19f78bf29c1abd7b7d44e0d29891fba61134ad",
+      "bytes": 3977,
       "disposition": "measured_observer557_overlay",
-      "base_sha256": "2df1d4c0b54e043a6abf01f8ea8f112db061da1323110ab4c786bcd0982bac37"
+      "base_sha256": "2df1d4c0b54e043a6abf01f8ea8f112db061da1323110ab4c786bcd0982bac37",
+      "pre_profile_scrub_sha256": "a3f10781fed55e51f595c53a88209104e6065ad45f576ae37d157b3ea6d6acaa",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_quant.zig",
@@ -27410,11 +27544,13 @@
       "path": "engine/zig/src/families/glm/cuda_ranks.zig",
       "source_relative": "zig/src/families/glm/cuda_ranks.zig",
       "source_blob": "fc458ed304d9fd9920638083af362d50ec4b6261",
-      "sha256": "c4c1fcc264e6294e8c3f130831c85d451511d0cc36b7e51869d8902a489dc6a8",
-      "bytes": 23892,
+      "sha256": "e7c437977e96aff44cae609fc6a220872dadbb5935c148167360c159dab465d2",
+      "bytes": 23916,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "398899edd188b8cf9690ed2f2b0826ccf4d8dead",
-      "hardware_tested_sha256": "1869b27ea937a952633f83e35c36c8e55c2858dbf42940e12cf9f64852f59b0a"
+      "hardware_tested_sha256": "1869b27ea937a952633f83e35c36c8e55c2858dbf42940e12cf9f64852f59b0a",
+      "pre_profile_scrub_sha256": "c4c1fcc264e6294e8c3f130831c85d451511d0cc36b7e51869d8902a489dc6a8",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_ranks_roce_test.zig",
@@ -27524,11 +27660,13 @@
       "path": "engine/zig/src/families/glm/cuda_snapshot_pages.zig",
       "source_relative": "zig/src/families/glm/cuda_snapshot_pages.zig",
       "source_blob": "c7c312c402cb8150d069287fa5520776acd48fdb",
-      "sha256": "109fba9652f9cd26087b195e1f132418e52b97c11ec98cd42fc1dd0d8c661140",
-      "bytes": 3965,
+      "sha256": "4129456ae1bdc03cfd1b83a77bd1ca34c7339df1fb00e89d55223aa7dde752be",
+      "bytes": 3972,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "f18faecc8d156d5fb2276196052d9128986a7ed9",
-      "hardware_tested_sha256": "829b4a5d58ac4c4af1589255645a470b9730c7ef131264c3362968d87e510e97"
+      "hardware_tested_sha256": "829b4a5d58ac4c4af1589255645a470b9730c7ef131264c3362968d87e510e97",
+      "pre_profile_scrub_sha256": "109fba9652f9cd26087b195e1f132418e52b97c11ec98cd42fc1dd0d8c661140",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_snapshots.zig",
@@ -27566,11 +27704,13 @@
       "path": "engine/zig/src/families/glm/cuda_state.zig",
       "source_relative": "zig/src/families/glm/cuda_state.zig",
       "source_blob": "41bb0c63032ef0fec99271fe4bc9fd2971a5b81f",
-      "sha256": "8e77dda1adaee73db50c822e17a76a5779336898635cb4638c83e5c5e9120c8d",
-      "bytes": 28774,
+      "sha256": "ddb4c7fb7a1ac8ee0806940f0778ab03bce848f8f9d75ba520a834ef8547a03d",
+      "bytes": 28781,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "b692667d72341194422444344a6807872320bb93",
-      "hardware_tested_sha256": "8a2d8651c755554fd61c3717ba8ea20c34919d0791b26d085401bb91e6528b16"
+      "hardware_tested_sha256": "8a2d8651c755554fd61c3717ba8ea20c34919d0791b26d085401bb91e6528b16",
+      "pre_profile_scrub_sha256": "8e77dda1adaee73db50c822e17a76a5779336898635cb4638c83e5c5e9120c8d",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_structured.zig",
@@ -27608,11 +27748,13 @@
       "path": "engine/zig/src/families/glm/cuda_tile.zig",
       "source_relative": "zig/src/families/glm/cuda_tile.zig",
       "source_blob": "7737dd6e2a893924b325d2a49889f870a2ec393a",
-      "sha256": "d2d0b2628bfb13356de18fd226ed704913b5227889e0a741fac084e1d65af3ea",
-      "bytes": 14398,
+      "sha256": "4f8c9dc8629ba526634871393c37ff78d961782c83d95c17c08701a65f2f749f",
+      "bytes": 14405,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "b4159bf3d7bcbda930d5b1a7f4276206eddfdc8a",
-      "hardware_tested_sha256": "9ca2c6079313a135937cedefc9f25d965ac79b48d56dcc6146634dd194735e7b"
+      "hardware_tested_sha256": "9ca2c6079313a135937cedefc9f25d965ac79b48d56dcc6146634dd194735e7b",
+      "pre_profile_scrub_sha256": "d2d0b2628bfb13356de18fd226ed704913b5227889e0a741fac084e1d65af3ea",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_upload_owner.zig",
@@ -27690,11 +27832,13 @@
       "path": "engine/zig/src/families/glm/cuda_weights.zig",
       "source_relative": "zig/src/families/glm/cuda_weights.zig",
       "source_blob": "cb295780781e233f33866dd92bd002bd5aa54164",
-      "sha256": "6a6eafddfd7f4c8ce083b3ebf16f9716a54f0c0ed949293a056d53c47bff314b",
-      "bytes": 39371,
+      "sha256": "907c5acab69f5335fde4772d97aaa6c7c1e351d1adb7f2fd9f4cdb5ec8a95911",
+      "bytes": 39395,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "e4888a3a9ba8d7d3a9f62eeb863c13b40a1ed60f",
-      "hardware_tested_sha256": "c805a72b724f3e936cb2b9894777f6eb76dcd7635cc49285a3fd8d3be372a40c"
+      "hardware_tested_sha256": "c805a72b724f3e936cb2b9894777f6eb76dcd7635cc49285a3fd8d3be372a40c",
+      "pre_profile_scrub_sha256": "6a6eafddfd7f4c8ce083b3ebf16f9716a54f0c0ed949293a056d53c47bff314b",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/families/glm/cuda_zero_budget_test.zig",
@@ -37492,11 +37636,13 @@
       "path": "engine/zig/src/native/cuda.zig",
       "source_relative": "zig/src/native/cuda.zig",
       "source_blob": "9dce2b5cb4d5a87404e61c76015d900bc6dcaf4c",
-      "sha256": "959d485ba627a04e2ec4dcd33874f4077c9ee2fd8f919643a6fbcc31f3be18ad",
-      "bytes": 35378,
+      "sha256": "2b2352ad89729a4f19b35b2bd4f6d2c8700af0e9e750a7917252f99633edd82e",
+      "bytes": 35385,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "df5f78823332dd143c503130280ec1271e1a7aae",
-      "hardware_tested_sha256": "353af6f3386e24859be5d1c5d0c61b564f285cc9d2ac19dc19085db35def6c2c"
+      "hardware_tested_sha256": "353af6f3386e24859be5d1c5d0c61b564f285cc9d2ac19dc19085db35def6c2c",
+      "pre_profile_scrub_sha256": "959d485ba627a04e2ec4dcd33874f4077c9ee2fd8f919643a6fbcc31f3be18ad",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/native/cuda_alias.zig",
@@ -37590,11 +37736,13 @@
       "path": "engine/zig/src/native/cuda_family_memory.zig",
       "source_relative": "zig/src/native/cuda_family_memory.zig",
       "source_blob": "3e93e4714dce2a5b3a17ce238156b16fafa2d1a3",
-      "sha256": "96dcd94bbdc6c2abfbf28d264e8e72f8c276c89a03258b43f8b6ba049fce41af",
-      "bytes": 6863,
+      "sha256": "1a2cffa41edd37484ed105243c4893c97292c752e341d93d26d8b73cb7a953d4",
+      "bytes": 6870,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "dde14bd6d6f3cac75c6c8ef8abd44e3c0ef7b03f",
-      "hardware_tested_sha256": "750d32cca213aa78c27e1eac38815efbbff2eacb308632cb20f5a9de139dd6ec"
+      "hardware_tested_sha256": "750d32cca213aa78c27e1eac38815efbbff2eacb308632cb20f5a9de139dd6ec",
+      "pre_profile_scrub_sha256": "96dcd94bbdc6c2abfbf28d264e8e72f8c276c89a03258b43f8b6ba049fce41af",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/native/cuda_family_memory_test.zig",
@@ -37632,11 +37780,13 @@
       "path": "engine/zig/src/native/cuda_host_close.zig",
       "source_relative": "zig/src/native/cuda_host_close.zig",
       "source_blob": "8b36fc61278df1fe2e203c8169221c78f5962ee9",
-      "sha256": "876d405b151df3b5a2380e2693a3edf26518cb348cb7eb757e9190d7f760c11a",
-      "bytes": 4633,
+      "sha256": "41119c97e53a7779c9089bd6d65da152507870ec2e61518a50e371b81c2a28ba",
+      "bytes": 4640,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "43aec10256243e7086448f11815547f92d61cc15",
-      "hardware_tested_sha256": "68f1fdf4f67819fc613cc550675df0cec70debcab289a6f3ca1600ed5c0665c5"
+      "hardware_tested_sha256": "68f1fdf4f67819fc613cc550675df0cec70debcab289a6f3ca1600ed5c0665c5",
+      "pre_profile_scrub_sha256": "876d405b151df3b5a2380e2693a3edf26518cb348cb7eb757e9190d7f760c11a",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/native/cuda_keep_others_test.zig",
@@ -37682,11 +37832,13 @@
       "path": "engine/zig/src/native/cuda_load_gpu.zig",
       "source_relative": "zig/src/native/cuda_load_gpu.zig",
       "source_blob": "8fa356be8c65675e2500d2d42f033efe8f04dd66",
-      "sha256": "9a7432f568bc0bb745a7ede953e482d84da0d06646b74fab59f9f0dfb52102cf",
-      "bytes": 17595,
+      "sha256": "00510125a430687e410930893cd36de40487922b504e08da9e157c228bc7888b",
+      "bytes": 17602,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "049a30bb5c2ceeeafbfd1d971c41d812d6ff25a3",
-      "hardware_tested_sha256": "a6822905cb15c6524969a00748967fcc59da48eca579db9a0b66f24b2a3f43af"
+      "hardware_tested_sha256": "a6822905cb15c6524969a00748967fcc59da48eca579db9a0b66f24b2a3f43af",
+      "pre_profile_scrub_sha256": "9a7432f568bc0bb745a7ede953e482d84da0d06646b74fab59f9f0dfb52102cf",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/native/cuda_memory.zig",
@@ -37700,11 +37852,13 @@
       "path": "engine/zig/src/native/cuda_options.zig",
       "source_relative": "zig/src/native/cuda_options.zig",
       "source_blob": "4022acc9a4b5c5512d7875ddc42b61aa3ef2e5d0",
-      "sha256": "854b0ca39cc13e25e263c971c77a2f77528193afd06a955f44e0c9a650630702",
-      "bytes": 6785,
+      "sha256": "875ba37041c519e6e2a865cb551f8c2d9f58334c504347165bd0be2222ac336c",
+      "bytes": 6792,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "080ab6afe6e743a16c9259155a21a28f0ac623ae",
-      "hardware_tested_sha256": "a3aebf9be0ca72c9c4d7985338a3a9952b04ac9c01e806e93d855f2e54cf7fc4"
+      "hardware_tested_sha256": "a3aebf9be0ca72c9c4d7985338a3a9952b04ac9c01e806e93d855f2e54cf7fc4",
+      "pre_profile_scrub_sha256": "854b0ca39cc13e25e263c971c77a2f77528193afd06a955f44e0c9a650630702",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/native/cuda_prompt_cancel_test.zig",
@@ -37766,9 +37920,11 @@
       "path": "engine/zig/src/native/cuda_retained_exit.zig",
       "source_relative": "zig/src/native/cuda_retained_exit.zig",
       "source_blob": "1c72a2360d62eee58d920599f4ad33e1136f84c7",
-      "sha256": "fbf764567aa1e20eb8b8f863ced47977c5e40b12cc17e0dbef7b346e2fa847bb",
-      "bytes": 755,
-      "disposition": "byte_identical_selected_source540"
+      "sha256": "a5554ec1cc3aa4472be08abd0b07aa630a3494089d4babca684c83807f6aa0f5",
+      "bytes": 772,
+      "disposition": "selected source with profile-alias comment scrub; no executable edits",
+      "pre_profile_scrub_sha256": "fbf764567aa1e20eb8b8f863ced47977c5e40b12cc17e0dbef7b346e2fa847bb",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/native/cuda_snaps.zig",
@@ -38342,11 +38498,13 @@
       "path": "engine/zig/src/native/none.zig",
       "source_relative": "zig/src/native/none.zig",
       "source_blob": "989579fd4b83e6f3f332b32b3a9dea9592459abe",
-      "sha256": "3a263ff5bf5850a94af313899866b692a4241102c84f0e40ca7811100d5d36ea",
-      "bytes": 1213,
+      "sha256": "a7f705646fdceb2f0bdb52570d084f9722df16a3d0985f56001505fffd7ac50b",
+      "bytes": 1220,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "122bf909f35e529c936e7bdbaf3fcbb6737fec9a",
-      "hardware_tested_sha256": "9c6f653b01131f3019f9f0c97fe943bcbf7bc139ce243fc7bba0e840380f70e4"
+      "hardware_tested_sha256": "9c6f653b01131f3019f9f0c97fe943bcbf7bc139ce243fc7bba0e840380f70e4",
+      "pre_profile_scrub_sha256": "3a263ff5bf5850a94af313899866b692a4241102c84f0e40ca7811100d5d36ea",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/native/parked_pages.zig",
@@ -39992,11 +40150,13 @@
       "path": "engine/zig/src/server/engines.zig",
       "source_relative": "zig/src/server/engines.zig",
       "source_blob": "11aadb8305bb41bc0108ed99d983cacdd5e7a2bf",
-      "sha256": "782bb62e986fec8a7c9c44ccd06d6f70a6c821844f4f5ff8503388fd24e0ff6b",
-      "bytes": 4042,
+      "sha256": "f65be5e6ed8b3f15dc3aec2b62299f5a6d457efb5553bc5dd634d46fdacf9636",
+      "bytes": 4049,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "4c0fa442cf67979a703de0efeeb96a51d1d3e0d5",
-      "hardware_tested_sha256": "1faf3825fecd3f799ad376179cf49d44c7c38d5001d8ba4908752df0c4fe69f3"
+      "hardware_tested_sha256": "1faf3825fecd3f799ad376179cf49d44c7c38d5001d8ba4908752df0c4fe69f3",
+      "pre_profile_scrub_sha256": "782bb62e986fec8a7c9c44ccd06d6f70a6c821844f4f5ff8503388fd24e0ff6b",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/server/env_defaults_test.zig",
@@ -40738,11 +40898,13 @@
       "path": "engine/zig/src/server/main.zig",
       "source_relative": "zig/src/server/main.zig",
       "source_blob": "86ef7e7fce60ff86ce3f27f6eb46f9c76d09e8b9",
-      "sha256": "dfa5bfd7d2b8eb459f505b393543392ad3d589b8808480be0bc9389b87d78464",
-      "bytes": 17609,
+      "sha256": "349fcce83ee6a0f22517e613a971d4f72c8908b6f3290235d2b33e93bb46493f",
+      "bytes": 17633,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "272050cc350a99c29cd73356a6dd82eff0c5477d",
-      "hardware_tested_sha256": "f4db62d484ec8b82def943b1c3c063fc5a9be48bafee4b7430d83b2eb2ffa3d4"
+      "hardware_tested_sha256": "f4db62d484ec8b82def943b1c3c063fc5a9be48bafee4b7430d83b2eb2ffa3d4",
+      "pre_profile_scrub_sha256": "dfa5bfd7d2b8eb459f505b393543392ad3d589b8808480be0bc9389b87d78464",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/server/mark_text.zig",
@@ -41436,11 +41598,13 @@
       "path": "engine/zig/src/server/serve.zig",
       "source_relative": "zig/src/server/serve.zig",
       "source_blob": "c1c672fb0a45a3cb114a4b7c03642a828bb0512c",
-      "sha256": "ccbc44b441f849a4c6cc6fc7be4d25715c2d25158b7d0048ec79f49da783762c",
-      "bytes": 25995,
+      "sha256": "0b1b47421b5ca627185cde20ccf16a3f0700c39c94ba535b717546386242fbd1",
+      "bytes": 26002,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "f6fdee15292bbe18f22693e8c0ec8afcd4e72501",
-      "hardware_tested_sha256": "7501da1758c0ffdc253f1659e8ebfa44610a5b49c5a741b6f4bbc338550371be"
+      "hardware_tested_sha256": "7501da1758c0ffdc253f1659e8ebfa44610a5b49c5a741b6f4bbc338550371be",
+      "pre_profile_scrub_sha256": "ccbc44b441f849a4c6cc6fc7be4d25715c2d25158b7d0048ec79f49da783762c",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/server/server.zig",
@@ -42270,11 +42434,13 @@
       "path": "engine/zig/src/server/startup.zig",
       "source_relative": "zig/src/server/startup.zig",
       "source_blob": "4a73319db53dacf2a138367025ac16f6243214d8",
-      "sha256": "ee12a1291a21dd667c511028b31d17f54f31461ef795b2e6322533442cc75784",
-      "bytes": 10426,
+      "sha256": "bd5a7b3e233a8ad17fda8234f3952d35ffe684d18625bdd4e8dc744825b3fc39",
+      "bytes": 10450,
       "disposition": "notice-comment successor; not byte-identical hardware-tested source",
       "hardware_tested_source_blob": "67518b55ba41dedcb24e6ce61186e71d34f5fd51",
-      "hardware_tested_sha256": "4db8bc2be90311a060bb9a3bb856ccd89b331a487c3a0ae3c4747cf2c05d9226"
+      "hardware_tested_sha256": "4db8bc2be90311a060bb9a3bb856ccd89b331a487c3a0ae3c4747cf2c05d9226",
+      "pre_profile_scrub_sha256": "ee12a1291a21dd667c511028b31d17f54f31461ef795b2e6322533442cc75784",
+      "publication_edit": "Local AI profile aliases removed from comments only"
     },
     {
       "path": "engine/zig/src/server/startup_receipt.zig",

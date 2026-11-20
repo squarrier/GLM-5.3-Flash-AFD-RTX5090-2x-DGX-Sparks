@@ -4,7 +4,7 @@
 
 - Replaces the Python-engine recipe with the staged native Zig source tree: RTX 5090 attention/KV/MTP and two DGX Spark expert halves over native RoCE v2. The source is pinned to the soaked 1fab9035 head, with shared/shared-drafts/batched-MTP/ping-pong ON; final soak, same-head M-on restart and same-window prompt/C1/C2/C4/C8 figures are filled from original receipts.
 - Documents four-user throughput and first-token losses against the two-Spark lane, code/JSON and prompt/concurrency trade-offs against v2.15, undrafted request shapes, row/context limits, source-only toolchain pins and retained gate failures/dispositions.
-- Retains v2.15's first-screen credits and NOTICE body verbatim, its own v1.0/Mia comparisons, every older changelog entry, current source authors and the actual Claude Opus 5.5/GPT-6.1 Sol assistance. Earlier GLM executor credit stays historical.
+- Retains v2.15's first-screen credits and NOTICE body verbatim, its own v1.0/Mia comparisons, every older changelog entry, current source authors and the actual Opus 5.5/GPT-6.1 Sol assistance. Earlier GLM executor credit stays historical.
 - Apache-2.0 is unchanged from v2.15. No weights, binaries, libdevice objects, caches or private history ship; all inherited licence texts and Mia's attribution guide remain.
 
 ## 2.15: four exchanges in flight, BF16 partial sums, the big-window kernel schedule, the watcher

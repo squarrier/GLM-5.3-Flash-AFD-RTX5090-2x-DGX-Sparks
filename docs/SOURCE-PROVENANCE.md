@@ -2,6 +2,8 @@
 
 The release is built on [TensorFold v1.2.8](https://github.com/ashhart/TensorFold/tree/09a9eb33176df8c3f56c86fceb9af94c3ac1618f). The inherited engine [LICENSE](../engine/LICENSE), [NOTICE](../engine/NOTICE) and [third-party notices](../engine/THIRD_PARTY_NOTICES.md) match that public revision byte for byte. The [engine source manifest](../manifests/engine-source.json) binds the outgoing files and separates measured lab bytes from this packaging. See [NOTICE](../NOTICE) and [credits](../CREDITS.md) for the V4 hybrid deltas and the retained public V3 credits.
 
+The V4.0.1 source on `main` has comment-only redactions of local AI agent profile names. The manifest records the exact published bytes and the pre-redaction hashes for those files. These comments are not a new hardware qualification; the tagged release and code behavior are unchanged.
+
 Where no original donor extraction revision can be established, this release accepts verified equivalent material with the applicable terms preserved. The table distinguishes equivalent donor content from exact inherited TensorFold blobs, external dependency custody, and design acknowledgments. It does not infer an original extraction commit from any of those checks.
 
 | Credit | What is verified | Original historical donor revision |

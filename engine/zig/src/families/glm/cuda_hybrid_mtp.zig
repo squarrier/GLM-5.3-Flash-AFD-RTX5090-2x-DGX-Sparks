@@ -1,6 +1,6 @@
 //! V3 batched MTP port on native TensorFold state/cache/quantized kernel interfaces.
 //! TensorFold/MTP: Ash Hart; weights/drafter: Mia's AI Lab. V3 extension: GPT-6.1 Sol via Hermes.
-//! Helios (GPT-6.1 Sol/OpenAI Codex via Hermes) authored these minimal current-native adapters.
+//! GPT-6.1 Sol via OpenAI Codex authored these minimal current-native adapters.
 const std = @import("std");
 const cuda = @import("cuda");
 const engine = @import("cuda_engine.zig");

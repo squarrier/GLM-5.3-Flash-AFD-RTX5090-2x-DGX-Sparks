@@ -1,4 +1,4 @@
-// Modified for V4 by Scott Quarrier with Helios: native hybrid integration/adaptation.
+// Modified for V4 by Scott Quarrier with AI assistance: native hybrid integration/adaptation.
 // Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
 //! A paired prompt step's pass (TF_GLM_PROMPT_PAIR): two chunks site by site, each one's exchanges under the other's.
 const glue = @import("cuda_glue.zig");
@@ -86,7 +86,7 @@ fn awaitShared(f: *const Forward, p: *const Pieces, count: usize) !void {
     for (p.shared[0..count]) |e| try f.stream.wait(e);
 }
 
-// Helios: V3 layer-major all-post/oldest-take port on current-native kernel/state interfaces.
+// AI-assisted integration: V3 layer-major all-post/oldest-take port on current-native kernel/state interfaces.
 // Hugh Madden authored the original lane scheduler. TensorFold kernels/state remain Ash Hart's.
 pub const LaneStage = enum { prepare, mixer, post, take, finish };
 pub const Testing = if (@import("builtin").is_test) struct {

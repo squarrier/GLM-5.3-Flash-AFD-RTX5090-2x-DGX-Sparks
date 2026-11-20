@@ -1,4 +1,4 @@
-//! Helios: finite trial-only pause of completed near-full prompts; default-inert, native Stream lifetime retained.
+//! AI-assisted integration: finite trial-only pause of completed near-full prompts; default-inert, native Stream lifetime retained.
 const std=@import("std");
 pub fn selected() bool {
  const value=std.c.getenv("TF_GLM_QUALIFY_524X8") orelse return false;
