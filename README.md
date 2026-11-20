@@ -2,6 +2,36 @@
 
 **V4 source-only lab release. Provided as-is, without support. Not qualified for production.**
 
+## V4.1 status — TensorFold v1.3.0
+
+**This is a documentation update, not a V4.1 code release.** The downloadable code and install instructions below still describe [V4.0.1](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/tree/v4.0.1). The separate V4.1 hybrid uses [TensorFold v1.3.0](https://github.com/ashhart/TensorFold/releases/tag/v1.3.0), with attention on an RTX 5090 and routed experts on two DGX Sparks over RoCE.
+
+| V4.1 / v1.3.0 verification | Result |
+|---|---|
+| Authenticated chat | Passed a short generation check |
+| Main BF16 KV cache | **7,496 pages (47,787 MiB) pinned in the attention host's system RAM** |
+| Pooled index keys | 2,811 MiB on the attention GPU, separate from the host KV history |
+| Advertised per-request limit | **479,232 tokens**, prompt plus output |
+| Eight simultaneously occupied full windows | Not measured on v1.3.0; neither the allocation nor the advertised limit proves this capacity |
+| Decode speed, extended soak and restart qualification | Not measured on v1.3.0 |
+
+**Source limitation:** The V4.1 port includes inherited GLM code with an oMLX/mlx-vlm source chain. Historical license evidence was found, but the precise original source selection and the terms applicable to the inherited adaptations have not been confirmed. The V4.1 implementation, binaries and weights are not included in this update.
+
+### Historical decode speed — not v1.3.0 results
+
+Median aggregate output tokens/s, with measured per-stream ranges in parentheses. Both older runs used one RTX 5090 and two DGX Sparks, the same short prompts, greedy 300-token generation, built-in MTP at confidence 0.50, and three measured repetitions per cell.
+
+| Prompt | Concurrent requests | V4 / v1.2.8 | V4.1 lab / v1.2.9 |
+|---|---:|---:|---:|
+| Code | 1 | 63.75 (63.14–64.07) | 63.61 (63.52–64.56) |
+| Code | 4 | 126.47 (31.59–32.79) | 126.22 (31.54–32.68) |
+| Code | 8 | 207.26 (25.89–27.73) | 207.00 (25.87–27.72) |
+| Chat | 1 | 54.83 (54.14–55.33) | 55.58 (53.59–56.07) |
+| Chat | 4 | 106.04 (26.48–27.77) | 105.86 (26.46–27.73) |
+| Chat | 8 | 173.01 (21.62–23.66) | 172.75 (21.59–23.62) |
+
+These were separate lab runs, not an alternating same-window comparison. The rates were similar and do not establish a version speedup or long-context speed. The recorded RTX 5090 power limit was 400 W; GPU clock caps and Spark power limits were not established for these runs. The older eight-window capacity result below is also historical.
+
 ## Authors
 
 - [Ash Hart (@ashhart)](https://github.com/ashhart) authored [TensorFold](https://github.com/ashhart/TensorFold/tree/09a9eb33176df8c3f56c86fceb9af94c3ac1618f) and [MCDMA](https://github.com/ashhart/MCDMA). [Russell Marr (@russellmm)](https://github.com/russellmm) authored [pinned host KV](https://github.com/russellmm/TensorFold/commit/adc001b4bdf9fcdde38647ae5a46fbafd3e829f3); [Bizuayeu (@Bizuayeu)](https://github.com/Bizuayeu) authored the [MTP pooled-key fix](https://github.com/Bizuayeu/TensorFold/commit/b0e1cdcbab3b6ebc183129f9b26c9887ed22ff3e).
@@ -53,13 +83,15 @@ A real operator must separately verify device vacancy/ownership, physical floors
 
 ## Results and limitations
 
-Private benchmark scores, raw records, binaries and measurement comparison tables are intentionally absent. No new speedup, fairness, quality or power-efficiency claim is made against any comparator. Historical public V3 documentation is preserved as historical attribution, not current evidence.
+The historical speed table above is the only performance summary added by this documentation update. Raw benchmark records, quality scores and binaries remain private. No new speedup, fairness, quality or power-efficiency claim is made against any comparator. Historical public V3 documentation is preserved as historical attribution, not current evidence.
 
 The selected launch files are unchanged. The source manifest distinguishes the original lab-tested engine blobs from this packaging successor, which adds change notices to 60 files and two license-text aliases. The notice-only edits are not a new device test or proof of binary identity. Its original selected-0.50 lifecycle attempt had failures; later normal closure does not qualify restart, unattended recovery or lifecycle fault handling. Restart/production operation is not approved. CPU wrapper tests do not establish device qualification of this new packaging head. Observation diagnostics can hold histories; do not interpret them as production latency.
 
 See the [source manifest](manifests/engine-source.json), [third-party notices](THIRD_PARTY_NOTICES.md) and [inherited-source record](docs/SOURCE-PROVENANCE.md) for what ships. The record distinguishes matched source, direct custody, and historical extraction revisions that remain unknown. No weights, CUDA objects, checkpoint payloads, raw benchmark data or private Git ancestry are imported. Operator-supplied paths and fabric addresses in the retained recipe are examples, not author machine settings. Profile numerical/runtime settings are intentionally unchanged, not a user's personal preferences.
 
 ## AI-assisted development
+
+Helios / GPT-6.2 Sol via Hermes/OpenAI Codex prepared the V4.1 status and historical performance summary.
 
 Helios / GPT-6.1 Sol via Hermes/openai-codex authored the native port/adapters, packaging and tests for Scott Quarrier. Workerbee's recorded local execution route authored earlier packaging/evaluation work (underlying model unknown). Claude Opus5.5 via Hermes/Anthropic authored earlier hybrid/recorder/CPU-fixture work. Earlier self-hosted GLM-5.3-Flash agent work is previous-version scope. Model under test: GLM-5.3-Flash built-in MTP. See CREDITS.md for retained roles; missing historical identities remain unknown.
 
