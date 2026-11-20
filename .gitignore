@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 engine/.zig-cache/
 engine/zig-out/
+/input-cache/
+/overlay/
+/reconstruction.json

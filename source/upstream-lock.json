@@ -1,0 +1,26 @@
+[
+  {
+    "path": "LICENSE",
+    "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/LICENSE",
+    "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "bytes": 11358
+  },
+  {
+    "path": "NOTICE",
+    "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/NOTICE",
+    "sha256": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7",
+    "bytes": 356
+  },
+  {
+    "path": "THIRD_PARTY_NOTICES.md",
+    "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/THIRD_PARTY_NOTICES.md",
+    "sha256": "8dcd56d270a085f0278c306e1af6ba3762deea93a5da6ec6230c51cffc9860f4",
+    "bytes": 41117
+  },
+  {
+    "path": "LICENSES/MIT.txt",
+    "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/LICENSES/MIT.txt",
+    "sha256": "be6a9ee4462784a762b21790954b8e76c4dcacc9fb6da2a40d03a8a9bddec93e",
+    "bytes": 1080
+  }
+]

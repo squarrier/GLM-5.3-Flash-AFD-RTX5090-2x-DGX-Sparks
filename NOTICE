@@ -1761,3 +1761,14 @@ Sol (OpenAI Codex), via Hermes. CPU only; hardware NOT RUN; no adoption or
 public/production authority. Every earlier notice and licence is retained.
 
 Scope note for historical ledger entries: the entry describing the new batched-MTP extension is an authorship-phase receipt for code now included/enabled at 1fab9035. Entries describing the separate 16-physical-row extension remain excluded. Their source authors and original entry text are retained.
+
+
+## TensorFold v1.3.0 source overlay
+
+Ash Hart (@ashhart) and TensorFold contributors authored the official base at https://github.com/ashhart/TensorFold/tree/d3d0bf110d57161edfbd20234a84833f14548b57. The exact base LICENSE, NOTICE, THIRD_PARTY_NOTICES.md and older MIT terms are retained in source/upstream/. Original nested grants remain applicable.
+
+Scott Quarrier directed the composition. GPT-6.1 Sol via Hermes/openai-codex authored this bounded packaging tool and the prospective generic cache-epoch-label changes only; inherited source authorship is not reassigned. The 129-path patch and four source-grant aliases are not a complete upstream tree, build or new speed/capacity result. Prior bundled source and executable recipe files are removed from this successor; pre-existing public ancestry is unchanged.
+
+Hugh Madden / Turquoise Bay AI authored the g53 prompt kernel/launch work; both retained MIT grants are attached under their source-referenced names. Mia / MiaAI-Lab authored the Apache-2.0 transport adaptations and the attribution guide; her exact transport license and NOTICE remain attached. All historical names, NVIDIA and distinct original agent roles remain in the preserved previous-version notices. The retained historical paragraphs are not reinterpreted as new extraction pins or blanket redistribution permission.
+
+This overlay retains the scoped upstream component grants and change notices. See source/README.md for historical oMLX scope. The shared GLM interfaces retain Z Lab’s MIT attribution and permission text in LICENSES/z-lab-dflash-MIT.txt. Original extraction revisions remain unknown where noted in the README; no notice here asserts a grant for unbundled checkpoints or a full reconstructed engine.
