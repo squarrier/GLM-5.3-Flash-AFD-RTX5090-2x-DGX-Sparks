@@ -1,15 +1,15 @@
 {
   "schema": 1,
-  "status": "reconstruction only",
+  "status": "draft reconstruction only; not a qualified build",
   "base_commit": "d3d0bf110d57161edfbd20234a84833f14548b57",
-  "scope": "affected-path overlay only; external complete upstream required for a build",
+  "scope": "143 implementation paths plus four grant/notice aliases; exact upstream required separately",
   "files": [
     {
       "path": "zig/build/cuda.zig",
       "mode": "100644",
-      "blob": "9dcce9b438f4df1a71d264693a7bd9e8434fe0c2",
-      "sha256": "f03346897ff79aaea10a4391844d650284e4ecea22b392e0b3c14f4127c98785",
-      "bytes": 50826,
+      "blob": "37ec9371ce2b1a06c0c2bbf0d8012d4d50e3ff47",
+      "sha256": "d8caa40ce1ca2edb0b504f50530c0e8d100ea803ec1d93678521a490a2994bbf",
+      "bytes": 50836,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -22,9 +22,9 @@
     {
       "path": "zig/build/cuda_kernels.zig",
       "mode": "100644",
-      "blob": "f12f07d06b42964368d1933a385240e428a24ed1",
-      "sha256": "38190412b2a7ee8074b68abe09097fe3a48995f6d053e26c6323eac548a9aa82",
-      "bytes": 17307,
+      "blob": "0134caf09870fd444ffcae4d62e2063793aa4235",
+      "sha256": "6076085c22c5b9a9da7ba4f161d8bd59e4dc962083392139c12daa6201318151",
+      "bytes": 17317,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -37,9 +37,9 @@
     {
       "path": "zig/build/cuda_runtime.zig",
       "mode": "100644",
-      "blob": "9f03d045aee3d396c64cb009c67df4f1795c73f5",
-      "sha256": "12b3667c21d2963d26a4e8bfe954e3d8f161cb7095238e9c8b661eade5351138",
-      "bytes": 4156,
+      "blob": "59cd46ae207485966a84860f6f274866a85d7b90",
+      "sha256": "2a87e808011a6fe96f03a03a398f5f52428828df75af71f7fd24aeae6fd862f2",
+      "bytes": 4166,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -52,9 +52,9 @@
     {
       "path": "zig/build/digest.zig",
       "mode": "100644",
-      "blob": "7181d2b0f39a7a11826bc8dbad4dab4643e8709e",
-      "sha256": "34d4a7515a7d0a388d614f66cd2c892b49760d69e6f96fe9b72a57450fd100ae",
-      "bytes": 5160,
+      "blob": "6cac07feb1630f14c90969fecebf6c3d03ebd6e3",
+      "sha256": "ecd1cb9e1da75435b5d7be5d959a058e88b6a2ea23d549b282b35402408b6f3b",
+      "bytes": 5170,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -67,9 +67,9 @@
     {
       "path": "zig/build/glm_family_host.zig",
       "mode": "100644",
-      "blob": "a20bfe3b3431a8e3f11cdb2a974097e4bb522953",
-      "sha256": "4454cf8b957ebd2ac45aee688e72862784b4eadfc232284b018a1d88e3980bba",
-      "bytes": 16200,
+      "blob": "fc56881b94b4cef4a24cf9edc74c3f1694516011",
+      "sha256": "29a5792fac8cd168b4c117c02c42302eaccdcf5e31408e662566c9d4d3cd1097",
+      "bytes": 16210,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -82,16 +82,16 @@
     {
       "path": "zig/build/glm_hybrid.zig",
       "mode": "100644",
-      "blob": "8cd089aa07ced5a1786958e17af430081626a9b7",
-      "sha256": "8b0902bfb1f0102ad35e5caaaed40e3c03e40bc6a82a8d3e1c327e66430d7e89",
-      "bytes": 14097
+      "blob": "11a57c43636d20d1cb77b8f2f3807612803d679b",
+      "sha256": "476b125ed7b57da6d444ed24a411095ebc258409a4363cc4dccf087673099610",
+      "bytes": 14633
     },
     {
       "path": "zig/build/server.zig",
       "mode": "100644",
-      "blob": "26ace73c1f345e43d6a65fb9246c749bcb9327c4",
-      "sha256": "15b1530f56a6243b07a7b37c794b1983ea5fc9cec68f24ec2da4dbd19de49dd5",
-      "bytes": 17324,
+      "blob": "eac22ea27ce11fd3707a4c74ba42a87b47d8dc87",
+      "sha256": "5255fb9f61d1ff19a686eed4e85c928b6919984bfd92b68a3c3184cc85e3db2d",
+      "bytes": 17334,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -104,16 +104,16 @@
     {
       "path": "zig/glm_524_tile_host.zig",
       "mode": "100644",
-      "blob": "45e0407bd28b833e8c72568cd3f606aaf4721233",
-      "sha256": "3c3f02c456406fbb7a961a131ab76b4c6cc0e3755c55ec6690424c1a0dbb49fd",
-      "bytes": 1687
+      "blob": "9dc8387cc518619e902ae5da11822fca8fbfabcc",
+      "sha256": "9aa281ec14334579d44b1b9f872e1003e3364363808241fcaeee836f714514cc",
+      "bytes": 1694
     },
     {
       "path": "zig/glm_expert.zig",
       "mode": "100644",
-      "blob": "e47bfeecf01b153fcc6c8c80256d30f0adfa4587",
-      "sha256": "225187ac993973a9b5970c97fae31d42977bd1e8f8a3f15e2d8ac0d2b0c6d9f7",
-      "bytes": 19321
+      "blob": "52a1ae9ef541330a84b3b9095711a10668624c0f",
+      "sha256": "6dc20caea6d0223317751bd4fc9f9e6e590540e35720e5b0f95b53e431524cd0",
+      "bytes": 19335
     },
     {
       "path": "zig/glm_hybrid_expert_memory_host.zig",
@@ -125,9 +125,9 @@
     {
       "path": "zig/glm_hybrid_host.zig",
       "mode": "100644",
-      "blob": "a39cd6f91d88ffadd64a6616aa2f8ef9a369ef93",
-      "sha256": "9ca4b516c8efc002fa83fd51c231f3097c9b0489295bf1616e91b6af2dd962e0",
-      "bytes": 30154
+      "blob": "bf2dc174e3ca4c78739510d28eced023db50fa3b",
+      "sha256": "5784c9f99efa42c6eb6fefa1caf36552801f6d1d27a2be8d87565effaae3e165",
+      "bytes": 38771
     },
     {
       "path": "zig/glm_hybrid_ledger_host.zig",
@@ -139,23 +139,23 @@
     {
       "path": "zig/glm_hybrid_memory_fixture.zig",
       "mode": "100644",
-      "blob": "231f4bfafbe61aabe8e86f66dbf5ac1933d65c90",
-      "sha256": "136df95b429e38a494fc1b47d4d72010af90cf17542f7ded3847c80059ecf106",
-      "bytes": 5999
+      "blob": "c5f0ae334719c6dd907784cb0688c281642738a2",
+      "sha256": "acb25020bd6d450d2c0371f441b81841c91c7f6488fde5579c86a34ec2a79f3f",
+      "bytes": 6012
     },
     {
       "path": "zig/glm_hybrid_memory_host.zig",
       "mode": "100644",
-      "blob": "2fe64b7434f64ff5c1ce7834ffed8295d7c8bd7e",
-      "sha256": "b7ca28b404be71dd9caeaa47d68f28c6a86562c2bd972692052a14e42d04cc67",
-      "bytes": 15510
+      "blob": "d6b61d1b4b99f83cbb7682e35a6a546d97276268",
+      "sha256": "6b108156769a7950ddbf0d79da9087df856939b4ab36589d02e54fa9f9ccf20b",
+      "bytes": 15530
     },
     {
       "path": "zig/glm_hybrid_owned_gather_host.zig",
       "mode": "100644",
-      "blob": "ffb635cd8dc7cc2af6cfe0f6d6efaa2c9a01f0aa",
-      "sha256": "55c7bbe0da5b0af348ad0e8ca60c50dcc716a960b304cd6b0ed06397237f2afb",
-      "bytes": 3597
+      "blob": "1d1f4f273ea93e6bca49deabd9a175e052141e51",
+      "sha256": "fec95cef6ea05f79ea90d7d79a4ae39819f28e1411c3e69ba6494c2887126f68",
+      "bytes": 3610
     },
     {
       "path": "zig/glm_hybrid_packed_memory_host.zig",
@@ -174,23 +174,23 @@
     {
       "path": "zig/glm_hybrid_repair_host.zig",
       "mode": "100644",
-      "blob": "8399a3cde7fa9b7838c9c0fb582c4800031981c0",
-      "sha256": "acfca0d7a8ec6d45c0250a7ead2fc4c770c5a851b8fa72cbf8b5953e15db1918",
-      "bytes": 7404
+      "blob": "2c9452f9debe2da1019b438de4de1ebd22a3cf8b",
+      "sha256": "c65206ba240f71c78ad16a682573bd0061b6390a1837b2e9958993f1b174b720",
+      "bytes": 7425
     },
     {
       "path": "zig/glm_kv_host_hybrid_host.zig",
       "mode": "100644",
-      "blob": "0c88c7d75c2bfaa54a703f4b023cfe57af31f511",
-      "sha256": "6408b050521a72510fe06286f69e41ae23ff242c95907242e39c90d23224b428",
-      "bytes": 29454
+      "blob": "4a7d84faa6975dfa6cf88604936a6b85497165a0",
+      "sha256": "a340925189c1d8c10647b87e2c91585270988b170847c26c72f8ed7da6e3425f",
+      "bytes": 29464
     },
     {
       "path": "zig/glm_lane_costs_host.zig",
       "mode": "100644",
-      "blob": "0c099fc4edf3a9b94f393cd950185f60c20e3c97",
-      "sha256": "8e87ce590f03c9d1dc8346a4f5d3c4e383f2b1f3c8d8c7a24acd225aac8c3f98",
-      "bytes": 6915,
+      "blob": "0ae4ba373e0918cc6597dbfdca220b34c8c873a4",
+      "sha256": "62d873350c53804c697cf313bfb86807fa8483c858ad9dc24ec73f23f57851b4",
+      "bytes": 6925,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -203,9 +203,9 @@
     {
       "path": "zig/i1_startup_host.zig",
       "mode": "100644",
-      "blob": "97373ec32e32b8d901040e90343a042ee96c62d4",
-      "sha256": "22577f595c2305cd6270dfeb25c5f9d6e26348a6e956b4b8f0bc27c88ab8d20a",
-      "bytes": 3991
+      "blob": "010fd5510fd7737df6f34141b7b8532d3a60a0d1",
+      "sha256": "bbd13d081555e15c2076af2c431ae04852afab94982fb3170fe6d6961575b4e2",
+      "bytes": 3998
     },
     {
       "path": "zig/k1_residual_host.zig",
@@ -238,16 +238,16 @@
     {
       "path": "zig/kernels/cuda/g53/rank_math.cuh",
       "mode": "100644",
-      "blob": "2bfe1809337d0b1d506c63b5acf49abb0515dc93",
-      "sha256": "5966d72f7694360a0f536374d0c375473b8206aee63a365ec632e35473c2f79d",
-      "bytes": 24796
+      "blob": "4ee416a5d659e1f46eb2c132e07f51e0c685cc62",
+      "sha256": "f380a8d2cdb849356b82af22d80778c23b7365efe4beb073cb669928228d3979",
+      "bytes": 24806
     },
     {
       "path": "zig/src/core/checkpoint_identity.zig",
       "mode": "100644",
-      "blob": "052de4c7557d9e425c1f007980836cf5ccb8edda",
-      "sha256": "2956a80736ab9b45b97945a8dc5ef4e7928a7b2348808cf2fedd9b185e182dbc",
-      "bytes": 19908,
+      "blob": "58626a516bf0342d0aa345d8400c817e70261755",
+      "sha256": "b24bd5b9f654e795ba46423cbde138e130a2874cd7d146e01f71416d439afa3a",
+      "bytes": 19918,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -260,9 +260,9 @@
     {
       "path": "zig/src/core/digest_cache.zig",
       "mode": "100644",
-      "blob": "3be2c0e6fe1ad2985f008ae0dfe50d0d9620c5a7",
-      "sha256": "9f57097bd94367e75b4583910aa66b701bcdd5b1ff0c10e977aa69e4accc78a6",
-      "bytes": 8400,
+      "blob": "96f8d644e52aa65c9b42076f10de3aa4dedcada1",
+      "sha256": "d8d9a09e685a549bcacfc35d006fdbe927bf76115477ac3d26715acf7064a2fb",
+      "bytes": 8410,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -275,9 +275,9 @@
     {
       "path": "zig/src/core/digest_cache_test.zig",
       "mode": "100644",
-      "blob": "f95f17894ddb80d977f285c07d30d98fc7009ae4",
-      "sha256": "ef8602f7954b4666337987601c7ac4d65d6af552dece73bbea025da20ad81963",
-      "bytes": 19748,
+      "blob": "2e2512738d2ca9aa667bcdeb5b2220c1aed1e1ed",
+      "sha256": "35ecaf0f4166ad852ab4f7bd743cc3e44b5f8d22c32018b463023dc516ffb8ef",
+      "bytes": 19765,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -290,9 +290,9 @@
     {
       "path": "zig/src/core/digest_lock.zig",
       "mode": "100644",
-      "blob": "74b7b71569655b1abb187c7f0608a1adf0c7de94",
-      "sha256": "47e94f8c26a6e8c9b1455e04013ba3def61dea7cf3bbfc2ab0fffb80b3951a51",
-      "bytes": 3676,
+      "blob": "b18e01dffb91230fba332603290bcd51ef902edc",
+      "sha256": "3e1dbb71018367f5f8e70d32ef33b0b7e90916659e25e76e4e6849df3c43ad37",
+      "bytes": 3686,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -305,9 +305,9 @@
     {
       "path": "zig/src/core/engine_api.zig",
       "mode": "100644",
-      "blob": "2e95821feeef8066dbfe05aed2137ef2e94df9ba",
-      "sha256": "9f07d4f98b8cab44bdce30ff6633bfdf3c88feef723fa8788e171165bb50cdac",
-      "bytes": 34216,
+      "blob": "41495c3813089ec0e804c95ccfea4d2a7ade2b3b",
+      "sha256": "29a22eab0e11ab155c50c60dc6c80faf8a51f942407f82169aaf23598c6a7198",
+      "bytes": 34294,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -318,11 +318,26 @@
       }
     },
     {
+      "path": "zig/src/core/lane_halt.zig",
+      "mode": "100644",
+      "blob": "d09970375e96bd6a046b8e4d7e45596e2af88587",
+      "sha256": "c237ebea799db96b20694a7245a87cda7b7266adc5c12752eb434da634cc5612",
+      "bytes": 1464,
+      "base": {
+        "mode": "100644",
+        "kind": "blob",
+        "blob": "f2cbe4e8ba4de9079b3d7c1d4cf2fbb76560206a",
+        "sha256": "23a37b9bc203b781b60f54861c93342a6647575ba2536caacad7f033572955d4",
+        "bytes": 1415,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/core/lane_halt.zig"
+      }
+    },
+    {
       "path": "zig/src/core/lane_host.zig",
       "mode": "100644",
-      "blob": "8a3fd40bf2acafdae2acc9b9995c96decf0ae288",
-      "sha256": "26fd6733d0c55a1afd691171ed294c3cd187260d1f8ad7d0976a918d8444fb0c",
-      "bytes": 29030,
+      "blob": "36a84ab5d281992036fbbe06a5b5afec363af34e",
+      "sha256": "d7a8d45c43b8045b04ad2755a94ce802e278a4e54318a5abc87841bbb74a0317",
+      "bytes": 30640,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -333,11 +348,41 @@
       }
     },
     {
+      "path": "zig/src/core/lane_host_end.zig",
+      "mode": "100644",
+      "blob": "e3cfea6115acb0f86f41a626c2273222a5f0fee0",
+      "sha256": "a3243a2a77f694315dd32e1065ffa02685f4f7a8f4a01ce17bf9941b6ff5a44f",
+      "bytes": 8300,
+      "base": {
+        "mode": "100644",
+        "kind": "blob",
+        "blob": "e302b3b7deaa5a99853b7a50ff2c46f4a9af1d31",
+        "sha256": "4736dae0ea75112e55178578ef5a2d1767f5a42ffb444a0decd78510941d4a85",
+        "bytes": 8225,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/core/lane_host_end.zig"
+      }
+    },
+    {
+      "path": "zig/src/core/lane_host_rows.zig",
+      "mode": "100644",
+      "blob": "4ee2bbd6fbc69d72959149ed62331a22b5e79037",
+      "sha256": "c374ecf07e3322a9767d2e37149bb6c57a78bdcb1766aa6496c541d2fad9aa51",
+      "bytes": 3246,
+      "base": {
+        "mode": "100644",
+        "kind": "blob",
+        "blob": "19007002f002298a29f53d88671ede4631550f54",
+        "sha256": "0af0ae2cc7b09414b18b89a7d04e1575feb23d4706ead85a57fb38e56982a3ec",
+        "bytes": 3197,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/core/lane_host_rows.zig"
+      }
+    },
+    {
       "path": "zig/src/core/lane_qualify524.zig",
       "mode": "100644",
-      "blob": "70deabefcd50016ac11ab21d70b9a7b993f4873c",
-      "sha256": "31ff26d4c8dc91068298695aa66635a4997463dcacf155728f21acccbc317144",
-      "bytes": 2000
+      "blob": "dd17701a2897d010d8f719cd2a4b2659e393431b",
+      "sha256": "5c7768d37d29811f0b718452243c3382f24ef8dde10229cb90166d3f9b20a1e6",
+      "bytes": 4936
     },
     {
       "path": "zig/src/core/lane_qualify524_test.zig",
@@ -347,11 +392,25 @@
       "bytes": 1177
     },
     {
+      "path": "zig/src/core/occupancy_profile.zig",
+      "mode": "100644",
+      "blob": "d0a5e21d9560a66216cfeeb37f5f1c6c97f52dea",
+      "sha256": "521fdaaf57ca55061be97485833ecda34e5ae922897e3a773aeb732f10453ce7",
+      "bytes": 1732
+    },
+    {
+      "path": "zig/src/core/occupied_phase.zig",
+      "mode": "100644",
+      "blob": "cf98361078e579eba784a4ade0d2be4a53363c71",
+      "sha256": "eacdad042206f295191a2f34ccc3957edb5044ee6c836597dd30b93ed55e76f2",
+      "bytes": 4371
+    },
+    {
       "path": "zig/src/cuda/copy_source.zig",
       "mode": "100644",
-      "blob": "7b99931ee5210b0fedf8ad9b78294d2620b146e1",
-      "sha256": "3931410e4532bc07d948f5ad9e4ad20e3e3bf3b14b774962f43c119df1e5aa77",
-      "bytes": 23165,
+      "blob": "d077370f1aeb82ad1aa0385c277df99700946dc7",
+      "sha256": "e01cbed659ca9eae3dde09b23933a8d2dff1748fcf483f5120c3cc211392ce87",
+      "bytes": 23175,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -371,9 +430,9 @@
     {
       "path": "zig/src/cuda/kernels.zig",
       "mode": "100644",
-      "blob": "b511a96536e6c857e0cb97bffb5504cb6f26c1e9",
-      "sha256": "5088cc80b5836f70104478cef32250e215f6e32dfa5367091268ecfef6c957cd",
-      "bytes": 14726,
+      "blob": "e0d031ec0a9cf21c4003434b4ae0f79fecd09c31",
+      "sha256": "939d6b5aab2447f546a29c22ee95c318666e9c4fe4dc767a8796d752210e086b",
+      "bytes": 14736,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -393,9 +452,9 @@
     {
       "path": "zig/src/cuda/memory.zig",
       "mode": "100644",
-      "blob": "cd3c7f99406c944be00932f8c1da1ef530bba5d1",
-      "sha256": "368ea83c3ca21587227e3e6e60f6676b4c98c016b3866a1b8e94b35f1dd9d42e",
-      "bytes": 25875,
+      "blob": "957ee65b0dff202f178432772860d61c94718888",
+      "sha256": "99efd1f6273a86b28ba027372956eb259cb3e3622e0e16d10f07b18f2dbd131d",
+      "bytes": 25885,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -415,9 +474,9 @@
     {
       "path": "zig/src/cuda/memory_receipt.zig",
       "mode": "100644",
-      "blob": "ffc6a7b37c624ddabba4c71153e7d94e3a32f552",
-      "sha256": "8f2af0f700349ba97bad8c7f04bba617ba1ce9e042826b64af890f87dbf96989",
-      "bytes": 3853,
+      "blob": "042be773a6ae43823b36b09d2f0d596b6adad749",
+      "sha256": "9246aa0045b86aae4831d09045f3e09afb33a0b576c7e0cd70f8a84fc8043fcb",
+      "bytes": 3863,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -430,16 +489,16 @@
     {
       "path": "zig/src/cuda/roce_proxy.c",
       "mode": "100644",
-      "blob": "2fd0356c448035d86aace7e8ea8e3354ceeb35d1",
-      "sha256": "882f99844b7abad712fa3b58805a751aa48d0d239533043a43a03bc8b9ae2d19",
-      "bytes": 26750
+      "blob": "bd8c25af7615157e85c74a1fd9e8fc7950a4957e",
+      "sha256": "c6c594a0688c6776b5ea709fe161494d6a9bde37f7c13c75fe36c827069508ce",
+      "bytes": 26774
     },
     {
       "path": "zig/src/cuda/root.zig",
       "mode": "100644",
-      "blob": "96d11e13f40e769e5d424850a3dd550294fc659c",
-      "sha256": "57b294991d6b4b500ddcdea44cbe5df7864938b52add68f037325588fbdf3329",
-      "bytes": 7014,
+      "blob": "b6961a6316a6860963dc2352feb1efaba08cf9f8",
+      "sha256": "bde328b531298c80a5b7565a266e80eece643cb1aeac669cc3cdc36f562f27f9",
+      "bytes": 7024,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -466,16 +525,16 @@
     {
       "path": "zig/src/cuda/xchg/node.zig",
       "mode": "100644",
-      "blob": "8ad616b344b38bc2da58bd2ece3ba417f5042a6e",
-      "sha256": "4cac9b185207fc36379607359ae90a53553e59f54c59452a82e5a6f9f72eee58",
-      "bytes": 26163
+      "blob": "b8dc36223935871fe7a6b028c3f8218e7afbadf8",
+      "sha256": "7a1f88854bf8dea6d4abd45a537e40415d9ee00d91047be8ad2be698e717610e",
+      "bytes": 26187
     },
     {
       "path": "zig/src/cuda/xchg/proto.zig",
       "mode": "100644",
-      "blob": "3472e895ead812dc609387708f63194000ffa627",
-      "sha256": "225696f3381ad540791d160e42f4b980a5badc1ccc36f58139e04c9cd81c6d13",
-      "bytes": 31655
+      "blob": "e544f2973ab4a8ca7ba70b5103392215274dc11f",
+      "sha256": "6e8f482cde90fc0fae362387caf3078c6170338d1196ea3c9d1a539bd918b3fa",
+      "bytes": 31665
     },
     {
       "path": "zig/src/cuda/xchg/setup.zig",
@@ -494,16 +553,16 @@
     {
       "path": "zig/src/cuda/xchg/xchg.zig",
       "mode": "100644",
-      "blob": "8fbdfedc05e947f8c039ee6434585bc7f80db6d2",
-      "sha256": "565187a3253537745f1e28aa73efefcaa19dda9a3dd8d6dc07bb4a492c233a64",
-      "bytes": 1362
+      "blob": "73241f5796be8c6137bf16a836cd7f263370f6fa",
+      "sha256": "f9b2aa633317c077b3aa191ed8bd16f29e4c1e9093e57abdd90b195b801d6506",
+      "bytes": 1372
     },
     {
       "path": "zig/src/fabric/tp/bootstrap.zig",
       "mode": "100644",
-      "blob": "72fbe2a7f8cc30570924029b6c2fd187dea5dd0d",
-      "sha256": "d37cff021b136a038c1967ff0876ae7a95f4e97cb9278cabfa4a40d399cb193d",
-      "bytes": 16933,
+      "blob": "3da097024b966464704deccfc6d8ec8198c7546d",
+      "sha256": "6d935ef2ef7ff0de72f560a6eee5ed451ea321dd51d969d186cf29835f45916f",
+      "bytes": 16943,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -516,9 +575,9 @@
     {
       "path": "zig/src/fabric/tp/roce.zig",
       "mode": "100644",
-      "blob": "43ceb7a78f0e96371f1d986b26dd2239aac50f32",
-      "sha256": "6c25880f1de1e593ed18c33cbeba2557f32c83a02bd48306902fda1d88afaf08",
-      "bytes": 34013,
+      "blob": "0b702971222d19e362135289e12c51df1bc7ea83",
+      "sha256": "e36489733ea239310e5a609e77b12403ca7961b092a3caceb9bbf47a34dafac6",
+      "bytes": 34023,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -538,9 +597,9 @@
     {
       "path": "zig/src/fabric/tp/sock.zig",
       "mode": "100644",
-      "blob": "b5e24a6a48c84c0e015064f0cc26b8fb98e46280",
-      "sha256": "6cc8cf4f68b58aeefdb6e8612f6324fdcafb44a820918a8fbc6b5269a166700d",
-      "bytes": 13238,
+      "blob": "daa9eb1b4c2ff9d386fb7e6edc8073f31e5e88c3",
+      "sha256": "f8ec3364c0af84b9f5e7478d57fe9cb255e3656fda4b1e75da4f7332006779d0",
+      "bytes": 13255,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -553,9 +612,9 @@
     {
       "path": "zig/src/families/glm/cuda.zig",
       "mode": "100644",
-      "blob": "b012a3d260da8fbde1dfa824ed256d6c1346a269",
-      "sha256": "abeeb7d256e22743e179c1c5909765f5b35625b862aa7bceee88c52dc0a89a79",
-      "bytes": 5101,
+      "blob": "59f0645b015fb58446320afad86734c688899efd",
+      "sha256": "e1ec1fb767b0acb57a4dd3113547265a8af84f2b77b95273360bc61f3f43b4a1",
+      "bytes": 5159,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -568,16 +627,16 @@
     {
       "path": "zig/src/families/glm/cuda_attention_tile.zig",
       "mode": "100644",
-      "blob": "cec2eb4c8fca478ff6fe9861348725b0cee454be",
-      "sha256": "7c928766b1cbf98e8f41d04fd846e0aed42b190959ac965210a9d10e140b9fd6",
-      "bytes": 1398
+      "blob": "2d54d0b32c0d4886f6eb90a9e5170bada01f217d",
+      "sha256": "7ce6e022ad283f133aafb0de3c0bccf0274d202fc4e5b4738547ff1917f994ce",
+      "bytes": 1405
     },
     {
       "path": "zig/src/families/glm/cuda_dsa_block.zig",
       "mode": "100644",
-      "blob": "43b46d58c1907dd564c9421b3d929b6ccf004198",
-      "sha256": "7570d60e6b6062d1daff5747359a64acbfb777bd8d5b3021f93e41cf5e716b34",
-      "bytes": 16027,
+      "blob": "02e47196a10ad10d9d90e1ff45802473af21bc3d",
+      "sha256": "9fcdd4057a18d02a0f835365d028dc4c122d193d7fcae6e867c8a9800ac8bde3",
+      "bytes": 16037,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -590,9 +649,9 @@
     {
       "path": "zig/src/families/glm/cuda_engine.zig",
       "mode": "100644",
-      "blob": "9543fbbf234b3df9dd2ffc15abb22470ccc1df60",
-      "sha256": "7c2009152095314ac464cd85ae256521c16f710aced03fcf732e2ea8c9111c31",
-      "bytes": 36249,
+      "blob": "2cb01c25e343556ff108c3dcd8764bd9bdfe09e7",
+      "sha256": "f961c4f655d81efb979032c016ba4fef7802c6463bb132141ebfecaf9893d481",
+      "bytes": 36239,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -605,9 +664,9 @@
     {
       "path": "zig/src/families/glm/cuda_engine_gate.zig",
       "mode": "100644",
-      "blob": "3b83ce0e689942cfc160ac11b300deadc32f7146",
-      "sha256": "f4ed073b5f909215625845e35ba2f83847fa945f5c60fa485f16d72e57b83e92",
-      "bytes": 2967,
+      "blob": "341efa8d95aa7861b86585399a5510134a14ba17",
+      "sha256": "a57a53f57573afa557bf86e2946b9b4e5675383c66aeed4be36ef976769693fe",
+      "bytes": 2977,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -620,9 +679,9 @@
     {
       "path": "zig/src/families/glm/cuda_engine_types.zig",
       "mode": "100644",
-      "blob": "11fe8d0115e9b3cf536b794006eec967d713283b",
-      "sha256": "e66d006626d6777b22ea8cb3b47763b2078611f8be557b5c00f1561f79cc6cce",
-      "bytes": 3108,
+      "blob": "847de9c8e54e027434f347b6e9314b810e252f30",
+      "sha256": "e1f9bf44d5dac7c4e49a6a086ea14aa53eee88af7d7f38fdbae475934a35d1bd",
+      "bytes": 3118,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -633,11 +692,26 @@
       }
     },
     {
+      "path": "zig/src/families/glm/cuda_env_test.zig",
+      "mode": "100644",
+      "base": {
+        "mode": "100644",
+        "kind": "blob",
+        "blob": "4d601ab113ebcaea68d6171b119bceae8240c201",
+        "sha256": "067d3bedac26297151f7ae74f6df72d11bd8cfc08efa88358cabcb0cf1158a83",
+        "bytes": 9591,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_env_test.zig"
+      },
+      "blob": "4b193db2d353a951683390e75de9d25e9f5cbe3c",
+      "sha256": "4cd5e4e15dadf2c268e1a0cd72d6e696d8abd3a8f8041d260ba2abb42d3fc95a",
+      "bytes": 9605
+    },
+    {
       "path": "zig/src/families/glm/cuda_exl3.zig",
       "mode": "100644",
-      "blob": "3ae316b328fb9884ca2a0f8ad618eb9e3a7ac360",
-      "sha256": "a60bbd59e4ec6808e1cb047506cd02663d5de98456c1eca5b66b1d9a36e22967",
-      "bytes": 13351,
+      "blob": "2d27422a500c0d809b991083330890fbae380b9c",
+      "sha256": "fcf5ac5d6b794654e010244bb06376827d05680190be4be7ba5050b609900fe0",
+      "bytes": 13361,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -650,9 +724,9 @@
     {
       "path": "zig/src/families/glm/cuda_forward.zig",
       "mode": "100644",
-      "blob": "5860c16eee9b3109808aa3ec92483c092809619d",
-      "sha256": "464000c0c4a3a9dce7627226d5a48ec11dca5602785a58ecbc32bddc88f53541",
-      "bytes": 30747,
+      "blob": "34220ad09907e3f26555d7a150a2914f7dad42c1",
+      "sha256": "dd284a07ef3aaeb3678543480c47b5cb5bd7b9ac256535779fcd96999a9ff2ed",
+      "bytes": 30757,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -665,9 +739,9 @@
     {
       "path": "zig/src/families/glm/cuda_forward_pair.zig",
       "mode": "100644",
-      "blob": "a8ab2ef1caf87d14368d6d3ba55814745baf21ab",
-      "sha256": "c10b427bb43298b635baf23ba0da8203b6aefbdad28fe6929697369c24f95f39",
-      "bytes": 10864,
+      "blob": "2c152dcaed7614e8bd188ddb60b1ace45c2c7127",
+      "sha256": "41252ec06994e9b1cf56c3eeedd922a6a80f43ab4cb986575d1e4eaa2c0009da",
+      "bytes": 10881,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -680,23 +754,23 @@
     {
       "path": "zig/src/families/glm/cuda_g53.zig",
       "mode": "100644",
-      "blob": "f40802b6baeca785f29e6abb75477b816e0e7543",
-      "sha256": "8c59e0f43d7d1b1500fda094af75900e903050658468e55369d27396690b7968",
-      "bytes": 18843
+      "blob": "9763bd9a0dc683e91dfed88fbf8881c23b15eca8",
+      "sha256": "c465c4f899bdcd73388784412b8da732368167af917ecc2423f8f2e1e600dc0b",
+      "bytes": 18853
     },
     {
       "path": "zig/src/families/glm/cuda_g53_test.zig",
       "mode": "100644",
-      "blob": "1e87e01adf7a23dbd34e40e2139b893ec4236e8d",
-      "sha256": "6c05076a5dc261fbe09201ad44b7fbdf52ea4b2af2102ccf8fe55f6666818a6b",
-      "bytes": 12542
+      "blob": "23bdb49d15758361afb2c9db66e73820fd97f213",
+      "sha256": "0a0b0caa8862a5be5f7ee4328e4a3c9b22c046d26e9b9da2126a73a65577c56f",
+      "bytes": 12552
     },
     {
       "path": "zig/src/families/glm/cuda_glue.zig",
       "mode": "100644",
-      "blob": "397c8e6ab3cb7c39289669aa2d4e2f4c3f894e8e",
-      "sha256": "6656040c1d0aab039efc8d069f5db9796fbd83fc850957030518e8f5dca088de",
-      "bytes": 16027,
+      "blob": "2f14b4ba976b80d378d789c85f4020a562ea8560",
+      "sha256": "5b5630e482a3341e46b3a8b4eac3cd704f9ae2e5c0942824c8e99dc1ff2570f1",
+      "bytes": 16037,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -721,6 +795,13 @@
       "bytes": 2028
     },
     {
+      "path": "zig/src/families/glm/cuda_hybrid_dflash_test.zig",
+      "mode": "100644",
+      "blob": "71e7d15645b1a7dc96f4446a2cf03ceecfe8e029",
+      "sha256": "7f4579e1346afe15798e6b7104d48ac57198a8340f279e32fd545aefec5095ce",
+      "bytes": 4618
+    },
+    {
       "path": "zig/src/families/glm/cuda_hybrid_expert.zig",
       "mode": "100644",
       "blob": "3dd3727ef8b48ec239569a1cf656f84e089b49e0",
@@ -730,16 +811,16 @@
     {
       "path": "zig/src/families/glm/cuda_hybrid_forward.zig",
       "mode": "100644",
-      "blob": "09ab918d291cdc55a2fdf18312d3cbe1457d2b00",
-      "sha256": "1ef0fe029d7189dd69ca61f858a4a4942d627ba370894c12faed87e245cea660",
-      "bytes": 50944
+      "blob": "366bdabb9ce97e20192c4de4045ac5444c4277b0",
+      "sha256": "c4134b201e4be1f68225d547ae4b2c01a94e8c6504b9f1422e29b7dbcc6603ff",
+      "bytes": 50958
     },
     {
       "path": "zig/src/families/glm/cuda_hybrid_ledger.zig",
       "mode": "100644",
-      "blob": "82d352c19a88d0b828a2e5b3638c08375c7b0207",
-      "sha256": "36646fc0e948c18da3cdbcea7f9fc1702186cfa3dec6e986c27f80e8841eac63",
-      "bytes": 6275
+      "blob": "b66adb0804e7b09989f5422eff71524365b74ecc",
+      "sha256": "c1636e85138981883fdccb39799e22de958d9b691d5306cfe57bbbed5c8887bc",
+      "bytes": 6288
     },
     {
       "path": "zig/src/families/glm/cuda_hybrid_load.zig",
@@ -751,23 +832,23 @@
     {
       "path": "zig/src/families/glm/cuda_hybrid_load_test.zig",
       "mode": "100644",
-      "blob": "39bc2f6e822f28410f4aee63245bded4e4dec2cc",
-      "sha256": "65f8a1ae680bbcced32dbc20c80138357bb99289f5ca05fa80d8134bfd19a9d1",
-      "bytes": 16959
+      "blob": "dfbaddcc2be9d352df332f9c6d668e0b0b0d6a31",
+      "sha256": "81be34b3f29d129b006b179bd306bc4e54f274f47ba596c6379760d7e799f3f4",
+      "bytes": 16973
     },
     {
       "path": "zig/src/families/glm/cuda_hybrid_memory.zig",
       "mode": "100644",
-      "blob": "2bac0d0f9d6f28aed54d82420b6ff86d9f8f68f3",
-      "sha256": "656e96b1a2a4f3bc9d52f39c30ef01786c0b5a655e9c5e98538fefaca19cbd60",
-      "bytes": 20882
+      "blob": "ff75d6bcb976164933e2df5bba0104a72d5c7d07",
+      "sha256": "dffbb8669ee18bab9d222decfcef946368d8cd154230ffc6c4ec0ef4f47bc3ea",
+      "bytes": 20904
     },
     {
       "path": "zig/src/families/glm/cuda_hybrid_memory_fixture_cpu.zig",
       "mode": "100644",
-      "blob": "232b007da6ce56e8c2c4382bc2895880e963e02a",
-      "sha256": "f77019a8087bc342fdcfdea9ce6e3d7444d7c9312780d696ef6f4535c38b6ea2",
-      "bytes": 2513
+      "blob": "5d67ce97843c95f6ba1e9b59fa7e009957fd04cf",
+      "sha256": "c6754328acb73d31511517664fb681b5f4019b68b0cb602f157c6f893f3300ed",
+      "bytes": 2526
     },
     {
       "path": "zig/src/families/glm/cuda_hybrid_memory_test.zig",
@@ -779,9 +860,9 @@
     {
       "path": "zig/src/families/glm/cuda_hybrid_mtp.zig",
       "mode": "100644",
-      "blob": "c0003ee7da9d17113e756dd0a7f24a898d18dbe4",
-      "sha256": "eff40843359a5ebf07cbf3ed0d39a7023d305b85ae4cfc5edb911bce4fe22a87",
-      "bytes": 9022
+      "blob": "5fbc62aa121cf73ab0ac24ef2a5db4a5f235a664",
+      "sha256": "df7dd1680c92a806959a664d2db6d020c34716f380d8d331b19402228431e2a3",
+      "bytes": 9055
     },
     {
       "path": "zig/src/families/glm/cuda_hybrid_owner_fixture.zig",
@@ -793,9 +874,9 @@
     {
       "path": "zig/src/families/glm/cuda_hybrid_preload.zig",
       "mode": "100644",
-      "blob": "29ca775b3b4179359e29a97f4ccd9c03ae3377a1",
-      "sha256": "52dae8f842ef86b96c6f4b94f58226e5a73fbb0c2f3898d17937e3f5e04d8ef2",
-      "bytes": 8536
+      "blob": "27e45050723111d57ccf33b9b77f2ab207299708",
+      "sha256": "01ee543bc2f5bf9d8b11a9b3e5b2d3ed737028cf31d7c2c7389f7e557468e500",
+      "bytes": 8549
     },
     {
       "path": "zig/src/families/glm/cuda_hybrid_provider_test.zig",
@@ -807,9 +888,9 @@
     {
       "path": "zig/src/families/glm/cuda_hybrid_schema.zig",
       "mode": "100644",
-      "blob": "adbc7789fcec32f88d84af29f71bae0432f6b743",
-      "sha256": "6bfdfcf708525e41909774b6d1f608dffddffa563367c1e9377e8a55fc147be8",
-      "bytes": 6715
+      "blob": "1e37f29585c69aefcb7db8c481541cf4a6f111a5",
+      "sha256": "132b08b48d8cebff24c98c8a15f1f6eaee6ae994390fbe28088c8fbea18b255b",
+      "bytes": 6728
     },
     {
       "path": "zig/src/families/glm/cuda_hybrid_transport.zig",
@@ -828,23 +909,23 @@
     {
       "path": "zig/src/families/glm/cuda_hybrid_users.zig",
       "mode": "100644",
-      "blob": "69d0be4552e2ce9bba783f39cd2bbc2e0e3d41d9",
-      "sha256": "3cfc6343e7d6284cd9d53253e0d9495b3d1e8bcb52cae5bf4cd23dfc018ccf94",
-      "bytes": 3834
+      "blob": "6c2c1d88ab5da14c98ec946b5d091ab36c2a32e2",
+      "sha256": "da502692e4973b17112cd92579c1622b54122d2be44d37fadeda7f93e5243685",
+      "bytes": 3867
     },
     {
       "path": "zig/src/families/glm/cuda_hybrid_v3.zig",
       "mode": "100644",
-      "blob": "4e642eac927d970182364d9ac5d85b637a921416",
-      "sha256": "b4ef78e1adfa50de66713208d02b5e068fd3b4d397af68423cf753c64ecfa0e9",
-      "bytes": 10620
+      "blob": "9fd604a5eaa1762f38ab1a9bf43186d66af0f651",
+      "sha256": "00de0dbc89ed55c77c94d3e8ede918d9b9367462e59296191d9ff597d16384cd",
+      "bytes": 10627
     },
     {
       "path": "zig/src/families/glm/cuda_hybrid_v3_expert.zig",
       "mode": "100644",
-      "blob": "e4d7a24bd3cc02154d97c6c0d37f2d6230cd770d",
-      "sha256": "78301aa8d5824f411a0b0ee748cded15960e1dd5f9ce168b808e72acef6a9beb",
-      "bytes": 7951
+      "blob": "db01f9c00c851128413322ec3833d92f05b44de7",
+      "sha256": "e761244506ae0ada427781d979344b7025792eb2df1b65ad163fa61d3b69f54c",
+      "bytes": 7958
     },
     {
       "path": "zig/src/families/glm/cuda_hybrid_wire.zig",
@@ -856,9 +937,9 @@
     {
       "path": "zig/src/families/glm/cuda_kv_host.zig",
       "mode": "100644",
-      "blob": "0f1e5fe7fbca5c9315a25a43017d736766046264",
-      "sha256": "6f31872805667b6d540e95617eabf2449e0b0c2a8b2b16ffb944fd52138fbed3",
-      "bytes": 17518,
+      "blob": "1a2a1cd7835ec704356fb7795b9b05bfa0c23360",
+      "sha256": "61e72f4f826b5fc9fb6e0ffea8316492046a1e239776d600f92271c94648784f",
+      "bytes": 17528,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -871,9 +952,9 @@
     {
       "path": "zig/src/families/glm/cuda_lane_costs.zig",
       "mode": "100644",
-      "blob": "22b1955cd3ba65a6ac2ec2d8c2ccd4e98b79a32f",
-      "sha256": "6954d0988322ff263ebb5b1aeb42481c4e5c68405dfe71330fde7e41a380487a",
-      "bytes": 17976,
+      "blob": "6928f0386eb934a9944e96eb66896ba9ab4bd194",
+      "sha256": "cbb8357d4ad9fd324203b0081ce325964842c31f461145f1c2b6e18cc24d2068",
+      "bytes": 17986,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -886,9 +967,9 @@
     {
       "path": "zig/src/families/glm/cuda_lanes.zig",
       "mode": "100644",
-      "blob": "7a1714bcf83055324eb17d4aed0ab73de5e6e0c4",
-      "sha256": "78a1bec9e67c9b6eadb9f8ae69287cabaa2bf1dd9a266604e783ba630eda010a",
-      "bytes": 32619,
+      "blob": "c1db7e1e6aa728f9447fcacf9fa2b85164fee5dc",
+      "sha256": "92669dc47473d0ab083b5e92be629ed0fd4dbd7a6694cc015b42a17112204ee8",
+      "bytes": 32703,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -901,9 +982,9 @@
     {
       "path": "zig/src/families/glm/cuda_latent.zig",
       "mode": "100644",
-      "blob": "aefe94194cc298ec913c68f103cbb679f8727a5c",
-      "sha256": "edbedaecdeb84edab3a2d0d35f902928df3291f50a059c256493134ea125e54c",
-      "bytes": 8906,
+      "blob": "1e0b942363edb806cc604f37d1b3b643f3ce840a",
+      "sha256": "f859369f7de61a822ddbd931c56ae0a02295e33526bd5477448fc1db5de4a5d1",
+      "bytes": 8916,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -916,9 +997,9 @@
     {
       "path": "zig/src/families/glm/cuda_moe.zig",
       "mode": "100644",
-      "blob": "19e6665762f2deddb0f6211f179e2a3ce28d1425",
-      "sha256": "535b9ea139dd9b627d5f8f67554602c93b1538769a8df41e01177da05490e7f4",
-      "bytes": 6061,
+      "blob": "650410f3f8d47783e9c3ee3a26c8aa82f1e06937",
+      "sha256": "af30fa7715aade4013ba2ba67731be992f552abe651ffe909e9d7e4e3347e436",
+      "bytes": 6071,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -931,9 +1012,9 @@
     {
       "path": "zig/src/families/glm/cuda_native.zig",
       "mode": "100644",
-      "blob": "a08b9e52ef71a2dec891333ebcd269ada3c6f175",
-      "sha256": "5b40a13f07665e2b375e553ac872a80d08b1a4343058b23de7bbd990308bf947",
-      "bytes": 54010,
+      "blob": "59b78db730cc67d2a6046a61108c33cb6614ea6b",
+      "sha256": "2780d7c061e7681f5554a9063a388e9cb80437c43f98d3bea868ef93b38ad412",
+      "bytes": 58734,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -946,9 +1027,9 @@
     {
       "path": "zig/src/families/glm/cuda_pages.zig",
       "mode": "100644",
-      "blob": "f1121edd70fd445d0f6ef148e19518cbccc5116c",
-      "sha256": "527969e440faced0666525768d9ca54c15bd2886c7e59912a802f69559b736af",
-      "bytes": 13737,
+      "blob": "697c9141b49514eba8fc32e23cfbc88f02837232",
+      "sha256": "a90cd168dd31916d135b53911c43badc0565ee8e00dafe5029ebd415c33b5ad1",
+      "bytes": 13791,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -959,18 +1040,25 @@
       }
     },
     {
+      "path": "zig/src/families/glm/cuda_precommit_memory.zig",
+      "mode": "100644",
+      "blob": "ac6350463a32ef00a3f6e9de0137b6c6987b456c",
+      "sha256": "e36c28ae3b3a793dc297e5b366ac419303f5981aa017fc4e15d3aafcdf282346",
+      "bytes": 10786
+    },
+    {
       "path": "zig/src/families/glm/cuda_prompt_lanes.zig",
       "mode": "100644",
-      "blob": "b583bb052e5d76012bd13aac2a8a2649b3e0917b",
-      "sha256": "f04b8a35e625541ecee434c4192c44a7fc426dc7af98511c01b6041e25a1b102",
-      "bytes": 3867
+      "blob": "08ceb6d1f29bb1a0241b56090d54693f73d38af9",
+      "sha256": "40cc141085d2785af4d06c7b7f42b5150a3638097a4c96cf09b5411641d239e5",
+      "bytes": 3876
     },
     {
       "path": "zig/src/families/glm/cuda_prompt_pair.zig",
       "mode": "100644",
-      "blob": "875f57fc18e71a9033178f4e108afef84e29656b",
-      "sha256": "1cb53689e3340fb1a192c3bf223611c5bf94e7d04909ddc35a95401f12c7f9a1",
-      "bytes": 10514,
+      "blob": "e36619972100991ba48d58cacc3d714e58420ac4",
+      "sha256": "273cf20c001f94abe5470dca7ea8c1fe1f5f64e0ed0f260989e66dda83806293",
+      "bytes": 10524,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -983,16 +1071,16 @@
     {
       "path": "zig/src/families/glm/cuda_qualify524.zig",
       "mode": "100644",
-      "blob": "0a5c48e8c797c385f523390043dddd2ae2955808",
-      "sha256": "6a8b7c319cb2fd002a66c224f8f8f0a74a3e9f620cb64b279e76d16df397db21",
-      "bytes": 3970
+      "blob": "244e6eca2b3df43cab717a46cc57c44fb96b9406",
+      "sha256": "2a9be704fd13d82dbc9b98f38dcceae10cc37bd3848e922445a9ddd9edba21be",
+      "bytes": 4176
     },
     {
       "path": "zig/src/families/glm/cuda_ranks.zig",
       "mode": "100644",
-      "blob": "4287c0d3f18ba706da68cbe84b48007e4adcfb36",
-      "sha256": "453482623649c1f67daacae691434b06e2807495d8f7038b5dbbb47dbdde923a",
-      "bytes": 23909,
+      "blob": "e8741dc076a42dfd767128a0e13a19bde559dfc1",
+      "sha256": "92ef28e54fd92fbe3047760f47a120be56eb506e27af527f8ef40d19fd713fe6",
+      "bytes": 23926,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -1010,11 +1098,18 @@
       "bytes": 6372
     },
     {
+      "path": "zig/src/families/glm/cuda_serving_admission.zig",
+      "mode": "100644",
+      "blob": "7e0bbfafc764a6889f0f09f7a062ddba37a4d917",
+      "sha256": "eda26f761295a7e65d06e3ffd9f9a078d0792e2567e6b60a9d35f8aa1c3d4d2d",
+      "bytes": 2148
+    },
+    {
       "path": "zig/src/families/glm/cuda_snapshot_pages.zig",
       "mode": "100644",
-      "blob": "189766b8e60c7a467f34070139ca7ebb6d92fbdf",
-      "sha256": "4129456ae1bdc03cfd1b83a77bd1ca34c7339df1fb00e89d55223aa7dde752be",
-      "bytes": 3972,
+      "blob": "a27ccb82107de640c12dfd6e9d66af62c54efc11",
+      "sha256": "bfbb39a913a924bb4357c708c335a92322a7e73fc2333d2b6151cc290b29e6ae",
+      "bytes": 3982,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -1027,9 +1122,9 @@
     {
       "path": "zig/src/families/glm/cuda_state.zig",
       "mode": "100644",
-      "blob": "1b48ad74eb107983bd5ffbf2124292c8012d5fb7",
-      "sha256": "bf8049352dd22cbc23a963b4673a36838c98117fdcab4d52aba05bb2ded4cbcc",
-      "bytes": 30134,
+      "blob": "d07a55f47cd8cea3815dfba1989622e56b799d32",
+      "sha256": "4906dbca5306b1100ed5403d57b1f36da8deb27e22dbde95f3657dfd381ede79",
+      "bytes": 30144,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -1042,9 +1137,9 @@
     {
       "path": "zig/src/families/glm/cuda_tile.zig",
       "mode": "100644",
-      "blob": "3ae1b5ef5efcbed022a56256ed11a02d98da942d",
-      "sha256": "4f8c9dc8629ba526634871393c37ff78d961782c83d95c17c08701a65f2f749f",
-      "bytes": 14405,
+      "blob": "b1f1b01023038e678d0db03ef723cac7087865ea",
+      "sha256": "bd051c77ada601bd8bead97a54f2a18fd6bcfef9efbdf00eef644a9a7e2eb569",
+      "bytes": 14415,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -1064,9 +1159,9 @@
     {
       "path": "zig/src/families/glm/cuda_weights.zig",
       "mode": "100644",
-      "blob": "5f1e7e0380591d6d8988e9adb6307ce9cad2f7d4",
-      "sha256": "46e90ef6d7e88ae2156c8ac2e4ffe128ad01d92c1efae79f65b1be7f9e872d6c",
-      "bytes": 39388,
+      "blob": "188a47bc3798437824c184ce8d3390a23ac78019",
+      "sha256": "59c5dd5b9bfd2ebcb8bdb62c97e4a20955855a3ae278088d0996f0817ace9f4e",
+      "bytes": 39405,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -1077,18 +1172,48 @@
       }
     },
     {
+      "path": "zig/src/families/glm/dflash.zig",
+      "mode": "100644",
+      "blob": "7ea84840ec51aed951fa62f6450cd20f164ee298",
+      "sha256": "c6bc178b8f2ffbe01b1ea8e9ee99ad58151be6964bac3664f784febf34020cd6",
+      "bytes": 16564,
+      "base": {
+        "mode": "100644",
+        "kind": "blob",
+        "blob": "aa039ffc299d13b357ef8033a92dfa8d4460a45a",
+        "sha256": "0cfe94f80706bc78b52f53d4cf3097d1b8370a2e99e085b9174be2ff29bc6b50",
+        "bytes": 15310,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/dflash.zig"
+      }
+    },
+    {
+      "path": "zig/src/families/glm/dflash_select.zig",
+      "mode": "100644",
+      "blob": "b1d73e9049e9866822b3b4da8157db7f504cf1c9",
+      "sha256": "dca6522a6d9dae8b977698d32dd7ccbdc18e06ad91e996d6c6fdffd02047a1b6",
+      "bytes": 2575,
+      "base": {
+        "mode": "100644",
+        "kind": "blob",
+        "blob": "996398e1d812dc011ac90a812777ca25ab6d4c44",
+        "sha256": "c63912e042bb7e262e9e1098948ee8b0cb4c23c0247617e20f68b08fe9a7ce91",
+        "bytes": 2327,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/dflash_select.zig"
+      }
+    },
+    {
       "path": "zig/src/families/glm/i1/counter258.zig",
       "mode": "100644",
-      "blob": "5b5d8bc035d1ddbfa13549d8695a5a6bf3531990",
-      "sha256": "699c637f876ac21deee3894ac84fe5ccfaa294ff6ac348aab681925458c76a18",
-      "bytes": 3501
+      "blob": "fcceafc46448ae0ffdd01f8fd05b96e43f2c02db",
+      "sha256": "da164d343d1a0674c9b52247ada3bfb98fdde7aa37bc5e56d06cc8d673ba729d",
+      "bytes": 3508
     },
     {
       "path": "zig/src/families/glm/i1/dense257.zig",
       "mode": "100644",
-      "blob": "7b824e5d6d06630be2138d8e6c0e85fa52b4ab4b",
-      "sha256": "7dac2f5f8b975bca3fbbfbd1b47d4a52a4342a49a24d298199f64146933071cc",
-      "bytes": 2978
+      "blob": "8982f8fc73cf64b6d7bed889940780054998dcc6",
+      "sha256": "1b4e6bd0edaeaf32e528518d514835cde6db16eac007e0d3d011ac60ff6bce1f",
+      "bytes": 2985
     },
     {
       "path": "zig/src/families/glm/i1/device210.zig",
@@ -1100,44 +1225,44 @@
     {
       "path": "zig/src/families/glm/i1/expert_owner212.zig",
       "mode": "100644",
-      "blob": "8a772c48977bcb0fecd90411c879c2f98206d238",
-      "sha256": "89964032c92c9aca9342bbfa2df965d5371535125fc24268c8859a19b4503df0",
-      "bytes": 4904
+      "blob": "ee182c7e27868da2fc9720c82e58a7a7135ed20c",
+      "sha256": "92abf998203e92333590f913a5216fe7aa5a5a8aa90e08cd0359fb9bcce055cb",
+      "bytes": 4911
     },
     {
       "path": "zig/src/families/glm/i1/header283.zig",
       "mode": "100644",
-      "blob": "95dbc1049cbfd70fcf678521e4578800406a0e90",
-      "sha256": "8cd6160557cd598ecde908db7183f8ff908548d8c3c54441f0359005facf6d0e",
-      "bytes": 6378
+      "blob": "5128a53fc5864e8a23746c99dc1b5f79169566de",
+      "sha256": "c219acafd767e493e2de28df309cb9290b6c1e619ab13e38a660edf8e513a993",
+      "bytes": 6385
     },
     {
       "path": "zig/src/families/glm/i1/lanes214.zig",
       "mode": "100644",
-      "blob": "cfedf335b96781350fb670beb9616d88a79d120f",
-      "sha256": "095ec173c4b25a536ea3642a398e88808b725768b8e576786de1d685e6cb780d",
-      "bytes": 2269
+      "blob": "f8ee6200397b74c792dcef869fbae7cf9914b64f",
+      "sha256": "140ebcde2fa3162241d6dfc7ad8cf7308c3afec42e21256427fd777a12a548d9",
+      "bytes": 2276
     },
     {
       "path": "zig/src/families/glm/i1/mtp218.zig",
       "mode": "100644",
-      "blob": "33200463f3f168ac9ded79c650257822d65e8cea",
-      "sha256": "47e1cac75da33f53f65061ad0eb879143e1e3829dcd04bf21894c98a1d46ba27",
-      "bytes": 6498
+      "blob": "d3c882d2cf9008faa98b4d910c0ea4b3aa30b07b",
+      "sha256": "7e9adf1050f8725a40fc7a815d7febb212a4ec24b66e05f62c989efada9f5e5b",
+      "bytes": 6505
     },
     {
       "path": "zig/src/families/glm/i1/ping216.zig",
       "mode": "100644",
-      "blob": "f3e81076cb17396a1455927136796170706b78f3",
-      "sha256": "18979e27dd5dc1b3bb4958b63a8af52c0529020134889551e13d2d163895fe39",
-      "bytes": 1329
+      "blob": "003a19269eff26d293b3c4d603c6c8533ffdffd9",
+      "sha256": "d7319cd6f170e2a971fe45256628edcb3e436779d458ab3ed821996763541fe9",
+      "bytes": 1336
     },
     {
       "path": "zig/src/families/glm/i1/prompt215.zig",
       "mode": "100644",
-      "blob": "ea52c56d3698e5b690b6abc3c660b1b1bd4a3827",
-      "sha256": "641a330bbefcde09f82c7a5cfe484af7dc320405384eba57b1be444e4e5b1c90",
-      "bytes": 4137
+      "blob": "468a597536ac1617364f46cded1813afb7dcf1d2",
+      "sha256": "9f027f1c3b14ff6fe2dd2b501ff1088602d9f3f006d168b06b5b737feedc1c3b",
+      "bytes": 4144
     },
     {
       "path": "zig/src/families/glm/i1/repairs262.zig",
@@ -1149,23 +1274,23 @@
     {
       "path": "zig/src/families/glm/i1/rotation281.zig",
       "mode": "100644",
-      "blob": "b10c589c161898ec78554b443825b5585215f9a6",
-      "sha256": "4e78c958b7849b382e747fbad8f21910b985c0a903bde84a44b90d106e5e1556",
-      "bytes": 3578
+      "blob": "d973ea80f4fa408d0c8089727c2b86af0e1ae41e",
+      "sha256": "c1df6c0b0e4c8c720c0d0220a1e633c296f6f8d84919cf767f6339c6b19dc2f9",
+      "bytes": 3585
     },
     {
       "path": "zig/src/families/glm/i1/test210.zig",
       "mode": "100644",
-      "blob": "d41fa870c98f3b9479eb81ce3ce9f34d421e996c",
-      "sha256": "930ae12be10557e3c08ba55ac9a594cbbc70c98c9cce4d55b4b8a985eb78ec93",
-      "bytes": 24851
+      "blob": "cd38776229c2d11bdcdc2d6981a41d9bd35e9cd5",
+      "sha256": "0fb4bd94c1a7c11b228b0a683756516da0dc8c5202b956230e62b8df697a7944",
+      "bytes": 24858
     },
     {
       "path": "zig/src/families/glm/i1/users217.zig",
       "mode": "100644",
-      "blob": "383dd4801fb77674c30f8625218dedf7a3b0652d",
-      "sha256": "47d9da650d9b635e82b71f99db5316c32fb18788005abe40b7e03a4a35676beb",
-      "bytes": 2948
+      "blob": "d691f7fb9257b0c1d72faeb0674236da705580dd",
+      "sha256": "0b673bd97bfad50e7738a5a6b89a0898a548d35b11b1f5e4b53b51262a17eeb8",
+      "bytes": 2955
     },
     {
       "path": "zig/src/families/glm/k1_mtp_test.zig",
@@ -1177,9 +1302,9 @@
     {
       "path": "zig/src/native/cuda.zig",
       "mode": "100644",
-      "blob": "287da7288fea7132187ea49ea43e6848fac08f80",
-      "sha256": "ac2729247ed8c7b9f904a4a9da353d575edb0d4d0667670e473ef1e96a7906b9",
-      "bytes": 34281,
+      "blob": "0c8d3190e2e7a4081da4e90c8b65ba9ba7e89a03",
+      "sha256": "a5d44bdef75fe189a0cc436fbef3f7d6462db35e13ed880f08ba59add4f36a56",
+      "bytes": 34458,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -1192,9 +1317,9 @@
     {
       "path": "zig/src/native/cuda_family_memory.zig",
       "mode": "100644",
-      "blob": "a90b09e41a26478817a975a4c141f60224f47f5c",
-      "sha256": "a215097239a534eaaf1f1ea3aa9e7c605e557c2ff39df801f840025da1d395c5",
-      "bytes": 7175,
+      "blob": "31bf2dd55497f97bf6ad3db7a2320f51be0493e9",
+      "sha256": "5dc038ec3d3a518832c6b375806b1977a3ef50f2fc9b281a2aef46b383527736",
+      "bytes": 7185,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -1207,9 +1332,9 @@
     {
       "path": "zig/src/native/cuda_host_close.zig",
       "mode": "100644",
-      "blob": "36d3b9c1f1f21d28e7168a0b7d61c4509a7997fd",
-      "sha256": "41119c97e53a7779c9089bd6d65da152507870ec2e61518a50e371b81c2a28ba",
-      "bytes": 4640,
+      "blob": "65cdb16ca0a50776886f8747815192a7bf0e406e",
+      "sha256": "1e32f5700c8a44cc66d7c684e914b36b620e754348dfd71bbd94c146cefb27fd",
+      "bytes": 4650,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -1222,9 +1347,9 @@
     {
       "path": "zig/src/native/cuda_load_gpu.zig",
       "mode": "100644",
-      "blob": "f0331217c2b1ff6d2acf7a194fb4c3c117d8d52d",
-      "sha256": "0fcca61cffbc9b454c6a1646dd17eca893c474498915e481084f99b9c010a9eb",
-      "bytes": 17646,
+      "blob": "7fb890348c176624cc661ca965f8dae9a2f9878b",
+      "sha256": "5841d1e1da29b10f0732838eba469bdb2ea29d0a42827d56edadffa532a76436",
+      "bytes": 17656,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -1237,9 +1362,9 @@
     {
       "path": "zig/src/native/cuda_options.zig",
       "mode": "100644",
-      "blob": "6fa7bf8cf947edc097e0f65d61195cd76c84e101",
-      "sha256": "875ba37041c519e6e2a865cb551f8c2d9f58334c504347165bd0be2222ac336c",
-      "bytes": 6792,
+      "blob": "a11516b3eb8858ab9704d6c51c29f0c92f624c69",
+      "sha256": "bc89c464e18a11ccf4515065d6024791d7ad7275138dcb5ffb4fdb15b257f986",
+      "bytes": 6802,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -1252,16 +1377,31 @@
     {
       "path": "zig/src/native/cuda_retained_exit.zig",
       "mode": "100644",
-      "blob": "30fce43f7ba2acaab1a5601d2bcd5bcb214ef63b",
-      "sha256": "4fb264d4dd7f915739eab6a1955285e96ed3f7226c135a9dee77589cb8e10b13",
-      "bytes": 765
+      "blob": "19e6b03896442702817ac1d4f85e65ca11dea68e",
+      "sha256": "a5554ec1cc3aa4472be08abd0b07aa630a3494089d4babca684c83807f6aa0f5",
+      "bytes": 772
+    },
+    {
+      "path": "zig/src/native/cuda_startup_phase.zig",
+      "mode": "100644",
+      "blob": "413896b067713efb5826edcf3affae74858818d2",
+      "sha256": "ed37c5f107f617b4d60d8c9699167ac6193fb93f954097b43ce8c19044d14ffb",
+      "bytes": 2925,
+      "base": {
+        "mode": "100644",
+        "kind": "blob",
+        "blob": "6a680b3efb5fc0b4e05fbc90da97e95d90fdead4",
+        "sha256": "98f2fd038853c4e56c2187f7a662e2d5ceeb3c4856cd5e1981fe91c384526964",
+        "bytes": 2596,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/native/cuda_startup_phase.zig"
+      }
     },
     {
       "path": "zig/src/native/none.zig",
       "mode": "100644",
-      "blob": "12ba76811ed72cb3048560e86807d5f4d485a7c4",
-      "sha256": "a7f705646fdceb2f0bdb52570d084f9722df16a3d0985f56001505fffd7ac50b",
-      "bytes": 1220,
+      "blob": "86bdfe4184910316a1bdff99574d1090cb4eefb8",
+      "sha256": "1d597705671c1eb3d2b3a4106b21677ca2114343130f864a5b4b54a4796fe11b",
+      "bytes": 1230,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -1272,11 +1412,26 @@
       }
     },
     {
+      "path": "zig/src/platform/environment.zig",
+      "mode": "100644",
+      "blob": "3f18848e5268f2804ab68f669acfe4b29e4152cd",
+      "sha256": "ade44cd5ca315315b8733e16146518f24c17e966088d850dce4349b56fddf6f7",
+      "bytes": 42262,
+      "base": {
+        "mode": "100644",
+        "kind": "blob",
+        "blob": "aadc2fbd99b58131fc9cab471fb9221e3dbbc840",
+        "sha256": "4113873bfe5ebd42d084640e847334ed7d1a603b2f2e649c5a128fc4780f79e3",
+        "bytes": 38673,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/platform/environment.zig"
+      }
+    },
+    {
       "path": "zig/src/server/engines.zig",
       "mode": "100644",
-      "blob": "7c59ce55d382fc067d9c721f0c61a6788acb2d02",
-      "sha256": "3d2044d1a8c2154eafbf96b5330ac1d9d97f187cbd53fe3a1b8c32b95d671d06",
-      "bytes": 5848,
+      "blob": "e55f1613fc823183bd3c5e8db2060f02d405e290",
+      "sha256": "003c15d80c00c2d5d73b38745fd4ca603f2ecf1bf2b426fbf605615c8328d9f8",
+      "bytes": 5858,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -1287,11 +1442,26 @@
       }
     },
     {
+      "path": "zig/src/server/load_metrics.zig",
+      "mode": "100644",
+      "blob": "c6aa688c3f83a4a4c91eea7573f96219e54c99a1",
+      "sha256": "13fa1ea85ade328bcb1edb26b51b0995071fae24b6890ffb36790bb201b549b7",
+      "bytes": 11229,
+      "base": {
+        "mode": "100644",
+        "kind": "blob",
+        "blob": "b37f610138a595d7616e22c737b2f424c5fae670",
+        "sha256": "a038a012498eca37d605d7186e67d81d8a779cf138871838f2180d0abae6e510",
+        "bytes": 10556,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/server/load_metrics.zig"
+      }
+    },
+    {
       "path": "zig/src/server/main.zig",
       "mode": "100644",
-      "blob": "8ec51ffbb5da32a636327ff54033354d652d2dd7",
-      "sha256": "4cada6bf13f95f1b47f6bdfd6628095bba7bd1ab9ed8af1c0145d63c9f12999c",
-      "bytes": 20107,
+      "blob": "f59623a1e9ee4546b9f2a7468a8a079488ae0046",
+      "sha256": "e67d0cc7c9b48fbda50e55b4b81f04d817d35111b365dd593b26453e247b1f6d",
+      "bytes": 20124,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -1304,9 +1474,9 @@
     {
       "path": "zig/src/server/serve.zig",
       "mode": "100644",
-      "blob": "3fd78846d47358c93d0bb04c9422ce8ddf1d315b",
-      "sha256": "77892c1de521cdf3196a22f40cdd44175866500c1a4500f6957f5f24fd3b9768",
-      "bytes": 27524,
+      "blob": "8d79d80f7bb3f2b8c69f5be193d16e4cf08d349b",
+      "sha256": "ce43c564f17c9e9901d914177552cc231c248a83fc1d899fdf0b741bb0bc11fc",
+      "bytes": 27534,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -1319,9 +1489,9 @@
     {
       "path": "zig/src/server/startup.zig",
       "mode": "100644",
-      "blob": "8f296b521bc706176f29cf48667c756baf2e64a9",
-      "sha256": "a365288b96813a6b64dfdfc05fbd8d4deb78f9453f554658539c60e78d0a6608",
-      "bytes": 10443,
+      "blob": "7b34d0a22ba20a1b1381d560e11af6f468ba7872",
+      "sha256": "a0d0c9342e9467a0b2956dddcdcb622298b3e8f78071f17baf1da4c20b13e4d7",
+      "bytes": 10460,
       "base": {
         "mode": "100644",
         "kind": "blob",
@@ -1329,30 +1499,6 @@
         "sha256": "ef75d63bc55fe877940699aa2df3367754a2419b0b8d9d39c8a27ac95676fd31",
         "bytes": 3784,
         "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/server/startup.zig"
-      }
-    },
-    {
-      "path": "LICENSES/glm53f-afd-MIT.txt",
-      "mode": "100644",
-      "blob": "99cfbccee8d0982ef1fc103615a4dd107264fe40",
-      "sha256": "bcf2864b2403249319c65320d79c708236f6fd46c61eee568a52ac1e8816e8fa",
-      "bytes": 1081,
-      "grant": {
-        "url": "https://raw.githubusercontent.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/9e1590000788254ee4f827524781b0a06421cb84/LICENSES/previous/glm53f-afd-MIT.txt",
-        "sha256": "bcf2864b2403249319c65320d79c708236f6fd46c61eee568a52ac1e8816e8fa",
-        "bytes": 1081
-      }
-    },
-    {
-      "path": "LICENSES/glm53f-afd-LICENSE.tensorfold.txt",
-      "mode": "100644",
-      "blob": "a8e21673dd7b84698ff4a30cd5b8015771f2f367",
-      "sha256": "be6a9ee4462784a762b21790954b8e76c4dcacc9fb6da2a40d03a8a9bddec93e",
-      "bytes": 1080,
-      "grant": {
-        "url": "https://raw.githubusercontent.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/9e1590000788254ee4f827524781b0a06421cb84/LICENSES/previous/glm53f-afd-LICENSE.tensorfold.txt",
-        "sha256": "be6a9ee4462784a762b21790954b8e76c4dcacc9fb6da2a40d03a8a9bddec93e",
-        "bytes": 1080
       }
     },
     {
@@ -1378,7 +1524,31 @@
         "sha256": "af31508392aec270f2bf1f322fc9eb3b00005584afc782051172907a43332f1a",
         "bytes": 5568
       }
+    },
+    {
+      "path": "LICENSES/glm53f-afd-LICENSE.tensorfold.txt",
+      "mode": "100644",
+      "blob": "a8e21673dd7b84698ff4a30cd5b8015771f2f367",
+      "sha256": "be6a9ee4462784a762b21790954b8e76c4dcacc9fb6da2a40d03a8a9bddec93e",
+      "bytes": 1080,
+      "grant": {
+        "url": "https://raw.githubusercontent.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/9e1590000788254ee4f827524781b0a06421cb84/LICENSES/previous/glm53f-afd-LICENSE.tensorfold.txt",
+        "sha256": "be6a9ee4462784a762b21790954b8e76c4dcacc9fb6da2a40d03a8a9bddec93e",
+        "bytes": 1080
+      }
+    },
+    {
+      "path": "LICENSES/glm53f-afd-MIT.txt",
+      "mode": "100644",
+      "blob": "99cfbccee8d0982ef1fc103615a4dd107264fe40",
+      "sha256": "bcf2864b2403249319c65320d79c708236f6fd46c61eee568a52ac1e8816e8fa",
+      "bytes": 1081,
+      "grant": {
+        "url": "https://raw.githubusercontent.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/9e1590000788254ee4f827524781b0a06421cb84/LICENSES/previous/glm53f-afd-MIT.txt",
+        "sha256": "bcf2864b2403249319c65320d79c708236f6fd46c61eee568a52ac1e8816e8fa",
+        "bytes": 1081
+      }
     }
   ],
-  "patch_sha256": "2a1984d6d8b5bfb9547ac994a3389778f5a1c8a5870ec6c760f0be6d32534e2c"
+  "patch_sha256": "94eaf638b7ae2506869625967f2d26848110da86878db675678cc858c4133183"
 }

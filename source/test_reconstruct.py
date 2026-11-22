@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline reconstruction guard tests. Requires the already verified public input cache."""
 from pathlib import Path
-import argparse, copy, importlib.util, json, tempfile
+import argparse, copy, importlib.util, json, os, tempfile
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('source_reconstruct', HERE / 'reconstruct.py')
@@ -17,7 +17,7 @@ def main():
     a = ap.parse_args()
     original = json.loads((HERE / 'source-lock.json').read_bytes())
     results = []
-    cases = ['positive', 'changed_patch', 'traversal', 'duplicate', 'moving_input_ref',
+    cases = ['positive', 'restrictive_umask', 'changed_patch', 'traversal', 'duplicate', 'moving_input_ref',
              'unsupported_mode', 'actual_mode_mismatch', 'patch_path_omission', 'corrupt_cache']
     for case in cases:
         with tempfile.TemporaryDirectory(prefix='source-test-', dir=a.scratch) as tmp:
@@ -53,14 +53,18 @@ def main():
                 (cache / first['sha256']).write_bytes(b'not-the-pinned-source')
             lp = p / 'lock.json'
             lp.write_text(json.dumps(lock))
+            positive = case in ('positive', 'restrictive_umask')
+            previous_umask = os.umask(0o077 if case == 'restrictive_umask' else 0o022)
             try:
                 result = m.reconstruct(lp, patch, p / 'out', cache, False)
-                assert case == 'positive', 'negative control unexpectedly passed: ' + case
-                assert result['files'] == 133
+                assert positive, 'negative control unexpectedly passed: ' + case
+                assert result['files'] == len(original['files']) == 147
                 results.append({'case': case, 'pass': True, 'files': result['files'], 'apply': result['apply']})
             except ValueError as error:
-                assert case != 'positive', str(error)
+                assert not positive, str(error)
                 results.append({'case': case, 'pass': True, 'refusal': str(error)})
+            finally:
+                os.umask(previous_umask)
     a.receipt.write_text(json.dumps({'status': 'PASS', 'tests': len(results), 'results': results}, indent=2) + '\n')
     print(json.dumps({'status': 'PASS', 'tests': len(results), 'cases': [x['case'] for x in results]}, indent=2))
 

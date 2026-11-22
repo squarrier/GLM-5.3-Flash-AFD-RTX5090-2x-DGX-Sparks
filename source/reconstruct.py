@@ -5,7 +5,7 @@ import argparse, concurrent.futures, hashlib, json, os, re, stat, subprocess, ur
 
 HERE = Path(__file__).resolve().parent
 MAX_FILE = 2 * 1024 * 1024
-MAX_FILES = 140
+MAX_FILES = 160
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
@@ -93,8 +93,10 @@ def reconstruct(lock_path, patch_path, output, cache, fetch):
     env.update(GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1', GIT_OPTIONAL_LOCKS='0')
     applies = []
     for extra in (['--check'], []):
+        # Git recreates changed files. Set its umask for the pinned modes;
+        # the reconstruction root itself is created with mode 0700 above.
         q = subprocess.run(['git', 'apply', *extra, str(patch_path.resolve())], cwd=output,
-                           env=env, capture_output=True, timeout=30)
+                           env=env, capture_output=True, timeout=30, umask=0o022)
         applies.append({'check_only': bool(extra), 'exit': q.returncode,
                         'stdout': q.stdout.decode(), 'stderr': q.stderr.decode()})
         if q.returncode:
@@ -127,7 +129,7 @@ def reconstruct(lock_path, patch_path, output, cache, fetch):
         if blob != row['blob']:
             raise ValueError('output Git blob mismatch: ' + row['path'])
         checked.append({'path': row['path'], 'sha256': digest(data), 'blob': blob, 'mode': row['mode']})
-    return {'status': 'RECONSTRUCTION PASS; NOT A BUILD', 'scope': '129 implementation paths plus four grant/notice aliases; not full TensorFold or a build',
+    return {'status': 'RECONSTRUCTION PASS; NOT A BUILD', 'scope': '143 implementation paths plus four grant/notice aliases; not full TensorFold or a build',
             'lock_sha256': digest(lock_path.read_bytes()), 'patch_sha256': digest(patch),
             'files': len(checked), 'apply': applies, 'checked': checked}
 
