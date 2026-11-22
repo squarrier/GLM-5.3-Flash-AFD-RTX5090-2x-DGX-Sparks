@@ -58,7 +58,7 @@ def main():
             try:
                 result = m.reconstruct(lp, patch, p / 'out', cache, False)
                 assert positive, 'negative control unexpectedly passed: ' + case
-                assert result['files'] == len(original['files']) == 147
+                assert result['files'] == len(original['files']) == 148
                 results.append({'case': case, 'pass': True, 'files': result['files'], 'apply': result['apply']})
             except ValueError as error:
                 assert not positive, str(error)

@@ -1787,3 +1787,12 @@ Inco AI authored the external GLM-5.3-Flash-DFlash2 checkpoint at https://huggin
 Additional V4.2 modification: the GLM allocation planner reserves one extra row before alignment; the 32-row verification width is unchanged. The overlay includes the matching startup and page-planner call sites and ceiling-validation tests. This change does not add a page to the measured 420K pool.
 
 Mia authored the attribution guide retained as AGENTS.md. All inherited author and license records remain. Original extraction revisions listed in the README remain unresolved. The source overlay does not establish redistribution rights for separately obtained dependencies or build outputs.
+
+
+## V4.2 TensorFold v1.3.3 successor — current source scope
+
+This supplement supersedes prior base-version and output-membership statements for the current overlay only. Ash Hart (@ashhart; https://github.com/ashhart) and TensorFold contributors authored TensorFold v1.3.3 at https://github.com/ashhart/TensorFold/tree/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc under Apache-2.0 with retained older/per-file/nested terms. Current immutable grants/notices are in source/upstream/; the former v1.3.0 third-party notice is retained in source/v42-notices/.
+
+Changes by Scott Quarrier with GPT-6.1 Sol / OpenAI Codex via Hermes: adapt the existing public V4.2 hybrid GLM source to v1.3.3 interfaces and add the exact-context request-opening/page-planner CPU fixture. The current lock describes 144 implementation paths and four grant/notice aliases. The selected sealed port already incorporates public comment/diagnostic and cache-namespace normalizations; no new native build of this public package is asserted. Source identity is distinct from binary/bit parity and from hardware qualification.
+
+All prior author credits, Apache and MIT grants and third-party notices remain applicable. Mia authored the retained selector guard, transport work and attribution guide; Z Lab authored DFlash. Their original roles and source boundaries are unchanged. Unknown original revisions in README require a new exact-release disposition; earlier owner exceptions do not authorize this head. No weights, Q4 derivative, compiled CUDA assets, executable, raw benchmark receipt, private configuration or credentials are supplied. External DFlash2 CC BY-NC-ND restrictions and the absence of a derivative redistribution grant remain as described above.

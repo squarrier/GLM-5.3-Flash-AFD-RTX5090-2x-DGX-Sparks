@@ -1,37 +1,37 @@
 {
   "schema": 1,
-  "status": "draft reconstruction only; not a qualified build",
-  "base_commit": "d3d0bf110d57161edfbd20234a84833f14548b57",
-  "scope": "143 implementation paths plus four grant/notice aliases; exact upstream required separately",
+  "status": "exact affected-source reconstruction; not a public-tree native build",
+  "base_commit": "1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc",
+  "scope": "144 implementation paths plus four grant/notice aliases; complete upstream required separately",
   "files": [
     {
       "path": "zig/build/cuda.zig",
       "mode": "100644",
-      "blob": "37ec9371ce2b1a06c0c2bbf0d8012d4d50e3ff47",
-      "sha256": "d8caa40ce1ca2edb0b504f50530c0e8d100ea803ec1d93678521a490a2994bbf",
-      "bytes": 50836,
+      "blob": "52c31e654433321cdc28f29531f3028597d5f6c1",
+      "sha256": "907500a1a31a5d718fd00428a11a575389b18e6bff389bb2bb3ccfb711ccbf6f",
+      "bytes": 53377,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "36498ee5a449d355488dfd663a6d8b9c4d252d54",
-        "sha256": "6b83e2315817506b5886040ea68f0f06325c5ed76119db6e452ee1b271f5566e",
-        "bytes": 49920,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/build/cuda.zig"
+        "blob": "73fb128cd4daee2dba5003af1d38ca9124cc5898",
+        "sha256": "60c7caacbe3b916b32c90b6a58336cbb2b1072be1aa37afb171745d89b91525c",
+        "bytes": 52461,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/build/cuda.zig"
       }
     },
     {
       "path": "zig/build/cuda_kernels.zig",
       "mode": "100644",
-      "blob": "0134caf09870fd444ffcae4d62e2063793aa4235",
-      "sha256": "6076085c22c5b9a9da7ba4f161d8bd59e4dc962083392139c12daa6201318151",
-      "bytes": 17317,
+      "blob": "34d0826d9a25506b25038f84dcd0ba03f9a1c0bc",
+      "sha256": "ba54b01becca273ac9756ad43ca2a292473fa621b9dbc18cb483eed70388afcb",
+      "bytes": 19884,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "2d63d3b0dbc42b43fbf2df6ec54bcea2a6194966",
-        "sha256": "3447fe360b2a33a6ad289c143f6003864df390c8e674cbfa0aeb9c5dfd65643d",
-        "bytes": 16833,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/build/cuda_kernels.zig"
+        "blob": "2af39b4855fc0e5c575863780f57a915bd36fcdb",
+        "sha256": "9a4a4b756b73d5495de6cf96106f727f599568a098ac5265b6c31467db777622",
+        "bytes": 19400,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/build/cuda_kernels.zig"
       }
     },
     {
@@ -46,7 +46,7 @@
         "blob": "6015fde71822942227309dd1a43aae2cf765e936",
         "sha256": "c508d2d0f803fd7bfea9ce9f76788106a82b88376a2bca86e9e8cc9d9ba7cf03",
         "bytes": 2895,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/build/cuda_runtime.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/build/cuda_runtime.zig"
       }
     },
     {
@@ -61,22 +61,22 @@
         "blob": "475deb34b8bde1fa6aeb93de313eea1eed50108a",
         "sha256": "aec63bd2caa0376f5c1b85ad0c8ba55c5026458984444a3c0e0117618b84835a",
         "bytes": 4674,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/build/digest.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/build/digest.zig"
       }
     },
     {
       "path": "zig/build/glm_family_host.zig",
       "mode": "100644",
-      "blob": "fc56881b94b4cef4a24cf9edc74c3f1694516011",
-      "sha256": "29a5792fac8cd168b4c117c02c42302eaccdcf5e31408e662566c9d4d3cd1097",
-      "bytes": 16210,
+      "blob": "8b83e26a37445f31c98a2bf3a960895e0aaa0cd5",
+      "sha256": "d45b1849f542b165ff683b4d369a2eb09668eb172dc389813c54279586b5c7fd",
+      "bytes": 17033,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "e20d136ad4be72899360a426c8a328ba739b9125",
-        "sha256": "e7c3c5e48f6a2f17c73683bfc6c0500649bdf8ea7118c08021b21065a9e61954",
-        "bytes": 15385,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/build/glm_family_host.zig"
+        "blob": "747675eb46bd8df84684ad11a0382eaa4efa49d0",
+        "sha256": "505d871044cde15941eef7ae53b36f8d6407fc449e2ce93e86cc36fdf3ec9fca",
+        "bytes": 15602,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/build/glm_family_host.zig"
       }
     },
     {
@@ -89,16 +89,16 @@
     {
       "path": "zig/build/server.zig",
       "mode": "100644",
-      "blob": "eac22ea27ce11fd3707a4c74ba42a87b47d8dc87",
-      "sha256": "5255fb9f61d1ff19a686eed4e85c928b6919984bfd92b68a3c3184cc85e3db2d",
-      "bytes": 17334,
+      "blob": "73977db2118bf0667b71ff55bbec5d37d7896ed2",
+      "sha256": "c09a74ccfbd612fab149a35846b0df62909b9bc407e4f8681b4bd9a3df9e8dd5",
+      "bytes": 17645,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "a157e0143b74177c83fa3f8ee41c9cd396bfbe83",
-        "sha256": "b0d473c2b9b9dae3627826a4301b30c48526d6d7c429395fea5af036fcf91029",
-        "bytes": 16823,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/build/server.zig"
+        "blob": "af6108ab8a61443163be1e9f2ab96dc068bba23b",
+        "sha256": "284132e278bb63a34b95903440988fa8343a5179bbfb8bdf1192c8dec92b7554",
+        "bytes": 17134,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/build/server.zig"
       }
     },
     {
@@ -107,6 +107,13 @@
       "blob": "9dc8387cc518619e902ae5da11822fca8fbfabcc",
       "sha256": "9aa281ec14334579d44b1b9f872e1003e3364363808241fcaeee836f714514cc",
       "bytes": 1694
+    },
+    {
+      "path": "zig/glm_exact_context_host.zig",
+      "mode": "100644",
+      "blob": "7a3fe32ade305f535d1f286b3a3a0c8c1f137b78",
+      "sha256": "933d69db146b9e56a3ef454170e234fa882956b519ac798a6af2db814dff6f58",
+      "bytes": 2181
     },
     {
       "path": "zig/glm_expert.zig",
@@ -125,9 +132,9 @@
     {
       "path": "zig/glm_hybrid_host.zig",
       "mode": "100644",
-      "blob": "bf2dc174e3ca4c78739510d28eced023db50fa3b",
-      "sha256": "5784c9f99efa42c6eb6fefa1caf36552801f6d1d27a2be8d87565effaae3e165",
-      "bytes": 38771
+      "blob": "6dcf3fa8c010641a16c78bd21d7481862adf6e70",
+      "sha256": "32e82644c32c8661bc92a88b0c0a1bf17f08e3b3ac17deb5c14f684c6e7be32f",
+      "bytes": 39107
     },
     {
       "path": "zig/glm_hybrid_ledger_host.zig",
@@ -181,23 +188,23 @@
     {
       "path": "zig/glm_kv_host_hybrid_host.zig",
       "mode": "100644",
-      "blob": "4a7d84faa6975dfa6cf88604936a6b85497165a0",
-      "sha256": "a340925189c1d8c10647b87e2c91585270988b170847c26c72f8ed7da6e3425f",
-      "bytes": 29464
+      "blob": "7fca8d976749ec23739836a48f220b7b7e8d9f98",
+      "sha256": "2fea4f85dda0c58f93740a99f45611c79877ed06ccef16775205522978f43819",
+      "bytes": 29528
     },
     {
       "path": "zig/glm_lane_costs_host.zig",
       "mode": "100644",
-      "blob": "0ae4ba373e0918cc6597dbfdca220b34c8c873a4",
-      "sha256": "62d873350c53804c697cf313bfb86807fa8483c858ad9dc24ec73f23f57851b4",
-      "bytes": 6925,
+      "blob": "8770e1562310f8cb47fdcb0d7e3c3c09cafb7398",
+      "sha256": "8d9ff341e64e07e2d91de88ced93f954737153d24acf61a140ba2c97a1340f9f",
+      "bytes": 11050,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "76518cdb770bfb533f135516210d7d83e3a5a693",
-        "sha256": "e02ddff316464d1a1664b3b13b553b65f523879f6333ce8f3625ff988bda9a9c",
-        "bytes": 5538,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/glm_lane_costs_host.zig"
+        "blob": "d1ffc50ce16b02410bf2afd1e9daf4bf9feb585d",
+        "sha256": "4722f4f2e4f2f38c5f5b4053bac59e61e0608a0aaaba22d697d676aa4f0edd9d",
+        "bytes": 9663,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/glm_lane_costs_host.zig"
       }
     },
     {
@@ -245,16 +252,16 @@
     {
       "path": "zig/src/core/checkpoint_identity.zig",
       "mode": "100644",
-      "blob": "58626a516bf0342d0aa345d8400c817e70261755",
-      "sha256": "b24bd5b9f654e795ba46423cbde138e130a2874cd7d146e01f71416d439afa3a",
-      "bytes": 19918,
+      "blob": "7dfda1e00fc313172bff3a2fba23391209ccc1d7",
+      "sha256": "445b9a05dbf0a397d72ff7e2a0b3117368ead2fd6a15fce1752ffe025151d394",
+      "bytes": 20140,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "7af4b56c413bcb15f8f3603131a434f51e1e6636",
-        "sha256": "e2fd170861568dad36a1cb023a28f8567386b78e5d7e57c28a4e969dc9c71646",
-        "bytes": 17097,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/core/checkpoint_identity.zig"
+        "blob": "610a5f091d00bebfe5d994404098f8ea54d281bb",
+        "sha256": "58a7416a80ca2edec8c77ee4a64ca0ce0a4e9fdb7f688ac4f29426a3dd7aee71",
+        "bytes": 17319,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/core/checkpoint_identity.zig"
       }
     },
     {
@@ -269,7 +276,7 @@
         "blob": "e481930d0869ad807d50893bc1300f8f90388f12",
         "sha256": "92616a1527533e25ba4d16176e3f405d18d78bb20c81e36ffcb62982ff87ad03",
         "bytes": 7865,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/core/digest_cache.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/core/digest_cache.zig"
       }
     },
     {
@@ -284,7 +291,7 @@
         "blob": "85ee488717f74f27be7d07f3b39c30d57b5ae6d7",
         "sha256": "6c393b0bc9b23db8650baebc5db19cd20e9adfae7064fed210bafc4390f623ed",
         "bytes": 14603,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/core/digest_cache_test.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/core/digest_cache_test.zig"
       }
     },
     {
@@ -299,22 +306,22 @@
         "blob": "f7fa437a334777deeaee165b9b66df27f7ffdf1c",
         "sha256": "c7d6d7e4662dfdb94da6a5d071a6aa15483944f41c13afafd23cf66fbd7fd4a2",
         "bytes": 1893,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/core/digest_lock.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/core/digest_lock.zig"
       }
     },
     {
       "path": "zig/src/core/engine_api.zig",
       "mode": "100644",
-      "blob": "41495c3813089ec0e804c95ccfea4d2a7ade2b3b",
-      "sha256": "29a22eab0e11ab155c50c60dc6c80faf8a51f942407f82169aaf23598c6a7198",
-      "bytes": 34294,
+      "blob": "7129d27c472b8ca1ca8c3c98e0e3206d9b78fac2",
+      "sha256": "e5c520cc9001319ae765278bd343ad1ab9cb04cecd1accc2e7d94981593154c0",
+      "bytes": 30173,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "1d0bd4c8919b8b01f4311f8dd54d9158db7850d1",
-        "sha256": "7ca83417eb81c3855d89fbce78c91dabff4a65a28155acd22a74b3dc33e987c2",
-        "bytes": 33862,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/core/engine_api.zig"
+        "blob": "4ec674ace5ad31e54832aabebfbc9afa9f3f8bcc",
+        "sha256": "8768318bdd9b21271c42ff960b22f9743c65dc54c30c340026ee1fe7b12d1269",
+        "bytes": 29741,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/core/engine_api.zig"
       }
     },
     {
@@ -329,52 +336,52 @@
         "blob": "f2cbe4e8ba4de9079b3d7c1d4cf2fbb76560206a",
         "sha256": "23a37b9bc203b781b60f54861c93342a6647575ba2536caacad7f033572955d4",
         "bytes": 1415,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/core/lane_halt.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/core/lane_halt.zig"
       }
     },
     {
       "path": "zig/src/core/lane_host.zig",
       "mode": "100644",
-      "blob": "36a84ab5d281992036fbbe06a5b5afec363af34e",
-      "sha256": "d7a8d45c43b8045b04ad2755a94ce802e278a4e54318a5abc87841bbb74a0317",
-      "bytes": 30640,
+      "blob": "2a17e0cc8a4da78f20cd2e56e0601a840ba1e990",
+      "sha256": "ff0e863978e79a059747866f9fc73f1a27b21735e92859cd73236521346ac0c0",
+      "bytes": 30933,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "c0cf7231390f4d994f28fd10520f2eceb4f68c4f",
-        "sha256": "cad05827e342cce94dea9fbd63c22ce0d667b97cd962290683daf0a93426a8bb",
-        "bytes": 28600,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/core/lane_host.zig"
+        "blob": "1811a856251d4b9f0e2e9fc7e38d5c1d92f9aa76",
+        "sha256": "f9352298ccfcd9e262c0325b608f3938cf048530bd40eba73815c3504966860f",
+        "bytes": 28893,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/core/lane_host.zig"
       }
     },
     {
       "path": "zig/src/core/lane_host_end.zig",
       "mode": "100644",
-      "blob": "e3cfea6115acb0f86f41a626c2273222a5f0fee0",
-      "sha256": "a3243a2a77f694315dd32e1065ffa02685f4f7a8f4a01ce17bf9941b6ff5a44f",
-      "bytes": 8300,
+      "blob": "29884fc133eacafea48be832563672f82db97500",
+      "sha256": "70aba8a0306e5bff4c749ecd2ab0c38b670b8b9e95e843903c0823e209df4ac6",
+      "bytes": 8373,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "e302b3b7deaa5a99853b7a50ff2c46f4a9af1d31",
-        "sha256": "4736dae0ea75112e55178578ef5a2d1767f5a42ffb444a0decd78510941d4a85",
-        "bytes": 8225,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/core/lane_host_end.zig"
+        "blob": "29b67148793fcd4d8efc3036b2a65a0e7f43fde6",
+        "sha256": "d430067c098998fcf6fe3d86ad93628fb66470f65ebd9b024fa5bcecccc494c1",
+        "bytes": 8298,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/core/lane_host_end.zig"
       }
     },
     {
       "path": "zig/src/core/lane_host_rows.zig",
       "mode": "100644",
-      "blob": "4ee2bbd6fbc69d72959149ed62331a22b5e79037",
-      "sha256": "c374ecf07e3322a9767d2e37149bb6c57a78bdcb1766aa6496c541d2fad9aa51",
-      "bytes": 3246,
+      "blob": "a17c0dd4922b6c2cbe1be88b02b013f85a680a98",
+      "sha256": "91e92b2eb343e87e7183f85fb0a22ab2fe00695a62eaa4e9495bee1e3ad307f3",
+      "bytes": 3950,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "19007002f002298a29f53d88671ede4631550f54",
-        "sha256": "0af0ae2cc7b09414b18b89a7d04e1575feb23d4706ead85a57fb38e56982a3ec",
-        "bytes": 3197,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/core/lane_host_rows.zig"
+        "blob": "bfeaf32aa2b2cbb614f2183ddc5650734ae2b770",
+        "sha256": "34572bb1964b6a29d6f72a232b9b839e5c469b913938b9c4113a091b04579013",
+        "bytes": 3901,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/core/lane_host_rows.zig"
       }
     },
     {
@@ -417,7 +424,7 @@
         "blob": "95d4bd672c2e5e7f6311ba4fe508cf9715618d48",
         "sha256": "e8287948be9034b66ef599f81c252e77309807a13c36102107291bd7c9426b8d",
         "bytes": 21791,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/cuda/copy_source.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/cuda/copy_source.zig"
       }
     },
     {
@@ -430,16 +437,16 @@
     {
       "path": "zig/src/cuda/kernels.zig",
       "mode": "100644",
-      "blob": "e0d031ec0a9cf21c4003434b4ae0f79fecd09c31",
-      "sha256": "939d6b5aab2447f546a29c22ee95c318666e9c4fe4dc767a8796d752210e086b",
-      "bytes": 14736,
+      "blob": "19cd037fa57d2e88cd85004e4684461e5afe885a",
+      "sha256": "dca1c26e3ec44ae299c0f9c54626465473e0d9c4e8d1e8927e1ae771f377cc75",
+      "bytes": 16950,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "858f9deda0640d9e2affbb434372ec2df5d7eb1f",
-        "sha256": "ead90d65f23d9b6255ee53d95d41bebce0710d86547e579ce9d588ea12fdd548",
-        "bytes": 14265,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/cuda/kernels.zig"
+        "blob": "adc585058021a7e6b25464b509f740e3d58f3ea8",
+        "sha256": "d348915a2365645f8a0aa1106e73a34572ad13cc52e2d8c042d5de32fdde8d49",
+        "bytes": 16479,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/cuda/kernels.zig"
       }
     },
     {
@@ -461,7 +468,7 @@
         "blob": "3685228a93eba8947dc3798ed262831bdb19b820",
         "sha256": "c140f1700e0f257a3ac09b1bfaa4a0d704d1922ccbffc3d453d75be0fef4b617",
         "bytes": 24261,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/cuda/memory.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/cuda/memory.zig"
       }
     },
     {
@@ -483,7 +490,7 @@
         "blob": "6143868f9e015cf6f1ae81e60294c300d3b74911",
         "sha256": "dc1a67ec46037da8653475f0fa29cdd8d41ef1165fc820f80c68021494b1e3d1",
         "bytes": 2460,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/cuda/memory_receipt.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/cuda/memory_receipt.zig"
       }
     },
     {
@@ -496,16 +503,16 @@
     {
       "path": "zig/src/cuda/root.zig",
       "mode": "100644",
-      "blob": "b6961a6316a6860963dc2352feb1efaba08cf9f8",
-      "sha256": "bde328b531298c80a5b7565a266e80eece643cb1aeac669cc3cdc36f562f27f9",
-      "bytes": 7024,
+      "blob": "8275e8d8ecd2db9e18e0ada4426e0656daed95ac",
+      "sha256": "6ab5265290ecc6b1833354cb2d81c7e8b5783095b96d58d457a5212b971cae9d",
+      "bytes": 7250,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "b6476817f2b73ad60dd0a6c9e1b5f986c248dff7",
-        "sha256": "5dbca351bbf6a42cd83d7b615d4e4624809444d7d2e714b1d71d8eec53c6e606",
-        "bytes": 6622,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/cuda/root.zig"
+        "blob": "55ce159b6f074ef7eedadb7b454037281e14f29d",
+        "sha256": "d9111e31e96e697ee8e7883ffacbf463f642c7abd740726bde734e23e4b4ad1a",
+        "bytes": 6848,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/cuda/root.zig"
       }
     },
     {
@@ -569,7 +576,7 @@
         "blob": "1f133f09ccdc76fd25fea832fd707091fc893577",
         "sha256": "744e0eca3a1be805db0619dd2c45b866a8b7b32ed1721b7681085af02587b023",
         "bytes": 13614,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/fabric/tp/bootstrap.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/fabric/tp/bootstrap.zig"
       }
     },
     {
@@ -584,7 +591,7 @@
         "blob": "6f0821d6d8f939bdf52c8ed93f8e7cf750940550",
         "sha256": "a805feac03dddb82078b3f1d0482a83fd41578b73884fd5ba8e881348cfcc452",
         "bytes": 23158,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/fabric/tp/roce.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/fabric/tp/roce.zig"
       }
     },
     {
@@ -606,22 +613,22 @@
         "blob": "5953892364bf76003600cffee5463fe28a559213",
         "sha256": "e319e49cc75ae4abf452be76577ef3e4efb923d7feab814b1f4b24f77d90d4e5",
         "bytes": 8485,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/fabric/tp/sock.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/fabric/tp/sock.zig"
       }
     },
     {
       "path": "zig/src/families/glm/cuda.zig",
       "mode": "100644",
-      "blob": "59f0645b015fb58446320afad86734c688899efd",
-      "sha256": "e1ec1fb767b0acb57a4dd3113547265a8af84f2b77b95273360bc61f3f43b4a1",
-      "bytes": 5159,
+      "blob": "34482fcaf199c2b70f9a6227a6ca227f0a1797a4",
+      "sha256": "cab9ba61b62d0f9c201e334fc2b0b395edd9b1dc45b0c52de1e8b505960bee76",
+      "bytes": 5233,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "d11094d059936370f2532f7eca709e7718437c4f",
-        "sha256": "f4bd2bb0553b215c4468a25239dec30a7cd5e797fb722146a96402b9520ba198",
-        "bytes": 4412,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda.zig"
+        "blob": "588f1481ec9e0f42bb9031790fa3202a0bfb4531",
+        "sha256": "64d5ea78a13b322d5202b6d1a32adaf479ca72e115c5638cddafd1777f5653ce",
+        "bytes": 4486,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda.zig"
       }
     },
     {
@@ -634,31 +641,31 @@
     {
       "path": "zig/src/families/glm/cuda_dsa_block.zig",
       "mode": "100644",
-      "blob": "02e47196a10ad10d9d90e1ff45802473af21bc3d",
-      "sha256": "9fcdd4057a18d02a0f835365d028dc4c122d193d7fcae6e867c8a9800ac8bde3",
-      "bytes": 16037,
+      "blob": "38347581fde1003a5e9329ffeb6882b31e583b35",
+      "sha256": "1e4f14ddb7eb61517e0cd10bf8dcae613a7bef5afec0daa317759aeab54fe8dc",
+      "bytes": 16073,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "57c8c5d209dbba123a0c2ce432d9895909567e2b",
-        "sha256": "7bd57bd3ec9238cb20ab92276d5b3ff18b05239a89be38a06ec063c10f84b0f9",
-        "bytes": 14329,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_dsa_block.zig"
+        "blob": "61d9c15aa6379cdc1f0c127d59f6553b02418ad0",
+        "sha256": "1ddd20b5718af450576c174881704a499a8da5d0198564d1dea1be5bb7c4e525",
+        "bytes": 14365,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_dsa_block.zig"
       }
     },
     {
       "path": "zig/src/families/glm/cuda_engine.zig",
       "mode": "100644",
-      "blob": "2cb01c25e343556ff108c3dcd8764bd9bdfe09e7",
-      "sha256": "f961c4f655d81efb979032c016ba4fef7802c6463bb132141ebfecaf9893d481",
-      "bytes": 36239,
+      "blob": "a934dbcf325a186aecc36da220a16130fb3137a1",
+      "sha256": "b98491e802d2dafe723cd0e8ab3f5a2622820fa05f814692f858380f980f02ca",
+      "bytes": 36443,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "ac91dc2c2a8d4b55af8bab7f587bb35f01edf66f",
-        "sha256": "015de72e8500ecd5626faea15512e6795888023033cc155f0fe220f304e5d4ce",
-        "bytes": 30608,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_engine.zig"
+        "blob": "86e3453b9e4307a76bc4183f85f304fbf7b4708d",
+        "sha256": "f8053facc42786bfc3a2d470d73d01fc4d458f3471bc1dd439560f9b89ac2968",
+        "bytes": 30812,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_engine.zig"
       }
     },
     {
@@ -673,7 +680,7 @@
         "blob": "e51ca1772fb15b926668bec3a6d087bff107b400",
         "sha256": "5db13ca8f88b5700b9aa95851dd16e97d66fdfca38d318d6cd593f06b17dc107",
         "bytes": 2705,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_engine_gate.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_engine_gate.zig"
       }
     },
     {
@@ -688,52 +695,52 @@
         "blob": "280f12aa2a6f84d413dde70c6393291b8279c5c0",
         "sha256": "10ed5a3c72eee2f942c0a29600518f4da5ddbff3d897ed7c8bad108c3f028c39",
         "bytes": 2655,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_engine_types.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_engine_types.zig"
       }
     },
     {
       "path": "zig/src/families/glm/cuda_env_test.zig",
       "mode": "100644",
+      "blob": "61f3dcb9c725d7abf198e1a177f07828ec6db5c8",
+      "sha256": "a8c15f8edca7bc112c7f227e42fd4ddc85ea7dce780cf0f0599988ce113e7824",
+      "bytes": 9866,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "4d601ab113ebcaea68d6171b119bceae8240c201",
-        "sha256": "067d3bedac26297151f7ae74f6df72d11bd8cfc08efa88358cabcb0cf1158a83",
-        "bytes": 9591,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_env_test.zig"
-      },
-      "blob": "4b193db2d353a951683390e75de9d25e9f5cbe3c",
-      "sha256": "4cd5e4e15dadf2c268e1a0cd72d6e696d8abd3a8f8041d260ba2abb42d3fc95a",
-      "bytes": 9605
+        "blob": "9b70cb128c71d935485c612e65c0a1e5ec75ee1d",
+        "sha256": "b7adde919bf381f345dcbb76f0c09adbbab44cb89b86f5ddc5e0551993ae71ea",
+        "bytes": 9852,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_env_test.zig"
+      }
     },
     {
       "path": "zig/src/families/glm/cuda_exl3.zig",
       "mode": "100644",
-      "blob": "2d27422a500c0d809b991083330890fbae380b9c",
-      "sha256": "fcf5ac5d6b794654e010244bb06376827d05680190be4be7ba5050b609900fe0",
-      "bytes": 13361,
+      "blob": "0f330beb02ec178d9af616097b137659959a1b14",
+      "sha256": "1665dc6b59fc04c401b48035ba4dbce67119493a7974acdad694a4abe6a776a5",
+      "bytes": 17962,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "682db10e3f9520e43ea3f845d1fa73c18e3081f0",
-        "sha256": "974dca4e3c3618b2dc58f05224b9e13afc816a9130d1a8224566a1c68dace90c",
-        "bytes": 12640,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_exl3.zig"
+        "blob": "fce0f2234d8da651da7549b0a3d711a27c23938c",
+        "sha256": "6d61aef81ab09ed745a0a5953ff64f3df8d946f620e82bf4fc57da50946ff743",
+        "bytes": 17244,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_exl3.zig"
       }
     },
     {
       "path": "zig/src/families/glm/cuda_forward.zig",
       "mode": "100644",
-      "blob": "34220ad09907e3f26555d7a150a2914f7dad42c1",
-      "sha256": "dd284a07ef3aaeb3678543480c47b5cb5bd7b9ac256535779fcd96999a9ff2ed",
-      "bytes": 30757,
+      "blob": "72dbd1d2a0d1b11d483b279a722059eda34799ce",
+      "sha256": "0602b4e17d8ccac119b891f214dd05023bc1c04e41e14a8b0bb543c536c5e6de",
+      "bytes": 31575,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "28c4e4716864e9192ff3541ae4837e6555c0e2b8",
-        "sha256": "9b63661088db650142391c7d1508e7d64bca74804a33406f0a61c85a2de0dbff",
-        "bytes": 28198,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_forward.zig"
+        "blob": "fefb4ac197ab7d796f58abca5b09886939f3a15d",
+        "sha256": "e651af2b22c8f6de43e063dff51dd7e9cfa82cff77aab3df5592c85e4254af27",
+        "bytes": 29016,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_forward.zig"
       }
     },
     {
@@ -748,7 +755,7 @@
         "blob": "eec6992e708edba7adc44e9ed1694dcfcbbba504",
         "sha256": "80091c272fef2d3e44d36ff994bdc7e730dafb45feac169b9bd303d30da8f07c",
         "bytes": 4092,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_forward_pair.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_forward_pair.zig"
       }
     },
     {
@@ -768,16 +775,16 @@
     {
       "path": "zig/src/families/glm/cuda_glue.zig",
       "mode": "100644",
-      "blob": "2f14b4ba976b80d378d789c85f4020a562ea8560",
-      "sha256": "5b5630e482a3341e46b3a8b4eac3cd704f9ae2e5c0942824c8e99dc1ff2570f1",
-      "bytes": 16037,
+      "blob": "5e3da1f028d2119c3afb48479eeb8781621a354d",
+      "sha256": "f7fd5675b38676e9eda875dee86998cde3247f8c1b3131bd247b3501113d42c3",
+      "bytes": 16195,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "777355de58fa388562a3563f82425cbc05a07488",
-        "sha256": "d3a3b3d5309bcca8a37ee93d582add0aaf2771777ba3d4d46526e41b2035ba39",
-        "bytes": 15492,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_glue.zig"
+        "blob": "631d570dcd1125ee425b66721c9802a420e02d01",
+        "sha256": "aa00b20f220cdf56c5fff4051ef04b3c21a4f3e7f8ad1803e8c5023d4129a081",
+        "bytes": 15650,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_glue.zig"
       }
     },
     {
@@ -825,9 +832,9 @@
     {
       "path": "zig/src/families/glm/cuda_hybrid_load.zig",
       "mode": "100644",
-      "blob": "22450b1aa4e131f90663eded74ca39889dee6ac4",
-      "sha256": "33f88da33b81c65bb14b3f767044e62bee9892938bc7edf0a642924170d8d88a",
-      "bytes": 4418
+      "blob": "b46bdc81699e0257dd79889700002e14078cb2d7",
+      "sha256": "4f13a30e278d8d1b9973c8499fb83a4ec3d85417b8d28fc0bb0ebfe458186c87",
+      "bytes": 4452
     },
     {
       "path": "zig/src/families/glm/cuda_hybrid_load_test.zig",
@@ -846,9 +853,9 @@
     {
       "path": "zig/src/families/glm/cuda_hybrid_memory_fixture_cpu.zig",
       "mode": "100644",
-      "blob": "5d67ce97843c95f6ba1e9b59fa7e009957fd04cf",
-      "sha256": "c6754328acb73d31511517664fb681b5f4019b68b0cb602f157c6f893f3300ed",
-      "bytes": 2526
+      "blob": "1db532b76bb3d9a8117aaaf71581f0c1c78ca60e",
+      "sha256": "668f68fef9ca9cbad90964bbcfb98f0a95bd47613eccab57c5d9417f94e9ee62",
+      "bytes": 2525
     },
     {
       "path": "zig/src/families/glm/cuda_hybrid_memory_test.zig",
@@ -937,31 +944,31 @@
     {
       "path": "zig/src/families/glm/cuda_kv_host.zig",
       "mode": "100644",
-      "blob": "1a2a1cd7835ec704356fb7795b9b05bfa0c23360",
-      "sha256": "61e72f4f826b5fc9fb6e0ffea8316492046a1e239776d600f92271c94648784f",
-      "bytes": 17528,
+      "blob": "9f16be044f87c4742f60d6affe1cd1fa32068e0f",
+      "sha256": "c9308ab511aadb4c85f455b1f0d7b629de26b069678ad4ab800be58b83f4065f",
+      "bytes": 17567,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "6866d0d78cbd434f69ca69b3df05d980414accb7",
-        "sha256": "1d7c388156e352c39867b8880a2de77a7b3eb75a335d83a9060f344f19b62843",
-        "bytes": 16384,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_kv_host.zig"
+        "blob": "24485508a6113dc6bb657df000820e91502fd0b7",
+        "sha256": "cb1226ecca155de971e8eee33c13c83c091fa3e79c83d9d386d0e6e4254333fb",
+        "bytes": 16423,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_kv_host.zig"
       }
     },
     {
       "path": "zig/src/families/glm/cuda_lane_costs.zig",
       "mode": "100644",
-      "blob": "6928f0386eb934a9944e96eb66896ba9ab4bd194",
-      "sha256": "cbb8357d4ad9fd324203b0081ce325964842c31f461145f1c2b6e18cc24d2068",
-      "bytes": 17986,
+      "blob": "e19dabd6f4a859852cce3e7627b4f8fbd98da01a",
+      "sha256": "72567fd8bbb8288a0a8809454a4d58bc20d6f621c35c57e98edb56bdde390ed7",
+      "bytes": 20311,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "3e798ed90c29db4a982f5172156fd7fb99b8637f",
-        "sha256": "bf623d014c0f6880275ea59e4139d2603dd3f703bee31aa03e6dff555c8a6aaa",
-        "bytes": 17001,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_lane_costs.zig"
+        "blob": "b69018198abff3bf2c5958bf8aeee9feaa6e2455",
+        "sha256": "fc6f910e3640805f869d62000a3bb4f796ab48e3308cbd3b275bb422a162f6df",
+        "bytes": 19326,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_lane_costs.zig"
       }
     },
     {
@@ -976,52 +983,52 @@
         "blob": "37eedcc152ab6221a7d6a08431bee387783f1a02",
         "sha256": "995edc22a841ff3e5e57d5a93fd6627017a02688764f99c69098e7e203b5339e",
         "bytes": 29143,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_lanes.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_lanes.zig"
       }
     },
     {
       "path": "zig/src/families/glm/cuda_latent.zig",
       "mode": "100644",
-      "blob": "1e0b942363edb806cc604f37d1b3b643f3ce840a",
-      "sha256": "f859369f7de61a822ddbd931c56ae0a02295e33526bd5477448fc1db5de4a5d1",
-      "bytes": 8916,
+      "blob": "437928da0ce21b94df0e185bfaefa1346516defb",
+      "sha256": "190c9288d7279046305fe2165a65125ad7d62511ddd0e90eec5592d1d18e05cf",
+      "bytes": 8943,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "8cc7b2eeb925e19f9bbde7d3d2e761e9d02ff2cb",
-        "sha256": "ac8e8503f9238824611f9d5fe4a81f48f687c520629e6b16035ff6e678cf6a61",
-        "bytes": 8192,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_latent.zig"
+        "blob": "82e4028388100b803665554f2391494b5a736f50",
+        "sha256": "f4dd2f908425a8be3ff0662180c8f9ce90ceceac7abec3ce82f81420c0d54b7d",
+        "bytes": 8219,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_latent.zig"
       }
     },
     {
       "path": "zig/src/families/glm/cuda_moe.zig",
       "mode": "100644",
-      "blob": "650410f3f8d47783e9c3ee3a26c8aa82f1e06937",
-      "sha256": "af30fa7715aade4013ba2ba67731be992f552abe651ffe909e9d7e4e3347e436",
-      "bytes": 6071,
+      "blob": "b030158ba35bc8aaecd9ab897deae2176a520910",
+      "sha256": "34775a84e4dc19fe6240532debd7fa12c15223ee8808388e9176eab1f4c8afd2",
+      "bytes": 6120,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "1f21c38811a0d338da344cc4b98ea14c99a1b5ce",
-        "sha256": "8fc1391787f01775ba6fcd14d827c427c0396e93b802287a1afcd20cc8a3da36",
-        "bytes": 5326,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_moe.zig"
+        "blob": "b1ec249595200f7ee88fe7b62247a649a6b7fb91",
+        "sha256": "0b5194d691f9d484a5c65831010d51f36a335dbad7ab1dbd6045899501a8a1a6",
+        "bytes": 5375,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_moe.zig"
       }
     },
     {
       "path": "zig/src/families/glm/cuda_native.zig",
       "mode": "100644",
-      "blob": "59b78db730cc67d2a6046a61108c33cb6614ea6b",
-      "sha256": "2780d7c061e7681f5554a9063a388e9cb80437c43f98d3bea868ef93b38ad412",
-      "bytes": 58734,
+      "blob": "552661f64a41779697fed740da0ad3fa61b60404",
+      "sha256": "95b7673b4dba1c591c954ac3e4be76c6d5eb2a821366ce3e6af8de7c2245f1c3",
+      "bytes": 58884,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "e933c6b4c8121ee3c66beba11f55a9584727fc31",
-        "sha256": "40916bb69bcaf2ad732a88bbdea3188b529957e86c27ad3ea6bff061527f99d4",
-        "bytes": 32689,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_native.zig"
+        "blob": "783bddcac79249a26399a27c332fbb948e589bdf",
+        "sha256": "58aac4a77507d826068287e640113153984ad957b033a8e44b338e6fa206716e",
+        "bytes": 32839,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_native.zig"
       }
     },
     {
@@ -1036,7 +1043,7 @@
         "blob": "ee798111c22259b3b6c4e6700dda987d55bc4c59",
         "sha256": "759b970973db7325124ffea849c5c2461fba6371fa592cf170d86daeff5acc80",
         "bytes": 13323,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_pages.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_pages.zig"
       }
     },
     {
@@ -1065,7 +1072,7 @@
         "blob": "bf895cd2891b5507751624c5a5eeceaa6e025530",
         "sha256": "96baf1f1487e4c11c2ac140b039aa038f178ffe99531265c8669260ed20ed12f",
         "bytes": 8178,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_prompt_pair.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_prompt_pair.zig"
       }
     },
     {
@@ -1078,16 +1085,16 @@
     {
       "path": "zig/src/families/glm/cuda_ranks.zig",
       "mode": "100644",
-      "blob": "e8741dc076a42dfd767128a0e13a19bde559dfc1",
-      "sha256": "92ef28e54fd92fbe3047760f47a120be56eb506e27af527f8ef40d19fd713fe6",
-      "bytes": 23926,
+      "blob": "24ff8b97efa4e7df4f2c0935183e59c9062b2d22",
+      "sha256": "5ba90bd90b43ceee55f2c6f141bb669043dd849b0dab4feb9ba76edac96f3a06",
+      "bytes": 24862,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "e60f789e57bffa248907867c6f30cdb99597441a",
-        "sha256": "68b40fa874a86cbfde8b37c89aef62de45da8544ee99ce113112ffc3e3c62bc5",
-        "bytes": 23199,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_ranks.zig"
+        "blob": "9de1ebb372613b111e0fc702e7282494e6cb7242",
+        "sha256": "f9b287456cd70f2b41b1ee9edc972c08b73db7f963a1adb9e12d178a3627f80e",
+        "bytes": 24135,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_ranks.zig"
       }
     },
     {
@@ -1116,37 +1123,37 @@
         "blob": "2e48cb6d4df4a0517da2cc88c8d0365d282291d3",
         "sha256": "34cfbd236920b4601008fc9137b741a715be12d512ad4794af88f0d1306203b6",
         "bytes": 3662,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_snapshot_pages.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_snapshot_pages.zig"
       }
     },
     {
       "path": "zig/src/families/glm/cuda_state.zig",
       "mode": "100644",
-      "blob": "d07a55f47cd8cea3815dfba1989622e56b799d32",
-      "sha256": "4906dbca5306b1100ed5403d57b1f36da8deb27e22dbde95f3657dfd381ede79",
-      "bytes": 30144,
+      "blob": "edf02eabd303ceeed0b106913b01ecf277082346",
+      "sha256": "21325ae3a01334dc0d1a57d424a8b1d5a85aa01613298010f0e766b4af7b4b20",
+      "bytes": 30433,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "5a5c8919a69e6a1c5187090d831cbeaf95302d94",
-        "sha256": "61f35e863c79c45e9ef7e0a1707863d95daced38539eb1c2ebb465a96207e0b5",
-        "bytes": 28261,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_state.zig"
+        "blob": "633ea2e06a9dca5e61518b75c7c70a63a4f92421",
+        "sha256": "de98045a4386b9689d46fdf9252a867eed8a26e41110cb53450bc600f3deb10d",
+        "bytes": 28528,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_state.zig"
       }
     },
     {
       "path": "zig/src/families/glm/cuda_tile.zig",
       "mode": "100644",
-      "blob": "b1f1b01023038e678d0db03ef723cac7087865ea",
-      "sha256": "bd051c77ada601bd8bead97a54f2a18fd6bcfef9efbdf00eef644a9a7e2eb569",
-      "bytes": 14415,
+      "blob": "7c5508c94c1c52e1a1d5dde831ce6bba6cd4ebc2",
+      "sha256": "27a0d3fb21bd9fb9ae2ec0520a3f814bccf92e7685434fddf18136d9e7002ced",
+      "bytes": 14285,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "592a24dd2cbc57c1a4a3239137386a0dd335205a",
-        "sha256": "a8081a9079e2db6fb5def2b0a98112c775eeb270e8a2e213f406f62958a72680",
-        "bytes": 11175,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_tile.zig"
+        "blob": "3fef15dd2ad55d9183ff8130e28871930eacbc3e",
+        "sha256": "21d34b4e2f7615e46c48fabbace1815a713038b76b4f6abf974864979ec6b10b",
+        "bytes": 11045,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_tile.zig"
       }
     },
     {
@@ -1159,31 +1166,31 @@
     {
       "path": "zig/src/families/glm/cuda_weights.zig",
       "mode": "100644",
-      "blob": "188a47bc3798437824c184ce8d3390a23ac78019",
-      "sha256": "59c5dd5b9bfd2ebcb8bdb62c97e4a20955855a3ae278088d0996f0817ace9f4e",
-      "bytes": 39405,
+      "blob": "3d1ec12aa07c135449cbe2c4a9b7c6ecd49a456c",
+      "sha256": "21043734680bc234b1556c2ce1d64eb0ad9ef6c2c64ad9baca0a8d868c3fdc4a",
+      "bytes": 39357,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "ac9f7aea111396814975c01b503a4cfe7f8e6164",
-        "sha256": "76117e8da2a44b386ded39f03d1f2d9c1d6dca004c3ee893b5f48eb0b5aea374",
-        "bytes": 34366,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/cuda_weights.zig"
+        "blob": "438c71d93ad89198ba898a471e52c25a6cc1cc56",
+        "sha256": "5d7bcefb8ba224f0f437648b996802a3511d0c1abd4fda9088c8ff7d2bf97bfc",
+        "bytes": 34319,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/cuda_weights.zig"
       }
     },
     {
       "path": "zig/src/families/glm/dflash.zig",
       "mode": "100644",
-      "blob": "7ea84840ec51aed951fa62f6450cd20f164ee298",
-      "sha256": "c6bc178b8f2ffbe01b1ea8e9ee99ad58151be6964bac3664f784febf34020cd6",
-      "bytes": 16564,
+      "blob": "d37e7aa1f6f6f96e49d06abad6116955615fc082",
+      "sha256": "ec5536078eeb9257db597a5f46c6f9dd87eb82bbaa1dbce91e2f82cb6f717830",
+      "bytes": 16562,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "aa039ffc299d13b357ef8033a92dfa8d4460a45a",
-        "sha256": "0cfe94f80706bc78b52f53d4cf3097d1b8370a2e99e085b9174be2ff29bc6b50",
-        "bytes": 15310,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/dflash.zig"
+        "blob": "9a66e875e70c3a1c011ccdc79bb841a39957b05f",
+        "sha256": "6de842f272c64d0fcc41999eef5848210084be1deb36a7612824fd69cd762a23",
+        "bytes": 15308,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/dflash.zig"
       }
     },
     {
@@ -1198,7 +1205,7 @@
         "blob": "996398e1d812dc011ac90a812777ca25ab6d4c44",
         "sha256": "c63912e042bb7e262e9e1098948ee8b0cb4c23c0247617e20f68b08fe9a7ce91",
         "bytes": 2327,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/families/glm/dflash_select.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/families/glm/dflash_select.zig"
       }
     },
     {
@@ -1302,46 +1309,46 @@
     {
       "path": "zig/src/native/cuda.zig",
       "mode": "100644",
-      "blob": "0c8d3190e2e7a4081da4e90c8b65ba9ba7e89a03",
-      "sha256": "a5d44bdef75fe189a0cc436fbef3f7d6462db35e13ed880f08ba59add4f36a56",
-      "bytes": 34458,
+      "blob": "fddabac1576f870a9bc824a26ee95294dc43da4d",
+      "sha256": "52186e3f3b9c6001b18f5ae78acc90d29c6add3ea8580a69edb2c5e35146b3e6",
+      "bytes": 35434,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "289b73ef742e160b438aff421447db68e0f6c7fc",
-        "sha256": "33e378a951f10eaf75f1dafb673dca21a0386da82a2251aeb6aaa13d156d11cf",
-        "bytes": 32822,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/native/cuda.zig"
+        "blob": "c1f8294c618430ef816ab8bffc2cedcc057495cf",
+        "sha256": "fe19674d4ff9d5f3cd0267df27dae10cd79b1dc635a19c82f281c89f2f993db0",
+        "bytes": 33798,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/native/cuda.zig"
       }
     },
     {
       "path": "zig/src/native/cuda_family_memory.zig",
       "mode": "100644",
-      "blob": "31bf2dd55497f97bf6ad3db7a2320f51be0493e9",
-      "sha256": "5dc038ec3d3a518832c6b375806b1977a3ef50f2fc9b281a2aef46b383527736",
-      "bytes": 7185,
+      "blob": "a83939b6bce2f9122242ac9751f0aa182ae8b3c7",
+      "sha256": "8e7fcc3040b187b3d8969937039b3abb94dd479222cd6c7dbeae2db82e1aeba7",
+      "bytes": 8632,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "b1f1b043d99d6b9405996890e052f737cce9df13",
-        "sha256": "4ad961e2ba36f1df30ce8b96b756d62200aef7801c454ba8c0111ea1c023345e",
-        "bytes": 6702,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/native/cuda_family_memory.zig"
+        "blob": "56db251f435b30a3dac1068d2b89cedeedb3d2a8",
+        "sha256": "20a5184491b580be314f290cb0b5b8eb3a046f7a377e7bfb352d6743206620c0",
+        "bytes": 8149,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/native/cuda_family_memory.zig"
       }
     },
     {
       "path": "zig/src/native/cuda_host_close.zig",
       "mode": "100644",
-      "blob": "65cdb16ca0a50776886f8747815192a7bf0e406e",
-      "sha256": "1e32f5700c8a44cc66d7c684e914b36b620e754348dfd71bbd94c146cefb27fd",
-      "bytes": 4650,
+      "blob": "adfb85154f84768b952aa838873e4f65c9f124fb",
+      "sha256": "38b30e84a2f36df4d7bf4cc8c037279c43fc6408a559c1c8f90f9a043223ca57",
+      "bytes": 4752,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "4a515f4c59267d270aeab92c5112409530ace632",
-        "sha256": "7a4173f605647fd4f6259dfb0f7991399a9f57dd89ed8359b168f743b097ecb0",
-        "bytes": 892,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/native/cuda_host_close.zig"
+        "blob": "abb75a7d54fe84af98e6fcbfb7b139012ee843ec",
+        "sha256": "1a1d29c098b0b30ec437dfe5c516c9f71cd080913b516ab650ea912af43d96eb",
+        "bytes": 994,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/native/cuda_host_close.zig"
       }
     },
     {
@@ -1356,7 +1363,7 @@
         "blob": "23f31a93dff7501aedf9722867d429950cd3702e",
         "sha256": "cc9dae3bd070a8cb289979b0eef08fbf88c61a0b305d5ddad2ab52b18e125907",
         "bytes": 16844,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/native/cuda_load_gpu.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/native/cuda_load_gpu.zig"
       }
     },
     {
@@ -1371,7 +1378,7 @@
         "blob": "98cb42bec4fc70ece3a5c4cdfe494e9aadce3e6e",
         "sha256": "67ed99f3365090f2a078939a7cfa5e497818a4e056a418d73548bf372bede8a6",
         "bytes": 6177,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/native/cuda_options.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/native/cuda_options.zig"
       }
     },
     {
@@ -1393,97 +1400,97 @@
         "blob": "6a680b3efb5fc0b4e05fbc90da97e95d90fdead4",
         "sha256": "98f2fd038853c4e56c2187f7a662e2d5ceeb3c4856cd5e1981fe91c384526964",
         "bytes": 2596,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/native/cuda_startup_phase.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/native/cuda_startup_phase.zig"
       }
     },
     {
       "path": "zig/src/native/none.zig",
       "mode": "100644",
-      "blob": "86bdfe4184910316a1bdff99574d1090cb4eefb8",
-      "sha256": "1d597705671c1eb3d2b3a4106b21677ca2114343130f864a5b4b54a4796fe11b",
-      "bytes": 1230,
+      "blob": "eebf634a48cbd530802cb40ee511c90b337a7d9d",
+      "sha256": "e3be4901ba63582dd64431d8b1a36576a1498eac369f7f59e01528b996be45d2",
+      "bytes": 1066,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "e172eeacb55dc172a900977567a58690f2bf3f0b",
-        "sha256": "8716c813333ba0c55e497b7c3a778a230cb574a718a1f9fdef9fdcb51156b505",
-        "bytes": 726,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/native/none.zig"
+        "blob": "1d8f4312b69ec4278e5e32822d22a37655a65a15",
+        "sha256": "b8b5088fa1d4f604468558bc449a986e391d9c9d99db6698871828d2f8b705ab",
+        "bytes": 562,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/native/none.zig"
       }
     },
     {
       "path": "zig/src/platform/environment.zig",
       "mode": "100644",
-      "blob": "3f18848e5268f2804ab68f669acfe4b29e4152cd",
-      "sha256": "ade44cd5ca315315b8733e16146518f24c17e966088d850dce4349b56fddf6f7",
-      "bytes": 42262,
+      "blob": "aa9a976a6bc7a5ff82efe99fe07e7acaf90793d1",
+      "sha256": "d8028bcc2ec92b9562cd493e0ef5d702fa8767e770c7c16dc3abec12cfb66d5d",
+      "bytes": 50531,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "aadc2fbd99b58131fc9cab471fb9221e3dbbc840",
-        "sha256": "4113873bfe5ebd42d084640e847334ed7d1a603b2f2e649c5a128fc4780f79e3",
-        "bytes": 38673,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/platform/environment.zig"
+        "blob": "907cd26d86ad69b0ecd34e7e0952d7de7a2b0f6a",
+        "sha256": "1d48f9f8ee797fd17a33a9a2977491f7dc8dea0d6d0701e97e6a0a37c6030283",
+        "bytes": 46944,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/platform/environment.zig"
       }
     },
     {
       "path": "zig/src/server/engines.zig",
       "mode": "100644",
-      "blob": "e55f1613fc823183bd3c5e8db2060f02d405e290",
-      "sha256": "003c15d80c00c2d5d73b38745fd4ca603f2ecf1bf2b426fbf605615c8328d9f8",
-      "bytes": 5858,
+      "blob": "552388a09ba2f498a0348f32313afe5dc52295ce",
+      "sha256": "3c5c1526ef06dd92d58cc998892ff2f29b262a21ed85d04da2d837511f01e41d",
+      "bytes": 6087,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "dca07818f41e8d72dfe08819121ee6c7c68839c1",
-        "sha256": "2e6a5e63ad32c2893c6e5096b8920a482ff8c3eda7c87d1d26456ae40319661d",
-        "bytes": 5556,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/server/engines.zig"
+        "blob": "e7e199d6cd58bea7b4a32c75b287eb9f67b625af",
+        "sha256": "95eae1653d9576c2ef8aabe486a4e260e66a017fc1cabb82114cde383d30e85f",
+        "bytes": 5785,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/server/engines.zig"
       }
     },
     {
       "path": "zig/src/server/load_metrics.zig",
       "mode": "100644",
-      "blob": "c6aa688c3f83a4a4c91eea7573f96219e54c99a1",
-      "sha256": "13fa1ea85ade328bcb1edb26b51b0995071fae24b6890ffb36790bb201b549b7",
-      "bytes": 11229,
+      "blob": "5a489da6f7ee5ca29b001a338c861a4dd6990301",
+      "sha256": "890977b5a9bc45dc89fac9b85760ebf6604bd1598094b512e35dbd6c7656915c",
+      "bytes": 11609,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "b37f610138a595d7616e22c737b2f424c5fae670",
-        "sha256": "a038a012498eca37d605d7186e67d81d8a779cf138871838f2180d0abae6e510",
-        "bytes": 10556,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/server/load_metrics.zig"
+        "blob": "78083ba4eca868fa45f1201190f28991f9411b92",
+        "sha256": "4438ec869be40b16fda76942453a156ebd7e86abde53d31f9d159bb7b9b2a594",
+        "bytes": 10936,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/server/load_metrics.zig"
       }
     },
     {
       "path": "zig/src/server/main.zig",
       "mode": "100644",
-      "blob": "f59623a1e9ee4546b9f2a7468a8a079488ae0046",
-      "sha256": "e67d0cc7c9b48fbda50e55b4b81f04d817d35111b365dd593b26453e247b1f6d",
-      "bytes": 20124,
+      "blob": "b4db480b5a29c85563320f73fa23024185a2db57",
+      "sha256": "f300d9df9f5de174d4af766b8fa83ce04ca28555f2be64b6d6b360df66e17735",
+      "bytes": 21705,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "88c4f81b8c2460c44681110c664a6da1811071c6",
-        "sha256": "69db45324d2f6a49f2af272d7ef0b87fabe0a9c8e1dc4dfcecaf8b07d725ffc0",
-        "bytes": 17512,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/server/main.zig"
+        "blob": "60312e36b08410884feac67703cb130b0893e403",
+        "sha256": "b8ba5f8013a0a5e639e93da86a0de5d17fc367efe50e3a71fc41c1a2f0df3054",
+        "bytes": 19093,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/server/main.zig"
       }
     },
     {
       "path": "zig/src/server/serve.zig",
       "mode": "100644",
-      "blob": "8d79d80f7bb3f2b8c69f5be193d16e4cf08d349b",
-      "sha256": "ce43c564f17c9e9901d914177552cc231c248a83fc1d899fdf0b741bb0bc11fc",
-      "bytes": 27534,
+      "blob": "64068ab054b5bc23cf98282cb9be2a2bdd30610e",
+      "sha256": "9e68d57051ac93fff64bef5fc4e353651d6d5fe477698a54b41fa7e95c963a6d",
+      "bytes": 28606,
       "base": {
         "mode": "100644",
         "kind": "blob",
-        "blob": "b3e37c27ca6d9e6a244e9ce0bd5a3094282510e4",
-        "sha256": "b0d89488fba45a61f48eeefe1263d0260c32bc0cfb53898e7ce07d255327eab5",
-        "bytes": 26742,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/server/serve.zig"
+        "blob": "87474b695dfb52618268b2b29bdf414e64216332",
+        "sha256": "5d98d33e950be02fb8867b9ffba5e1e2db6fd03dd4e0b29d167f3c3953f9a9e3",
+        "bytes": 27814,
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/server/serve.zig"
       }
     },
     {
@@ -1498,7 +1505,7 @@
         "blob": "fa7a2ad86dc133fef5a13aeb462bf628f5d7c08d",
         "sha256": "ef75d63bc55fe877940699aa2df3367754a2419b0b8d9d39c8a27ac95676fd31",
         "bytes": 3784,
-        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/d3d0bf110d57161edfbd20234a84833f14548b57/zig/src/server/startup.zig"
+        "url": "https://raw.githubusercontent.com/ashhart/TensorFold/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc/zig/src/server/startup.zig"
       }
     },
     {
@@ -1550,5 +1557,5 @@
       }
     }
   ],
-  "patch_sha256": "94eaf638b7ae2506869625967f2d26848110da86878db675678cc858c4133183"
+  "patch_sha256": "0c688f44f9842394fe23f16e59dc3fe9fe61cd548f1630e30a95d7f7533e698f"
 }

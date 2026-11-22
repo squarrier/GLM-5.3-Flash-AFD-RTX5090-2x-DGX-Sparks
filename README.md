@@ -1,12 +1,15 @@
-# GLM-5.3-Flash AFD V4.2 — source-only release
+# GLM-5.3-Flash AFD V4.2 — TensorFold v1.3.3
 
-**Provided as-is, without support. The measurements describe the tested deployment, not a rebuild of this source overlay.**
+**One RTX 5090 for attention + two DGX Sparks for experts, with BF16 KV history in host RAM.**
+Short-workload throughput: **94.9 tok/s at four offered requests, 122.2 tok/s at eight**. Exact **420K prompt-plus-output** verified for one cold stream; eight full 420K histories are **not** qualified.
+
+**Provided as-is, without support. Source-only overlay; measurements describe the tested deployment, not a new build of this public package.**
 
 ## Authors
 
 [Mia (@MiaAI_lab)](https://github.com/MiaAI-Lab) also authored the [DFlash2 selector bounds patch 0014](https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104/blob/91a7ba6105ccbc961e34b337ef80a55e93a44040/patches/engine/0014-glm-dflash2-the-selector-skips-candidate-ids-outside.patch). This port moves the invalid-anchor normalization earlier and retains her authorship. [Inco AI](https://inco.ai) authored the external [DFlash2 checkpoint](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2/tree/bf582e4eacc1810f76656d1811693ff6c6737d2a); [Z Lab](https://github.com/z-lab) authored [DFlash](https://github.com/z-lab/dflash), whose original extraction revision remains unknown.
 
-- [Ash Hart (@ashhart)](https://github.com/ashhart) authored [TensorFold v1.3.0](https://github.com/ashhart/TensorFold/tree/d3d0bf110d57161edfbd20234a84833f14548b57) and [MCDMA](https://github.com/ashhart/MCDMA). [Russell Marr (@russellmm)](https://github.com/russellmm) authored [pinned host KV](https://github.com/russellmm/TensorFold/commit/adc001b4bdf9fcdde38647ae5a46fbafd3e829f3); [Bizuayeu (@Bizuayeu)](https://github.com/Bizuayeu) authored the [MTP pooled-key fix](https://github.com/Bizuayeu/TensorFold/commit/b0e1cdcbab3b6ebc183129f9b26c9887ed22ff3e).
+- [Ash Hart (@ashhart)](https://github.com/ashhart) authored [TensorFold v1.3.3](https://github.com/ashhart/TensorFold/tree/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc) and [MCDMA](https://github.com/ashhart/MCDMA). [Russell Marr (@russellmm)](https://github.com/russellmm) authored [pinned host KV](https://github.com/russellmm/TensorFold/commit/adc001b4bdf9fcdde38647ae5a46fbafd3e829f3); [Bizuayeu (@Bizuayeu)](https://github.com/Bizuayeu) authored the [MTP pooled-key fix](https://github.com/Bizuayeu/TensorFold/commit/b0e1cdcbab3b6ebc183129f9b26c9887ed22ff3e).
 - [Mia (@MiaAI_lab)](https://github.com/MiaAI-Lab) authored the [Spark recipe and RoCE adaptations](https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104/tree/80be4d6882837d8e0840827ae2aab6124fd48da3), [EXL3 quantization](https://huggingface.co/Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold/tree/078455ffe6472f9a52fbc1139f58b9db2881b25c) and [attribution guide](https://mia-ai.net/lab/downloads/agents-md-credit-and-attribution). [Z.ai](https://huggingface.co/zai-org) authored the [base model and MTP](https://huggingface.co/zai-org/GLM-5.3-Flash/tree/91b69215804f2d2036a8867f6ce44848e278dcda).
 - [Hugh Madden (@hughmadden)](https://github.com/hughmadden) authored the [attention/expert split and expert prompt kernels](https://github.com/hughmadden/glm53f-afd/tree/91db3cc6fe672e2724efa3464f63bd31493f63f6). [T.J. Purtell (@tpurtell)](https://github.com/tpurtell) authored the [expert channel split](https://github.com/tpurtell/glmrt-5.3-1rtx-4spark/tree/dc6d9b8e1600e001cb1d4228bd911f4df8091f99) and [CuteAFD](https://github.com/tpurtell/cuteafd/tree/b4818a73371788aa3b9dd54023c017646d109f01).
 - [Scott Quarrier (@squarrier)](https://github.com/squarrier) authored the recipe packaging and directed the program; an AI assistant authored the native integration and packaging changes for Scott. See [full credits](#license-and-credits), [AI-assisted development](#ai-assisted-development), and the [historical V4.0.1 source manifest](https://github.com/squarrier/GLM-5.3-Flash-AFD-RTX5090-2x-DGX-Sparks/blob/9e1590000788254ee4f827524781b0a06421cb84/manifests/engine-source.json).
@@ -20,36 +23,55 @@
 
 </details>
 
-## Measured speed — V4.2 against the live Mia deployment
+## Concurrency and speed
 
-Same-window API tests on the repaired V4.2 TensorFold deployment with Q4 DFlash2 versus the Mia recipe deployment at [`d8a7439`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-DGX-Sparks-1104/commit/d8a7439e8c5aac8645c423ccd24189690359ab69). These compare whole deployments on different hardware/topologies and settings, not the speedup of an individual kernel or drafter. They do not represent Mia's latest upstream or an A/B against public V4.1. Aggregate rates use all output tokens divided by workload wall time; the per-stream ranges use post-first-token decode speed.
+Adding an RTX 5090 moves attention to a separate GPU while the two Sparks serve experts. The native hybrid exchange overlaps expert work; pinned host RAM holds the main BF16 KV history while pooled keys remain on the attention GPU. This is a heterogeneous system, not three identical tensor-parallel ranks. The measured benefit belongs to the complete configuration: no matched causal test isolates the card, extra RAM, engine version or drafter.
 
-| Workload | Offered | V4.2 aggregate / per-stream, tok/s | Mia aggregate / per-stream, tok/s | Mean TTFT, V4.2 / Mia |
-|---|---:|---:|---:|---:|
-| Short concurrent, 300 output tokens/stream | 4 | **92.9–93.1** / 23.5–28.2 | **77.0** / 19.6–30.0 | 0.450 / 0.458 s |
-| Short concurrent, 300 output tokens/stream | 8 | **118.4** / 15.2–18.0 | **85.1** / 16.0–34.8 | 0.836 / 7.357 s |
-| Coding workload, 1,024 output tokens/stream | 4 | **111.63** / 28.15–29.49 | **96.32** / 24.26–26.47 | 0.849 / 0.885 s |
-| Coding workload, 1,024 output tokens/stream | 8 | **132.06** / 17.05–20.20 | Not measured | 1.535 s / — |
+Same short harness, 300 generated tokens per stream, Q4 DFlash2, same RTX 5090 + two Sparks. The v1.3.3 runs are later than the v1.3.0 runs, not alternating A/B trials:
 
-At four offered, V4.2 increased short-workload aggregate throughput by **20.6–20.9%**; Mia still recorded the fastest individual short stream. V4.2's coding C4 mean end-to-end latency was **36.207 s** versus **41.514 s**. At eight offered, the Mia endpoint had only four native lanes, so its TTFT includes queueing and this is not an eight-resident comparison. The single-stream code rows were **69.3–69.4 tok/s** for V4.2 and **66.0–66.1 tok/s** for Mia (post-first-token). See [BENCHMARKS.md](BENCHMARKS.md) for the other C1 rows, methodology and limits. Earlier release results below are historical and are not denominators for a V4.2 speedup.
+| Workload / metric | V4.2 / v1.3.3 | Prior V4.2 / v1.3.0 | Observed change |
+|---|---:|---:|---:|
+| C1 prose decode, tok/s | **65.5** | 63.9 | +2.5% |
+| C1 code decode, tok/s | **70.9** | 69.4 | +2.2% |
+| C1 JSON decode, tok/s | **81.9** | 80.6 | +1.6% |
+| C4 mixed aggregate, tok/s | **94.9** | 93.0 | +2.0% |
+| C8 mixed aggregate, tok/s | **122.2** | 118.4 | +3.2% |
 
-## KV and context — measured on the repaired deployment
+C1 values are medians of three probes; C4 is the median of two waves, C8 one wave. Actual post-first-token per-stream ranges on v1.3.3: **24.3–28.9 tok/s at C4**, **15.7–18.6 at C8**. Aggregate throughput is output tokens divided by workload wall time; it is not an individual user's rate. Power limits and clock caps for these runs are **unknown**, so no stock-power or efficiency claim is made.
 
-**420,000 prompt-plus-output tokens verified for one stream**: a cold 419,488-token prompt retrieved its exact test value and generated all 512 requested tokens. The 420,001-token control was rejected before inference. Startup verified eight available lanes, 6,568 attached pages of BF16 history (41,871 MiB pinned host RAM) and 2,463 MiB of pooled keys on the attention GPU. The lowest sampled startup free VRAM was 1,814 MiB; this is not a bound on unsampled or fully occupied phases. **Eight simultaneously occupied 420,000-token windows and cancellation/refill at that occupancy have not been hardware-qualified.** This cap is a tested deployment setting, not a new default for the source overlay.
+**Historical hardware comparison, not a new v1.3.3 head-to-head:** earlier same-window v1.3.0 AFD / Mia-recipe measurements were **93.0 / 77.0 tok/s at C4** and **118.4 / 85.1 at eight offered**. Mia's endpoint offered only four native lanes, so its eight-request result includes queueing. This does not isolate the benefit of adding a 5090 or RAM and is not a comparison to Mia's latest release. [Detailed results and methodology](BENCHMARKS.md) preserve the historical comparator revision and limitations.
+
+## KV cache: RAM capacity, not eight full windows
+
+| Verified v1.3.3 deployment property | Result |
+|---|---:|
+| Main history | **BF16, pinned host RAM** |
+| Attached shared pool | **6,568 pages / 41,871 MiB host RAM** |
+| Pooled keys on the attention GPU | **2,463 MiB** |
+| Available request slots | **8 configured** |
+| Exact cold C1 | **419,488 prompt + 512 output = 420,000 tokens** |
+| Cold C1 TTFT / end-to-end | **314.266 / 319.209 s** |
+| Eight simultaneously occupied 420K histories | **Not qualified** |
+
+The main history uses host RAM rather than keeping all BF16 history on the 5090. The device still needs pooled keys, gather buffers, state, weights and workspace; host bytes minus key bytes is **not** a measured net VRAM saving. There is no host-KV on/off hardware control or measured causal speedup. Cap-plus-one was rejected before inference. A shared pool and eight configured slots are not eight independently backed full-size sessions.
+
+A separate v1.3.3 context/concurrency matrix qualified **20 of 27 planned cells**: all short and ~13.6K-prompt cells, plus ~82.5K prose at C1/C4. Long-prose C8 completed only one of eight streams before a controller-local storage guard stopped the run; it is unqualified, **not a GPU OOM result**. Long code/JSON were not run. These are throughput/completion observations, not answer-quality results. [Matrix scope and latency](BENCHMARKS.md#extended-context-matrix--partial) matter for long-prompt use.
 
 ## Source scope and bounded reconstruction (no build)
 
-This release is an affected-path overlay against official TensorFold v1.3.0 commit `d3d0bf110d57161edfbd20234a84833f14548b57`. It reconstructs **143 source paths plus four grant/notice aliases**, not a complete engine checkout, consumer build or deployment. It retains the prior public hybrid implementation, adds Mia's selector guard and the DFlash2 admission port, and includes the selected source's occupancy/lifecycle, prepaid-ring, bounded host-reader, early-parser and startup-observation changes. It also includes the allocation repair and coupled tests: the planner reserves one extra row before alignment, without changing the 32-row verification width or adding a required page to the 420K pool.
+This successor targets official [TensorFold v1.3.3](https://github.com/ashhart/TensorFold/tree/1e4a32cb5e80f2908e4642f9e7ffe71ae63792cc). It reconstructs **144 affected source paths plus four grant/notice aliases**, not a complete engine, consumer build or deployment. It retains the public V4.2 hybrid implementation, Mia's selector guard, the DFlash2 admission port and the allocation repair, adapted to the v1.3.3 APIs; it adds the coupled exact-context request-opening/page-planner fixture. The 32-row verification width is retained.
 
-Only source text, reconstruction metadata and retained notices are supplied. No model weights, quantized drafters, compiled CUDA assets, executables, private runtime configuration, credentials or benchmark payloads are included. Users must separately obtain the complete pinned upstream tree, preserve its component notices, and build with their own CUDA toolkit. This source package does not supply the toolchain or certify redistribution rights for its outputs.
+Only source text, reconstruction metadata and notices ship. **No weights, drafters, compiled CUDA assets, executables, private configuration, credentials or raw benchmark records.** Obtain the complete pinned upstream separately, preserve its component terms and build with your own toolkit. This is not a turnkey launcher or a claim of native binary/bit parity.
 
 Use Python 3.9 or later and Git on Linux in an isolated directory:
 
 ```sh
 python3 -B source/reconstruct.py --fetch --cache ./input-cache --output ./overlay --receipt ./reconstruction.json
+mkdir -p ./scratch
+python3 -B source/test_reconstruct.py --cache ./input-cache --scratch ./scratch --receipt ./packaging-tests.json
 ```
 
-The output must not exist. Optional `--fetch` reads only immutable public GitHub URLs in the lock; later replay can use the verified cache offline. Every resulting path, mode, size, Git blob and SHA-256 is checked. This command reconstructs the affected files only. It does not run a compiler, source test, GPU, model, service, or benchmark. Public cache labels and comment/diagnostic privacy edits are explicitly distinct from the privately built source bytes; there is no claim of a new native build of this exported tree.
+The output must not exist. `--fetch` reads only exact immutable public URLs from the lock; the verified cache supports offline replay. Every output path, mode, size, Git blob and SHA-256 is checked. The ten packaging tests include both normal/restrictive umasks and eight refusal controls; they execute Python and Git, not a compiler, GPU, model or server. The selected source already contains the public comment/diagnostic and cache-label normalizations; reconstruction identity does not imply a new public-tree native build. The historical `hybrid-v1.3.0` cache namespace is intentionally retained with its coupled assertions; it is not the engine version pin.
 
 ## Third-party terms and unresolved boundaries
 
@@ -76,7 +98,7 @@ All previous author names, source grants and historical credits remain in the re
 
 ## AI-assisted development
 
-Scott Quarrier directed the program. GPT-6.1 Sol / OpenAI Codex via Hermes prepared the V4.2 port, offline source selection and packaging draft; this session verified custody and reconstruction, not historical per-call authorship. Earlier local-agent and Anthropic Opus 5.5 roles remain in CREDITS and inherited notices. This source reconstruction is not a hardware qualification, benchmark result or model-quality claim.
+Scott Quarrier directed the program. GPT-6.1 Sol / OpenAI Codex via Hermes prepared the V4.2 port, v1.3.3 API adaptations, source selection and this packaging/QA. Earlier local-agent and Anthropic Opus 5.5 roles remain in CREDITS and inherited notices; historical per-call authorship is not inferred from the current session. No model-quality claim is included.
 
 ## Security
 

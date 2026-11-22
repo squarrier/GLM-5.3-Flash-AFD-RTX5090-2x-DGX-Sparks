@@ -129,7 +129,7 @@ def reconstruct(lock_path, patch_path, output, cache, fetch):
         if blob != row['blob']:
             raise ValueError('output Git blob mismatch: ' + row['path'])
         checked.append({'path': row['path'], 'sha256': digest(data), 'blob': blob, 'mode': row['mode']})
-    return {'status': 'RECONSTRUCTION PASS; NOT A BUILD', 'scope': '143 implementation paths plus four grant/notice aliases; not full TensorFold or a build',
+    return {'status': 'RECONSTRUCTION PASS; NOT A BUILD', 'scope': '144 implementation paths plus four grant/notice aliases; not full TensorFold or a build',
             'lock_sha256': digest(lock_path.read_bytes()), 'patch_sha256': digest(patch),
             'files': len(checked), 'apply': applies, 'checked': checked}
 

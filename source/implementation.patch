@@ -7,7 +7,7 @@ diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
  //! The CUDA half of the root build: kernel fatbins with their Python extensions' nvcc flags, the runtime, the CLI.
  const std = @import("std");
  const exlr8_build = @import("exlr8.zig");
-@@ -90,6 +92,9 @@
+@@ -96,6 +98,9 @@
      cli.addOptions("build_options", build_options);
      cli.addImport("checkpoint_cli", checkpointCli(b, target, optimize, strip, native.engines, mods.core));
      b.installArtifact(b.addExecutable(.{ .name = "tensorfold", .root_module = cli }));
@@ -92,7 +92,7 @@ diff --git a/zig/build/digest.zig b/zig/build/digest.zig
 diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
 --- a/zig/build/glm_family_host.zig
 +++ b/zig/build/glm_family_host.zig
-@@ -1,7 +1,10 @@
+@@ -1,10 +1,23 @@
 +// Modified for V4 by Scott Quarrier with AI-assisted integration: native hybrid integration/adaptation.
 +// Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
  //! Existing GLM family recording controls on the CPU runtime.
@@ -103,7 +103,20 @@ diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
      // GLM CUDA's startup watcher (named phases, a warning while NCCL init or a load blocks), from cuda.zig's room
      b.step("test-startup-watch-host", "Blocked startup phase warnings without a driver or communicator").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = &.{"startup watcher:"} })).step);
      const host = b.graph.host;
-@@ -33,6 +36,7 @@
++    const exact_context = b.createModule(.{
++        .root_source_file = b.path("zig/glm_exact_context_host.zig"),
++        .target = host,
++        .optimize = .ReleaseSmall,
++        .link_libc = true,
++        .imports = &.{ .{ .name = "glm", .module = glm }, .{ .name = "lanes", .module = mods.lanes }, .{ .name = "core", .module = mods.core } },
++    });
++    const exact_run = b.addRunArtifact(b.addTest(.{ .root_module = exact_context }));
++    exact_run.has_side_effects = true;
++    b.step("test-glm-exact-context-host", "Real GLM opening and page planning at 420k, no devices").dependOn(&exact_run.step);
+     const exl3 = b.createModule(.{ .root_source_file = b.path("zig/glm_exl3_prompt_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm", .module = glm }, .{ .name = "cuda", .module = cuda } } });
+     const exl3_run = b.addRunArtifact(b.addTest(.{ .root_module = exl3, .filters = &.{"GLM EXL3 prompt:"} }));
+     b.step("test-glm-exl3-prompt-host", "Actual EXL3 whole prompt calls, shared-slot ABI and scratch without a GPU").dependOn(&exl3_run.step);
+@@ -33,6 +46,7 @@
      step.dependOn(&kda_header_run.step);
      const startup = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm/cuda_start_test.zig"), .target = host, .optimize = .debug });
      const startup_run = b.addRunArtifact(b.addTest(.{ .root_module = startup }));
@@ -111,7 +124,7 @@ diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
      b.step("test-glm-startup-host", "Page refusals propagate through rank liveness before engine construction").dependOn(&startup_run.step);
      step.dependOn(&startup_run.step);
      const thin_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM thin weights:"} }));
-@@ -57,12 +61,14 @@
+@@ -58,12 +72,14 @@
      step.dependOn(&profile_run.step);
      const pages = b.createModule(.{ .root_source_file = b.path("zig/glm_pages_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm", .module = glm }, .{ .name = "cuda", .module = cuda }, .{ .name = "lanes", .module = mods.lanes }, .{ .name = "core", .module = mods.core } } });
      const pages_run = b.addRunArtifact(b.addTest(.{ .root_module = pages, .filters = &.{"GLM pages:"} }));
@@ -126,7 +139,7 @@ diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
      b.step("test-glm-image-cache-host", "Image-content prefix reuse over the shared store and suffix rows across both ranks without devices").dependOn(&image_cache_run.step);
      step.dependOn(&image_cache_run.step);
      const page_contract = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/contract_glm_controls_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm_cuda", .module = glm }, .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } });
-@@ -76,10 +82,12 @@
+@@ -77,10 +93,12 @@
      const copies = b.createModule(.{ .root_source_file = b.path("zig/src/native/cuda_snaps.zig"), .target = host, .optimize = .debug, .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "core", .module = mods.core } } });
      const snapshots = b.createModule(.{ .root_source_file = b.path("zig/glm_snapshot_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm", .module = glm }, .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core }, .{ .name = "engine_api", .module = api }, .{ .name = "copies", .module = copies } } });
      const snapshots_run = b.addRunArtifact(b.addTest(.{ .root_module = snapshots }));
@@ -139,7 +152,7 @@ diff --git a/zig/build/glm_family_host.zig b/zig/build/glm_family_host.zig
      b.step("test-glm-request-starts-host", "GLM message-start prompt cuts and the shared-KV startup refusal without devices").dependOn(&request_starts.step);
      const mm_record = b.createModule(.{ .root_source_file = b.path("zig/test_support/glm_mm_cuda.zig"), .target = host, .optimize = .debug });
      const mm_actual = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm/cuda_mm.zig"), .target = host, .optimize = .debug, .imports = &.{.{ .name = "cuda", .module = mm_record }} });
-@@ -90,7 +98,9 @@
+@@ -91,7 +109,9 @@
      const packed_host = b.createModule(.{ .root_source_file = b.path("zig/glm_packed_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "glm", .module = glm }, .{ .name = "core", .module = mods.core } } });
      b.step("test-glm-packed-host", "Packed GLM launch records, cap parsing and native loader on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = packed_host, .filters = &.{"glm packed:"} })).step);
      const ring_host = b.createModule(.{ .root_source_file = b.path("zig/glm_ring_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "glm", .module = glm } } });
@@ -256,7 +269,7 @@ diff --git a/zig/build/server.zig b/zig/build/server.zig
  //! The server's shared JSON values, available to server and family modules.
  const std = @import("std");
  
-@@ -214,6 +216,8 @@
+@@ -217,6 +219,8 @@
      }) });
      exe.root_module.addOptions("build_options", build_options);
      _ = addTo(b, exe.root_module, target, optimize);
@@ -291,6 +304,58 @@ new file mode 100644
 + try std.testing.expectEqual(@as(c_int,0),setenv("TF_GLM_ATTENTION_TILE_ROWS","16",1));defer _=unsetenv("TF_GLM_ATTENTION_TILE_ROWS");
 + for([_]usize{1,8,16,17,32}) |rows| {const r=try fixture.tile524(rows,32,30000);try std.testing.expectEqual(@as(usize,1),r.calls);try std.testing.expectEqual(r.base_qa,r.qa);}
 + const dense=try fixture.tile524(65,16,0);try std.testing.expectEqual(@as(usize,5),dense.calls);try std.testing.expectEqual(@as(usize,0),dense.copies);
++}
+diff --git a/zig/glm_exact_context_host.zig b/zig/glm_exact_context_host.zig
+new file mode 100644
+--- /dev/null
++++ b/zig/glm_exact_context_host.zig
+@@ -0,0 +1,47 @@
++//! CPU fixture for the real GLM request-opening guard and page planner.
++const std = @import("std");
++const glm = @import("glm");
++const lanes = @import("lanes");
++const core = @import("core");
++const testing = std.testing;
++
++fn opening(prompt: usize, reply: u32, cap: usize, expected: anyerror) !void {
++    const ids = try testing.allocator.alloc(u32, prompt);
++    defer testing.allocator.free(ids);
++    @memset(ids, 1);
++    var s = try lanes.Stream.init(testing.allocator, .{ .id = "exact-420k", .prompt = ids, .max_new = reply, .eos = &.{} });
++    defer s.deinit(testing.allocator);
++    var fail = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
++    var e: glm.engine.Engine = undefined;
++    e.gpa = fail.allocator();
++    e.capacity = cap;
++    e.pages = null;
++    var owner: glm.lanes.Lanes = .{ .x = .{ .e = &e, .link = undefined } };
++    defer owner.lanes.deinit(e.gpa);
++    const backend = owner.backend();
++    try testing.expectError(expected, backend.vtable.prefill_step.?(backend.ptr, &s, 0));
++    try testing.expectEqual(@as(u32, 0), owner.lanes.count());
++}
++
++test "exact 420k prompt plus reply reaches the first seat allocation" {
++    try opening(419488, 512, glm.native.capacity(420000), error.OutOfMemory);
++}
++
++test "one less succeeds but physical equality still refuses" {
++    const cap = glm.native.capacity(420000);
++    try opening(419487, 512, cap, error.OutOfMemory);
++    try opening(cap - glm.lanes.max_rows - 512, 512, cap, error.PromptTooLong);
++}
++
++test "physical allocation at 420k keeps 32 verify rows and 821 pages" {
++    const cap = glm.native.capacity(420000);
++    try testing.expectEqual(@as(usize, 32), glm.lanes.max_rows);
++    try testing.expectEqual(@as(usize, 420096), cap);
++    try testing.expectEqual(@as(usize, 821), glm.pages.tableLen(cap));
++    const layout: core.kv_pool.Layout = .{ .fixed_bytes = 0, .token_bytes = 1, .page_tokens = 512, .snap_bytes = 0 };
++    for (419488..420512) |context| {
++        const actual = glm.native.capacity(context);
++        try testing.expect(context + glm.lanes.max_rows < actual);
++        try testing.expectEqual(glm.pages.tableLen(actual), glm.pages.need(layout, context - 512, 512));
++    }
 +}
 diff --git a/zig/glm_expert.zig b/zig/glm_expert.zig
 new file mode 100644
@@ -581,7 +646,7 @@ new file mode 100644
 +test "hybrid provider: actual prompt fill treats absent remote EXL3 as FP32 and keeps shared separate" {
 +    Record.combine_calls=0; Record.put_calls=0;
 +    var d: cuda.Driver=undefined;
-+    d.api.cuLaunchKernel=Record.launch;
++    d.api.cuLaunchKernel=Record.launch;d.api.cuLaunchKernelEx=glm.pdl.forwardEx(Record.launch);
 +    d.api.cuMemcpy2DAsync_v2=Record.copy;
 +    d.api.cuMemcpyDtoDAsync_v2=Record.dcopy;
 +    d.api.cuStreamWaitEvent=Record.wait;
@@ -610,7 +675,7 @@ new file mode 100644
 +}
 +
 +test "hybrid provider: actual nonzero piece HC epilogue consumes three packed planes not TP world" {
-+    var d: cuda.Driver=undefined;d.api.cuLaunchKernel=Record.launch;
++    var d: cuda.Driver=undefined;d.api.cuLaunchKernel=Record.launch;d.api.cuLaunchKernelEx=glm.pdl.forwardEx(Record.launch);
 +    var modules: glm.forward.Modules=undefined;setFunctions(&modules,&d);modules.index=null;modules.tiled=false;modules.packs=null;
 +    modules.glue.hc_post=Record.fun(&d,3);
 +    var w: glm.weights.Weights=.{.gpa=t.allocator,.config=.{},.share=try glm.shard.Share.of(&glm.config.Config{},0,1)};
@@ -631,7 +696,7 @@ new file mode 100644
 +}
 +
 +test "hybrid provider: worker actual native EXL3 caller expands wire8 to native9 before prompt and decode" {
-+    var d: cuda.Driver=undefined;d.api.cuLaunchKernel=Record.launch;d.api.cuMemcpy2DAsync_v2=Record.copy;
++    var d: cuda.Driver=undefined;d.api.cuLaunchKernel=Record.launch;d.api.cuLaunchKernelEx=glm.pdl.forwardEx(Record.launch);d.api.cuMemcpy2DAsync_v2=Record.copy;
 +    d.api.cuMemsetD32Async=Record.memset;
 +    var modules: glm.forward.Modules=undefined;setFunctions(&modules,&d);
 +    modules.exl3.grouped=.{Record.fun(&d,7),Record.fun(&d,7),Record.fun(&d,7)};
@@ -723,7 +788,7 @@ new file mode 100644
 +
 +test "hybrid provider: actual Forward ffn dispatches target and MTP after router with row identity" {
 +    var d: cuda.Driver=undefined;
-+    d.api.cuLaunchKernel=Record.launch;d.api.cuMemcpy2DAsync_v2=Record.copy;
++    d.api.cuLaunchKernel=Record.launch;d.api.cuLaunchKernelEx=glm.pdl.forwardEx(Record.launch);d.api.cuMemcpy2DAsync_v2=Record.copy;
 +    var modules: glm.forward.Modules=undefined;setFunctions(&modules,&d);modules.index=null;modules.tiled=false;modules.packs=null;
 +    var w: glm.weights.Weights=.{.gpa=t.allocator,.config=.{.exl3=true},.share=try glm.shard.Share.of(&glm.config.Config{},0,1)};
 +    var b: glm.forward.Buffers=undefined;b.rows=32;b.prefill=true;b.normed=0x900000;b.moe=std.mem.zeroes(glm.moe.Scratch);
@@ -797,7 +862,7 @@ new file mode 100644
 +    const input=try a.alloc(u8,tr.wire.request_bytes);defer a.free(input);@memset(input,0);
 +    const output=try a.alloc(u8,tr.wire.reply_bytes);defer a.free(output);
 +    std.mem.writeInt(i32,input[128*4096*2..][0..4],288,.little);
-+    var d: cuda.Driver=undefined;d.api.cuLaunchKernel=Record.launch;d.api.cuMemcpy2DAsync_v2=Record.copy;d.api.cuMemsetD32Async=Record.memset;
++    var d: cuda.Driver=undefined;d.api.cuLaunchKernel=Record.launch;d.api.cuLaunchKernelEx=glm.pdl.forwardEx(Record.launch);d.api.cuMemcpy2DAsync_v2=Record.copy;d.api.cuMemsetD32Async=Record.memset;
 +    var modules: glm.forward.Modules=undefined;setFunctions(&modules,&d);modules.exl3.grouped=.{Record.fun(&d,7),Record.fun(&d,7),Record.fun(&d,7)};
 +    var h=tr.wire.Header{.session=1,.sequence=1,.native_round=1,.buffer_epoch=1,.layer=3,.phase=.target,.live_rows=1,.call_rows=1};h.bind();
 +    if(comptime @hasDecl(glm.moe.hybridExpert,"Worker")) {
@@ -826,7 +891,7 @@ new file mode 100644
 +    fn allg(_: u64,_: u64,_: usize,_: cuda.nccl.DataType,_: cuda.nccl.Comm,_: cuda.abi.Stream) callconv(.c) c_int {return 0;}
 +    fn reduce(_: u64,_: u64,_: usize,_: cuda.nccl.DataType,_: cuda.nccl.RedOp,_: cuda.nccl.Comm,_: cuda.abi.Stream) callconv(.c) c_int {return 0;}
 +    fn init(e: *glm.engine.Engine,d: *cuda.Driver,q: anytype,h: *glm.moe.routed.Buffer,layers: []glm.weights.Layer,cur: []u1,lib: *cuda.nccl.Library) !void {
-+        d.api.cuLaunchKernel=Record.launch;d.api.cuMemcpy2DAsync_v2=Record.copy;d.api.cuMemcpyDtoDAsync_v2=Record.dcopy;d.api.cuStreamWaitEvent=Record.wait;
++        d.api.cuLaunchKernel=Record.launch;d.api.cuLaunchKernelEx=glm.pdl.forwardEx(Record.launch);d.api.cuMemcpy2DAsync_v2=Record.copy;d.api.cuMemcpyDtoDAsync_v2=Record.dcopy;d.api.cuStreamWaitEvent=Record.wait;
 +        d.api.cuMemcpyHtoDAsync_v2=h2d;d.api.cuStreamSynchronize=sync;d.api.cuMemcpyDtoH_v2=d2h;d.api.cuMemsetD32Async=Record.memset;
 +        d.api.cuMemHostAlloc=host;d.api.cuMemFreeHost=hfree;d.api.cuEventCreate=event;d.api.cuEventRecord=evrecord;d.api.cuEventQuery=evop;d.api.cuEventDestroy_v2=evop;d.api.cuEventSynchronize=evop;
 +        d.api.cuCtxGetDevice=getdev;d.api.cuDeviceGetAttribute=attribute;
@@ -1622,7 +1687,7 @@ diff --git a/zig/glm_kv_host_hybrid_host.zig b/zig/glm_kv_host_hybrid_host.zig
 new file mode 100644
 --- /dev/null
 +++ b/zig/glm_kv_host_hybrid_host.zig
-@@ -0,0 +1,617 @@
+@@ -0,0 +1,618 @@
 +//! I2 actual native DSA/MTP host-KV consumers. Recording driver only; no CUDA math/device qualification.
 +//! Native host-KV: russellmm/PR1795; native MTP stride: Bizuayeu/PR2173.
 +//! Private I2 regression/adapter: Scott Quarrier with AI-assisted integration (OpenAI gpt-6.1-sol).
@@ -1752,6 +1817,7 @@ new file mode 100644
 +        R.reset();
 +        f.d = undefined;
 +        f.d.api.cuLaunchKernel = R.launch;
++        f.d.api.cuLaunchKernelEx = glm.pdl.forwardEx(R.launch);
 +        f.d.api.cuModuleGetFunction = R.lookup;
 +        f.d.api.cuMemsetD32Async = R.clear;
 +        inline for (@typeInfo(glm.glue.Kernels).@"struct".field_names, 0..) |name, i| {
@@ -2234,7 +2300,7 @@ new file mode 100644
 +    d.api.cuEventRecord=F.record;d.api.cuEventQuery=F.query;
 +    const cfg: glm.moe.hybridConfig.Config=.{.revision=3,.role=.attention,.session="00000000000000000000000000000001",.model_sha256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",.master=.{"127.0.0.1","127.0.0.1"},.ports=.{29550,29551},.traffic_class=104,.verbs_device="fixture",.roce_image="fixture",.setup_ms=3000,.transaction_ms=3000,.close_ms=1,.served_context=262144,.resident_users=8,.mtp=true,.settings=.{}};
 +    const session=try glm.moe.hybridForward.Session.create(t.allocator,e,cfg);
-+    session.peers[0].proof=.{.d=&d,.handle=null};
++    session.exchange.proof=.{.d=&d,.handle=null};
 +    try t.expect(!session.closeChecked().quiet);try t.expect(session.retained);
 +    try t.expect(!session.closeChecked().quiet);try t.expect(e.owns_host_gather and glm.kv_host.active!=null);try t.expectEqual(held,Lifetime.live);
 +    // CPU fixture has no actual queued work. Dispose synthetic retained Session explicitly; production sticky state is unchanged.
@@ -2248,12 +2314,11 @@ diff --git a/zig/glm_lane_costs_host.zig b/zig/glm_lane_costs_host.zig
 +// Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
  //! The production load-time measurement controller over recording timers, without devices or a checkpoint.
  const std = @import("std");
- const costs = @import("glm").lane_costs;
-@@ -24,6 +26,25 @@
-         return 2 + 0.5 * @as(f64, @floatFromInt(depth));
-     }
- };
-+
+ const glm = @import("glm");
+@@ -41,6 +43,25 @@
+ /// Each width's windows in a race: the untimed sweeps on both forms, then seven timed on each.
+ const raced = 2 * m.sweeps + 14;
+ 
 +test "V4.1 cache: actual consumed shape distinguishes effective DSEL mode" {
 +    var e: @import("glm").engine.Engine = undefined;
 +    e.settings = .{}; e.capacity = 479296; e.checkpoint_digest = @splat(1);
@@ -2272,12 +2337,13 @@ diff --git a/zig/glm_lane_costs_host.zig b/zig/glm_lane_costs_host.zig
 +    try t.expect(std.mem.indexOf(u8, on[2], "hybrid-v1.3.0/") != null);
 +    try t.expect(std.mem.indexOf(u8, on[2], "hybrid-previous/") == null);
 +}
- 
- test "GLM load prices: DFlash2 races expert forms without timing unused windows or head steps" {
++
+ test "GLM load prices: DFlash2 races the forms at every width without timing head steps or keeping prices" {
      var r: Recording = .{};
-@@ -100,11 +121,13 @@
+     const kept = try m.measure(&r, true, null);
+@@ -182,11 +203,13 @@
      }
-     var e: @import("glm").engine.Engine = undefined;
+     var e: glm.engine.Engine = undefined;
      e.settings = .{};
 +    e.capacity = 524352;
      e.checkpoint_digest = @splat(1);
@@ -3637,7 +3703,7 @@ diff --git a/zig/src/core/checkpoint_identity.zig b/zig/src/core/checkpoint_iden
  //! A rank's checkpoint for the ranks' agreement: its identity before any weight loads, then every byte as it loads.
  const std = @import("std");
  const builtin = @import("builtin");
-@@ -116,6 +118,8 @@
+@@ -121,6 +123,8 @@
      split: bool,
      names: []const []const u8,
      cache_root: ?[]const u8 = null,
@@ -3646,7 +3712,7 @@ diff --git a/zig/src/core/checkpoint_identity.zig b/zig/src/core/checkpoint_iden
      keys: []digest_cache.Key,
      errors: []?anyerror,
      hits: std.atomic.Value(usize) = .init(0),
-@@ -129,9 +133,13 @@
+@@ -134,9 +138,13 @@
      hash_backend: runtime_sha.Backend,
      t0: Io.Timestamp,
  
@@ -3661,7 +3727,7 @@ diff --git a/zig/src/core/checkpoint_identity.zig b/zig/src/core/checkpoint_iden
  
      pub fn workerCount(cpus: usize, serving: usize, files: usize, storage: usize) usize {
          return @min(files, max_workers, @max(1, cpus -| serving), @max(1, storage));
-@@ -148,10 +156,11 @@
+@@ -153,10 +161,11 @@
      }
  
      pub fn startWithOptions(gpa: std.mem.Allocator, io: Io, dir: []const u8, split: bool, root: ?[]const u8, options: Options) !*Content {
@@ -3674,7 +3740,7 @@ diff --git a/zig/src/core/checkpoint_identity.zig b/zig/src/core/checkpoint_iden
          errdefer c.arena.deinit();
          const a = c.arena.allocator();
          c.dir = try a.dupe(u8, dir);
-@@ -162,6 +171,7 @@
+@@ -167,6 +176,7 @@
          c.keys = try a.alloc(digest_cache.Key, c.names.len);
          c.errors = try a.alloc(?anyerror, c.names.len);
          @memset(c.errors, null);
@@ -3682,7 +3748,7 @@ diff --git a/zig/src/core/checkpoint_identity.zig b/zig/src/core/checkpoint_iden
          const workers = workerCount(std.Thread.getCpuCount() catch 1, options.serving_threads, c.names.len, options.storage_workers);
          var started: usize = 0;
          for (c.threads[0..workers]) |*thread| {
-@@ -172,10 +182,19 @@
+@@ -177,10 +187,19 @@
          return c;
      }
  
@@ -3702,7 +3768,7 @@ diff --git a/zig/src/core/checkpoint_identity.zig b/zig/src/core/checkpoint_iden
              const i = c.next.fetchAdd(1, .monotonic);
              if (i >= c.names.len) return;
              c.file(i, buf) catch |err| return c.fail(i, err);
-@@ -190,16 +209,19 @@
+@@ -195,16 +214,19 @@
  
      /// Reuse both the whole-file and shared-tensor digests under the same descriptor identity.
      fn file(c: *Content, i: usize, buf: []u8) !void {
@@ -3722,7 +3788,7 @@ diff --git a/zig/src/core/checkpoint_identity.zig b/zig/src/core/checkpoint_iden
          c.files[i] = got.value.sha256;
          c.plain[i] = got.value.shared.?;
          c.keys[i] = got.key;
-@@ -234,6 +256,8 @@
+@@ -239,6 +261,8 @@
          var at: u64 = 0;
          var r: usize = 0;
          while (at < size) {
@@ -3731,7 +3797,7 @@ diff --git a/zig/src/core/checkpoint_identity.zig b/zig/src/core/checkpoint_iden
              if (c.stop.load(.acquire)) return error.Stopped;
              const n = try f.readPositionalAll(c.io, buf[0..@intCast(@min(buf.len, size - at))], at);
              if (n == 0) return error.FileShrank;
-@@ -250,6 +274,7 @@
+@@ -255,6 +279,7 @@
              at = end;
              _ = c.bytes.fetchAdd(n, .monotonic);
          }
@@ -3739,7 +3805,7 @@ diff --git a/zig/src/core/checkpoint_identity.zig b/zig/src/core/checkpoint_iden
          return .{ .sha256 = all.finalResult(), .shared = part.finalResult() };
      }
  
-@@ -283,6 +308,13 @@
+@@ -288,6 +313,13 @@
      pub fn finishWithStats(c: *Content) !Stats {
          defer c.abandon();
          c.wait();
@@ -3753,7 +3819,7 @@ diff --git a/zig/src/core/checkpoint_identity.zig b/zig/src/core/checkpoint_iden
          const bad = c.failed.load(.monotonic);
          if (bad != std.math.maxInt(usize)) {
              if (!builtin.is_test) std.log.err("hashing the checkpoint failed at {s}", .{if (bad < c.names.len) c.names[bad] else "a buffer"});
-@@ -306,6 +338,8 @@
+@@ -311,6 +343,8 @@
          }
          const s = @as(f64, @floatFromInt(Io.Clock.awake.now(c.io).toNanoseconds() - c.t0.toNanoseconds())) / 1e9;
          std.log.info("checkpoint digest: {d:.1} GiB read in {d:.1} s, {d}/{d} cached files", .{ @as(f64, @floatFromInt(c.bytes.load(.monotonic))) / (1 << 30), s, c.hits.load(.monotonic), c.names.len });
@@ -3762,7 +3828,7 @@ diff --git a/zig/src/core/checkpoint_identity.zig b/zig/src/core/checkpoint_iden
          return .{ .digest = h.finalResult(), .bytes_read = c.bytes.load(.monotonic), .cache_hits = c.hits.load(.monotonic) };
      }
  };
-@@ -369,3 +403,15 @@
+@@ -374,3 +408,15 @@
  test {
      _ = @import("checkpoint_identity_test.zig");
  }
@@ -3955,7 +4021,7 @@ diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
  pub const profile = @import("profile");
  pub const tfvideo = @import("tfvideo.zig");
  pub const DraftSources = @import("draft_sources.zig").Sources;
-@@ -286,6 +289,8 @@
+@@ -220,6 +223,8 @@
              return "--ssd-experts requires a positive finite GiB budget below 2^33";
          return null;
      }
@@ -3984,7 +4050,7 @@ diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
  //! The lane core served to the HTTP threads: one thread owns ``core`` and steps rounds while any stream lives.
  const std = @import("std");
  const lanes = @import("lanes");
-@@ -96,6 +98,7 @@
+@@ -97,6 +99,7 @@
      capacity: ?load.Source = null, // how the engine holds KV, set before start; null: no capacity group
      kv: ?@import("kv_ledger.zig").Ledger = null, // Info.ledger's budget or the paged pool's (lane_host_ledger.zig)
      trace: ?*lane_trace.Trace = null, // TF_LANE_TRACE=<file>, read once at start (unless set before); null: no trace
@@ -3992,16 +4058,16 @@ diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
  
      pub const ThreadInit = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque) anyerror!void };
  
-@@ -107,7 +110,7 @@
+@@ -108,7 +111,7 @@
      pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
          var shown = info_.ofLanes();
          shown.draft_sources = shown.draft_sources.ofLanes(core.cfg, shown.lanes);
--        return .{ .gpa = gpa, .io = io, .core = core, .info_ = shown, .share = .withDecode(info_.decode_share), .decode_cap = info_.decode_share != null, .prefix = .fromEnv(), .pressure = .fromEnv(), .srpt = .fromEnv(), .kv = ledger.of(info_) };
-+        return .{ .gpa = gpa, .io = io, .core = core, .info_ = shown, .share = .withDecode(info_.decode_share), .decode_cap = info_.decode_share != null, .prefix = .fromEnv(), .pressure = .fromEnv(), .srpt = .fromEnv(), .kv = ledger.of(info_), .qualify524 = .fromEnv() };
+-        return .{ .gpa = gpa, .io = io, .core = core, .info_ = shown, .share = fill.decodeShare.resolved(info_.decode_share, info_.default_decode_share), .decode_cap = fill.decodeShare.capped(info_.decode_share, info_.default_decode_share), .prefix = .fromEnv(), .pressure = .fromEnv(), .srpt = .fromEnv(), .kv = ledger.of(info_) };
++        return .{ .gpa = gpa, .io = io, .core = core, .info_ = shown, .share = fill.decodeShare.resolved(info_.decode_share, info_.default_decode_share), .decode_cap = fill.decodeShare.capped(info_.decode_share, info_.default_decode_share), .prefix = .fromEnv(), .pressure = .fromEnv(), .srpt = .fromEnv(), .kv = ledger.of(info_), .qualify524 = .fromEnv() };
      }
  
      /// A paged family's pool counts in this host's ledger, the only test its promises pass (#1943); before `start`.
-@@ -121,6 +124,7 @@
+@@ -122,6 +125,7 @@
      }
  
      pub fn start(h: *LaneHost) !void {
@@ -4009,7 +4075,7 @@ diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
          if (h.rounds != null and ledger.priced(h)) return error.LedgerWithRounds; // a planner admits past takeJob
          // opened here, not at init: an owner failing before start leaks no file; a failed start closes it below
          lane_trace.openInto(&h.trace, h.gpa, h.io);
-@@ -390,6 +394,7 @@
+@@ -391,6 +395,7 @@
  
      /// A taken job's stream, set up to start; null when the job ended instead (dropped or cancelled).
      pub fn setup(h: *LaneHost, job: *Job) ?i96 {
@@ -4017,7 +4083,7 @@ diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
          const r = job.request;
          if (r.background and r.max_tokens == 0 and h.warm_quiet > 0 and !h.quiet(job)) return h.ended(h.cancel(job)); // other work came first
          if (!lane_stream.open(h, job)) return null; // the job was finished instead
-@@ -513,6 +518,17 @@
+@@ -514,6 +519,17 @@
          };
      }
  
@@ -4035,8 +4101,8 @@ diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
      fn run(h: *LaneHost) void {
          defer scoring.close(h);
          if (!@import("lane_thread.zig").start(h)) return;
-@@ -521,12 +537,18 @@
-         while (true) {
+@@ -523,12 +539,18 @@
+             @import("lane_host_backlog.zig").step(h); // holds precede activity: waits are idle
              var activity = @import("lane_activity.zig").Activity.enter(h.activity);
              defer activity.end();
 +            if(h.qualify524.phase_config!=null and h.qualificationDrain(std.Io.Clock.awake.now(h.io).toNanoseconds()))return rows_host.flush(h);
@@ -4055,7 +4121,7 @@ diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
              fill.run(h);
              h.core.sweep() catch |err| {
                  ends.failRound(h, err);
-@@ -534,6 +556,8 @@
+@@ -536,6 +558,8 @@
              };
              ends.deliverPending(h);
              status.noteLive(h);
@@ -4064,7 +4130,7 @@ diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
              h.lock();
              if (h.closing) {
                  const left = h.queued.items.len + h.admitted.items.len;
-@@ -546,7 +570,7 @@
+@@ -548,7 +572,7 @@
                  ends.closeAll(h);
                  continue;
              }
@@ -4922,7 +4988,7 @@ diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
  //! Our .cu kernels as fatbins built at build time with each Python extension's nvcc flags, embedded in the binary.
  
  const std = @import("std");
-@@ -183,3 +185,7 @@
+@@ -205,3 +207,7 @@
  pub const flashnext_train: []const u8 = if (available) &Blob("fatbin_flashnext_train").bytes else &.{};
  pub const attn_train: []const u8 = if (available) &Blob("fatbin_attn_train").bytes else &.{};
  pub const qwen27_train: []const u8 = if (available) &Blob("fatbin_qwen27_train").bytes else &.{};
@@ -6032,10 +6098,10 @@ diff --git a/zig/src/cuda/root.zig b/zig/src/cuda/root.zig
  pub const download_stage = @import("download_stage.zig");
  pub const memory_receipt = @import("memory_receipt.zig");
  pub const setAllocationLimit = @import("memory.zig").setAllocationLimit;
-@@ -31,6 +34,8 @@
- pub const cublaslt = @import("cublaslt.zig");
+@@ -32,6 +35,8 @@
  pub const nccl = @import("nccl.zig");
  pub const roce = @import("roce.zig");
+ pub const roce_pair_rule = @import("roce_pair_rule.zig");
 +/// Released V3 stream-driven exchange; native integration/ABI qualification remains separate.
 +pub const xchg = @import("xchg/xchg.zig");
  pub const triton = @import("triton.zig");
@@ -8422,10 +8488,10 @@ diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
  //! GLM-5.3-Flash on CUDA: the family's parts, ported from the Python family's CUDA path.
  
  pub const experts = @import("cuda_experts.zig");
-@@ -43,8 +45,13 @@
- pub const native = @import("cuda_native.zig");
+@@ -44,8 +46,13 @@
  pub const snapshots = @import("cuda_snapshots.zig");
  pub const kv_host = @import("cuda_kv_host.zig");
+ pub const pdl = @import("cuda_pdl.zig");
 +pub const hybrid_memory = @import("cuda_hybrid_memory.zig");
 +pub const hybrid_preload = @import("cuda_hybrid_preload.zig");
 +pub const hybrid_ledger = @import("cuda_hybrid_ledger.zig");
@@ -8436,7 +8502,7 @@ diff --git a/zig/src/families/glm/cuda.zig b/zig/src/families/glm/cuda.zig
      _ = lane_costs;
      _ = @import("cuda_formats_csf0_test.zig");
      _ = @import("cuda_tile.zig");
-@@ -119,3 +126,7 @@
+@@ -121,3 +128,7 @@
  pub const structured = @import("cuda_structured.zig");
  
  pub const kv8_ref = @import("cuda_kv8_ref.zig");
@@ -8483,7 +8549,7 @@ diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda
  //! GLM-5.3-Flash's DSA block on CUDA, a rank's latent-path share (the Python family's dsa_block) to an fp32 partial.
  
  const std = @import("std");
-@@ -125,6 +127,7 @@
+@@ -126,6 +128,7 @@
  
  /// One sequence's rows r0..r0 + rows at pos: latent and index keys written, dense then sparse attention into s.ol.
  pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, r0: usize, rows: usize, pos: u64, host_pos: usize, nch: usize, part_rows: usize) !void {
@@ -8491,7 +8557,7 @@ diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda
      const set = k.set;
      const ix = l.index;
      const kw_rows = ix.d + ix.heads;
-@@ -152,6 +155,17 @@
+@@ -153,6 +156,17 @@
          const stamp = prof.span(k.prof, stream, .mla);
          defer stamp.end();
          if (c.pks != 0) if (kv_host.active) |*g| { // host rows: gather the picks into device slots, attend there
@@ -8509,7 +8575,7 @@ diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda
              const slots = try g.gather(k.ops, stream, ix.gate, c.lc, c.pt, t.page_rows, pos, v.tokens, v.counts, rows, sparse.width);
              return latent.sparseAttentionFormat(set, stream, v.qa, slots, 0, .{}, v.tokens, v.counts, sparse.width, v.partials, v.ol, rows, l.heads, l.lw, scale);
          };
-@@ -162,6 +176,7 @@
+@@ -163,6 +177,7 @@
  /// A prompt MTP chunk's block: every row's caches, then the last row's attention and o_proj partial into `out` row 0.
  pub fn blockLastRow(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, x: u64, x_stride: usize, rows: usize, pos: u64, host_pos: usize, nch: usize, out: u64) !void {
      if (rows == 0) return error.BadWindow;
@@ -8517,7 +8583,7 @@ diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda
      const t, const tk = try tables(l, c);
      const ix = l.index;
      const kw_rows = ix.d + ix.heads;
-@@ -200,7 +215,11 @@
+@@ -201,7 +216,11 @@
      const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(l.qk), -0.5));
      if (host_pos < l.dense_limit) { // the same keys today's whole-chunk call read for this row
          var stamp = prof.span(k.prof, stream, .mla);
@@ -8530,7 +8596,7 @@ diff --git a/zig/src/families/glm/cuda_dsa_block.zig b/zig/src/families/glm/cuda
          stamp.end();
      }
      if (sparseRows(l, host_pos, rows)) {
-@@ -208,6 +227,10 @@
+@@ -209,6 +228,10 @@
          try sparse.selectTokensProfile(k.set, k.ops, stream, v.qi, s.ikr + r0 * (ix.d + ix.heads) * 2 + ix.d * 2, ix.d + ix.heads, c.pk, tk, at, host_pos + r0, 1, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts, null, k.prof);
          var stamp = prof.span(k.prof, stream, .mla);
          defer stamp.end();
@@ -8607,7 +8673,7 @@ diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_en
          var fp = ranks.Fingerprint.of(
              world,
              rank,
-@@ -158,13 +179,14 @@
+@@ -159,13 +180,14 @@
          const block32 = if (exl3.isExl3(gpa, text)) null else try @import("cuda_experts.zig").wantsBlock32(gpa, text);
          var m = try fw.Modules.load(d, ctx, block32);
          errdefer m.deinit();
@@ -8623,7 +8689,7 @@ diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_en
          const has_packs = o.settings.dense_bits != 16 or o.settings.head_bits != 16;
          if (has_packs and !o.settings.tiled) return error.PackedNeedsGlmMm;
          const Tile = struct {
-@@ -181,7 +203,7 @@
+@@ -183,7 +205,7 @@
              }
          };
          const tiler: Tile = .{ .gpa = gpa, .mk = &e.m.mm, .s = stream, .d = d, .enabled = o.settings.tiled, .dense = o.settings.dense_bits, .head = o.settings.head_bits, .packs = &e.packs };
@@ -8632,7 +8698,7 @@ diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_en
          errdefer e.w.deinit();
          errdefer {
              gpa.free(e.packs.ptrs);
-@@ -209,6 +231,8 @@
+@@ -211,6 +233,8 @@
          errdefer e.bm.deinit();
          if (o.mtp) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
          errdefer if (e.bs) |*b| b.deinit();
@@ -8641,7 +8707,7 @@ diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_en
          e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world * pick_rows);
          errdefer e.pairs.free();
          try d.check(d.api.cuMemsetD8_v2(e.pairs.ptr, 0, pair_bytes * world * pick_rows), "cuMemsetD8"); // each pair's padding stays zero
-@@ -232,7 +256,38 @@
+@@ -234,7 +258,38 @@
          return e;
      }
  
@@ -8680,7 +8746,7 @@ diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_en
          e.stream.synchronize() catch {};
          e.gpa.free(e.packs.ptrs);
          e.gpa.free(e.packs.bits);
-@@ -249,6 +304,7 @@
+@@ -251,6 +306,7 @@
          e.smp.deinit();
          e.pairs.free();
          if (e.bs) |*b| b.deinit();
@@ -8688,7 +8754,7 @@ diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_en
          e.bm.deinit();
          e.bd.deinit();
          if (e.pair) |*p| p.deinit();
-@@ -269,6 +325,20 @@
+@@ -271,6 +327,20 @@
  
      const freeProfs = @import("cuda_engine_prof.zig").freeProfs;
  
@@ -8709,7 +8775,7 @@ diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_en
      /// The serving group, its RoCE wires open: the main stream's and the boundary's gathers take its route now.
      pub fn installGroup(e: *Engine, g: *cuda.tp_group.Group) void {
          e.group = g;
-@@ -346,6 +416,7 @@
+@@ -348,6 +418,7 @@
  
      /// A fresh sequence with `sampling` (null or temperature 0: greedy).
      pub fn begin(e: *Engine, sampling: ?sampler.Sampling) !void {
@@ -8717,7 +8783,7 @@ diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_en
          e.cur.sampling = sampler.check(sampling);
          e.cur.in_head = 0;
          e.cur.cuts.clearRetainingCapacity(); // a request without starts cuts on the grid alone
-@@ -450,6 +521,7 @@
+@@ -452,6 +523,7 @@
  
      /// A verify window: `ids` (pending token, then drafts) at the committed position; `out[r]` drawn at pos + 1 + r.
      pub fn verify(e: *Engine, ids: []const u32, out: []u32, bits: u64) !void {
@@ -8725,7 +8791,7 @@ diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_en
          if (ids.len == 0 or ids.len > fw.window_rows) return error.WindowTooWide;
          var one: [1]fw.Rank = undefined;
          var f = e.view(&e.bd, &one);
-@@ -466,7 +538,10 @@
+@@ -468,7 +540,10 @@
      const verifyLabel = @import("cuda_engine_prof.zig").verifyLabel;
  
      /// Several streams' windows in one forward: shared row ops, per-part attention and KDA.
@@ -8736,7 +8802,7 @@ diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_en
          const b = if (e.bs) |*x| x else return error.NoSharedWindows;
          if (parts.len == 0 or parts.len > max_shared) return error.WindowTooWide;
          var segs: [max_shared]fw.Seg = undefined;
-@@ -508,8 +583,10 @@
+@@ -510,8 +585,10 @@
          try f.commit(n);
      }
  
@@ -8747,7 +8813,7 @@ diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_en
          if (!e.mtp) return error.NoDraftHead;
          if (depth > max_drafts) return error.TooDeep;
          var one: [1]fw.Rank = undefined;
-@@ -544,6 +621,7 @@
+@@ -546,6 +623,7 @@
  
      /// `rows` logits rows of this rank's vocabulary -> the tokens at positions first, first + 1, ...
      pub fn draw(e: *Engine, logits: u64, rows: usize, first: u64, bits: u64, out: []u32) !void {
@@ -8755,7 +8821,7 @@ diff --git a/zig/src/families/glm/cuda_engine.zig b/zig/src/families/glm/cuda_en
          if (e.structured) return e.drawWhole(logits, rows, first, bits, out);
          if (e.cur.sampling) |s| {
              try e.smp.draw(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = logits }}, rows, first, sampler.rule(s), out);
-@@ -557,10 +635,11 @@
+@@ -559,10 +637,11 @@
      pub const redrawFirst = @import("cuda_structured.zig").redrawFirst;
      /// decode.sample_rows' greedy pick: per-rank top-1 (tf_glm_top1), all-gathered, largest value then lowest id.
      const greedy = @import("cuda_engine_pick.zig").greedy;
@@ -8808,7 +8874,7 @@ diff --git a/zig/src/families/glm/cuda_engine_types.zig b/zig/src/families/glm/c
 diff --git a/zig/src/families/glm/cuda_env_test.zig b/zig/src/families/glm/cuda_env_test.zig
 --- a/zig/src/families/glm/cuda_env_test.zig
 +++ b/zig/src/families/glm/cuda_env_test.zig
-@@ -156,18 +156,18 @@
+@@ -160,18 +160,18 @@
      try t.expectError(error.InvalidEnvironment, @import("cuda_env.zig").startup());
  }
  
@@ -8836,10 +8902,10 @@ diff --git a/zig/src/families/glm/cuda_exl3.zig b/zig/src/families/glm/cuda_exl3
 @@ -1,3 +1,5 @@
 +// Modified for V4 by Scott Quarrier with AI-assisted integration: native hybrid integration/adaptation.
 +// Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
- //! GLM-5.3-Flash's EXL3 routed experts on CUDA (Mia-AiLab's checkpoint: 4-bit mcg trellis experts, the rest bf16).
+ //! GLM's EXL3 routed experts on CUDA: "mcg" trellis experts at any whole-bit width, mixed per projection; rest bf16.
  
  const std = @import("std");
-@@ -155,6 +157,10 @@
+@@ -277,6 +279,10 @@
      try stream.d.check(stream.d.api.cuMemcpy2DAsync_v2(&m, stream.handle), what);
  }
  pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w: Experts, sc: Scratch, plan_buf: cuda.grouped.Plan, x: u64, x_stride: usize, picks: u64, slots: usize, rows: usize, count: usize, dims: usize, width: usize, limit: f32, prompt: bool, ey: u64, xd: u64) !void {
@@ -8849,13 +8915,22 @@ diff --git a/zig/src/families/glm/cuda_exl3.zig b/zig/src/families/glm/cuda_exl3
 +pub fn runRouter(k: *const Kernels, router: cuda.grouped.Router, stream: cuda.Stream, w: Experts, sc: Scratch, plan_buf: cuda.grouped.Plan, x: u64, x_stride: usize, picks: u64, slots: usize, rows: usize, count: usize, dims: usize, width: usize, limit: f32, prompt: bool, ey: u64, xd: u64) !void {
      _ = xd;
      if (slots != top_k + 1) return error.UnsupportedTopK;
-     if (dims % 256 != 0 or width % 128 != 0) return error.NotExl3Mcg4;
-@@ -164,7 +170,7 @@
+     if (dims % 256 != 0 or width % 128 != 0) return error.UnreadableExl3;
+@@ -286,7 +292,7 @@
          var at: usize = 0;
          while (at < rows) : (at += prompt_rows) {
              const n: usize = @min(prompt_rows, rows - at);
 -            try k.prompt.run(k, ek.router, stream, l, x + at * x_stride * 2, x_stride, picks + at * slots * 4, n, scratch, plan_buf, ey + at * slots * dims * 4, count);
 +            try k.prompt.run(k, router, stream, l, x + at * x_stride * 2, x_stride, picks + at * slots * 4, n, scratch, plan_buf, ey + at * slots * dims * 4, count);
+         }
+         return;
+     }
+@@ -296,7 +302,7 @@
+         var at: usize = 0;
+         while (at < rows) : (at += chunk_rows) {
+             const n: usize = @min(chunk_rows, rows - at);
+-            try k.runWith(stream, l, x + at * x_stride * 2, x_stride, .bf16, picks + at * slots * 4, 0, n, 0, scratch, ey + at * slots * dims * 4, .{ .router = &ek.router, .plan = plan_buf });
++            try k.runWith(stream, l, x + at * x_stride * 2, x_stride, .bf16, picks + at * slots * 4, 0, n, 0, scratch, ey + at * slots * dims * 4, .{ .router = &router, .plan = plan_buf });
          }
          return;
      }
@@ -8868,7 +8943,7 @@ diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_f
  //! GLM-5.3-Flash's TP forward on CUDA (the Python family's forward.compute and commit), partials over NCCL or copied.
  
  const std = @import("std");
-@@ -184,7 +186,7 @@
+@@ -196,7 +198,7 @@
          try glue.hcPre(f.set(), f.stream, b.x, hc.fn_w, hc.base, hc.scale, norm, b.normed, b.xs, b.post, b.comb, b.hcpart, c.eps, c.hc_eps, c.sinkhorn, rows, c.hidden, c.hc);
      }
  
@@ -8877,7 +8952,7 @@ diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_f
          const stamp = prof_mod.span(f.prof, f.stream, .glue);
          defer stamp.end();
          const c = &r.w.config;
-@@ -242,6 +244,20 @@
+@@ -254,6 +256,20 @@
                  if (out) |o| try mlp.fill(f.mlpKernels(), f.stream, m, b.dense, 0, rows, b.prefill, o);
              },
              .moe => |m| {
@@ -8898,7 +8973,7 @@ diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_f
                  try moe.body(f.moeKernels(), f.stream, m, b.moe, b.normed, c.hidden, rows, b.prefill);
                  if (out) |o| try moe.fill(f.moeKernels(), f.stream, m, b.moe, b.normed, c.hidden, 0, rows, b.prefill, o);
              },
-@@ -298,13 +314,13 @@
+@@ -310,13 +326,13 @@
      const exchangePieces = @import("cuda_forward_pieces.zig").exchangePieces;
  
      /// hc_post of rows lo..hi from partials `g` [world][hi - lo][D] (a gathered room or a split one's own rows).
@@ -8914,7 +8989,7 @@ diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_f
      }
  
      /// forward._pre of rows lo..hi.
-@@ -322,7 +338,14 @@
+@@ -334,7 +350,14 @@
          defer stamp.end();
          const c = &r.w.config;
          const layers = r.w.layers;
@@ -8930,7 +9005,7 @@ diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_f
          if (site == .mixer) return f.preRows(r, layers[j].ffn_hc, layers[j].post_norm, lo, hi);
          if (j + 1 < layers.len) return f.preRows(r, layers[j + 1].attn_hc, layers[j + 1].in_norm, lo, hi);
          try glue.streamMean(f.set(), f.stream, r.b.x + lo * c.hc * c.hidden * 2, r.b.hidden + lo * c.hidden * 2, hi - lo, c.hidden, c.hc);
-@@ -357,6 +380,7 @@
+@@ -369,6 +392,7 @@
      }
  
      pub const pairBody = @import("cuda_forward_pair.zig").pairBody;
@@ -8938,7 +9013,7 @@ diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_f
  
      /// forward.forward of `ids`: logits in b.logits; a prompt chunk's KDA layers committed, a window's at `commit`.
      pub fn run(f: *const Forward, ids: []const i32) !void {
-@@ -411,7 +435,15 @@
+@@ -423,7 +447,15 @@
              if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].ffn == .dense) .dense else .shared); // MoE: its fill
              if (pf) |p| try p.fork(f.stream, j, .n);
              try f.resolve(R);
@@ -8955,7 +9030,7 @@ diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_f
              if (f.taps) |t| try t.at(f.stream, j, f.ranks[0].b.x, 0, R);
              if (f.prof) |p| p.mark(f.stream, .gather_b);
              switch (f.ranks[0].w.layers[j].mixer) {
-@@ -494,7 +526,11 @@
+@@ -506,7 +538,11 @@
          for (f.ranks) |r| {
              const m = r.w.mtp.?;
              const b = r.b;
@@ -8968,7 +9043,7 @@ diff --git a/zig/src/families/glm/cuda_forward.zig b/zig/src/families/glm/cuda_f
              try glue.rmsnorm(f.set(), f.stream, b.mx + (n - 1) * D * 2, D, m.norm, b.fnormed, D, b.fxs, c.eps, 1, D);
              if (!b.prefill) try q4.matmul(&f.m.q4, f.stream, b.fnormed, D, b.fxs, m.draft, b.logits, 1);
          }
-@@ -502,6 +538,7 @@
+@@ -514,6 +550,7 @@
  
      /// forward.commit: keep the first `keep` rows; window KDA layers take new states (replayed if fewer), conv shifted.
      pub fn commit(f: *const Forward, keep: usize) !void {
@@ -9798,7 +9873,7 @@ diff --git a/zig/src/families/glm/cuda_glue.zig b/zig/src/families/glm/cuda_glue
  //! GLM-5.3-Flash's glue on CUDA: the Python family's cuda/glue.py on glm_glue.cu, whose kernels keep Triton's bytes.
  
  const std = @import("std");
-@@ -196,9 +198,13 @@
+@@ -199,9 +201,13 @@
  
  /// glue.combine: out [rows][d] fp32 = sum over slots in order of wts[r][k] y[r][k] (y fp32 in decode, bf16 in prefill).
  pub fn combine(set: Set, stream: cuda.Stream, y: u64, y_f32: bool, wts: u64, out: u64, rows: usize, d: usize, slots: usize) !void {
@@ -11309,9 +11384,9 @@ new file mode 100644
 +/// Only the two native operations the common EXL3 loader needs. No attention/shared/Engine owner is constructed.
 +const Loader=struct {
 +    gpa: std.mem.Allocator,d: *const cuda.Driver,w: *ExpertWeights,ck: *core.Checkpoint,
-+    host: std.ArrayList(u8)=.empty,name_buf: [192]u8=undefined,control:Control=.{},
++    host: std.ArrayList(u8)=.empty,name_buf: [192]u8=undefined,last: []const u8="",control:Control=.{},
 +    pub fn get(L: *Loader,comptime fmt: []const u8,args: anytype) !core.checkpoint.Tensor {
-+        try L.control.check();return L.ck.get(try std.fmt.bufPrint(&L.name_buf,prefix++fmt,args));
++        try L.control.check();L.last=try std.fmt.bufPrint(&L.name_buf,prefix++fmt,args);return L.ck.get(L.last);
 +    }
 +    pub fn put(L: *Loader,comptime fmt: []const u8,args: anytype) !u64 {
 +        try L.control.check();const ptr=try @import("cuda_upload_owner.zig").keep(L,try cuda.DeviceBuffer.fromHost(L.d,L.host.items),fmt,args);
@@ -11955,7 +12030,7 @@ diff --git a/zig/src/families/glm/cuda_hybrid_memory_fixture_cpu.zig b/zig/src/f
 new file mode 100644
 --- /dev/null
 +++ b/zig/src/families/glm/cuda_hybrid_memory_fixture_cpu.zig
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,25 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Test-only I2 Lifetime CPU boundary adaptation, TensorFold/AI-assisted integration/OpenAI Codex/Scott credits retained.
 +const std=@import("std");const t=std.testing;const cuda=@import("cuda");const engine_mod=@import("cuda_engine.zig");
@@ -11981,7 +12056,6 @@ new file mode 100644
 +        const e=try t.allocator.create(engine_mod.Engine);@memset(std.mem.asBytes(e),0);bind(engine_mod.Engine,e,d);e.backend=try t.allocator.create(@typeInfo(@TypeOf(e.backend)).pointer.child);e.capacity=512;e.w.config=.{.layers=0,.kv_lora=16,.i_dim=8,.hidden=64};return e;
 +    }
 +};
-+
 diff --git a/zig/src/families/glm/cuda_hybrid_memory_test.zig b/zig/src/families/glm/cuda_hybrid_memory_test.zig
 new file mode 100644
 --- /dev/null
@@ -13928,7 +14002,7 @@ diff --git a/zig/src/families/glm/cuda_kv_host.zig b/zig/src/families/glm/cuda_k
  //! TF_GLM_KV_HOST=1: the DSA layers' latent rows on pinned host pages, each call's picked rows gathered to the device.
  const std = @import("std");
  const cuda = @import("cuda");
-@@ -39,11 +41,13 @@
+@@ -40,11 +42,13 @@
  /// Before the ranks measure their room: the gather's device buffers, so the budget counts them.
  pub fn prepare(d: *const cuda.Driver, page: u64, capacity: usize, row_bytes: usize) !void {
      if (!onHost() or active != null) return;
@@ -13943,7 +14017,7 @@ diff --git a/zig/src/families/glm/cuda_kv_host.zig b/zig/src/families/glm/cuda_k
  
  /// Engine.checkGathers' part: the engine's gather refuses a call past its slots by name (none: nothing to check).
  pub fn checkActive() !void {
-@@ -80,6 +84,7 @@
+@@ -81,6 +85,7 @@
      tags: [layers]u64 = @splat(0),
  
      pub fn init(d: *const cuda.Driver, arena_rows: usize, cap: usize, row_bytes: usize) !Gather {
@@ -13951,7 +14025,7 @@ diff --git a/zig/src/families/glm/cuda_kv_host.zig b/zig/src/families/glm/cuda_k
          var slot_of = try cuda.DeviceBuffer.alloc(d, arena_rows * 4);
          errdefer slot_of.free();
          var list = try cuda.DeviceBuffer.alloc(d, cap * 4);
-@@ -137,7 +142,13 @@
+@@ -138,7 +143,13 @@
  
      /// A sparse call's picked rows of `lc` (tokens [rows][width], counts) into the slots; the lists then name slots.
      pub fn gather(g: *Gather, ops: cuda.Module, stream: cuda.Stream, tag: u64, lc: u64, pt: u64, page_rows_at: u64, pos: u64, tokens: u64, counts: u64, rows: usize, width: usize) !u64 {
@@ -13972,10 +14046,10 @@ diff --git a/zig/src/families/glm/cuda_lane_costs.zig b/zig/src/families/glm/cud
 @@ -1,3 +1,5 @@
 +// Modified for V4 by Scott Quarrier with AI-assisted integration: native hybrid integration/adaptation.
 +// Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
- //! Rank 0 keeps MTP prices and each drafter's expert-form choice per build and timing identity.
+ //! Rank 0 keeps MTP prices and each drafter's expert forms by window width per build and timing identity.
  const std = @import("std");
  const sys = @import("sys");
-@@ -150,14 +152,23 @@
+@@ -170,14 +172,23 @@
      const hex = std.fmt.bytesToHex(e.checkpoint_digest, .lower);
      const draft_hex = std.fmt.bytesToHex(if (e.drafter) |dr| dr.checkpoint_digest else @as([32]u8, @splat(0)), .lower);
      const tail: []const u8 = if (pin) |f| (if (f) " form factored" else " form classic") else "";
@@ -14001,7 +14075,7 @@ diff --git a/zig/src/families/glm/cuda_lane_costs.zig b/zig/src/families/glm/cud
  }
  
  const Windows = struct {
-@@ -239,12 +250,13 @@
+@@ -259,12 +270,13 @@
  
  test "GLM cost identity: the consumed key includes drafter precision and all timing knobs" {
      var e: engine.Engine = undefined;
@@ -14016,7 +14090,7 @@ diff --git a/zig/src/families/glm/cuda_lane_costs.zig b/zig/src/families/glm/cud
      var dr: dflash.Drafter = undefined;
      dr.bits = 4;
      dr.checkpoint_digest = @splat(2);
-@@ -281,6 +293,7 @@
+@@ -301,6 +313,7 @@
          e.m.experts.nvfp4.warps = 4;
          e.m.mm.pdl = true;
          e.m.dsel = true;
@@ -14024,7 +14098,7 @@ diff --git a/zig/src/families/glm/cuda_lane_costs.zig b/zig/src/families/glm/cud
      }
      // a named form only ends the identity, so the race's key stays as it was
      var classic: [512]u8 = undefined;
-@@ -332,11 +345,13 @@
+@@ -352,11 +365,13 @@
      defer a.free(root);
      var e: engine.Engine = undefined;
      e.settings = .{};
@@ -14147,7 +14221,7 @@ diff --git a/zig/src/families/glm/cuda_latent.zig b/zig/src/families/glm/cuda_la
  //! GLM-5.3-Flash's MLA on the 512-wide latent cache (DSA layers): the Python family's latent on BF16, row by row.
  
  const std = @import("std");
-@@ -119,6 +121,12 @@
+@@ -120,6 +122,12 @@
      try merge(set, stream, p, out, counts, rows, heads, lw, nch, true);
  }
  
@@ -14169,7 +14243,7 @@ diff --git a/zig/src/families/glm/cuda_moe.zig b/zig/src/families/glm/cuda_moe.z
  //! GLM-5.3-Flash's MoE on CUDA, a rank's share of the Python family's moe_block: top-8 plus shared, grouped NVFP4.
  
  const std = @import("std");
-@@ -7,6 +9,12 @@
+@@ -8,6 +10,12 @@
  const exl3 = @import("cuda_exl3.zig");
  const prof_mod = @import("cuda_prof.zig");
  const projection = @import("cuda_proj.zig");
@@ -14182,7 +14256,7 @@ diff --git a/zig/src/families/glm/cuda_moe.zig b/zig/src/families/glm/cuda_moe.z
  
  /// One MoE layer on a rank: router (bf16 [count][dims]) and fp32 bias, routed experts, shared [gate | up] and down.
  pub const Layer = struct {
-@@ -25,6 +33,7 @@
+@@ -26,6 +34,7 @@
  
  /// The block's scratch for up to `rows` rows (forward.Buffers' MoE part).
  pub const Scratch = struct {
@@ -14190,15 +14264,15 @@ diff --git a/zig/src/families/glm/cuda_moe.zig b/zig/src/families/glm/cuda_moe.z
      mlog: u64, // fp32 [rows][count]
      router_part: u64, // fp32 [router_ks][rows][count]
      pick: u64, // i32 [rows][top_k + 1]
-@@ -62,6 +71,7 @@
+@@ -63,6 +72,7 @@
      defer stamp.end();
      if (k.prof) |p| p.mark(stream, .router);
      defer if (k.prof) |p| p.mark(stream, .routed);
 +    if (s.hybrid) |b| return b.dispatch();
      if (l.exl3) |w| return exl3.run(k.exl3, k.experts, stream, w, s.x3, s.plan, x, x_stride, s.pick, slots, rows, l.count, d, l.routed.width, l.routed.limit, prompt, s.ey, s.eact);
-     const plan: experts.Plan = .{ .route = s.plan, .slots = slots, .experts = l.count + 1, .prompt = prompt, .fact = !prompt and k.experts.fact and l.routed.format == .nvfp4 };
+     const plan: experts.Plan = .{ .route = s.plan, .slots = slots, .experts = l.count + 1, .prompt = prompt, .fact = !prompt and k.experts.factored(rows) and l.routed.format == .nvfp4 };
      try experts.route(k.experts, stream, s.pick, rows * slots, plan);
-@@ -81,6 +91,10 @@
+@@ -82,6 +92,10 @@
      try projection.matmul(k.set, stream, l.shared_gu, x + lo * x_stride * 2, x_stride, s.sgu + lo * 2 * l.shared * 2, s.mm_part, n, 2 * l.shared, d, false);
      try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, s.sact + lo * l.shared * 2, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
      try projection.matmul(k.set, stream, l.shared_down, s.sact + lo * l.shared * 2, l.shared, s.sy + lo * d * 4, s.mm_part, n, d, l.shared, true);
@@ -14687,7 +14761,7 @@ diff --git a/zig/src/families/glm/cuda_native.zig b/zig/src/families/glm/cuda_na
  }
  
  /// The server's words for this family's refusals.
-@@ -595,3 +806,126 @@
+@@ -593,3 +804,126 @@
  test "a small text context still sizes the link for every offered media span" {
      try std.testing.expectEqual(@as(usize, 792), try linkCapacity(64, .{ .image_tokens = 2048, .max_images = 8, .video_tokens = 4096, .max_videos = 2, .max_frames = 256 }));
  }
@@ -15311,7 +15385,7 @@ diff --git a/zig/src/families/glm/cuda_ranks.zig b/zig/src/families/glm/cuda_ran
  //! A TP rank's settings fingerprint, all-gathered before weights load: a mismatch stops every rank.
  
  const std = @import("std");
-@@ -498,3 +500,11 @@
+@@ -515,3 +517,11 @@
  pub fn artifact(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ![32]u8 {
      return @import("core").checkpoint_identity.fullIdentity(gpa, io, dir);
  }
@@ -15515,7 +15589,7 @@ diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_sta
          const c = &w.config;
          const s = &w.share;
          const D: usize = c.hidden;
-@@ -239,15 +243,16 @@
+@@ -239,18 +243,21 @@
          const pairs = rows * slots;
          const count: usize = c.experts;
          const lw: usize = c.kv_lora;
@@ -15530,12 +15604,19 @@ diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_sta
          var mm: usize = 4;
          // windows under rows_from rows keep their K slices apart (a prompt's tail chunk on the prefill buffers too)
          for (b16Shapes(w)) |sh_| mm = @max(mm, b16.partBytes(@min(rows, b16.rows_from - 1), sh_[0], sh_[1]));
--        const x3: [4]usize = if (c.exl3) exl3.scratchBytes(rows, D, ew, prefill, w.exl3_shx) else @splat(4);
-+        const x3: [4]usize = if (c.exl3 and w.role != .attention) exl3.scratchBytes(rows, D, ew, prefill, w.exl3_shx) else @splat(4);
+-        // EXL3 experts: each layer's path (the prompt kernels', or the grouped one) sizes it
++        // EXL3 experts: each layer's path sizes it; attention owns no routed experts.
+         var x3: [4]usize = @splat(4);
+-        for (w.layers) |l| if (l.ffn == .moe) if (l.ffn.moe.exl3) |x| exl3.mostScratch(&x3, rows, D, ew, prefill, x);
+-        if (w.mtp) |m| if (m.layer.ffn == .moe) if (m.layer.ffn.moe.exl3) |x| exl3.mostScratch(&x3, rows, D, ew, prefill, x);
++        if (w.role != .attention) {
++            for (w.layers) |l| if (l.ffn == .moe) if (l.ffn.moe.exl3) |x| exl3.mostScratch(&x3, rows, D, ew, prefill, x);
++            if (w.mtp) |m| if (m.layer.ffn == .moe) if (m.layer.ffn.moe.exl3) |x| exl3.mostScratch(&x3, rows, D, ew, prefill, x);
++        }
          var split = false; // a KDA stack in two parts moves each part's rows through one more buffer
          for (w.layers) |l| split = split or (l.mixer == .kda and l.mixer.kda.proj == .split);
          const hist_len = if (pairs > cuda.grouped.small) (pairs + cuda.grouped.small - 1) / cuda.grouped.small * (count + 1) else 1;
-@@ -291,11 +296,16 @@
+@@ -294,11 +301,16 @@
              if (split) rows * @max(3 * n, kw - 3 * n) * 2 else 4, // a split KDA stack's part rows
          };
          var held = sizes;
@@ -15552,7 +15633,7 @@ diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_sta
          var out: Buffers = .{
              .arena = a,
              .rows = rows,
-@@ -348,9 +358,21 @@
+@@ -351,9 +363,21 @@
          };
          out.moe.x3 = .{ .picks = p[71], .xg = p[72], .xu = p[73], .z = p[74] };
          out.kda.tmp = p[75];
@@ -15574,7 +15655,7 @@ diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_sta
              inline for (@typeInfo(@TypeOf(twin_at)).@"struct".field_names) |f| @field(t, f) = @field(out, f);
              return t;
          }
-@@ -358,6 +380,8 @@
+@@ -361,6 +385,8 @@
      }
  
      pub fn deinit(b: *Buffers) void {
@@ -15583,7 +15664,7 @@ diff --git a/zig/src/families/glm/cuda_state.zig b/zig/src/families/glm/cuda_sta
          b.arena.buf.free();
          b.* = undefined;
      }
-@@ -422,6 +446,7 @@
+@@ -425,6 +451,7 @@
      }
  
      fn make(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, kv8: bool, paged: ?Paged) !State {
@@ -15606,7 +15687,7 @@ diff --git a/zig/src/families/glm/cuda_tile.zig b/zig/src/families/glm/cuda_tile
  fn padOneKdaInput(w: *Weights, d: *const cuda.Driver, s: cuda.Stream, x: *@import("cuda_kda_block.zig").Layer) !void {
 +    const memory_scope=@import("cuda_hybrid_ledger.zig").scopeOwner(.weights);defer memory_scope.end();
      const np = x.matWidth();
-     if (np == x.width()) return; // already aligned, or the pad is off
+     if (np == x.width()) return; // already aligned
      // a split stack's MXFP8 [q | k | v] keeps its width (3 * heads * dk, aligned); its bf16 rest carries the pad
 @@ -127,6 +130,7 @@
  
@@ -15618,13 +15699,13 @@ diff --git a/zig/src/families/glm/cuda_tile.zig b/zig/src/families/glm/cuda_tile
      const was = w.buffers.items[at].len;
 @@ -141,6 +145,7 @@
  
- /// Eligible linears tiled in place; uneven KDA inputs and their views stay bf16 for the row-major kernels.
+ /// Eligible linears tiled in place; a padded KDA input and its views stay row-major bf16 without TF_GLM_KDA_PAD=1.
  pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernels, s: cuda.Stream, d: *const cuda.Driver, dense_bits: u8, head_bits: u8) !mm_mod.Packed {
 +    const memory_scope=@import("cuda_hybrid_ledger.zig").scopeOwner(.load_staging);defer memory_scope.end();
-     try padKdaInputs(w, d, s); // pad_to was set at load (Engine.open), so a stack pads only with TF_GLM_KDA_PAD=1
      var list: std.ArrayList(Lin) = .empty;
      defer list.deinit(w.gpa);
-@@ -230,3 +235,22 @@
+     try linears(w, &list);
+@@ -229,3 +234,22 @@
          }
      };
  }
@@ -15694,7 +15775,7 @@ diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_w
      gpa: std.mem.Allocator,
      config: cfg.Config,
      share: shard.Share,
-@@ -72,6 +77,7 @@
+@@ -71,6 +76,7 @@
  }
  
  const Loader = struct {
@@ -15702,7 +15783,7 @@ diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_w
      gpa: std.mem.Allocator,
      d: *const cuda.Driver,
      stream: cuda.Stream,
-@@ -86,8 +92,11 @@
+@@ -85,8 +91,11 @@
      recipes: ?*const core.modelopt.Recipes = null, // MIXED_PRECISION's table; null: the tensors decide (NVFP4)
  
      pub fn get(L: *Loader, comptime fmt: []const u8, args: anytype) !Tensor {
@@ -15715,7 +15796,7 @@ diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_w
      }
  
      /// Hidden-size norm `fmt` uploaded as `up`: bf16 as stored, or kept float32 for the _f32w kernels.
-@@ -112,6 +121,7 @@
+@@ -111,6 +120,7 @@
  
      /// `module`'s stored format (formats.of) when it is one of `wants`; any other is refused by name.
      pub fn formatOne(L: *Loader, ck: *core.Checkpoint, module: []const u8, wants: []const formats.Format) !formats.Format {
@@ -15723,7 +15804,7 @@ diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_w
          var buf: [224]u8 = undefined;
          const w = try ck.get(try std.fmt.bufPrint(&buf, "{s}.weight", .{module}));
          const scale_name = try std.fmt.bufPrint(&buf, "{s}.weight_scale", .{module});
-@@ -145,7 +155,11 @@
+@@ -144,7 +154,11 @@
  
      /// The host bytes gathered so far uploaded as one tensor named `fmt`.
      pub fn put(L: *Loader, comptime fmt: []const u8, args: anytype) !u64 {
@@ -15735,7 +15816,7 @@ diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_w
          L.host.clearRetainingCapacity();
          return ptr;
      }
-@@ -362,6 +376,7 @@
+@@ -361,6 +375,7 @@
  
      /// One device allocation the loader frees itself (staging for the GPU's quantizers).
      pub fn scratch(L: *Loader, n: usize) !cuda.DeviceBuffer {
@@ -15743,7 +15824,7 @@ diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_w
          return cuda.DeviceBuffer.alloc(L.d, n);
      }
  
-@@ -439,7 +454,9 @@
+@@ -438,7 +453,9 @@
          const count: usize = c.experts;
          var routed: cuda.experts.Layer = .{ .format = .nvfp4, .up = 0, .down = 0, .width = ni, .dims = d, .experts = count, .limit = c.swiglu_limit };
          var x3: ?exl3.Experts = null;
@@ -15752,9 +15833,9 @@ diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_w
 +            // The native router/shared projections remain local; remote results have an explicit FP32 tag.
 +        } else if (c.exl3) { // the MTP layer's experts too
              x3 = try exl3.load(L, i, count, d, c.moe_inter, cut);
-             if (!x3.?.shx) L.w.exl3_shx = false;
          } else routed = try L.nvfp4Experts(i);
-@@ -535,13 +552,23 @@
+         const sh = L.w.share.shared;
+@@ -533,14 +550,24 @@
  
  /// weights.load without the MTP head: embedding, layers, final norm, the rank's head rows (bf16, MXFP8); `pack_dense`.
  pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: cuda.Stream, tools: Tools, dir: []const u8, c: cfg.Config, share: shard.Share, layers: []const u32, with_mtp: bool) !Weights {
@@ -15774,13 +15855,14 @@ diff --git a/zig/src/families/glm/cuda_weights.zig b/zig/src/families/glm/cuda_w
 +    try control.check();
      var head_ck = try core.Checkpoint.openModelPrefix(gpa, io, dir, "lm_head.");
      defer core.checkpoint.cache.close(&head_ck);
+     try @import("cuda_dfloat11.zig").attach(gpa, io, dir, &c, &.{ &ck, &head_ck });
 -    var L: Loader = .{ .gpa = gpa, .d = d, .stream = stream, .pack_dense = tools.pack_dense, .tools = tools, .w = &w, .ck = &ck };
 +    try control.check();
-+    var L: Loader = . { .control=control, .gpa = gpa, .d = d, .stream = stream, .pack_dense = tools.pack_dense, .tools = tools, .w = &w, .ck = &ck };
++    var L: Loader = .{ .control=control, .gpa = gpa, .d = d, .stream = stream, .pack_dense = tools.pack_dense, .tools = tools, .w = &w, .ck = &ck };
      defer L.host.deinit(gpa);
      defer L.staging.deinit();
      var recipes = try formats.readRecipes(gpa, io, dir);
-@@ -555,7 +582,35 @@
+@@ -554,7 +581,35 @@
      const vocab: formats.Part = .{ .rel = "lm_head", .rows = .{ share.vocab.lo, share.vocab.hi } };
      w.head = try formats.cut(&L, &head_ck, &.{"lm_head"}, &.{vocab}, &.{ .bf16, .mxfp8 }, "head", .{});
      if (with_mtp and c.mtp > 0) w.mtp = try @import("cuda_mtp_load.zig").load(&L, &head_ck);
@@ -16832,9 +16914,9 @@ diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
 +// Modified for V4 by Scott Quarrier with AI-assisted integration: native hybrid integration/adaptation.
 +// Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
  //! CUDA family registration, device setup, memory admission and the native lane host.
- const openDrama = @import("drama_open.zig").open;
  const std = @import("std");
-@@ -57,6 +59,8 @@
+ const platform = @import("sys");
+@@ -58,6 +60,8 @@
      gpu: ?*Gpu, // null in host tests: no context to bind
      family: *anyopaque,
      release: *const fn (*anyopaque) void,
@@ -16843,15 +16925,15 @@ diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
      inner: lanes.backend.Backend,
      vtable: lanes.backend.Backend.VTable,
      cfg: lanes.Config,
-@@ -76,6 +80,7 @@
+@@ -77,6 +81,7 @@
      dir: []u8 = &.{}, // the model folder the learner writes its lessons into
      follow_fn: ?*const fn (*anyopaque) anyerror!void = null,
      health: ?api.HealthSource = null,
 +    ready_admission: ?*const fn (*anyopaque) anyerror!void = null,
      startup_phase: @import("cuda_startup_phase.zig").Hook = null,
      recording: ?*record.Recording = null, // --record: the recorder in front of the family's backend
-     served: drafted.Served = .{ .backend = undefined, .facts = .{}, .stream_bytes = 0 }, // the family's backend, wrapped with --drafter's draft model when given
-@@ -229,7 +234,7 @@
+     witness: ?*cuda_witness.Witness = null, // --execution-witness on its first path, closed before the family
+@@ -233,7 +238,7 @@
          return null;
      }
      const g = try gpa.create(Gpu);
@@ -16860,7 +16942,7 @@ diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
      g.next = null;
      var opened = false;
      defer if (!opened) gpa.destroy(g);
-@@ -289,12 +294,17 @@
+@@ -295,12 +300,17 @@
          return null;
      }
      const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels, opts) catch |e| {
@@ -16878,7 +16960,7 @@ diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
              error.LoadRetained => {
                  opened = true;
                  failed_load.keep(g);
-@@ -327,7 +337,14 @@
+@@ -333,7 +343,14 @@
              },
          }
      };
@@ -16894,7 +16976,7 @@ diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
      if (o.learn_conversations and kv_pages.ownCache(loaded)) {
          problem.* = "--learn-conversations writes the host prompt cache's states, and TF_QWEN_KV_SHARE keeps prompts as pool pages instead: serve with one of the two";
          return null;
-@@ -346,6 +363,7 @@
+@@ -352,6 +369,7 @@
      defer if (!opened) served.close(gpa);
      const model = cuda.usage(false).device - held0;
      const after = try pool(a, io, &g.ctx, problem) orelse return null;
@@ -16902,15 +16984,15 @@ diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
      family_memory.noteParked(after, "the CUDA memory budget");
      const L = @TypeOf(loaded); // a family's Loaded may leave out a learner and a lone driver
      const learn_bytes: usize = if (@hasField(L, "learn_bytes")) loaded.learn_bytes else 0;
-@@ -373,7 +391,7 @@
+@@ -379,7 +397,7 @@
      };
      const h = try gpa.create(Host);
      errdefer gpa.destroy(h);
 -    h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = served.backend, .served = served, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = if (@hasField(L, "lone")) loaded.lone else null };
 +    h.* = .{ .release_checked=if(comptime @hasField(L,"deinit_checked"))loaded.deinit_checked else null,.close_gate=if(comptime @hasField(L,"close_gate")) loaded.close_gate else null,.gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = served.backend, .served = served, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = if (@hasField(L, "lone")) loaded.lone else null };
      h.readiness(F);
-     h.kv_plan = counted.ledger;
-     // a ledger's plan placed the cache already, beside --parallel full-window requests
+     h.kv_plan = counted.ledger; // a ledger's plan placed the cache already, beside --parallel full-window requests
+     const kept = if (host_cache) kv_pages.kept(F, loaded, paged, o, room, held, final_host_budget, true) else if (counted.ledger) |lp| lp.kept else kv_pages.kept(F, loaded, paged, o, room, held, 0, false);
 diff --git a/zig/src/native/cuda_family_memory.zig b/zig/src/native/cuda_family_memory.zig
 --- a/zig/src/native/cuda_family_memory.zig
 +++ b/zig/src/native/cuda_family_memory.zig
@@ -16933,7 +17015,7 @@ diff --git a/zig/src/native/cuda_family_memory.zig b/zig/src/native/cuda_family_
 diff --git a/zig/src/native/cuda_host_close.zig b/zig/src/native/cuda_host_close.zig
 --- a/zig/src/native/cuda_host_close.zig
 +++ b/zig/src/native/cuda_host_close.zig
-@@ -1,8 +1,22 @@
+@@ -1,9 +1,23 @@
 +// Modified for V4 by Scott Quarrier with AI-assisted integration: native hybrid integration/adaptation.
 +// Compared with TensorFold v1.2.8 and/or the retained public V3 source; original author notices remain.
  //! Release a stopped native CUDA host in ownership order.
@@ -16943,6 +17025,7 @@ diff --git a/zig/src/native/cuda_host_close.zig b/zig/src/native/cuda_host_close
 +    if(checked)|run|return run(ctx);release(ctx);return true;
 +}
  pub fn close(h: anytype) void {
+     if (h.witness) |w| w.close(); // its hash reads files, not the engine: it stops at its next block
      h.host.stop();
 +    if(comptime @hasField(@TypeOf(h.*),"close_gate")) if(h.close_gate) |gate| {
 +        if(!gate(h.family)) {
@@ -16956,7 +17039,7 @@ diff --git a/zig/src/native/cuda_host_close.zig b/zig/src/native/cuda_host_close
      kv_pages.unwatch(&h.kv); // the engine thread is joined: the pool's teardown below reports to no one
      h.core.deinit();
      h.cfg.deinit(h.gpa);
-@@ -13,7 +27,14 @@
+@@ -14,7 +28,14 @@
      if (h.slide) |s| h.slide_free.?(h.gpa, s);
      h.gpa.free(h.dir);
      h.served.close(h.gpa);
@@ -16972,7 +17055,7 @@ diff --git a/zig/src/native/cuda_host_close.zig b/zig/src/native/cuda_host_close
      if (h.gpu) |g| {
          g.ctx.deinit();
          g.driver.close();
-@@ -22,3 +43,42 @@
+@@ -23,3 +44,42 @@
      h.gpa.free(h.startup);
      h.gpa.destroy(h);
  }
@@ -17141,7 +17224,7 @@ diff --git a/zig/src/native/none.zig b/zig/src/native/none.zig
  
  pub fn open(a: Allocator, _: Allocator, _: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
 +    if (comptime @import("builtin").is_test) if (StopTest.open) |hook| return hook(o);
-     problem.* = try std.fmt.allocPrint(a, "the native engine has no backend for {s} checkpoints yet; the Python engine 0.6.6 may serve them: python -m pip install git+https://github.com/ashhart/TensorFold.git@v0.6.6", .{o.model_type});
+     problem.* = try @import("no_backend.zig").message(a, o.model_type);
      return null;
  }
 +
@@ -17153,24 +17236,24 @@ diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
 @@ -4,7 +4,7 @@
  
  pub const Error = error{InvalidEnvironment};
- pub const Scope = enum { common, cuda, metal, xpu, slide, hooks, dsv41, gemma4, drama3, glm, flashnext, nemotron, minimax_m3 };
--pub const Kind = enum { u32, u64, size, percent, positive, device, segments, mib, bit_width, word, prompt, flag, toggle, real, positive_real, signed_real, range, path };
-+pub const Kind = enum { u32, u64, size, percent, positive, device, segments, mib, bit_width, word, prompt, flag, toggle, real, positive_real, signed_real, range, path, occupied_phase };
+ pub const Scope = enum { common, cuda, metal, xpu, slide, hooks, dsv41, gemma4, drama3, glm, flashnext, nemotron, minimax_m3, chat, hub };
+-pub const Kind = enum { u32, u64, size, percent, positive, device, segments, mib, bit_width, word, prompt, flag, toggle, real, positive_real, signed_real, range, path, parallel, names };
++pub const Kind = enum { u32, u64, size, percent, positive, device, segments, mib, bit_width, word, prompt, flag, toggle, real, positive_real, signed_real, range, path, parallel, names, occupied_phase };
+ /// The release from which the server refuses the rank aliases: the one after the release that first ships the flags.
+ pub const alias_retire = "1.4.0";
  pub const Rule = struct {
-     name: [:0]const u8,
-     scope: Scope,
-@@ -31,6 +31,7 @@
- }
+@@ -39,6 +39,7 @@
  
  pub const rules = [_]Rule{
+     .{ .name = "TF_QWEN_KV_HOST_GIB", .scope = .cuda, .kind = .u64, .min = 1, .max = std.math.maxInt(u64) >> 30, .forms = "positive whole GiB fitting an unsigned 64-bit byte count; blank or unset: one full KV window" },
 +    .{ .name = "TF_GLM_SERVING_ADMISSION", .scope = .glm, .kind = .word, .blank_default = false, .words = &.{ "observe-v1" }, .forms = "observe-v1 (startup observations only; requires serving geometry)" },
      .{ .name = "TF_CACHE_EVICT", .scope = .common, .kind = .word, .words = &.{ "main", "decayed_resume" }, .forms = "main or decayed_resume (default main)" },
      .{ .name = "TF_FLASHNEXT_BATCH_DRAWS", .scope = .cuda, .kind = .flag, .blank_default = false, .forms = "0 or 1 (0 restores per-stream Flash Next row draws; default 1)" },
      .{ .name = "TF_STARTUP_RECEIPT", .scope = .common, .kind = .flag, .forms = "0 or 1 (opt-in startup and first completion receipts)" },
-@@ -101,6 +102,10 @@
-     .{ .name = "TF_SLIDE_TAKE_OUT_CHECK", .scope = .slide, .kind = .flag, .forms = "0 or 1 (1 takes every kept lesson out again to check the facts before it come back)" },
-     .{ .name = "TF_SLIDE_TAP_CHECK", .scope = .slide, .kind = .flag, .forms = "0 or 1 (1 checks tapped rows against a fresh run's)" },
-     .{ .name = "TF_SLIDE_FORGET_FAIL", .scope = .hooks, .kind = .u32, .trim = " ", .forms = "a whole fact index from 0 to 4294967295 (0 disables the planted failure)" },
+@@ -136,6 +137,10 @@
+     .{ .name = "TF_MINIMAX_WORLD", .scope = .minimax_m3, .kind = .u32, .forms = "a whole world size from 1", .flag = "--tp", .retire = alias_retire },
+     .{ .name = "TF_NEMOTRON_RANK", .scope = .nemotron, .kind = .u32, .forms = "a whole rank from 0", .flag = "--rank", .retire = alias_retire },
+     .{ .name = "TF_NEMOTRON_WORLD", .scope = .nemotron, .kind = .u32, .forms = "a whole world size from 1", .flag = "--tp", .retire = alias_retire },
 +    .{ .name = "TF_GLM_SERVING_GEOMETRY", .scope = .glm, .kind = .word, .blank_default = false, .words = &.{ "490kx8-v1" }, .forms = "490kx8-v1 (exact serving geometry only; incompatible with qualification/proof/terminal diagnostic selectors)" },
 +    // AI-assisted integration: named, default-inert private qualification; Gate binds geometry and one-shot runtime cutoff.
 +    .{ .name = "TF_GLM_QUALIFY_OCCUPANCY", .scope = .glm, .kind = .word, .blank_default = false, .words = &.{ "300kx8-v1", "490kx8-v1" }, .forms = "300kx8-v1 or 490kx8-v1 (explicit private qualification only)" },
@@ -17178,23 +17261,25 @@ diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
      .{ .name = "TF_GLM_HOST_CACHE", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
      .{ .name = "TF_GLM_VISION_HOST", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
      .{ .name = "TF_GLM_PROF", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
-@@ -108,11 +113,12 @@
+@@ -143,12 +148,13 @@
      .{ .name = "TF_GLM_PDL", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
      .{ .name = "TF_GLM_PROMPT_STEPS", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
      .{ .name = "TF_GLM_SHARED", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
 +    .{ .name = "TF_GLM_HYBRID_DFLASH", .scope = .glm, .kind = .flag, .forms = "0 or 1 (explicit experimental hybrid DFlash2 opt-in)" },
      .{ .name = "TF_GLM_DSEL", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
+     .{ .name = "TF_GLM_DSCORES", .scope = .glm, .kind = .flag, .forms = "0 or 1" },
      .{ .name = "TF_GLM_DFLASH2_LOG", .scope = .glm, .kind = .u64, .forms = "a whole unsigned 64-bit round count (0 logs no drafts)" },
-     .{ .name = "TF_GLM_DRAFT_CONFIDENCE", .scope = .glm, .kind = .real, .max = 1, .forms = "a finite chain-chance cut from 0 to 1 (default 0.7)" },
-     // 2^31 - 32: GLM's slots, the window and its 32 verify rows (glm/cuda_native.zig's capacity), keep i32 positions
+     .{ .name = "TF_GLM_DRAFT_CONFIDENCE", .scope = .glm, .kind = .real, .max = 1, .forms = "a finite chain-chance cut from 0 to 1 (default 0.7 on CUDA, 0.5 on Metal)" },
+-    // 2^31 - 32: GLM's slots, the window and its 32 verify rows (glm/cuda_native.zig's capacity), keep i32 positions
 -    .{ .name = "TF_GLM_CONTEXT_CEILING", .scope = .glm, .kind = .u64, .first_digit = true, .min = 1, .max = 2147483616, .forms = "a whole token count from 1 to 2147483616 (the window GLM-5.3-Flash may serve in place of config.json's)" },
++    // Keep V4.2's window +33 allocation headroom within the i32-position capacity (runtime verify rows remain 32).
 +    .{ .name = "TF_GLM_CONTEXT_CEILING", .scope = .glm, .kind = .u64, .first_digit = true, .min = 1, .max = 2147483615, .forms = "a whole token count from 1 to 2147483615 (the window GLM-5.3-Flash may serve in place of config.json's)" },
-     .{ .name = "TF_GLM_EXPERT_FORM", .scope = .glm, .kind = .word, .words = &.{ "classic", "factored" }, .forms = "classic or factored (unset races the two when a build first loads)" },
+     .{ .name = "TF_GLM_EXPERT_FORM", .scope = .glm, .kind = .word, .words = &.{ "classic", "factored" }, .forms = "classic or factored at every width (unset races the two at each width when a build first loads)" },
      .{ .name = "TF_DSV41_MHC_DEFER", .scope = .dsv41, .kind = .toggle, .trim = " \t", .no_word = false, .forms = "0, 1, true, false, on, off or yes (any case)" },
      .{ .name = "TF_DSV41_COEF_LATE", .scope = .dsv41, .kind = .toggle, .trim = " \t", .no_word = false, .forms = "0, 1, true, false, on, off or yes (any case)" },
-@@ -259,6 +265,15 @@
-         for (r.words, 0..) |v, i| if (std.mem.eql(u8, text, v)) return i;
-         return error.InvalidEnvironment;
+@@ -318,6 +324,15 @@
+         if (n < r.min or n > r.max) return error.InvalidEnvironment;
+         return n;
      }
 +    if (r.kind == .occupied_phase) {
 +        if (text.len < 37 or !std.mem.startsWith(u8, text, "v1:") or text[35] != ':') return error.InvalidEnvironment;
@@ -17206,9 +17291,9 @@ diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
 +        return 0;
 +    }
      if (r.kind == .toggle) return toggle(r, text) orelse error.InvalidEnvironment;
+     if (r.kind == .names) return try nameCount(r, text);
      // a path travels as 0, its text read by `path`; the file itself is its reader's to check
-     if (r.kind == .path) return if (for (text) |ch| {
-@@ -428,8 +443,33 @@
+@@ -519,8 +534,33 @@
      }
  };
  
@@ -17251,7 +17336,7 @@ diff --git a/zig/src/server/engines.zig b/zig/src/server/engines.zig
  //! The engines this binary opens for a checkpoint: the backend module built in (Metal, or none for the tests).
  const std = @import("std");
  const api = @import("engine_api");
-@@ -66,7 +68,9 @@
+@@ -69,7 +71,9 @@
          problem.* = "--record writes rows from the CUDA engine only so far: serve without --record";
          return null;
      }
@@ -17265,7 +17350,7 @@ diff --git a/zig/src/server/engines.zig b/zig/src/server/engines.zig
 diff --git a/zig/src/server/load_metrics.zig b/zig/src/server/load_metrics.zig
 --- a/zig/src/server/load_metrics.zig
 +++ b/zig/src/server/load_metrics.zig
-@@ -65,9 +65,21 @@
+@@ -70,9 +70,21 @@
  pub fn get(srv: anytype, conn: anytype, a: Allocator) void {
      const snap = srv.load.read();
      const now_s = @as(f64, @floatFromInt(std.Io.Clock.real.now(srv.io).toNanoseconds())) / 1e9;
@@ -17297,9 +17382,9 @@ diff --git a/zig/src/server/main.zig b/zig/src/server/main.zig
  //! ``tensorfold-native``: ``capabilities --json`` for the Python switch, and ``serve MODEL [flags]`` with no Python.
  const std = @import("std");
  const json = @import("json");
-@@ -53,10 +55,15 @@
- 
- pub const std_options = engines.std_options;
+@@ -58,10 +60,15 @@
+ /// Read by the Metal wrapper at compile time: Metal 4 only in a binary whose engines use it.
+ pub const tf_metal4 = engines.metal4;
  
 +const StopTest = if (@import("builtin").is_test) struct { pub var entry: ?*const fn () anyerror!void = null; } else struct {};
  pub fn main(init: std.process.Init) !u8 {
@@ -17313,17 +17398,17 @@ diff --git a/zig/src/server/main.zig b/zig/src/server/main.zig
      const a = init.arena.allocator();
      const argv = try init.minimal.args.toSlice(a);
      if (comptime @import("builtin").os.tag != .windows) if (argv.len == 2 and std.mem.eql(u8, argv[1], pdf_worker.arg)) pdf_worker.serve();
-@@ -179,7 +186,8 @@
-     var text_arena: std.heap.ArenaAllocator = .init(gpa); // the text's problem, written on its own thread
-     defer text_arena.deinit();
-     var text_problem: []const u8 = "";
+@@ -197,7 +204,8 @@
+     defer if (witness_binary) |b| b.close(io);
+     const witness_text = if (args.execution_witness) witness.stampText(gpa, io, dir, args.chat_template) else null;
+     defer if (witness_text) |w| w.deinit();
 -    const up = startup.both(io, loadText, .{ gpa, io, dir, args.chat_template, text_arena.allocator(), &text_problem }, openEngine, .{ a, gpa, io, dir, model_type, &args, draft.automatic, &problem }) catch |e| {
 +    const up = startup.bothControlled(io, loadText, .{ gpa, io, dir, args.chat_template, text_arena.allocator(), &text_problem }, openEngine, .{ a, gpa, io, dir, model_type, &args, draft.automatic, &problem }, serve.stopToken()) catch |e| {
 +        if (e == error.Stopped and serve.stopping()) return 0;
          if (text_problem.len > 0) return fail(text_problem);
          if (problem.len > 0) return fail(problem); // an engine that failed after saying why
          return e;
-@@ -291,3 +299,25 @@
+@@ -311,3 +319,25 @@
  }
  
  const Closer = @import("idle_unload_closer.zig").Closer;
@@ -17358,7 +17443,7 @@ diff --git a/zig/src/server/serve.zig b/zig/src/server/serve.zig
  //! Server lifetime: keys, socket, startup and live lines, and a clean stop on SIGTERM or SIGINT.
  const std = @import("std");
  const platform = @import("sys");
-@@ -132,11 +134,11 @@
+@@ -136,11 +138,11 @@
  
  /// Serves until a stop signal; the process exit status.
  pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
@@ -17373,7 +17458,7 @@ diff --git a/zig/src/server/serve.zig b/zig/src/server/serve.zig
      var arena: std.heap.ArenaAllocator = .init(gpa);
      defer arena.deinit();
      const a = arena.allocator();
-@@ -514,3 +516,12 @@
+@@ -530,3 +532,12 @@
      }
      return out.toOwnedSlice(allocator);
  }
